@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+bench/corpus/
+bench/*.npz
+bench/*.log
+bench/*.err
+bench/snapshot/
+site/
+NUL

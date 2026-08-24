@@ -1,0 +1,60 @@
+site_name: raggio
+site_description: >-
+  Containerized RAG vector store built on turbovec: REST API, durable async
+  ingest, hybrid vector + BM25 search, disk-backed collections.
+site_url: https://emanuelemeazzo.github.io/raggio/
+repo_url: https://github.com/EmanueleMeazzo/raggio
+repo_name: EmanueleMeazzo/raggio
+
+# docs/agents/ holds agent-facing instructions, not user documentation.
+# adr/ IS built (not in nav): benchmark and concepts pages deep-link the ADRs.
+exclude_docs: |
+  agents/
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.details
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Search: search.md
+  - Concepts & terminology: concepts.md
+  - Vector indexing: indexing.md
+  - API reference: api.md
+  - Storage & durability: storage.md
+  - Benchmarks: benchmark.md
+  - Benchmark (arxiv abstracts): benchmark-arxiv.md
