@@ -35,6 +35,17 @@ records which one is current).
 After a crash, any `pending` or `processing` job is replayed on boot.
 Replays are idempotent: records are upserted by id.
 
+## Backup
+
+There is no backup API; a backup is a copy of `DATA_DIR`. `meta.db` is a WAL
+SQLite database and `index.tvim` is rewritten on every sync, so copy while
+nothing writes: stop the container, or copy a collection's directory while it
+is offloaded (idle past `COLLECTION_IDLE_TTL` with no pending jobs — `/healthz`
+lists the resident ones). Restore by placing the directory back on the volume
+before start; interrupted jobs replay as after a crash. For a logical export
+that survives version changes, page through
+`GET /collections/{name}/documents?include_vector=true` and re-ingest.
+
 ## Memory management
 
 Collections load into memory on first touch and are offloaded (synced +

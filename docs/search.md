@@ -117,9 +117,15 @@ Both apply to every mode (in hybrid, to both legs):
 ```
 
 - `scope`: `chunks` (default), `summaries`, or `both`.
-- `filter`: metadata equality (`"src": "sharepoint"`) and range operators
-  `gte` / `lte` / `gt` / `lt` — string comparison, so ISO dates work
-  naturally.
+- `filter`: one clause per metadata key, all ANDed:
+    - scalar — equality (`"src": "sharepoint"`);
+    - list — membership (`"src": ["sharepoint", "smb"]`, same as `{"in": [...]}`);
+    - object — `gte` / `lte` / `gt` / `lt` ranges (string comparison, so ISO
+      dates work naturally), `in`, and `contains` (case-insensitive substring,
+      ASCII case folding only: `{"title": {"contains": "acme"}}`).
+
+  There is no `or`, no `not`, and no filtering on `doc_id` or `text`. The same
+  grammar drives the unranked [listing endpoint](api.md#list-records).
 
 ## Result expansion
 

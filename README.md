@@ -99,7 +99,7 @@ curl :8000/collections/bu-sales/documents -H "x-api-key: sales-secret" --json '{
 # -> {"job_id": 1}    poll: GET /collections/bu-sales/jobs/1
 
 # search: mode vector (default) | text (BM25) | hybrid (RRF fusion of both),
-# scope chunks|summaries|both, equality + date-range filters,
+# scope chunks|summaries|both, metadata filters (equality, ranges, in, contains),
 # per-hit expansion to sibling chunks and/or the parent summary
 curl :8000/collections/bu-sales/search -H "x-api-key: sales-secret" --json '{
   "query": {"text": "acme pricing terms"},
@@ -115,8 +115,10 @@ scores; `text` runs BM25 over SQLite FTS5 (no embedding endpoint needed, score i
 (text required, vector optional to skip the embedding call). Records ingested without
 text are invisible to the BM25 leg.
 
-Also: `GET/DELETE /collections/{name}`, `GET/DELETE /collections/{name}/documents/{doc_id}`,
-`GET /healthz`. Re-ingesting an existing chunk/doc id upserts it.
+Also: `GET/DELETE /collections/{name}`, `GET/PATCH/DELETE /collections/{name}/documents/{doc_id}`
+(PATCH merge-patches metadata without re-embedding), `GET /collections/{name}/documents`
+(unranked filtered listing with paging, sort and total count), `GET /healthz`. Re-ingesting
+an existing chunk/doc id upserts it.
 
 ### Optional vector index
 

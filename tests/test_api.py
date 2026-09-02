@@ -343,3 +343,66 @@ def test_eviction_roundtrip(make_app, monkeypatch):
         r = c.post("/collections/a/search", headers=ROOT,
                    json={"query": {"text": "alpha"}, "mode": "text", "k": 1})
         assert r.json()["hits"][0]["id"] == "a1"  # FTS index survives eviction too
+
+
+def test_listing_filter_ops_and_patch(client):
+    client.post("/collections", headers=ROOT, json={"name": "main"})
+    ingest(client, "main", [DOC])
+    url = "/collections/main/documents"
+    ids = lambda r: [x["id"] for x in r.json()["records"]]
+    flt = lambda f, **kw: client.get(url, headers=ROOT, params={"scope": "chunks", "filter": json.dumps(f), **kw})
+
+    # unranked listing: total honors scope+filter; offset/limit page; default order = ingest order
+    r = client.get(url, headers=ROOT, params={"scope": "chunks", "limit": 2}).json()
+    assert r["total"] == 3 and [x["id"] for x in r["records"]] == ["c1", "c2"]
+    assert ids(client.get(url, headers=ROOT, params={"scope": "chunks", "limit": 2, "offset": 2})) == ["c3"]
+    r = client.get(url, headers=ROOT, params={"scope": "summaries"}).json()
+    assert r["total"] == 1 and r["records"][0]["type"] == "summary" and "score" not in r["records"][0]
+    assert client.get(url, headers=ROOT).json()["total"] == 4  # default scope: both
+
+    # sort on a metadata key, both directions
+    assert ids(client.get(url, headers=ROOT, params={"scope": "chunks", "sort": "-date"})) == ["c2", "c1", "c3"]
+    assert ids(client.get(url, headers=ROOT, params={"scope": "chunks", "sort": "date"})) == ["c3", "c1", "c2"]
+
+    # filter grammar: equality, in (explicit + list shorthand), contains (case-insensitive), ANDed
+    assert flt({"src": "wiki"}).json()["total"] == 2
+    assert ids(flt({"src": {"in": ["blog"]}})) == ["c3"]
+    assert flt({"src": ["blog", "wiki"]}).json()["total"] == 3
+    assert ids(flt({"src": {"contains": "IK"}})) == ["c1", "c2"]
+    assert ids(flt({"src": {"contains": "log"}, "date": {"lt": "2026-01-01"}})) == ["c3"]
+
+    # vectors on request: decoded fp16 originals, unit length
+    rec = flt({"src": "blog"}, include_vector="true").json()["records"][0]
+    assert len(rec["vector"]) == DIM and abs(sum(v * v for v in rec["vector"]) - 1) < 1e-2
+
+    # the new operators apply in every search mode
+    for mode in ("vector", "text", "hybrid"):
+        r = client.post("/collections/main/search", headers=ROOT,
+                        json={"query": {"text": "planet"}, "mode": mode, "k": 10,
+                              "filter": {"src": {"contains": "LOG"}}})
+        assert [h["id"] for h in r.json()["hits"]] == ["c3"], mode
+
+    # bad input is a 400, never a 500
+    assert client.get(url, headers=ROOT, params={"filter": "not json"}).status_code == 400
+    assert client.get(url, headers=ROOT, params={"filter": "[1]"}).status_code == 400
+    assert client.get(url, headers=ROOT, params={"sort": "date; DROP TABLE records"}).status_code == 400
+    assert flt({"src": {"like": "x"}}).status_code == 400
+    assert flt({"src": {"in": []}}).status_code == 400
+    assert flt({"src": {"in": [[1]]}}).status_code == 400
+
+    # metadata merge-patch: summary + chunks, existing keys kept, filters see the change
+    r = client.patch("/collections/main/documents/doc1", headers=ROOT,
+                     json={"metadata": {"src": "archive", "reviewed": True}})
+    assert r.json() == {"patched_records": 4}
+    doc = client.get("/collections/main/documents/doc1", headers=ROOT).json()
+    assert doc["summary"]["metadata"] == {"kind": "summary", "src": "archive", "reviewed": True}
+    assert all(c["metadata"]["src"] == "archive" and "date" in c["metadata"] for c in doc["chunks"])
+    r = client.post("/collections/main/search", headers=ROOT,
+                    json={"query": {"text": "planet"}, "mode": "text", "k": 10, "filter": {"src": "archive"}})
+    assert len(r.json()["hits"]) == 3
+    # null deletes a key; apply_to_chunks=false touches the summary only
+    r = client.patch("/collections/main/documents/doc1", headers=ROOT,
+                     json={"metadata": {"kind": None}, "apply_to_chunks": False})
+    assert r.json() == {"patched_records": 1}
+    assert "kind" not in client.get("/collections/main/documents/doc1", headers=ROOT).json()["summary"]["metadata"]
+    assert client.patch("/collections/main/documents/nope", headers=ROOT, json={"metadata": {}}).status_code == 404

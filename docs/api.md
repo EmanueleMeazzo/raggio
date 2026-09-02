@@ -140,6 +140,46 @@ Asynchronous: the job is journaled durably, then **202** returns immediately.
 
 **200** `{"doc_id": "...", "summary": {...} | null, "chunks": [...]}` · **404**
 
+### List records
+
+`GET /collections/{name}/documents`
+
+Unranked listing with a total count: the no-query counterpart of search, for
+browsing, paging, per-filter counts and exports.
+
+| Query param | Type | Default | Notes |
+|---|---|---|---|
+| `scope` | `chunks` \| `summaries` \| `both` | `both` | Record types listed |
+| `filter` | JSON object (URL-encoded) | none | Same grammar as the search `filter` |
+| `sort` | string | insertion order | Metadata key; `-` prefix for descending. Records lacking the key sort first ascending, last descending |
+| `limit` | int | `20` | 1–1000 |
+| `offset` | int | `0` | |
+| `include_vector` | bool | `false` | Attach each record's stored vector (decoded from the fp16 copy) as `vector` |
+
+```bash
+curl -G :8000/collections/kb/documents -H "x-api-key: $KEY" \
+  --data-urlencode 'scope=summaries' --data-urlencode 'sort=-date' \
+  --data-urlencode 'filter={"src": "sharepoint"}' --data-urlencode 'limit=20'
+```
+
+**200** `{"records": [hit…], "total": 12}` — hits shaped as in search, without
+`score` · **400** bad filter or sort
+
+### Patch document metadata
+
+`PATCH /collections/{name}/documents/{doc_id}`
+
+```json
+{"metadata": {"src": "archive", "reviewed": true, "draft": null}, "apply_to_chunks": true}
+```
+
+[JSON merge patch](https://www.rfc-editor.org/rfc/rfc7396) applied to the
+document's summary and, with `apply_to_chunks` (default `true`), every chunk:
+keys are added or replaced, `null` deletes a key, other keys are kept. Nothing
+is re-embedded or re-indexed.
+
+**200** `{"patched_records": 4}` · **404**
+
 ### Delete document
 
 `DELETE /collections/{name}/documents/{doc_id}`
@@ -171,7 +211,7 @@ Removes the document's summary and chunks from both indexes.
 | `mode` | `vector` \| `text` \| `hybrid` | `vector` | See [Search](search.md) |
 | `k` | int | `10` | 1–1000 |
 | `scope` | `chunks` \| `summaries` \| `both` | `chunks` | Record types searched |
-| `filter` | object | none | Metadata equality and `gte`/`lte`/`gt`/`lt` ranges |
+| `filter` | object | none | Metadata filters, ANDed: scalar = equality, list = `in`, object = `gte`/`lte`/`gt`/`lt`, `in`, `contains` ([grammar](search.md#scope-and-filters)) |
 | `expand` | object | none | Per-hit context expansion |
 | `nprobe` | int | index default | [IVF](indexing.md) shards probed for this query (speed/recall knob); ignored without an index |
 

@@ -134,7 +134,8 @@ def _normalize(mat: np.ndarray) -> np.ndarray:
 
 
 def _filter_sql(scope: str, filt: dict | None) -> tuple[str, list]:
-    """Build WHERE clause for records: type scope + metadata equality / range filters."""
+    """Build WHERE clause for records: type scope + metadata filters, all ANDed.
+    Per key: scalar = equality; list = `in`; object = range ops / `in` / `contains`."""
     clauses, params = ["indexed = 1"], []
     if scope == "chunks":
         clauses.append("type = 'chunk'")
@@ -142,15 +143,24 @@ def _filter_sql(scope: str, filt: dict | None) -> tuple[str, list]:
         clauses.append("type = 'summary'")
     for key, val in (filt or {}).items():
         path = "$." + key
-        if isinstance(val, dict):
-            for op, bound in val.items():
-                if op not in RANGE_OPS:
-                    raise ValueError(f"unsupported filter operator: {op}")
+        ops = val.items() if isinstance(val, dict) else [("in" if isinstance(val, list) else "eq", val)]
+        for op, bound in ops:
+            if op == "eq":
+                clauses.append("json_extract(metadata, ?) = ?")
+                params.extend([path, bound])
+            elif op in RANGE_OPS:
                 clauses.append(f"json_extract(metadata, ?) {RANGE_OPS[op]} ?")
                 params.extend([path, bound])
-        else:
-            clauses.append("json_extract(metadata, ?) = ?")
-            params.extend([path, val])
+            elif op == "in":
+                if not isinstance(bound, list) or not bound or any(isinstance(b, (list, dict)) for b in bound):
+                    raise ValueError(f"filter '{key}': 'in' needs a non-empty list of scalars")
+                clauses.append(f"json_extract(metadata, ?) IN ({','.join('?' * len(bound))})")
+                params.extend([path, *bound])
+            elif op == "contains":  # substring; SQLite lower() folds ASCII only
+                clauses.append("instr(lower(json_extract(metadata, ?)), lower(?)) > 0")
+                params.extend([path, str(bound)])
+            else:
+                raise ValueError(f"unsupported filter operator: {op}")
     return " AND ".join(clauses), params
 
 
@@ -1511,6 +1521,60 @@ class Collection:
         self._allow_cache.clear()
         self._df_cache_churn += len(rows)
         return len(rows)
+
+    def list_records(
+        self, scope: str, filt: dict | None, sort: str | None, limit: int, offset: int,
+        include_vector: bool = False,
+    ) -> dict:
+        """Unranked filtered listing with total count — the no-query counterpart of
+        search (browse, page, count per filter, export). Same scope/filter grammar."""
+        where, params = _filter_sql(scope, filt)
+        order, oparams = "id", []
+        if sort:
+            if not re.fullmatch(r"-?[\w.]+", sort):
+                raise ValueError("sort must be a metadata key, optionally prefixed with '-' for descending")
+            # ponytail: ORDER BY json_extract scans the filtered set (no expression index);
+            # add one per hot sort key if listing large collections gets slow
+            order = f"json_extract(metadata, ?) {'DESC' if sort[0] == '-' else 'ASC'}, id"
+            oparams = ["$." + sort.lstrip("-")]
+        db = self._rdb()
+        total = db.execute(f"SELECT COUNT(*) FROM records WHERE {where}", params).fetchone()[0]
+        ids = [
+            r[0]
+            for r in db.execute(
+                f"SELECT id FROM records WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
+                [*params, *oparams, limit, offset],
+            )
+        ]
+        recs = self._hydrate(ids)
+        if include_vector:  # decoded fp16 originals, keyed by external id (immune to a racing delete)
+            blobs = dict(_rows_by_id(
+                db, "SELECT r.external_id, v.vec FROM records r JOIN vecs v ON v.id = r.id WHERE r.id IN ({})", ids
+            ))
+            for rec in recs:
+                blob = blobs.get(rec["id"])
+                rec["vector"] = (
+                    np.frombuffer(blob, dtype=np.float16).astype(np.float32).tolist()
+                    if blob is not None and len(blob) == self.cfg.dim * 2 else None
+                )
+        return {"records": recs, "total": total}
+
+    async def patch_metadata(self, doc_id: str, patch: dict, apply_to_chunks: bool) -> int:
+        """RFC 7396 merge-patch the metadata of a document's records (null deletes a
+        key). Metadata is neither embedded nor FTS-indexed, so this is one UPDATE."""
+        async with self.lock.write():
+            return await asyncio.to_thread(self._patch_rows, doc_id, patch, apply_to_chunks)
+
+    def _patch_rows(self, doc_id: str, patch: dict, apply_to_chunks: bool) -> int:
+        types = "" if apply_to_chunks else " AND type='summary'"
+        with self.db_lock:
+            cur = self.db.execute(
+                f"UPDATE records SET metadata = json_patch(metadata, ?) WHERE doc_id=?{types}",
+                (json.dumps(patch), doc_id),
+            )
+            self.db.commit()
+        self._allow_cache.clear()  # cached allowlists were evaluated over the old metadata
+        return cur.rowcount
 
     def stats(self) -> dict:
         counts = dict(

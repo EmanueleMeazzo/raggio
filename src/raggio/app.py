@@ -1,10 +1,11 @@
 import asyncio
 import hmac
+import json
 from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 import numpy as np
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from .config import Settings
@@ -69,6 +70,11 @@ class SearchIn(BaseModel):
 class IndexIn(BaseModel):
     nlist: int | None = Field(default=None, ge=2, le=4096)  # default: ~rows/8192, power of 2
     nprobe: int | None = Field(default=None, ge=1, le=4096)
+
+
+class PatchIn(BaseModel):
+    metadata: dict[str, Any]  # RFC 7396 merge patch: null removes a key
+    apply_to_chunks: bool = True
 
 
 def create_app(settings: Settings | None = None, embedder_factory=None) -> FastAPI:
@@ -195,6 +201,38 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
         if doc is None:
             raise HTTPException(404, f"document '{doc_id}' not found")
         return doc
+
+    @app.get("/collections/{name}/documents")
+    async def list_documents(
+        c=Depends(get_collection),
+        scope: Literal["chunks", "summaries", "both"] = "both",
+        filter: str | None = Query(default=None, description="JSON object; same grammar as search"),
+        sort: str | None = Query(default=None, description="metadata key; '-' prefix = descending"),
+        limit: int = Query(default=20, ge=1, le=1000),
+        offset: int = Query(default=0, ge=0),
+        include_vector: bool = False,
+    ):
+        """Unranked listing with total count: the no-query counterpart of search."""
+        filt = None
+        if filter:
+            try:
+                filt = json.loads(filter)
+            except ValueError:
+                filt = filter  # not a dict -> rejected below
+            if not isinstance(filt, dict):
+                raise HTTPException(400, "filter must be a JSON object")
+        try:
+            return await asyncio.to_thread(c.list_records, scope, filt, sort, limit, offset, include_vector)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    @app.patch("/collections/{name}/documents/{doc_id}")
+    async def patch_document(doc_id: str, body: PatchIn, c=Depends(get_collection)):
+        """Merge-patch metadata on the document's records without re-ingesting."""
+        n = await c.patch_metadata(doc_id, body.metadata, body.apply_to_chunks)
+        if not n:
+            raise HTTPException(404, f"document '{doc_id}' not found")
+        return {"patched_records": n}
 
     @app.delete("/collections/{name}/documents/{doc_id}")
     async def delete_document(doc_id: str, c=Depends(get_collection)):
