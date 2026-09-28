@@ -8,20 +8,21 @@
 - **Build.** One `PYTHON` build arg picks the interpreter. On 3.14t, uv builds turbovec from its sdist in the Rust builder stage; PyO3 0.29 declares `gil_used = false`, so no patch is needed. `docker/check_image.py` is the last builder step. It fails the build unless the interpreter is the flavour `PYTHON` names and nothing the app loads turns the GIL back on.
 - **Guards.** The runtime image turns CPython's GIL-re-enable `RuntimeWarning` into an error. `/healthz` reports `gil_enabled` on every request.
 - **Server changes for 3.14t.** On free-threaded builds, meta.db connections skip sqlite3's statement cache; with it, biased reference counting leaves zombie connections behind. `GC_FREEZE=1` freezes the startup heap, so the free-threaded collector's stop-the-world passes skip it.
-- **Native code per interpreter.** `raggio_native` is rebuilt for each image's own interpreter (cp312, cp314t; never abi3), through Plan E's builder (`PYO3_PYTHON` names the uv-installed `/python`). turbovec is the one dependency without a cp314t wheel. The 3.14t aarch64 build of both has never run: spec §8's probe p4 is pending, and Task 11 runs it first, stopping if turbovec's sdist does not build (raggio never forks turbovec, D6).
-- **Evaluation.** A (3.12) and B (3.14t) are built from one commit and run as four sessions, A1 B1 A2 B2, on one boot, with Plan A's `session.sh` at `FLAT_RUNS=3`. Every image runs `OPENBLAS_NUM_THREADS=1` (D16), and every table row carries its `sqlite3.sqlite_version` (D15). The decision reads the flat rows of Plan A's `compare.py` tables. It separates the CPU-bound vector rows from the SQLite-bound hybrid rows, because SQLite's global memstatus mutex caps concurrent text search whatever the GIL does. It is Continue, Hold or Park, under a rule ADR 0006 writes down before the run.
+- **Native code per interpreter.** `raggio_native` is rebuilt for each image's own interpreter (cp312, cp314t; never abi3), through Plan E's builder (`PYO3_PYTHON` names the uv-installed `/python`). turbovec is the one dependency without a cp314t wheel. Spec §8's probe p4 ran on gn100 on 2026-09-28 (`docs/superpowers/research/2026-09-28-dgx-probe-p4-freethreaded.md`), on the 19a8a2e tree, which has no `raggio_native`: turbovec 1.0.0 built from its sdist as `cp314-cp314t-linux_aarch64` with 0 builder-stage fixes and no build arg, and the GIL stayed off. So G2's failure paths below are unlikely for turbovec. Still open, and Task 11 runs it first: `raggio_native`'s cp314t build, and G's real `check_image.py` on G's real Dockerfile. If turbovec's sdist does not build, Task 11 fixes a build-dependency, toolchain or build-flag cause in the Dockerfile's builder stage only, in at most 3 attempts; if 3 attempts fail, or no builder-stage line can express a fix that needs no source change, it stops and asks the maintainer, and ADR 0006 stays `Pending:` (spec §3.1 G3); if only a change to turbovec's own source would fix it, it drafts an upstream issue for the maintainer to post and parks the evaluation without asking (spec §3.1 G2; raggio never forks turbovec, D6).
+- **Evaluation.** A (3.12) and B (3.14t) are built from one commit and run as four sessions, A1 B1 A2 B2, on one boot, with Plan A's `session.sh` at `FLAT_RUNS=3` and `CONCURRENCY=8`. Each of them is followed, on the same image, by a c=16 session (`CONCURRENCY=16`, spec §3.1 G7), so the chain is eight sessions: A1 A1c16 B1 B1c16 A2 A2c16 B2 B2c16. The c=16 speed tables are reported, not gated; their GIL, Traceback and /healthz checks gate like any session's (G8). Every image runs `OPENBLAS_NUM_THREADS=1` (D16), and every table row carries its `sqlite3.sqlite_version` (D15). The decision reads the flat rows of Plan A's `compare.py` tables. It separates the CPU-bound vector rows from the SQLite-bound hybrid rows, because SQLite's global memstatus mutex caps concurrent text search whatever the GIL does. It is Continue, Hold or Park, under a rule ADR 0006 writes down before the run.
 
 **Tech Stack:** CPython 3.12 and 3.14t (uv-managed), uv 0.12.19, turbovec 1.0.0 (abi3 wheels; built from its sdist on 3.14t, Rust >= 1.89), PyO3 0.29, FastAPI, sqlite3, pytest, GitHub Actions, MkDocs Material. On the DGX: rootless podman 4.9.3, bash, and GNU coreutils `timeout`.
 
 **Spec:** `docs/superpowers/specs/2026-09-28-raggio-performance-design.md`:
 - §1 item 4 and §2 order 8 (scope);
 - §3 D1 (ADR 0006), D2 (one Dockerfile; G adds the 3.14t/turbovec-sdist path), D6 (experimental; not the default until turbovec ships cp314t wheels; never fork turbovec), D11 (a non-blocking 3.14t CI job), D15 (the SQLite memstatus mutex; G's verdict accounts for it), D16 (`OPENBLAS_NUM_THREADS=1`);
+- §3.1, the maintainer's decisions for G: G1 (one DGX measurement session, an ABAB session, runs for up to 90 minutes), G2 (a turbovec sdist that fails to build for 3.14t in p4 is fixed in the builder stage with flags and build dependencies only; a needed source change is drafted upstream in `D:/DEV/_scratch/upstream-drafts/` for the maintainer to post, and G is parked), G3 (3 failed builder-stage attempts, or a fix no allowed Dockerfile line can express although turbovec's source needs no change, stop G and ask the maintainer; ADR 0006 stays Pending; only G2's source-change case parks without asking), G4 (build and fix windows, Task 11, have no time cap; G1's cap applies to measurement sessions only), G5 (the decision's hybrid p99 guard, and CPU per query, which classifies each flat run's fast/slow state and is reported, not gated) and G7 (a c=16 session after each arm session; its tables are reported, not gated);
 - §4.1:
   - `/healthz` keys are additive only;
   - `bench/dgx/*` belongs to Plan A, and G adds only a `bench/<name>_probe.py`;
   - the Dockerfile and `tests.yml` are shared: A owns the base and the `OPENBLAS_NUM_THREADS` line, C the `MALLOC_TRIM_THRESHOLD_` line, E the Rust builder, G the 3.14t/turbovec-sdist path;
 - §4.2 (`GC_FREEZE`, owner G; `raggio_native` built without abi3, `gil_used = false`);
-- §6 (DGX protocol, including the noise band), §7 G (acceptance) and §8 (probe p4, pending).
+- §6 (DGX protocol, including the noise band, and the go-ahead rule: any run over about 5 minutes needs the user's go-ahead with a time cap, except build-and-fix windows, whose go-ahead has none per §3.1 G4), §7 G (acceptance) and §8 (probe p4, ran 2026-09-28: 0 G2 fixes, the GIL stays off, SQLite 3.53.1).
 
 Research:
 - `docs/superpowers/research/2026-09-28-item4a-freethreading-deps.md` (wheel availability, turbovec's sdist, the laptop's 3.14t numbers);
@@ -34,11 +35,16 @@ Research:
   - true-cold start: 128 s.
 - `…-dgx-probe-p2-hybrid-native.md` (D15):
   - SQL-only text search on Debian's SQLite 3.40.1 (memstatus on): 27.9 / 36.5 / 18.4 / 16.8 q/s at T = 1 / 2 / 4 / 8;
-  - on PBS SQLite 3.50.4, the SQLite that uv's interpreters bundle: 28.6 / 47.6 / 45.4 / 39.4 q/s, a plateau at about 39–48 q/s. memstatus cannot be switched off there;
+  - on PBS SQLite 3.50.4, the SQLite of the uv interpreter p2 used: 28.6 / 47.6 / 45.4 / 39.4 q/s, a plateau at about 39–48 q/s. memstatus cannot be switched off there. uv 0.12.19's PBS interpreters (3.12.14, 3.14.7, 3.14.7t), which G's images run, bundle SQLite 3.53.1 (p4); these figures were not re-measured on 3.53.1;
   - `raggio_native` must be rebuilt per interpreter (a non-manylinux wheel, built on the runtime's Debian release);
   - between-server variance: identical code 6–7% apart at IVF warm p50, ≤1.3% on flat; vector concurrent QPS bimodal, 120–225.
 - `…-dgx-probe-p3-ivf-fanout.md` (D16): numpy's default scipy-openblas starts 20 busy-spinning threads under search load. They burn about 16 cores and push query threads onto the A725 cores (cpus 0–4, 10–14): serial 4.06–4.08 ms on an X925 core (cpus 5–9, 15–19) against 8.31–8.33 ms on an A725, filtered 32.5 against 69.5 ms. `OPENBLAS_NUM_THREADS=1` removes that bimodality. Rootless podman cannot pin with `--cpuset-cpus`.
-- p4, the 3.14t aarch64 build (`…-dgx-probe-p4-freethreaded.md`): **pending**, never run. Task 11 runs it.
+- `…-dgx-probe-p4-freethreaded.md` (the 3.14t aarch64 build and concurrency; ran 2026-09-28 19:00–20:10Z on gn100, at the 19a8a2e tree, which has no `raggio_native`, with a stand-in `check_image.py`):
+  - the 3.14t image builds on aarch64 with 0 builder-stage fixes, in 28.7 s cold [28.2..29.3] (3 `--no-cache` builds, pre-pulled bases, no uv cache). The dependency step is 17–19 s of that, which is turbovec's compile. The 3.14 GIL image takes 10.6 s. The images are 323.6 MB (3.14t) and 320.9 MB (3.14);
+  - turbovec 1.0.0 builds from its sdist as `cp314-cp314t-linux_aarch64` with no build arg: PyPI has only the `cp39-abi3` wheel, so uv falls back to the sdist on its own. `ARG UV_NO_BINARY_PACKAGE` matters only for the C1 arm, whose local 3.14 build is `cp39-abi3-linux_aarch64` because the sdist enables `abi3-py39`;
+  - the GIL stays off at import, under pytest, under uvicorn load and in the race runs; the `PYTHONWARNINGS` guard was set in every probe container and never fired, and G keeps it. The suite gave 46 passed, 1 warning on every interpreter;
+  - uv 0.12.19's PBS interpreters (3.12.14, 3.14.7, 3.14.7t) bundle SQLite 3.53.1, not 3.50.4;
+  - still open, for Task 11: `raggio_native`'s cp314t build, whose compile time nobody has measured, and G's real `check_image.py` on G's real Dockerfile.
 
 ## Global Constraints
 
@@ -58,8 +64,10 @@ Research:
     It uses `--no-sync`, as the CI job does, so `uv run` never re-resolves that venv.
 - **The test module.** Every new test goes in `tests/test_freethreading.py` (UTF-8, LF). Task 1 creates it and each later task appends one section.
   - The counts after Tasks 1–9 are 2, 8, 11, 12, 20, 23, 25, 28 and 29; after Task 12, 30.
+  - Task 11 adds one test, `test_the_p4_turbovec_build_fix_stays_in_the_builder_stage`, only if probe p4 needs a builder-stage fix (spec §3.1 G2). The counts are then 30 after Task 11 and 31 after Task 12, and the full suites have one more test from Task 11 on.
   - On 3.12, 1 test skips from Task 3 on and 4 from Task 5 on. These are the GIL-guard tests, which need a free-threaded build.
   - On 3.14t nothing in the module skips.
+  - Plan B's Task 6 test, `test_http_searches_at_c16_and_racing_a_collection_delete`, postdates the sandbox: the sandbox's absolute full-suite counts below are one lower than on the real tree. The relative counts (`N more than the base`) stand. That test has never run on 3.14t; if it fails there, "Any other failure is a free-threading bug: stop" applies.
   - The full suite grows by the same numbers over whatever the base has. On 3.14t, the base's bench-group test modules skip (orjson has no free-threaded wheel).
 - **The GIL guard string** is exactly `error:The global interpreter lock (GIL) has been enabled:RuntimeWarning`.
   - It appears in three places: `docker/check_image.py` `GIL_WARNING_FILTER`, the runtime `ENV PYTHONWARNINGS`, and the CI job's env.
@@ -67,11 +75,12 @@ Research:
 - **`/healthz`** gains `gil_enabled`; `status`, `resident_collections` and `bm25` stay (spec §4.1).
 - **`GC_FREEZE`** is `0` (default) or `1`. Anything else raises `ValueError` from `Settings()` at startup.
 - **The default image stays `PYTHON=3.12`** (spec D6).
-  - turbovec is never forked or patched.
+  - turbovec is never forked, patched or vendored, and no other turbovec version is pinned.
+  - If turbovec's sdist does not build for cp314t in probe p4 (spec §3.1 G2), Task 11 classifies the cause from the build log. A missing system build dependency, a Rust or maturin toolchain version, or a missing interpreter-specific build flag or env is fixed in the Dockerfile's builder stage only, in at most 3 rebuild attempts, each recorded in the task log `D:/DEV/_scratch/dgx/planG/p4-attempts.md`. If 3 attempts do not fix it, or no builder-stage line can express the fix although turbovec's source needs no change, Task 11 stops and asks the user, and ADR 0006 stays `Pending:` until the user decides (spec §3.1 G3). A cause that only a change to turbovec's own source would fix gets an upstream issue draft in `D:/DEV/_scratch/upstream-drafts/turbovec-cp314t-build.md`, which the maintainer posts (never the implementer, D7), and G is parked in ADR 0006. That is the only case that parks without asking (spec §3.1 G3).
   - `pyproject.toml` and `uv.lock` do not change.
   - Making 3.14t the default, and choosing `GC_FREEZE`'s default, are out of scope.
 - **Shared files** (spec §4.1).
-  - The Dockerfile and `.github/workflows/tests.yml` gain only the lines quoted in Tasks 6 and 7.
+  - The Dockerfile and `.github/workflows/tests.yml` gain only the lines quoted in Tasks 6 and 7. The one exception is Task 11's probe p4 fix, only if p4 needs one: builder-stage lines of the kinds Task 11 Step 6 lists, and nothing outside the builder stage (spec §3.1 G2).
   - `bench/dgx/*` is Plan A's and is not edited. G adds `bench/unicode_drift_probe.py`.
 - **DGX helpers** live outside the repo and are never committed.
   - On the laptop they are in `D:/DEV/_scratch/dgx/planG/`. On gn100 they are in `~/raggio-bench/`, all prefixed `g-`.
@@ -80,8 +89,11 @@ Research:
   - Every ssh is `ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100`.
   - Local paths given to `scp` are relative, after a `cd`, because `scp` would read `D:` as a host name.
   - Only the `bench-tv` container is ever stopped or removed (`podman rm -f bench-tv`). Never touch `bench-wv` or its volume.
-  - Never `pkill -f`. Long runs are `setsid -f` into a log, then polled.
-  - Any DGX run over about 5 minutes needs the user's explicit go-ahead in the session, with a time cap. Tasks 11 and 12 are last, and each starts by asking.
+  - Never `pkill -f`. Long runs are `setsid -f` into a log, then polled. A stop recipe finds the PIDs first, leaves out the shell that runs it, and kills by PID.
+  - Any DGX run over about 5 minutes needs the user's explicit go-ahead in the session. Tasks 11 and 12 are last, and each starts by asking. Task 12's go-ahead names a time cap (spec §6). Task 11's names none: spec §6 exempts build-and-fix windows from the cap (§3.1 G4).
+  - One DGX measurement session, an ABAB session, runs for at most 90 minutes (spec §3.1 G1): Task 12 passes `90m` to `g-abab.sh` as the per-session cap, and `g-session.sh` enforces it with `timeout`. Each c=16 session (spec §3.1 G7) is a measurement session of its own, with its own 90 minutes.
+  - Build and fix windows have no time cap (spec §3.1 G4). Task 11, the 3.14t image build with up to 3 fix attempts, is one: none of its steps stops for time. It ends at Step 10, after Step 9, a Park or a stop-and-ask at p4, a stop one of its steps names for a failure, or the user's request for gn100 back.
+    - A stall is not a time cap. A deploy or build whose log has not grown for 30 consecutive minutes is hung: Task 11 stops it with Step 1's stop recipe and asks the user (the stall guard in Steps 4 and 6), and the hung build uses none of the 3 attempts.
   - No `sudo`. Never touch `~/turborag` except to read the corpus through Plan A's `deploy.sh` symlink.
 - **Spec lines this plan is held to, verbatim:**
   - "Not the default until turbovec publishes cp314t wheels. raggio never maintains a turbovec fork." (D6)
@@ -94,13 +106,21 @@ Research:
   - "Both arms of an A/B run with the same `OPENBLAS_NUM_THREADS`, and every row records it. Rootless podman cannot pin with `--cpuset-cpus`. When a single-thread latency needs attributing, pin in-process with `os.sched_setaffinity` (X925 = cpus 5–9, 15–19)." (§6)
   - "Claim a win only if it exceeds the band." (§6)
   - "Every row also states its memory cap and `sqlite3.sqlite_version` (D15)." "Arms of one A/B share the same regime." (§6)
-  - "**G:** the full test suite green on 3.14t with the GIL guard. QPS/latency ABAB on one boot. The report states whether to continue; making it the default is out of scope." (§7)
+  - "G's decision rule gets a p99 guard and CPU per query. A `Hybrid QPS concurrent` win counts only when the hybrid p99 under concurrency is present and not `worse` in either cross table (A1 → B1, A2 → B2). CPU per query is recorded for every run and classifies each flat run's fast/slow state, so the bimodal flat `QPS concurrent` row (p4: ~134 vs ~250 QPS on every interpreter) cannot fake a win through an uneven split. CPU per query is reported, not gated." (§3.1 G5)
+  - "Follow-up to G5: each ABAB arm session (A1, B1, A2, B2) is followed, on the same boot and image, by a **c=16 session**. It repeats that session's bench runs with `bench.py --concurrency 16`, in a fresh container per run. Each c=16 session is a measurement session with its own 90-minute cap (G1). Its pair tables (`A1 → B1 (c=16)`, `A2 → B2 (c=16)`, plus the same between-server checks) carry the usual verdicts and are reported in ADR 0006, not gated: the decision still reads the c=8 tables. C1 and D1 run at c=8 only. p4 saw 3.14t's hybrid gain only at c=16." (§3.1 G7)
+  - "Follow-up to G7: the c=16 sessions' GIL and log checks gate like the c=8 sessions'. ADR 0006's `GIL and logs` table has a row for every session, the c=16 ones included. A Traceback or GIL line in any session's container logs, or a 3.14t `/healthz` answer without `gil_enabled` false, parks B. Only the c=16 speed tables are reported and not gated (G7). A crash under load is a correctness failure, which G exists to catch." (§3.1 G8)
+  - "Follow-up to G5: an uneven or unknown fast/slow split fakes neither a win nor a loss. When either cross pair's flat runs split unevenly, or a flat run has no CPU per query, `QPS concurrent` and `p95 under concurrency (ms)`, both measured in those runs, count as neither a win nor a miss. The win check already skips `QPS concurrent` then; the "worse in both pairs" check skips both rows too." (§3.1 G9)
+  - "**G:** the full test suite green on 3.14t with the GIL guard. QPS/latency ABAB on one boot. A hybrid win needs a hybrid p99 present and not `worse` in either cross table, and every run records CPU per query (§3.1 G5); an uneven or unknown fast/slow split counts neither way (§3.1 G9). Each ABAB session is followed by a c=16 session, whose tables are reported and not gated (§3.1 G7); its GIL and log checks gate like the others (§3.1 G8). The report states whether to continue; making it the default is out of scope." (§7)
 - **How the ABAB meets them** (Tasks 9, 10 and 12):
   - The gate reads the CPU-bound flat rows. `QPS concurrent` (vector search and its rescoring) can win. `Hybrid QPS concurrent` can win only when A and B run the same `sqlite_version`. A hybrid row that does not scale, or gets worse, is recorded as SQLite-bound and never parks the evaluation.
+  - A `Hybrid QPS concurrent` win also needs `Hybrid p99 under concurrency (ms)` present and not `worse` in either cross table (spec §3.1 G5). A `QPS concurrent` win needs the flat runs' fast/slow states, read from CPU per query, to split evenly on both sides of each cross pair. CPU per query is reported for every run and never gated.
+  - Each arm session is followed by a c=16 session (spec §3.1 G7). Its four speed tables are reported in ADR 0006 and the decision does not read them.
+  - The c=16 sessions' checks gate (spec §3.1 G8): `GIL and logs` has a row for each of the eight sessions, and a Traceback, a GIL line or a `/healthz` answer without `gil_enabled` false in any of them parks B.
+  - An uneven or unknown fast/slow split counts neither way (spec §3.1 G9): `QPS concurrent` and `p95 under concurrency (ms)` are skipped by both the win check and the "worse in both pairs" check then.
   - Every session runs `FLAT_RUNS=3`, so the flat concurrent-QPS rows have 3 counted runs per side; IVF has 3 (`IVF_RUNS`). A table with Plan A's `Reported, not claimed` note fails the Task 12 test.
   - Every run is a fresh container: `session.sh` replaces it for every run, and each session's `g-ensure-ivf.sh` starts its own. The between-server variance shows in A1 → A2 and B1 → B2. A win row that moves beyond the band there is not claimed.
   - Every image inherits A's `ENV OPENBLAS_NUM_THREADS=1` from the one Dockerfile. `image.json` records it, and the Task 12 test requires `openblas_num_threads=1` on both `Regime` lines of every table.
-  - Every table states its regime above the rows: `page_cache=host-warm`, `memory=4g`, the swap, `python`, `sqlite_version` and `openblas_num_threads`. The arms of a table may differ only in `python` and `sqlite_version`, and two sessions of one arm in nothing.
+  - Every table states its regime above the rows: `page_cache=host-warm`, `memory=4g`, the swap, `concurrency` (16 in the `(c=16)` tables, 8 in the others), `python`, `sqlite_version` and `openblas_num_threads`. The arms of a table may differ only in `python` and `sqlite_version`, and two sessions of one arm in nothing.
 - **Windows.** Local `podman` in Git Bash needs `MSYS_NO_PATHCONV=1`.
 - **Commit trailer**, on every commit: `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
@@ -121,18 +141,20 @@ Five failure modes the spec implies, most likely first. Each has a pin test in i
 3. **A difference between the arms that is not free threading, blamed on it (Tasks 5, 6, 8, 10).**
    - What happens, in four ways:
      - Unicode: 3.12 has Unicode 15.0.0 and 3.14 has 16.0.0. The tokenizer runs on `unicodedata`, and `raggio_native` builds its tables from the interpreter it is compiled for.
-     - SQLite (D15): concurrent hybrid is capped by SQLite's global memstatus mutex, and the two interpreters may bundle different SQLite builds. A hybrid leg that does not scale on B would read as "free threading failed".
+     - SQLite (D15): concurrent hybrid is capped by SQLite's global memstatus mutex, and the two interpreters may bundle different SQLite builds (p4 found 3.53.1 in uv 0.12.19's 3.12.14 and 3.14.7t, but a different uv or interpreter pin can change it). A hybrid leg that does not scale on B would read as "free threading failed".
      - BLAS threads (D16): one arm with OpenBLAS spinners runs its query threads on the slow A725 cores.
      - The native scorer: an abi3 or other-ABI `raggio_native` cannot load on 3.14t, and raggio silently falls back to the Python scorer.
    - What must hold:
      - the drift dump folds each code point exactly as the tokenizer does, and the diff tells newly assigned code points from changed ones;
      - the decision never parks on a SQLite-bound row, and counts a hybrid win only when A and B run the same `sqlite_version`;
      - every table of the ABAB has `openblas_num_threads=1` on both sides;
+     - an uneven or unknown fast/slow split makes `QPS concurrent` and `p95 under concurrency (ms)` count neither as a win nor as a miss (`flat-split-uneven-worse`, spec §3.1 G9);
+     - a Traceback or GIL line in a `-c16` session parks B like one in any other session (`c16-traceback`, spec §3.1 G8), while the `(c=16)` speed tables gate nothing (`c16-not-gated`);
      - the image build fails unless `raggio_native` carries the interpreter's own extension suffix and `bm25` is `native`.
    - Pins:
      - `test_drift_probe_dump_records_what_the_tokenizer_does_per_code_point` and `test_drift_probe_diff_separates_new_code_points_from_changed_ones` (Task 8);
      - `test_check_image_finds_every_compiled_module_it_can_import`, which also asserts `built_for_this_interpreter` (Task 5);
-     - `g-check.py`'s `sqlite-bound`, `hybrid-win`, `hybrid-other-sqlite`, `blas-differs` and `thin` scenarios, which run `test_adr_0006_records_the_dgx_abab_and_its_decision` (Task 10).
+     - `g-check.py`'s `sqlite-bound`, `hybrid-win`, `hybrid-other-sqlite`, `hybrid-p99-worse`, `flat-split-uneven`, `flat-split-uneven-worse`, `flat-split-even`, `cpu-missing`, `c16-not-gated`, `c16-traceback`, `blas-differs` and `thin` scenarios, which run `test_adr_0006_records_the_dgx_abab_and_its_decision` (Task 10).
    - Mutations: `dump` without `_fold`, and `if False:` in place of the `Cn` newly-assigned test, which counts new code points as changed. For the D15/D16 part: `SQLITE_BOUND = ()`, which counts the hybrid win in `hybrid-other-sqlite`, and dropping the `openblas_num_threads` assert, which passes `blas-differs`.
 4. **`GC_FREEZE` keeps an evicted or deleted collection alive (Task 2).**
    - What happens: the freeze runs after `resume_pending`, so a collection a replayed job loaded is in the frozen heap. The collector skips frozen objects, so a collection that only a cycle collection could free would stay until shutdown.
@@ -159,13 +181,17 @@ Five failure modes the spec implies, most likely first. Each has a pin test in i
 | `src/raggio/store.py` | Modify: `import sysconfig`, `SQLITE_CACHED_STATEMENTS`, and both meta.db `sqlite3.connect` calls | 4 |
 | `docker/check_image.py` | Create: the build-time image check | 5 |
 | `Dockerfile` | Modify: the header comment, `ARG UV_NO_BINARY_PACKAGE`, the check step, the runtime `ENV PYTHONWARNINGS` | 6 |
+| | Only if probe p4 needs it: the turbovec build fix, builder-stage lines only (spec §3.1 G2) | 11 |
 | `.github/workflows/tests.yml` | Modify: the `freethreaded` job | 7 |
 | `bench/unicode_drift_probe.py` | Create: `dump`, `diff` and `scan` | 8 |
-| `docs/adr/0006-free-threaded-python.md` | Create. Task 12 replaces its `Pending:` Verification | 9, 12 |
+| `docs/adr/0006-free-threaded-python.md` | Create. Task 12 replaces its `Pending:` Verification; Task 11 replaces it instead only if G parks at probe p4 | 9, 11 (p4 Park only), 12 |
 | `README.md`, `docs/getting-started.md`, `docs/api.md` | Modify: the build arg, the `GC_FREEZE` row, the `/healthz` example | 9 |
-| `tests/test_freethreading.py` | Create in Task 1; each later task appends one section | 1–9, 12 |
+| `tests/test_freethreading.py` | Create in Task 1; each later task appends one section (Task 11 only if probe p4 needs a builder-stage fix) | 1–9, 11 (p4 fix only), 12 |
 | `D:/DEV/_scratch/dgx/planG/` (outside the repo) | `g-check.py`, `t12-section.py`, `g-render.py`, `g-decide.py`, `g-image-facts.py`, `g-session.sh`, `g-ensure-ivf.sh`, `g-abab.sh`, `g-build.sh`, `g-facts.sh`, `g-fanout.sh` | 10 |
-| `D:/DEV/_scratch/dgx/planG/g.env`, `deploy.log`, `results/` (outside the repo) | The pinned SHA and arms; the deploy log; the fetched outputs | 11, 12 |
+| `D:/DEV/_scratch/dgx/planG/g.env`, `deploy.log`, `deploy.stall`, `g-build.stall`, `results/` (outside the repo) | The pinned SHA and arms; the deploy log; the stall guard's state (Steps 4 and 6); the fetched outputs | 11, 12 |
+| `D:/DEV/_scratch/dgx/planG/hung-<UTC time>.log` (outside the repo) | Only if the stall guard fires: the hung deploy's or build's log. `p4-attempts.md` then also holds its `## p4 hung build, not counted` entry | 11 |
+| `D:/DEV/_scratch/dgx/planG/p4-attempts.md`, `g-build-p4-<k>.log` (outside the repo) | Only if turbovec's sdist does not build, or a deploy or build hangs: the task log of p4 builds, and each failed build's log | 11 |
+| `D:/DEV/_scratch/upstream-drafts/turbovec-cp314t-build.md` (outside the repo) | Only if a turbovec source change is needed: the upstream issue draft, which the maintainer posts | 11 |
 | gn100 `~/raggio-bench/g-*` | The scripts, the images' facts, the drift files, the fan-out outputs, the sessions and `g-verification.md` | 11, 12 |
 
 ### Task 1: Report `gil_enabled` in `/healthz`
@@ -302,7 +328,7 @@ def _gil_enabled() -> bool:
 
 Run: `uv run pytest -q tests/test_freethreading.py`. Expected: `2 passed`.
 
-Run: `uv run pytest -q`. Expected: all green, 2 more tests than the base (sandbox: `284 passed`).
+Run: `uv run pytest -q`. Expected: all green, 2 more tests than the base (sandbox: `284 passed`). Every absolute sandbox count in this plan is one lower than on the real tree, which has Plan B's Task 6 c=16 test (Global Constraints); the relative counts stand.
 
 - [ ] **Step 5: Commit**
 
@@ -1257,7 +1283,7 @@ git commit -m "Add the build-time image check" -m "Co-Authored-By: Claude Opus 5
   - `docker/check_image.py` (Task 5).
 - Produces:
   - `podman build --build-arg PYTHON=3.14t .`: the free-threaded image. turbovec is built from its sdist, and the build fails if the check fails.
-  - `--build-arg UV_NO_BINARY_PACKAGE=turbovec`: turbovec from its sdist on any interpreter. It is unset by default.
+  - `--build-arg UV_NO_BINARY_PACKAGE=turbovec`: turbovec from its sdist on any interpreter. It is unset by default, and 3.14t does not need it: PyPI has only the `cp39-abi3` wheel, which cannot load on 3.14t, so uv falls back to the sdist on its own (p4). It matters only for the C1 arm (3.14 with the GIL). That build is still an abi3 wheel, `cp39-abi3-linux_aarch64`, because the sdist enables `abi3-py39`, while 3.14t builds `cp314-cp314t`.
   - Every image runs with `PYTHONWARNINGS` set to `GIL_WARNING_FILTER`.
   - Every image, whatever its `PYTHON`, keeps the one `ENV OPENBLAS_NUM_THREADS=1`, so the ABAB arms run the same BLAS threads (spec §6, D16).
 
@@ -1315,8 +1341,9 @@ def test_the_builder_can_build_turbovec_from_its_sdist():
     dockerfile, builder, _ = _stages()
     rust = re.search(r"^ARG RUST_VERSION=(\d+)\.(\d+)\.\d+$", dockerfile, re.M)
     assert (int(rust[1]), int(rust[2])) >= TURBOVEC_MIN_RUST
-    # --build-arg UV_NO_BINARY_PACKAGE=turbovec: the sdist build on a GIL interpreter too
-    # (the 3.14 attribution arm); unset, uv installs the abi3 wheel as before
+    # --build-arg UV_NO_BINARY_PACKAGE=turbovec: a local sdist build on a GIL interpreter too
+    # (C1), still abi3 (the sdist enables abi3-py39), so not 3.14t's cp314t build; unset, uv
+    # installs PyPI's abi3 wheel as before, and 3.14t falls back to the sdist on its own
     assert re.search(r"^ARG UV_NO_BINARY_PACKAGE$", builder, re.M)
     assert builder.index("ARG UV_NO_BINARY_PACKAGE") < builder.index("RUN uv sync --frozen")
     # raggio_native is rebuilt for each image's own interpreter, never abi3 (spec §4.2):
@@ -1361,8 +1388,8 @@ The asserts on A's, C's and E's lines come after those, and pass on the base tha
 FROM docker.io/library/rust:${RUST_VERSION}-slim-trixie AS builder
 COPY --from=uv /uv /uvx /bin/
 ARG PYTHON
-# unset by default; --build-arg UV_NO_BINARY_PACKAGE=turbovec builds turbovec from its
-# sdist on a GIL interpreter too, so an A/B can hold the turbovec build constant
+# unset by default; 3.14t needs none. --build-arg UV_NO_BINARY_PACKAGE=turbovec (C1) builds
+# the sdist on a GIL interpreter too: a local abi3 wheel (abi3-py39), not 3.14t's cp314t
 ARG UV_NO_BINARY_PACKAGE
 ENV UV_PYTHON_INSTALL_DIR=/python \
 ```
@@ -1862,10 +1889,10 @@ git commit -m "Add the Unicode drift probe" -m "Co-Authored-By: Claude Opus 5.5 
 **Interfaces:**
 - Consumes:
   - ADR 0004 (Plan E) and ADR 0005 (Plan F), which this ADR cites;
-  - the research files `docs/superpowers/research/2026-09-28-item4a-freethreading-deps.md`, `…-item4b-freethreading-code.md`, `…-dgx-probe-p2-hybrid-native.md` (D15) and `…-dgx-probe-p3-ivf-fanout.md` (D16);
+  - the research files `docs/superpowers/research/2026-09-28-item4a-freethreading-deps.md`, `…-item4b-freethreading-code.md`, `…-dgx-probe-p2-hybrid-native.md` (D15), `…-dgx-probe-p3-ivf-fanout.md` (D16) and `…-dgx-probe-p4-freethreaded.md` (the 3.14t aarch64 build, SQLite 3.53.1);
   - the env tables that Plan F's `IVF_SEARCH_THREADS` row ends.
 - Produces:
-  - ADR 0006, with `## Decision rule`, the outcomes **Continue**, **Hold** and **Park**, and a `## Verification` that starts with `Pending:`. Task 12 replaces it; its test and `g-decide.py` split the ADR at `\n## Verification\n`;
+  - ADR 0006, with `## Decision rule`, the outcomes **Continue**, **Hold** and **Park**, and a `## Verification` that starts with `Pending:`. Task 12 replaces it, or Task 11 does with the Park if turbovec's sdist cannot build for cp314t without a change to turbovec's own source (spec §3.1 G2); Task 12's test and `g-decide.py` split the ADR at `\n## Verification\n`;
   - in the rule: the two rows that can carry a win (`QPS concurrent`, CPU-bound; `Hybrid QPS concurrent`, SQLite-bound and counted only with equal `sqlite_version`s), the between-server check on A1 → A2 and B1 → B2, and the SQLite-bound costs that never park (spec D15, §6). Task 10's `abab_decision` implements exactly this rule;
   - the documented `GC_FREEZE` and `gil_enabled`, and the build command `podman build --build-arg PYTHON=3.14t -t raggio:py314t .`.
 
@@ -1934,13 +1961,15 @@ free threading.
 
 The GIL is not the only lock on the hybrid path (spec D15). Every SQLite call takes
 SQLite's global memstatus malloc mutex. On the DGX, SQL-only text search on Debian's SQLite
-3.40.1 went 27.9 / 36.5 / 18.4 / 16.8 q/s at 1 / 2 / 4 / 8 threads; on SQLite 3.50.4, the
-build that uv's CPython bundles, 28.6 / 47.6 / 45.4 / 39.4 q/s, a plateau at about 39–48
-q/s whatever the GIL does (`docs/superpowers/research/2026-09-28-dgx-probe-p2-hybrid-native.md`).
-Memstatus cannot be switched off from Python (`sqlite3_config` is not exported), and
-building a custom SQLite is out of scope. So the concurrent hybrid rows are SQLite-bound,
-and the two interpreters may bundle different SQLite builds: every table records each
-arm's `sqlite_version`.
+3.40.1 went 27.9 / 36.5 / 18.4 / 16.8 q/s at 1 / 2 / 4 / 8 threads; on SQLite 3.50.4, in
+the uv-managed CPython that probe p2 used, 28.6 / 47.6 / 45.4 / 39.4 q/s, a plateau at about
+39–48 q/s whatever the GIL does (`docs/superpowers/research/2026-09-28-dgx-probe-p2-hybrid-native.md`).
+The interpreters these images run, uv 0.12.19's CPython 3.12.14, 3.14.7 and 3.14.7t, all
+bundle SQLite 3.53.1 (probe p4, `docs/superpowers/research/2026-09-28-dgx-probe-p4-freethreaded.md`);
+p2's figures were not re-measured on 3.53.1. Memstatus cannot be switched off from Python
+(`sqlite3_config` is not exported), and building a custom SQLite is out of scope. So the
+concurrent hybrid rows are SQLite-bound, and two interpreters can bundle different SQLite
+builds: every table records each arm's `sqlite_version`.
 
 The DGX's own noise is mostly BLAS threads (spec D16, `…-dgx-probe-p3-ivf-fanout.md`).
 numpy's default OpenBLAS starts 20 busy-spinning threads under any search load; they burn
@@ -1951,7 +1980,11 @@ removes that bimodality. Rootless podman cannot pin cores with `--cpuset-cpus`.
 Every runtime dependency ships cp314t wheels at the locked version except turbovec 1.0.0,
 which ships only `cp39-abi3` wheels. An abi3 wheel cannot load on a free-threaded build, so
 uv builds turbovec from its sdist (Rust >= 1.89). The built module keeps the GIL off
-(PyO3 0.29 modules default to `gil_used = false`), so no patch to turbovec is needed.
+(PyO3 0.29 modules default to `gil_used = false`), so no patch to turbovec is needed. On
+the DGX (aarch64), probe p4 built it as `cp314-cp314t-linux_aarch64` with no build arg and
+no builder-stage fix, and the GIL stayed off at import, under pytest, under uvicorn load
+and in its race runs; the suite passed on every interpreter. p4 ran on a tree without
+`raggio_native` and with a stand-in for the build-time check below.
 `raggio_native` is never abi3: each image builds it for its own interpreter (cp312,
 cp314t) in the Rust builder (ADR 0004), with `gil_used = false`, and the build-time check
 refuses a `raggio_native` built for any other interpreter.
@@ -1960,8 +1993,8 @@ refuses a `raggio_native` built for any other interpreter.
 
 | Decision | Rationale |
 |---|---|
-| **`PYTHON=3.14t` build arg on the one Dockerfile** (`podman build --build-arg PYTHON=3.14t`); no `Dockerfile.ft` | Spec D2. The builder is already the Rust image (ADR 0004), so the turbovec sdist builds there with no extra stage. `PYTHON=3.14 UV_NO_BINARY_PACKAGE=turbovec` builds a GIL control with the same turbovec build from the same file |
-| **The image stays experimental.** The default stays `PYTHON=3.12` until turbovec publishes cp314t wheels; raggio never forks turbovec | Spec D6. A cp314t wheel request is one of the upstream drafts (ADR 0005) |
+| **`PYTHON=3.14t` build arg on the one Dockerfile** (`podman build --build-arg PYTHON=3.14t`); no `Dockerfile.ft` | Spec D2. The builder is already the Rust image (ADR 0004), so the turbovec sdist builds there with no extra stage; 3.14t needs no other build arg, because uv falls back to the sdist on its own (probe p4). `PYTHON=3.14 UV_NO_BINARY_PACKAGE=turbovec` builds the optional C1 control from the same file: 3.14 with the GIL, turbovec built locally from the same sdist with maturin, as an abi3 wheel (`cp39-abi3-linux_aarch64` on the DGX; the sdist enables `abi3-py39`), while 3.14t builds `cp314-cp314t`. So C1 is not the same turbovec build: it separates the 3.12 → 3.14 interpreter effect and a local build from PyPI's manylinux wheel (maturin 1.14.1) |
+| **The image stays experimental.** The default stays `PYTHON=3.12` until turbovec publishes cp314t wheels; raggio never forks turbovec | Spec D6. A cp314t wheel request is one of the upstream drafts (ADR 0005). If turbovec's sdist does not build for cp314t, only the builder stage's build dependencies and flags may change; a fix that needs turbovec's own source is drafted upstream for the maintainer to post, and the evaluation parks (spec §3.1 G2) |
 | **Build-time check** (`docker/check_image.py`, the last builder step): the interpreter is the flavour `PYTHON` names; every compiled module in the venv imports with the GIL still off; uvicorn's own loading of the app and one pass over the request path (ingest, get, list, vector/text/hybrid/filtered search, IVF attach and search, detach, delete) keep it off; `/healthz` agrees; `bm25` is `native`, from a `raggio_native` that carries the interpreter's own extension suffix (never abi3, spec §4.2) | CPython re-enables the GIL, with only a RuntimeWarning, when it imports an extension that has not declared free-threading support. The check makes that warning an error and also reads the GIL state after every import |
 | **Runtime guard**: the image sets `PYTHONWARNINGS=error:The global interpreter lock (GIL) has been enabled:RuntimeWarning` | A lazy import that would re-enable the GIL fails loudly instead of silently serving with it. On a GIL build it never fires. `PYTHON_GIL=0` / `-X gil=0` hide exactly this and are refused by the check |
 | **`/healthz` reports `"gil_enabled"`** (additive, spec §4.1) | What a deployment actually runs with, visible without a shell |
@@ -1973,7 +2006,9 @@ refuses a `raggio_native` built for any other interpreter.
 ## Decision rule
 
 The DGX A/B (spec §6, §7) runs `PYTHON=3.12` (A) and `PYTHON=3.14t` (B), built from the same
-commit, as four sessions on one boot in the order A1 B1 A2 B2. Each session starts from the
+commit, as four sessions on one boot in the order A1 B1 A2 B2, each at 8 concurrent
+clients (`CONCURRENCY=8`) and each followed, on the same image, by a c=16 session (spec §3.1
+G7; the chain is A1 A1c16 B1 B1c16 A2 A2c16 B2 B2c16). Each session starts from the
 IVF index, so every session runs the same order (IVF runs, the 8 GiB detach, flat runs), and
 every run is a fresh container of its image. Each session measures 3 flat runs
 (`FLAT_RUNS=3`) and 3 IVF runs after the warm-up, so the concurrent-QPS rows, which are
@@ -1997,11 +2032,35 @@ B **wins** when all of these hold:
 
 - one of those two rows is `better` in A1 → B1 and in A2 → B2 (spec §6: claim a win only if
   it exceeds the band), and neither `better` nor `worse` in A1 → A2 or B1 → B2; for
-  `Hybrid QPS concurrent`, A and B also run the same `sqlite_version`;
+  `Hybrid QPS concurrent`, A and B also run the same `sqlite_version`, and
+  `Hybrid p99 under concurrency (ms)` is present and not `worse` in either table (spec §3.1
+  G5: p4's c=16 hybrid gain came with a p99 3.8–4.0x worse, and a throughput win that
+  costs the tail is no win); for `QPS concurrent`, the flat runs' fast/slow states must
+  split evenly (below);
 - none of the flat rows QPS concurrent, p95 under concurrency, Recall@10 vs exact and
-  Hybrid text-hit@10 is `worse` in both tables;
+  Hybrid text-hit@10 is `worse` in both tables (QPS concurrent and p95 under concurrency
+  are skipped on an uneven or unknown split, spec §3.1 G9);
 - every B session's `/healthz` samples say `gil_enabled` false and every A sample says
   true, and no container log of any session has a `Traceback` or a GIL line.
+
+The flat `QPS concurrent` row is bimodal on every interpreter (p4: about 134 against 250
+QPS on 3.12, 3.14 and 3.14t alike), so a median over 3 runs can move with no interpreter
+effect. CPU per query under concurrency is recorded for every run, medians included, and
+classifies each flat run: high-CPU is at least 1.5x the lowest CPU per query in its
+pair (p4: slow runs at 115.9–117.6 ms, fast ones at 50.8–56.8 ms). In each of A1 → B1 and
+A2 → B2 the two sides must hold the same number of high-CPU runs, and every run needs a
+known state. On an uneven split, or where no cpu.stat could be read, `QPS concurrent` and
+`p95 under concurrency (ms)`, both measured in those flat runs, count as neither a win nor a
+miss (spec §3.1 G9): the win check skips the first and the "worse in both pairs" check
+skips both, and the decision records why. CPU per query is reported for every run and
+never gated.
+
+The c=16 tables (`A1 → B1 (c=16)`, `A2 → B2 (c=16)`, `A1 → A2 (c=16)`, `B1 → B2 (c=16)`)
+carry the same verdicts and regime lines and are reported, not gated (spec §3.1 G7): the
+decision reads the c=8 tables only. p4 saw 3.14t's hybrid gain only at c=16.
+The `-c16` sessions' GIL, Traceback and `/healthz` checks are not speed tables: every
+session's checks gate, c=16 included (spec §3.1 G8). Only the c=16 speed tables are
+reported, not gated.
 
 Any other flat row that is `worse` in both tables (free threading costs 1–8% of
 single-thread speed, so the serial latencies may move) is listed in the decision as a
@@ -2026,19 +2085,28 @@ The outcome:
   the CI job, and re-run this A/B when turbovec releases a cp314t wheel; an own turbovec
   build never becomes the default (spec D6).
 - **Park** otherwise: keep the build arg and the CI job, and stop measuring until a
-  turbovec or CPython release changes the inputs.
+  turbovec or CPython release changes the inputs. The evaluation also parks, with no A/B,
+  when turbovec's sdist does not build for cp314t on the DGX and only a change to
+  turbovec's own source would fix it (spec D6, §3.1 G2).
 
 Recorded, not gated: the IVF rows; `bench/ivf_fanout_probe.py fanout` in both images on one
 IVF index (whether 3.14t's shard pool oversubscribes the cores); the optional arms C1
-(`PYTHON=3.14 UV_NO_BINARY_PACKAGE=turbovec`) and D1 (B with `GC_FREEZE=1`); each image's
-`sqlite_version`, `OPENBLAS_NUM_THREADS` and `raggio_native` build. Making 3.14t the default
-is out of scope, and so is `GC_FREEZE`'s default. So is building a custom SQLite (spec D15).
+(`PYTHON=3.14 UV_NO_BINARY_PACKAGE=turbovec`, a local abi3 turbovec build with the GIL) and
+D1 (B with `GC_FREEZE=1`); each image's `sqlite_version`, `OPENBLAS_NUM_THREADS` and
+`raggio_native` build. Making 3.14t the default is out of scope, and so is `GC_FREEZE`'s
+default. So is building a custom SQLite (spec D15).
 
 ## Consequences
 
 - `podman build --build-arg PYTHON=3.14t` compiles turbovec and `raggio_native` in the
   builder (about 2 minutes for the whole image on a 3-CPU x86_64 podman machine); the
-  runtime stage copies no toolchain.
+  runtime stage copies no toolchain. On the DGX (aarch64), probe p4's 3.14t image, without
+  `raggio_native`, built in 28.7 s [28.2..29.3] over 3 `--no-cache` builds with pre-pulled
+  bases and no uv cache; the dependency step, turbovec's compile, took 17–19 s of that.
+  The 3.14 GIL image built in 10.6 s. The images are 323.6 MB (3.14t) and 320.9 MB (3.14).
+  `raggio_native`'s cp314t compile time on the DGX was not measured.
+- The 3.14t image runs SQLite 3.53.1, the build uv 0.12.19's interpreters bundle (p4), as
+  the 3.12 image does.
 - The 3.14t CI job needs Rust on the runner and takes longer than the other jobs; it cannot
   fail the workflow.
 - `GC_FREEZE=1` keeps the startup heap alive for the process lifetime (it would be anyway:
@@ -2049,9 +2117,12 @@ is out of scope, and so is `GC_FREEZE`'s default. So is building a custom SQLite
 Pending: Plan G's DGX ABAB records here the boot, the images (with each one's
 `raggio_native` build, SQLite and `OPENBLAS_NUM_THREADS`), the `gil_enabled` and log checks
 of every session, the `compare.py` tables A1 → B1, A2 → B2, A1 → A2 and B1 → B2 with their
-regime lines, the IVF fan-out probe in both images, the Unicode drift diff and scan
+regime lines and each flat run's CPU per query, their four `(c=16)` twins (reported, not
+gated, spec §3.1 G7), the IVF fan-out probe in both images, the Unicode drift diff and scan
 (`bench/unicode_drift_probe.py`), the upstream wheels, and the decision (Continue, Hold or
-Park) under the rule above.
+Park) under the rule above. If turbovec's sdist does not build for cp314t on the DGX and
+only a change to turbovec's own source would fix it (spec §3.1 G2), probe p4's build
+failure and the Park are recorded here instead.
 ````
 
 3b. In `README.md`, insert this paragraph after the first podman block. That block ends with `podman run -p 8000:8000 -v raggio-data:/data -e ROOT_API_KEY=change-me raggio` and its closing fence. Leave a blank line on each side:
@@ -2150,11 +2221,12 @@ The shell scripts cannot run on the laptop, because they need podman, the bench 
     - `render(base_dir, cand_dir) -> str`, a table with the columns `| Engine | Metric | base median | base band | cand median | cand band | verdict |` and the verdicts `better`, `worse`, `within band`, `no band` and `not claimable`;
     - `beyond_band(base_dir, cand_dir) -> {"better": [(engine, key)], "worse": [...]}`;
     - the flat engine name `raggio`;
-    - the metric labels `Hybrid QPS concurrent`, `QPS concurrent`, `p95 under concurrency (ms)`, `Recall@10 vs exact`, `Hybrid text-hit@10` and `Search p50 (ms)`, and the hybrid timing labels of `SQLITE_BOUND` (Plan A Task 5 adds `Hybrid first 10 queries, slowest (ms)` and `Hybrid p99 without the first 10 (ms)`);
-    - the lines `render` prints above an A/B table: `Regime (baseline): page_cache=…, first_start=…, memory=…, memory_swap=…, python=…, sqlite_version=…, openblas_num_threads=…`, the same for `candidate`, and, when the arms differ outside `first_start`, `The arms differ in <keys>: a re-baseline across them, not a same-regime A/B (spec §6).`;
+    - the metric labels `Hybrid QPS concurrent`, `QPS concurrent`, `p95 under concurrency (ms)`, `Hybrid p99 under concurrency (ms)`, `CPU per query under concurrency (ms)`, `Hybrid CPU per query under concurrency (ms)` (all lower-is-better; the two CPU rows are absent where `cpu.stat` is unreadable), `Recall@10 vs exact`, `Hybrid text-hit@10` and `Search p50 (ms)`, and the hybrid timing labels of `SQLITE_BOUND` (Plan A Task 5 adds `Hybrid first 10 queries, slowest (ms)` and `Hybrid p99 without the first 10 (ms)`);
+    - the lines `render` prints above an A/B table: `Regime (baseline): page_cache=…, first_start=…, memory=…, memory_swap=…, concurrency=…, python=…, sqlite_version=…, openblas_num_threads=…`, the same for `candidate`, and, when the arms differ outside `first_start`, `The arms differ in <keys>: a re-baseline across them, not a same-regime A/B (spec §6).`;
     - the note `Reported, not claimed (spec §6 needs >= 3 runs per side; FLAT_RUNS=3): …` under a table whose vector concurrent-QPS row has fewer than 3 counted runs on a side;
     - `regime()`, which reads `regime.json` and `image.json` from the session directory (`image.json` = `{"python", "sqlite_version", "turbovec", "openblas_num_threads"}`, read inside the image) and prints `unknown` for a missing label.
   - Plan A's `lib.sh` reads `FLAT_RUNS` from the environment (default 2). `g-session.sh` passes `FLAT_RUNS=3`.
+  - Plan A's `lib.sh` reads `CONCURRENCY` from the environment (default 8) and passes `--concurrency "$CONCURRENCY"` to every `bench.py` run (spec §4.2). `g-abab.sh` sets `CONCURRENCY=16` for the c=16 sessions and 8 for the others, and `g-session.sh` hands it to `session.sh` (spec §3.1 G7).
   - Plan F's `bench/ivf_fanout_probe.py fanout --data PATH --threads LIST`: read-only, seed 7. It prints a `GATE grouped vs plain at N: WIN|LOSS` line.
   - This plan's pieces:
     - `/healthz`'s `gil_enabled` (Task 1);
@@ -2173,11 +2245,12 @@ The shell scripts cannot run on the laptop, because they need podman, the bench 
 | `g-abab.sh <sha> <cap> <C1:0\|1> <D1:0\|1>` | `<ts> g-abab: done`, or `<ts> g-abab: <label> ended with '<last line>': stopping` |
 
   - Image tags: A is `localhost/raggio:<sha>` (built by `deploy.sh`), B is `…:<sha>-py314t`, C is `…:<sha>-py314`, and D is `…:<sha>-py314t-gcfreeze`.
-  - Session labels: `g-a1-py312`, `g-b1-py314t`, `g-a2-py312`, `g-b2-py314t`, and optionally `g-c1-py314` and `g-d1-py314t-gcfreeze`.
+  - Session labels, in the chain's order: `g-a1-py312`, `g-a1-py312-c16`, `g-b1-py314t`, `g-b1-py314t-c16`, `g-a2-py312`, `g-a2-py312-c16`, `g-b2-py314t`, `g-b2-py314t-c16`, and optionally `g-c1-py314` and `g-d1-py314t-gcfreeze`. A `-c16` session runs its arm session's image at `CONCURRENCY=16` right after it, with its own cap (spec §3.1 G1, G7); every other session runs at `CONCURRENCY=8`.
   - `g-render.py` writes `~/raggio-bench/g-verification.md`, with these subsections:
     - `### Images`;
-    - `### GIL and logs`;
+    - `### GIL and logs`, one row per session, the `-c16` ones included (spec §3.1 G8);
     - `### A1 → B1`, `### A2 → B2`, `### A1 → A2`, `### B1 → B2`, and optionally `### A2 → C1` and `### B2 → D1`;
+    - `### A1 → B1 (c=16)`, `### A2 → B2 (c=16)`, `### A1 → A2 (c=16)`, `### B1 → B2 (c=16)`: the same pairs from the `-c16` sessions, reported and not gated (spec §3.1 G7); `abab_decision` drops every section whose title ends in ` (c=16)`;
     - `### IVF fan-out`;
     - `### Unicode drift`.
   - `g-decide.py` appends `### Upstream wheels` and `### Decision`.
@@ -2211,11 +2284,15 @@ BASE = {"lat_p50": 21.0, "lat_p95": 30.0, "lat_p99": 40.0, "qps_serial": 47.0,
         "qps_concurrent": 116.0, "lat_c_p95": 60.0, "lat_filtered_p50": 28.0,
         "lat_filtered_p95": 40.0, "recall_at_10": 0.95, "hybrid_p50": 88.0, "hybrid_p95": 120.0,
         "hybrid_p99": 150.0, "hybrid_qps_serial": 9.8, "hybrid_qps_concurrent": 13.8,
-        "hybrid_text_hit_rate": 0.984, "mem_under_load_mb": 2500.0, "cold_start_s": 30.0}
+        "hybrid_text_hit_rate": 0.984, "mem_under_load_mb": 2500.0, "cold_start_s": 30.0,
+        # spec §3.1 G5: every flat run in its fast state (p4: 50.8-56.8 ms), so the split is even
+        "hybrid_c_p99": 700.0, "cpu_ms_per_q_c": 54.0, "hybrid_cpu_ms_per_q_c": 360.0}
 EXACT = ("recall_at_10", "hybrid_text_hit_rate")  # no run-to-run noise in the synthetic runs
 JITTER = (-0.01, 0.0, 0.01)  # run n scales by 1 + JITTER[n % 3]: every session has the same band
 WHEELS = ["turbovec-1.0.0-cp39-abi3-manylinux_2_28_aarch64.whl",
           "turbovec-1.0.0-cp39-abi3-manylinux_2_28_x86_64.whl", "turbovec-1.0.0.tar.gz"]
+# a future PyPI upload, so manylinux: PyPI refuses a plain linux_aarch64 tag. The images'
+# own sdist builds are linux_aarch64 (maturin, not audited), as the image lines below show
 FT_WHEEL = "turbovec-1.0.0-cp314-cp314t-manylinux_2_28_aarch64.whl"
 # name: (synthetic session knobs, cp314t wheel on PyPI, expected decision or None when the
 # Task 12 test must fail, expected costs)
@@ -2234,40 +2311,83 @@ SCENARIOS = {
     "gil-on": ({"qps": 1.5, "b_gil": True}, False, "Park", []),
     "traceback": ({"qps": 1.5, "traceback": True}, False, "Park", []),
     "with-c1": ({"qps": 1.5, "c1": True}, False, "Hold", []),
+    # spec §3.1 G5: a hybrid QPS win with a worse concurrent p99 is no win (p4: 3.8-4.0x worse)
+    "hybrid-p99-worse": ({"hybrid": 1.5, "hybrid_c_p99": 4.0}, False, "Park",
+                         ["Hybrid p99 under concurrency (ms)"]),
+    # G5: two of A's three flat runs in the slow state, none of B's: the split, not the
+    # interpreter, can move the median, so QPS concurrent is neither a win nor a miss
+    "flat-split-uneven": ({"qps": 1.5, "slow": {"g-a1-py312": 2, "g-a2-py312": 2}}, False, "Park", []),
+    # spec §3.1 G9: B's QPS concurrent and p95 under concurrency are worse in both pairs, but on
+    # the same uneven split as above, so neither row is a cost: the hybrid win stands, Hold
+    "flat-split-uneven-worse": ({"hybrid": 1.5, "qps": 0.5, "lat_c": 2.0,
+                                 "slow": {"g-a1-py312": 2, "g-a2-py312": 2}}, False, "Hold", []),
+    # G5: one slow run in every session, so each pair splits 1 high/2 low on both sides
+    "flat-split-even": ({"qps": 1.5, "slow": dict.fromkeys(
+        ("g-a1-py312", "g-b1-py314t", "g-a2-py312", "g-b2-py314t"), 1)}, False, "Hold", []),
+    # G5 and spec §4.2: no readable cpu.stat, so no CPU rows and no known state
+    "cpu-missing": ({"qps": 1.5, "cpu": False}, False, "Park", []),
+    # spec §3.1 G7: the c=16 tables are reported, not gated. Here B is worse beyond the band in
+    # all four of them (QPS concurrent, Hybrid QPS concurrent, and the hybrid p99 4x): read
+    # as gate tables, "worse in both" would turn this Hold into a Park
+    "c16-not-gated": ({"qps": 1.5, "c16": {"qps": 0.5, "hybrid": 0.5, "hybrid_c_p99": 4.0}},
+                      False, "Hold", []),
+    # spec §3.1 G8: the checks gate for every session. A Traceback only in B1's c=16 session
+    # (its speed tables stay reported, not gated) still parks; the reason names that session
+    "c16-traceback": ({"qps": 1.5, "traceback": "g-b1-py314t-c16"}, False, "Park", []),
     "two-boots": ({"qps": 1.5, "boot_after": "5b1e0c4d-9a8f-4e7d-8c6b-3a2f1e0d9c8b"}, False, None, []),
     "two-shas": ({"qps": 1.5, "b_sha": "def5678"}, False, None, []),
     "blas-differs": ({"qps": 1.5, "b_blas": "unset"}, False, None, []),  # spec D16
     "thin": ({"qps": 1.5, "flat_runs": 2}, False, None, []),  # spec §6: >= 3 runs a side
 }
+# what one of g-decide.py's reason lines must contain, for the scenarios that turn on one
+REASONS = {"hybrid-p99-worse": "`Hybrid p99 under concurrency (ms)` is ['worse', 'worse']",
+           "flat-split-uneven": "A1 → B1: A1 2 high/1 low, B1 0 high/3 low",
+           "c16-traceback": "g-b1-py314t-c16: 1 Traceback or GIL lines",
+           "cpu-missing": "A1 → B1: no CPU per query under concurrency for every flat run"}
 
 
-def synth(home: Path, qps=1.0, hybrid=1.0, lat_p50=1.0, hit=0.0, a2_qps=1.0, b_sqlite="3.50.4",
+def synth(home: Path, qps=1.0, hybrid=1.0, lat_p50=1.0, hit=0.0, a2_qps=1.0, b_sqlite="3.53.1",
           b_blas="1", flat_runs=3, b_gil=False, traceback=False, c1=False, boot_after=BOOT,
-          b_sha="abc1234"):
-    """What Task 12's sessions leave in ~/raggio-bench, with B's metrics scaled."""
+          b_sha="abc1234", hybrid_c_p99=1.0, slow=None, cpu=True, c16=None, lat_c=1.0):
+    """What Task 12's sessions leave in ~/raggio-bench, with B's metrics scaled. `slow` puts
+    the first n measured flat runs of a session in p4's slow state; with `cpu` false no run
+    has the CPU rows. `c16` scales B's qps, hybrid and hybrid_c_p99 in the four -c16 sessions
+    (spec §3.1 G7); by default they equal A's. `lat_c` scales B's lat_c_p95 in the c=8 sessions.
+    `traceback` True puts a Traceback line in one log of every B session, the -c16 ones included
+    (spec §3.1 G8); a session label puts it in that session only."""
     sessions = [("g-a1-py312", "A"), ("g-b1-py314t", "B"), ("g-a2-py312", "A"), ("g-b2-py314t", "B")]
+    sessions += [(f"{label}-c16", arm) for label, arm in sessions]  # G8: they get /healthz and logs too
     sessions += [("g-c1-py314", "C")] if c1 else []
+    c16 = {"qps": 1.0, "hybrid": 1.0, "hybrid_c_p99": 1.0, **(c16 or {})}
     for label, arm in sessions:
+        k = c16 if label.endswith("-c16") else {"qps": qps, "hybrid": hybrid, "hybrid_c_p99": hybrid_c_p99}
         (home / label).mkdir(parents=True)
         # what Plan A's session.sh records next to the runs (compare.py's Regime lines)
         (home / label / "regime.json").write_text(json.dumps(
             {"page_cache": "host-warm", "first_start": "host-warm", "memory": "4g",
-             "memory_swap": "host-default", "detach_memory": "8g"}), encoding="utf-8")
+             "memory_swap": "host-default", "detach_memory": "8g",
+             "concurrency": "16" if label.endswith("-c16") else "8"}), encoding="utf-8")
         (home / label / "image.json").write_text(json.dumps(
             {"python": "3.12.14" if arm == "A" else "3.14.7",
-             "sqlite_version": b_sqlite if arm == "B" else "3.50.4", "turbovec": "1.0.0",
+             "sqlite_version": b_sqlite if arm == "B" else "3.53.1", "turbovec": "1.0.0",
              "openblas_num_threads": b_blas if arm == "B" else "1"}), encoding="utf-8")
         # run0 is the warm-up; FLAT_RUNS and IVF_RUNS=3 measured runs follow it
         for engine, runs in (("raggio", flat_runs + 1), ("raggio-ivf", 4)):
             for n in range(runs):
                 m = {k: v if k in EXACT else v * (1 + JITTER[n % 3]) for k, v in BASE.items()}
                 if arm == "B":
-                    m["qps_concurrent"] *= qps
-                    m["hybrid_qps_concurrent"] *= hybrid
+                    m["qps_concurrent"] *= k["qps"]
+                    m["hybrid_qps_concurrent"] *= k["hybrid"]
                     m["lat_p50"] *= lat_p50
+                    m["lat_c_p95"] *= lat_c if k is not c16 else 1.0
                     m["hybrid_text_hit_rate"] += hit
+                    m["hybrid_c_p99"] *= k["hybrid_c_p99"]
                 if label == "g-a2-py312":
                     m["qps_concurrent"] *= a2_qps
+                if not cpu:  # cpu.stat unreadable: the CPU rows are absent, never zero (spec §4.2)
+                    del m["cpu_ms_per_q_c"], m["hybrid_cpu_ms_per_q_c"]
+                elif engine == "raggio" and 1 <= n <= (slow or {}).get(label, 0):
+                    m["cpu_ms_per_q_c"] = 116.0 * (1 + JITTER[n % 3])  # p4: 115.9-117.6 ms
                 (home / label / f"run{n}-{engine}.json").write_text(json.dumps({engine: m}), encoding="utf-8")
         gil = "false" if arm == "B" and not b_gil else "true"
         body = '{"status":"ok","resident_collections":["bench"],"bm25":"native","gil_enabled":%s}' % gil
@@ -2277,22 +2397,22 @@ def synth(home: Path, qps=1.0, hybrid=1.0, lat_p50=1.0, hit=0.0, a2_qps=1.0, b_s
         (home / f"{label}.logs").mkdir()
         for i in range(8):
             log = "INFO:     Application startup complete.\n"
-            if traceback and arm == "B" and i == 3:
+            if traceback in (True, label) and arm == "B" and i == 3:
                 log += "Traceback (most recent call last):\n"
             (home / f"{label}.logs" / f"{i:012x}.log").write_text(log, encoding="utf-8")
     (home / "g-boot-before.txt").write_text(BOOT + "\n", encoding="utf-8")
     (home / "g-boot-after.txt").write_text(boot_after + "\n", encoding="utf-8")
     images = [("A", "localhost/raggio:abc1234", "Python 3.12.14, GIL enabled, turbovec 1.0.0"
                " (cp39-abi3-manylinux_2_28_aarch64), raggio_native 0.1.0"
-               " (raggio_native.cpython-312-aarch64-linux-gnu.so), SQLite 3.50.4,"
+               " (raggio_native.cpython-312-aarch64-linux-gnu.so), SQLite 3.53.1,"
                " OPENBLAS_NUM_THREADS 1, Unicode 15.0.0, raggio_native Unicode 15.0.0"),
               ("B", f"localhost/raggio:{b_sha}-py314t", "Python 3.14.7t, GIL disabled, turbovec 1.0.0"
                " (cp314-cp314t-linux_aarch64), raggio_native 0.1.0"
                f" (raggio_native.cpython-314t-aarch64-linux-gnu.so), SQLite {b_sqlite},"
                f" OPENBLAS_NUM_THREADS {b_blas}, Unicode 16.0.0, raggio_native Unicode 16.0.0")]
     images += [("C", "localhost/raggio:abc1234-py314", "Python 3.14.7, GIL enabled, turbovec 1.0.0"
-                " (cp314-cp314-linux_aarch64), raggio_native 0.1.0"
-                " (raggio_native.cpython-314-aarch64-linux-gnu.so), SQLite 3.50.4,"
+                " (cp39-abi3-linux_aarch64), raggio_native 0.1.0"
+                " (raggio_native.cpython-314-aarch64-linux-gnu.so), SQLite 3.53.1,"
                 " OPENBLAS_NUM_THREADS 1, Unicode 16.0.0, raggio_native Unicode 16.0.0")] if c1 else []
     (home / "g-images.txt").write_text("".join("\t".join(i) + "\n" for i in images), encoding="utf-8")
     for arm in "AB":
@@ -2325,6 +2445,13 @@ def check(name, knobs, ft_wheel, want, want_costs, tmp: Path) -> str:
     env = {"BENCH_HOME": str(home), "PYTHONPATH": str(repo / "src")}
     r = run([sys.executable, str(HERE / "g-render.py")], repo, env)
     assert r.returncode == 0, f"{name}: g-render.py failed\n{r.stderr}"
+    rendered = (home / "g-verification.md").read_text(encoding="utf-8")
+    for pair in ("A1 → B1", "A2 → B2", "A1 → A2", "B1 → B2"):  # spec §3.1 G7
+        assert f"\n### {pair} (c=16)\n" in rendered, f"{name}: no {pair} (c=16) table"
+    if name == "c16-not-gated":  # the tables that would flip the verdict are really there
+        table = rendered.split("\n### A1 → B1 (c=16)\n", 1)[1].split("\n### ", 1)[0]
+        assert any(line.startswith("| raggio | QPS concurrent |") and line.rstrip().endswith("| worse |")
+                   for line in table.splitlines()), f"{name}: the c=16 table shows no worse QPS concurrent"
     pypi = tmp / "turbovec.json"
     files = WHEELS + ([FT_WHEEL] if ft_wheel else [])
     pypi.write_text(json.dumps({"info": {"version": "1.0.0"},
@@ -2340,8 +2467,12 @@ def check(name, knobs, ft_wheel, want, want_costs, tmp: Path) -> str:
         return f"{name}: Task 12 test fails, as it must"
     assert decision == want, f"{name}: decided {decision}, expected {want}\n{r.stdout}"
     assert costs == f"costs: {want_costs}", f"{name}: {costs}, expected {want_costs}"
+    reason = REASONS.get(name)
+    if reason:
+        assert any(reason in line for line in r.stdout.splitlines()[1:-1]), \
+            f"{name}: no reason names {reason!r}\n{r.stdout}"
     assert t.returncode == 0, f"{name}: the Task 12 test failed\n{t.stdout}"
-    return f"{name}: {decision}, {costs}, Task 12 test passes"
+    return f"{name}: {decision}, {costs}, Task 12 test passes" + (", reason checked" if reason else "")
 
 
 def main():
@@ -2369,14 +2500,24 @@ Create `D:/DEV/_scratch/dgx/planG/t12-section.py`. It starts with two empty line
 GATE_BETTER = ("QPS concurrent", "Hybrid QPS concurrent")
 GATE_NOT_WORSE = ("QPS concurrent", "p95 under concurrency (ms)", "Recall@10 vs exact",
                   "Hybrid text-hit@10")
+# the two rows of the same flat concurrent runs, which the fast/slow split moves (spec §3.1 G9)
+FLAT_CONCURRENT = ("QPS concurrent", "p95 under concurrency (ms)")
 # the hybrid timing rows run FTS5 under SQLite's global memstatus mutex, whatever the GIL does
 # (spec D15): never read as a free-threading failure, and a win only on equal sqlite_versions
 SQLITE_BOUND = ("Hybrid p50 (ms)", "Hybrid p95 (ms)", "Hybrid p99 (ms)",
                 "Hybrid first 10 queries, slowest (ms)", "Hybrid p99 without the first 10 (ms)",
                 "Hybrid QPS serial", "Hybrid QPS concurrent")
+# spec §3.1 G5: a Hybrid QPS concurrent win needs this row present and not `worse` in either
+# cross pair (p4: 3.14t's c=16 hybrid gain came with a p99 3.8-4.0x worse)
+HYBRID_P99 = "Hybrid p99 under concurrency (ms)"
+# spec §3.1 G5: the flat QPS concurrent row is bimodal on every interpreter (p4: slow runs at
+# 115.9-117.6 ms CPU per query, fast ones at 50.8-56.8 ms). A flat run is high-CPU at >= 1.5x
+# the lowest CPU per query in its cross pair; the row wins only on an even split.
+HIGH_CPU = 1.5
 FREE_THREADED_ARMS = {"A": False, "B": True, "C": False, "D": True}  # C: 3.14, D: 3.14t GC_FREEZE=1
 OUTCOMES = ("Continue", "Hold", "Park")
 CROSS_PAIRS, SAME_ARM_PAIRS = ("A1 → B1", "A2 → B2"), ("A1 → A2", "B1 → B2")
+C16 = " (c=16)"  # suffix of the c=16 tables' titles: reported, never read by the decision (G7)
 
 
 def _cells(line):
@@ -2426,10 +2567,45 @@ def abab_sections(adr):
     return dict(re.findall(r"^### (.+?)\n(.*?)(?=^### |\Z)", verification, re.M | re.S))
 
 
+def _flat_cpu(section):
+    """{"baseline" | "candidate": [CPU per query under concurrency (ms) of each measured flat
+    run, None where cpu.stat was unreadable]}: the json block g-render.py writes under a table.
+    {} when the block is missing."""
+    try:
+        return _json_block(section)["cpu_ms_per_q_c"]
+    except (IndexError, KeyError, TypeError, ValueError):
+        return {}
+
+
+def uneven_states(sections):
+    """Why the flat runs' fast/slow state keeps `QPS concurrent` from counting (spec §3.1 G5):
+    per cross pair, an unknown state or an uneven split of high-CPU runs."""
+    why = []
+    for pair in CROSS_PAIRS:
+        cpu = _flat_cpu(sections[pair])
+        runs = [cpu.get(side) or [] for side in ("baseline", "candidate")]
+        values = runs[0] + runs[1]
+        if not (runs[0] and runs[1]) or None in values:
+            why.append(f"{pair}: no CPU per query under concurrency for every flat run, so their"
+                       " fast/slow state is unknown")
+            continue
+        high = [sum(v >= HIGH_CPU * min(values) for v in r) for r in runs]
+        if high[0] != high[1]:
+            split = ", ".join(f"{s} {h} high/{len(r) - h} low"
+                              for s, h, r in zip(pair.split(" → "), high, runs))
+            why.append(f"{pair}: {split} (high-CPU: >= {HIGH_CPU}x the pair's lowest CPU per query)")
+    return why
+
+
 def worse_in_both(sections):
     """The flat metrics compare.py calls `worse` in both A1 → B1 and A2 → B2."""
     pairs = [_flat(sections[pair]) for pair in CROSS_PAIRS]
-    return [m for m in pairs[0] if all(p.get(m, ("", "", ""))[2] == "worse" for p in pairs)]
+    # spec §3.1 G9: both rows come from the same flat runs, so on an uneven or unknown
+    # fast/slow split (the one rule that keeps `QPS concurrent` from winning) they count
+    # neither as a win nor as a cost; gate_rows, abab_decision and g-decide.py all read this
+    skip = FLAT_CONCURRENT if uneven_states(sections) else ()
+    return [m for m in pairs[0] if m not in skip
+            and all(p.get(m, ("", "", ""))[2] == "worse" for p in pairs)]
 
 
 def gate_rows(sections):
@@ -2437,11 +2613,17 @@ def gate_rows(sections):
     cross = [_flat(sections[pair]) for pair in CROSS_PAIRS]
     same = [_flat(sections[pair]) for pair in SAME_ARM_PAIRS]
     sqlite_a, sqlite_b = sqlite_versions(sections)
+    p99 = [p.get(HYBRID_P99, ("", "", "missing"))[2] for p in cross]
     wins, misses = [], []
     for m in GATE_BETTER:
         verdicts = [p.get(m, ("", "", "-"))[2] for p in cross]
         noise = [p.get(m, ("", "", "-"))[2] for p in same]
-        if verdicts != ["better", "better"]:
+        uneven = uneven_states(sections) if m == "QPS concurrent" else []
+        if uneven:  # an uneven split moves the median with no interpreter effect (p4)
+            misses.append(f"{m}: {'; '.join(uneven)}. The flat runs' fast/slow state must split"
+                          " evenly on both sides of a pair; until it does, the pair is neither a"
+                          " win nor a miss (spec §3.1 G5)")
+        elif verdicts != ["better", "better"]:
             misses.append(f"{m}: {verdicts} in {', '.join(CROSS_PAIRS)}; a win needs `better`"
                           " (beyond the noise band) in both")
         elif {"better", "worse"} & set(noise):
@@ -2451,6 +2633,10 @@ def gate_rows(sections):
         elif m in SQLITE_BOUND and sqlite_a != sqlite_b:
             misses.append(f"{m}: better in both, but A runs SQLite {sqlite_a} and B SQLite {sqlite_b};"
                           " a SQLite-bound row credits free threading only on one SQLite build (spec D15)")
+        elif m == "Hybrid QPS concurrent" and {"worse", "missing"} & set(p99):
+            misses.append(f"{m}: better in both, but `{HYBRID_P99}` is {p99} in"
+                          f" {', '.join(CROSS_PAIRS)}; a hybrid win needs that row present and not"
+                          " `worse` in either (spec §3.1 G5)")
         else:
             wins.append(m)
     return wins, misses
@@ -2458,6 +2644,8 @@ def gate_rows(sections):
 
 def abab_decision(sections):
     """(outcome, reasons B did not win): ADR 0006's decision rule over its Verification."""
+    # the c=16 tables are reported, not gated (spec §3.1 G7): none of them is passed in below
+    sections = {title: body for title, body in sections.items() if not title.endswith(C16)}
     wins, misses = gate_rows(sections)
     reasons = [] if wins else misses  # one winning row is a win; the other's miss is recorded
     reasons += [f"{m}: worse beyond the noise band in both pairs"
@@ -2496,7 +2684,8 @@ def test_adr_0006_records_the_dgx_abab_and_its_decision():
         assert ", OPENBLAS_NUM_THREADS 1," in text and ", SQLite 3." in text, (arm, text)
     # every session left /healthz samples and container logs, and each GIL arm really had it
     gil = _gil_rows(sections["GIL and logs"])
-    assert sorted(arm for _, arm, *_ in gil if arm in "AB") == ["A", "A", "B", "B"]
+    # G8: the four c=8 sessions and the four -c16 ones each have a row
+    assert sorted(arm for _, arm, *_ in gil if arm in "AB") == ["A"] * 4 + ["B"] * 4
     for session, arm, answers, off, on, logs, _ in gil:
         assert answers > 0 and logs > 0, session
         if not FREE_THREADED_ARMS[arm]:
@@ -2561,6 +2750,8 @@ SESSIONS = [("g-a1-py312", "A"), ("g-b1-py314t", "B"), ("g-a2-py312", "A"), ("g-
 PAIRS = [("A1 → B1", "g-a1-py312", "g-b1-py314t"), ("A2 → B2", "g-a2-py312", "g-b2-py314t"),
          ("A1 → A2", "g-a1-py312", "g-a2-py312"), ("B1 → B2", "g-b1-py314t", "g-b2-py314t"),
          ("A2 → C1", "g-a2-py312", "g-c1-py314"), ("B2 → D1", "g-b2-py314t", "g-d1-py314t-gcfreeze")]
+# the c=16 sessions (spec §3.1 G7): the same four pairs, reported and never gated
+PAIRS += [(f"{title} (c=16)", f"{base}-c16", f"{cand}-c16") for title, base, cand in PAIRS[:4]]
 
 
 def read(name):
@@ -2590,7 +2781,17 @@ def logs(label):
     return len(files), len(bad)
 
 
+def flat_cpu(label):
+    """CPU per query under concurrency (ms) of each measured flat run (run0 is the warm-up), None
+    where cpu.stat was unreadable: the decision reads each run's fast/slow state (spec §3.1 G5)."""
+    runs = sorted((B / label).glob("run*-raggio.json"), key=lambda f: int(f.name[3:].split("-")[0]))
+    return [json.loads(f.read_text(encoding="utf-8"))["raggio"].get("cpu_ms_per_q_c") for f in runs[1:]]
+
+
 ran = [(label, arm) for label, arm in SESSIONS if (B / label).is_dir()]
+# every session's checks gate, the -c16 ones included (spec §3.1 G8); only their speed tables do not
+gil_ran = [(name, arm) for label, arm in ran for name in (label, f"{label}-c16")
+           if name == label or (B / name).is_dir()]
 os.chdir(B)  # compare.render prints the directories as given
 lines = [
     f"DGX ABAB on gn100 (spec §6): the sessions {', '.join(label for label, _ in ran)}, in this",
@@ -2599,6 +2800,8 @@ lines = [
     "`--limit 2549619`, seed 42. Every image runs `OPENBLAS_NUM_THREADS=1` (spec D16); each",
     "table's Regime lines give both arms' `sqlite_version` (D15). A and B differ in `python`",
     "by design, and in `sqlite_version` when their interpreters bundle different SQLite builds.",
+    "The `(c=16)` tables are the same four pairs from the `-c16` sessions (`CONCURRENCY=16`, spec",
+    "§3.1 G7): reported, and not read by the decision.",
     "On one boot:",
     f"boot_id `{read('g-boot-before.txt').strip()}` before the first session,",
     f"boot_id `{read('g-boot-after.txt').strip()}` after the last.", "",
@@ -2610,13 +2813,15 @@ lines = [
     " Traceback or GIL lines |",
     "|---|---|---|---|---|---|---|",
     *[f"| {label} | {arm} | {' | '.join(map(str, (*healthz(label), *logs(label))))} |"
-      for label, arm in ran], "",
+      for label, arm in gil_ran], "",
 ]
 for title, base, cand in PAIRS:
     if (B / base).is_dir() and (B / cand).is_dir():
         beyond = compare.beyond_band(base, cand)
         lines += [f"### {title}", "", compare.render(base, cand), "",
-                  f"Beyond the noise band: better {beyond['better']}, worse {beyond['worse']}.", ""]
+                  f"Beyond the noise band: better {beyond['better']}, worse {beyond['worse']}.", "",
+                  "```json", json.dumps({"cpu_ms_per_q_c": {"baseline": flat_cpu(base),
+                                                            "candidate": flat_cpu(cand)}}), "```", ""]
 lines += ["### IVF fan-out", "",
           "`bench/ivf_fanout_probe.py fanout` in each image, on the same IVF index, `bench-tv` stopped:", ""]
 for arm in ("A", "B"):
@@ -2736,12 +2941,16 @@ Create `D:/DEV/_scratch/dgx/planG/g-session.sh`:
 # <image>, /healthz goes to <label>.healthz.log (gil_enabled is on record for every run's
 # container) and the container's log to <label>.logs/<container id>.log (session.sh
 # replaces the container for every run; the previous session's container is skipped).
-# The last line of its own log is "g-session <label>: exit <status>".
-# Usage: setsid -f bash ~/raggio-bench/g-session.sh <label> <image> <cap, e.g. 100m> \
-#          > ~/raggio-bench/<label>.log 2>&1 < /dev/null
+# Every bench.py run uses Plan A's CONCURRENCY: lib.sh reads it from the environment (default
+# 8), and g-abab.sh sets 16 for the c=16 sessions (spec §3.1 G7).
+# The first line of its own log names the image and the concurrency; the last line is
+# "g-session <label>: exit <status>".
+# Usage: [CONCURRENCY=16] setsid -f bash ~/raggio-bench/g-session.sh <label> <image> \
+#          <cap, e.g. 90m> > ~/raggio-bench/<label>.log 2>&1 < /dev/null
 source "${LIB:-$HOME/raggio/bench/dgx/lib.sh}"
 set +e  # a failed sample must not end the session
-LABEL="${1:?label}" IMAGE="${2:?image}" CAP="${3:?cap, e.g. 100m}"
+LABEL="${1:?label}" IMAGE="${2:?image}" CAP="${3:?cap, e.g. 90m}"
+echo "g-session $LABEL: $IMAGE, CONCURRENCY=$CONCURRENCY"
 if ! (set -o noclobber; echo "$LABEL" > "$BENCH_HOME/g-active") 2> /dev/null; then
   echo "g-session '$(cat "$BENCH_HOME/g-active")' is running" >&2
   exit 1
@@ -2774,9 +2983,12 @@ touch "$BENCH_HOME/$LABEL.healthz.log"
   done
 ) &
 # FLAT_RUNS=3: three measured flat runs, so the bimodal concurrent-QPS rows have the 3 runs a
-# side that spec §6 needs before a win is claimed (IVF_RUNS is 3 already)
-timeout --kill-after=60 "$CAP" bash -c 'bash "$1" "$2" && FLAT_RUNS=3 IMAGE="$2" bash "$3" "$4"' _ \
-  "$BENCH_HOME/g-ensure-ivf.sh" "$IMAGE" "$RAGGIO_DIR/bench/dgx/session.sh" "$LABEL"
+# side that spec §6 needs before a win is claimed (IVF_RUNS is 3 already). CONCURRENCY is
+# handed to session.sh by name, so its lib.sh passes the same --concurrency to every run
+timeout --kill-after=60 "$CAP" bash -c \
+  'bash "$1" "$2" && FLAT_RUNS=3 CONCURRENCY="$5" IMAGE="$2" bash "$3" "$4"' _ \
+  "$BENCH_HOME/g-ensure-ivf.sh" "$IMAGE" "$RAGGIO_DIR/bench/dgx/session.sh" "$LABEL" \
+  "$CONCURRENCY"
 status=$?
 touch "$BENCH_HOME/$LABEL.end"
 wait
@@ -2847,27 +3059,33 @@ Create `D:/DEV/_scratch/dgx/planG/g-abab.sh`:
 
 ```bash
 #!/usr/bin/env bash
-# Plan G (ADR 0006): the ABAB on one boot. g-session.sh runs A1 B1 A2 B2 of one commit, then
-# the optional C1 (3.14 with the GIL, turbovec from its sdist) and D1 (B with GC_FREEZE=1),
-# one after another, each capped. The chain stops at the first session that does not end
-# with "exit 0". The boot id is recorded before the first session and after the last.
+# Plan G (ADR 0006): the ABAB on one boot. g-session.sh runs A1 B1 A2 B2 of one commit at
+# CONCURRENCY=8, each followed on the same image by its c=16 session (<label>-c16,
+# CONCURRENCY=16, spec §3.1 G7), then the optional C1 (3.14 with the GIL, turbovec from its
+# sdist) and D1 (B with GC_FREEZE=1) at c=8 only: A1 A1c16 B1 B1c16 A2 A2c16 B2 B2c16 [C1]
+# [D1], one after another, each with its own cap. The chain stops at the first session that
+# does not end with "exit 0". The boot id is recorded before the first session and after
+# the last.
 # ADOPT=1 is passed to the first session only (no fingerprint in ~/raggio-bench/state yet).
-# Usage: setsid -f bash ~/raggio-bench/g-abab.sh <sha> <per-session cap, e.g. 75m> <C1: 0|1> \
+# Usage: setsid -f bash ~/raggio-bench/g-abab.sh <sha> <per-session cap, e.g. 90m> <C1: 0|1> \
 #          <D1: 0|1> > ~/raggio-bench/g-abab.log 2>&1 < /dev/null
 source "${LIB:-$HOME/raggio/bench/dgx/lib.sh}"
-SHA="${1:?sha}" CAP="${2:?per-session cap, e.g. 75m}" WITH_C1="${3:?C1: 0|1}" WITH_D1="${4:?D1: 0|1}"
-SESSIONS=("g-a1-py312 localhost/raggio:$SHA" "g-b1-py314t localhost/raggio:$SHA-py314t"
-          "g-a2-py312 localhost/raggio:$SHA" "g-b2-py314t localhost/raggio:$SHA-py314t")
-if [ "$WITH_C1" = 1 ]; then SESSIONS+=("g-c1-py314 localhost/raggio:$SHA-py314"); fi
-if [ "$WITH_D1" = 1 ]; then SESSIONS+=("g-d1-py314t-gcfreeze localhost/raggio:$SHA-py314t-gcfreeze"); fi
+SHA="${1:?sha}" CAP="${2:?per-session cap, e.g. 90m}" WITH_C1="${3:?C1: 0|1}" WITH_D1="${4:?D1: 0|1}"
+SESSIONS=()  # "<label> <image> <concurrency>"
+for arm in "g-a1-py312 localhost/raggio:$SHA" "g-b1-py314t localhost/raggio:$SHA-py314t" \
+           "g-a2-py312 localhost/raggio:$SHA" "g-b2-py314t localhost/raggio:$SHA-py314t"; do
+  SESSIONS+=("$arm 8" "${arm%% *}-c16 ${arm#* } 16")
+done
+if [ "$WITH_C1" = 1 ]; then SESSIONS+=("g-c1-py314 localhost/raggio:$SHA-py314 8"); fi
+if [ "$WITH_D1" = 1 ]; then SESSIONS+=("g-d1-py314t-gcfreeze localhost/raggio:$SHA-py314t-gcfreeze 8"); fi
 adopt="${ADOPT:-0}"
 cat /proc/sys/kernel/random/boot_id > "$BENCH_HOME/g-boot-before.txt"
 log "g-abab: $SHA, ${#SESSIONS[@]} sessions, $CAP each, boot $(cat "$BENCH_HOME/g-boot-before.txt")"
 for session in "${SESSIONS[@]}"; do
-  label="${session%% *}" image="${session#* }"
-  log "g-abab: $label ($image)"
-  ADOPT="$adopt" bash "$BENCH_HOME/g-session.sh" "$label" "$image" "$CAP" \
-    > "$BENCH_HOME/$label.log" 2>&1 < /dev/null || true
+  read -r label image concurrency <<< "$session"
+  log "g-abab: $label ($image, c=$concurrency)"
+  CONCURRENCY="$concurrency" ADOPT="$adopt" bash "$BENCH_HOME/g-session.sh" "$label" "$image" \
+    "$CAP" > "$BENCH_HOME/$label.log" 2>&1 < /dev/null || true
   adopt=0
   last=$(tail -n 1 "$BENCH_HOME/$label.log")
   if [ "$last" != "g-session $label: exit 0" ]; then
@@ -3002,7 +3220,7 @@ sed -i 's/\r$//' D:/DEV/_scratch/dgx/planG/*.sh D:/DEV/_scratch/dgx/planG/*.py
 
 - [ ] **Step 4: Run the check to verify it passes**
 
-Run from the repo root: `uv run python D:/DEV/_scratch/dgx/planG/g-check.py`. It takes about 30 s.
+Run from the repo root: `uv run python D:/DEV/_scratch/dgx/planG/g-check.py`. It takes about 50 s.
 
 Expected:
 
@@ -3019,6 +3237,13 @@ noisy: Park, costs: [], Task 12 test passes
 gil-on: Park, costs: [], Task 12 test passes
 traceback: Park, costs: [], Task 12 test passes
 with-c1: Hold, costs: [], Task 12 test passes
+hybrid-p99-worse: Park, costs: ['Hybrid p99 under concurrency (ms)'], Task 12 test passes, reason checked
+flat-split-uneven: Park, costs: [], Task 12 test passes, reason checked
+flat-split-uneven-worse: Hold, costs: [], Task 12 test passes
+flat-split-even: Hold, costs: [], Task 12 test passes
+cpu-missing: Park, costs: [], Task 12 test passes, reason checked
+c16-not-gated: Hold, costs: [], Task 12 test passes
+c16-traceback: Park, costs: [], Task 12 test passes, reason checked
 two-boots: Task 12 test fails, as it must
 two-shas: Task 12 test fails, as it must
 blas-differs: Task 12 test fails, as it must
@@ -3031,6 +3256,14 @@ What the new scenarios pin:
 - `hybrid-win` and `hybrid-other-sqlite`: a hybrid-only win counts on one SQLite build and is refused across two (D15).
 - `noisy`: A2 moves beyond the band against A1, so B's win is inside the between-server variance and is not claimed (spec §6).
 - `blas-differs` and `thin`: an arm without `OPENBLAS_NUM_THREADS=1` (D16), or a table with Plan A's `Reported, not claimed` note (fewer than 3 flat runs a side), fails the Task 12 test.
+- `hybrid-p99-worse`: B's hybrid concurrent QPS is `better` in both pairs, but its `Hybrid p99 under concurrency (ms)` is 4x A's, `worse` in both. The hybrid row does not win, so B parks, with the p99 row as the cost (spec §3.1 G5; p4 saw 3.8-4.0x).
+- `flat-split-uneven`: B's `QPS concurrent` is `better` in both pairs, but two of A's three flat runs are high-CPU (116 ms per query against 54) and none of B's. The reason names the split, `A1 2 high/1 low, B1 0 high/3 low`, and the row counts as neither a win nor a miss, so B parks (G5).
+- `flat-split-uneven-worse`: the same uneven split, but B's `QPS concurrent` is 0.5x and its `p95 under concurrency (ms)` 2x A's, `worse` in both pairs, and `Hybrid QPS concurrent` is `better`. On an uneven split neither flat row counts a win or a cost (G9), so `worse_in_both` drops both: the hybrid win stands and the decision is Hold, with `costs: []`. Without the rule it parks on `QPS concurrent: worse beyond the noise band in both pairs`. No reason line is checked: a Hold has none, and the uneven-split text goes under `Not won`.
+- `flat-split-even`: one high-CPU run in every session, so each side of each pair splits 1 high/2 low. The split is even, B's `better` counts, and the decision is Hold, as in `hold`.
+- `cpu-missing`: no run has the CPU rows, as where `cpu.stat` is unreadable (spec §4.2). The fast/slow state is unknown, the reason says so, and B's `better` does not count.
+- `c16-traceback`: `synth`'s `traceback` knob names one session, `g-b1-py314t-c16`, and puts a Traceback line in one of its logs; everything else is as in `hold`. The `GIL and logs` table has a row for every `-c16` session, so `abab_decision` reads it and parks; the reason line `g-b1-py314t-c16: 1 Traceback or GIL lines in the container logs` is checked through `REASONS`. The c=16 speed tables stay reported, not gated (spec §3.1 G7, G8).
+- `c16-not-gated`: `synth`'s `c16` knob makes B worse in the four `-c16` sessions (`QPS concurrent` at 0.5x, `Hybrid QPS concurrent` at 0.5x, `Hybrid p99 under concurrency (ms)` at 4x), while the c=8 sessions are as in `hold`. Every scenario asserts that `g-render.py` wrote the four `(c=16)` tables; this one also asserts that the `A1 → B1 (c=16)` table's `QPS concurrent` row ends in `worse` (the line under a table, "Beyond the noise band: better ..., worse ...", always contains the word, so the assertion reads the row). Read as gate tables, "worse in both" would turn the Hold into a Park; the decision is Hold, because it reads only the c=8 titles and `abab_decision` also drops every `(c=16)` section (spec §3.1 G7).
+- The reason checks: for `hybrid-p99-worse`, `flat-split-uneven`, `cpu-missing` and `c16-traceback`, one of `g-decide.py`'s reason lines must contain the scenario's `REASONS` text, and the line ends `, reason checked`.
 
 Run:
 
@@ -3049,7 +3282,7 @@ Nothing in the repo changed. `git status --short --untracked-files=no` prints no
 
 ### Task 11 (DGX, the first of two): deploy, probe p4 (the 3.14t aarch64 build), record the images' facts, run the fan-out probe
 
-This task prepares Task 12's ABAB on gn100, under spec §6. It follows Tasks 1–10, and needs the user's explicit go-ahead with a time cap. It is Plan G's first DGX task, and it opens with spec §8's probe p4, which has never run: whether turbovec 1.0.0's sdist and `raggio_native` build for cp314t on aarch64 (Step 6). If turbovec's sdist does not build, the task stops there and reports. Nobody patches, forks or vendors turbovec (D6), and ADR 0006 stays `Pending:`. After p4, it records what each image runs: interpreter, GIL, turbovec wheel tag, `raggio_native`'s compiled file, the bundled SQLite (D15), `OPENBLAS_NUM_THREADS` (D16) and the Unicode versions. It also records the Unicode drift between the arms, and runs Plan F's fan-out probe in both images on one IVF index. It changes nothing in the repo.
+This task prepares Task 12's ABAB on gn100, under spec §6. It follows Tasks 1–10, and needs the user's explicit go-ahead, with no time cap: it is a build and fix window, which spec §6 exempts from the cap (§3.1 G4). A deploy or build whose log stops growing for 30 minutes is hung, which is not a cap: Task 11 stops it and asks the user (Steps 4 and 6). It is Plan G's first DGX task, and it opens with spec §8's probe p4 on G's own tree (Step 6). p4 ran on gn100 on 2026-09-28 (`docs/superpowers/research/2026-09-28-dgx-probe-p4-freethreaded.md`) at the 19a8a2e tree, which has no `raggio_native`, with a stand-in `check_image.py`: turbovec 1.0.0's sdist built for cp314t on aarch64 with 0 builder-stage fixes and no build arg, in a 28.7 s cold image build, and the GIL stayed off. Two things stay open, and Step 6 settles them: whether `raggio_native` builds for cp314t on aarch64, and whether G's real `check_image.py` passes on G's real Dockerfile. If turbovec's sdist does not build, which p4 makes unlikely, Step 6 classifies the cause from the build log (spec §3.1 G2). A missing system build dependency, a Rust or maturin toolchain version, or a missing interpreter-specific build flag or env is fixed in the Dockerfile's builder stage only, in at most 3 rebuild attempts, each recorded in the task log `D:/DEV/_scratch/dgx/planG/p4-attempts.md`. If 3 attempts do not fix it, or no builder-stage line can express the fix although turbovec's source needs no change, Task 11 stops and asks the user, and ADR 0006 stays `Pending:` (spec §3.1 G3). A cause that only a change to turbovec's own source would fix gets an upstream issue draft in `D:/DEV/_scratch/upstream-drafts/turbovec-cp314t-build.md`, which the maintainer posts, and G is parked in ADR 0006, the only case that parks without asking (spec §3.1 G3). Nobody patches, forks or vendors turbovec (D6). After p4, it records what each image runs: interpreter, GIL, turbovec wheel tag, `raggio_native`'s compiled file, the bundled SQLite (D15), `OPENBLAS_NUM_THREADS` (D16) and the Unicode versions. It also records the Unicode drift between the arms, and runs Plan F's fan-out probe in both images on one IVF index. It changes nothing in the repo, except on p4's failure path: a builder-stage fix and its regression test, committed on G's branch, or the Park recorded in ADR 0006.
 
 Every `ssh` and `scp` is written out in full, with `-F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes`. Rules for gn100:
 - Local paths given to `scp` are relative, after a `cd`, because `scp` would read `D:` as a host name.
@@ -3061,7 +3294,12 @@ Every `ssh` and `scp` is written out in full, with `-F "C:/Users/emanu/AppData/L
 - Every script runs detached with `setsid -f`, and is followed by polling its log.
 
 **Files:**
-- Outside the repo: create `D:/DEV/_scratch/dgx/planG/g.env` and `D:/DEV/_scratch/dgx/planG/deploy.log`.
+- Outside the repo: create `D:/DEV/_scratch/dgx/planG/g.env` and `D:/DEV/_scratch/dgx/planG/deploy.log`, and the stall guard's state files `deploy.stall` and `g-build.stall` next to them (Steps 4 and 6).
+- Only if the stall guard stops a hung deploy or build (Steps 4 and 6): outside the repo, `D:/DEV/_scratch/dgx/planG/hung-<UTC time>.log`, and a `## p4 hung build, not counted` entry in `p4-attempts.md`.
+- Only if turbovec's sdist does not build (Step 6, spec §3.1 G2):
+  - outside the repo: `D:/DEV/_scratch/dgx/planG/g-build.log`, `p4-attempts.md` and `g-build-p4-<k>.log` for each failed build `<k>`;
+  - for a builder-stage cause: modify `Dockerfile` (builder-stage lines only) and `tests/test_freethreading.py` (append the probe p4 section);
+  - for a turbovec source cause: create `D:/DEV/_scratch/upstream-drafts/turbovec-cp314t-build.md` (never posted by the implementer), and modify `docs/adr/0006-free-threaded-python.md` (the `Pending:` Verification is replaced with the Park).
 - On gn100:
   - `~/raggio`, replaced with this commit's tree by Plan A's `deploy.sh` (spec §6);
   - the images `localhost/raggio:<SHA>` (A), `…:<SHA>-py314t` (B), and optionally `…:<SHA>-py314` (C) and `…:<SHA>-py314t-gcfreeze` (D);
@@ -3082,38 +3320,74 @@ Every `ssh` and `scp` is written out in full, with `-F "C:/Users/emanu/AppData/L
 - Produces:
   - `g.env`, which holds `SHA`, `WITH_C1` and `WITH_D1`;
   - the images, and p4's answer in `g-build.log`: `built <image> in <N> s` for each image, or `== BUILD_FAILED <image>` with the failing stage above it;
+  - only on p4's turbovec failure path (spec §3.1 G2):
+    - `p4-attempts.md`, one `## p4 build <k>` entry per failed build;
+    - for each builder-stage fix attempt `<k>` (at most 3): the constant `P4_BUILDER_FIX`, the pattern `P4_FIX_LINE`, the test `test_the_p4_turbovec_build_fix_stays_in_the_builder_stage`, and the commit `Fix the turbovec cp314t build in the builder stage (p4, attempt <k>)`. Each fix gives a new SHA, and the task restarts from Step 2 with it;
+    - for a turbovec source cause: the draft `turbovec-cp314t-build.md`, ADR 0006's Verification with the p4 record and `**Park**`, and the commit `Park the free-threaded evaluation at probe p4 (ADR 0006)`. Task 12 does not run;
+  - only if the stall guard stops a hung deploy or build: the `p4-attempts.md` entry `## p4 hung build, not counted`, whose last line is `- next: stop: build hung (no log output for 30 min)`. Task 12 does not run until the user decides;
   - `g-images.txt`, with one line per image: `<arm>\t<image>\tPython …, GIL …, turbovec … (<wheel tags>), raggio_native <version> (<compiled file>), SQLite …, OPENBLAS_NUM_THREADS …, Unicode …, raggio_native Unicode …`;
   - the drift files;
   - `g-fanout-A.txt` and `g-fanout-B.txt`, each with a `GATE` line.
 
-- [ ] **Step 1: Ask the user for a run window (time cap)**
+- [ ] **Step 1: Ask the user for a run window (no time cap, spec §6 and §3.1 G4)**
 
 Ask, and wait for an explicit answer. Do not run anything on gn100 before it:
 
-> Plan G's DGX preparation needs a run window on gn100, about 60 minutes:
+> Plan G's DGX preparation needs a run window on gn100. It is a build and fix window, so it has no time cap (spec §6 exempts these windows, §3.1 G4); these estimates add up to about 50 minutes, plus about 15 min for each p4 fix attempt if turbovec's sdist needs one:
 > - about 10 min to deploy this commit to `~/raggio` (spec §6) and build the 3.12 image;
-> - about 15 min to build the free-threaded 3.14t image. This is spec §8's probe p4, which has never run: it compiles turbovec 1.0.0 from its sdist and `raggio_native` for cp314t on aarch64. If turbovec's sdist does not build, I stop there and report, and the rest of the window goes unused. raggio never patches or forks turbovec (D6);
+> - about 5 min to build the free-threaded 3.14t image. This is spec §8's probe p4 on this commit: it compiles turbovec 1.0.0 from its sdist and `raggio_native` for cp314t on aarch64. p4 already built the image shape on gn100 on 2026-09-28 without `raggio_native`, with 0 fixes, in 28.7 s cold [28.2..29.3] over 3 builds, 17–19 s of it turbovec's compile. Nobody has measured `raggio_native`'s Rust compile for cp314t, so the estimate leaves minutes, not seconds, for it. What stays open is `raggio_native`'s build and the real build-time check. If turbovec's sdist does not build, which p4 makes unlikely, I classify the cause from the build log (spec §3.1 G2):
+>   - a missing system build dependency, a Rust or maturin toolchain version, or a missing build flag or env: I fix it in the Dockerfile's builder stage only, with a regression test, commit it on G's branch, and redeploy and rebuild. At most 3 attempts, each about 15 min, with no time cap; every attempt is recorded in `D:/DEV/_scratch/dgx/planG/p4-attempts.md`. After 3 failed attempts, or if no builder-stage line of these kinds can express the fix, I stop, report, and ask you how to go on, and ADR 0006 stays `Pending:` (spec §3.1 G3);
+>   - a cause only a change to turbovec's own source would fix: I write an upstream issue draft to `D:/DEV/_scratch/upstream-drafts/turbovec-cp314t-build.md` for you to post (I never post it), park the evaluation in ADR 0006 without asking (spec §3.1 G3), and the task ends there. raggio never patches, vendors or forks turbovec (D6);
 > - about 5 min to record what each image runs (interpreter, GIL, the turbovec and `raggio_native` builds, SQLite version, `OPENBLAS_NUM_THREADS`), and the Unicode drift between them;
 > - up to 10 min to make sure the `bench-tv` volume has its IVF index; it builds one at 4 GiB if the volume is flat;
 > - about 20 min for Plan F's read-only IVF fan-out probe, in both images, one after the other, in a transient 8 GiB container.
 >
 > Two optional arms for Task 12 can be built now:
-> - C: 3.14 with the GIL and turbovec built from source, which separates "free threading" from "3.14 plus a source-built turbovec". Its build adds about 15 min here, and its session adds about 50 min to Task 12.
+> - C: 3.14 with the GIL, and turbovec built locally from the same sdist with maturin. That build is still an abi3 wheel (`cp39-abi3-linux_aarch64`), because the sdist enables `abi3-py39`, while 3.14t builds `cp314-cp314t`, so C is not the same turbovec build as B. It separates the 3.12 → 3.14 interpreter effect and a local build from PyPI's manylinux wheel (maturin 1.14.1). Its build adds about 5 min here (p4's took 29 s without `raggio_native`), and its session adds about 50 min to Task 12.
 > - D: 3.14t with `GC_FREEZE=1`. Its build takes under a minute, and its session adds about 50 min to Task 12.
 >
 > The run uses only `bench-tv`, its volume, `~/raggio` and `~/raggio-bench/g-*`. It never touches `bench-wv`, reads `~/turborag` only through Plan A's corpus symlink, and needs no `sudo`.
 >
-> May I run it? If so, with what time cap, and with or without C and D?
+> If a deploy's or a build's log shows no new output for 30 minutes, I treat the build as hung, which is not a time cap: I stop it, and ask you how to go on. A hung build uses none of the 3 fix attempts.
+>
+> May I run it, and with or without C and D? If you need gn100 back before it ends, for example for your own containers, tell me and I stop what runs on gn100, a deploy or build included.
 
 If the user declines, stop here. Tasks 1–10 stand on their own, and ADR 0006 stays `Pending:`.
 
-Note the cap and the start time. If the cap is reached before Step 9 sees `== FANOUT_DONE`, run this stop recipe, then go to Step 10:
+Note the start time, for the report; there is no cap to track (spec §6, §3.1 G4). The stop recipe below is kept, although there is no cap, because gn100 is shared: the maintainer's own containers may need it before Task 11 ends. The stall guard of Steps 4 and 6 uses it too. If the user asks for gn100 back before Step 9 sees `== FANOUT_DONE`, run this stop recipe, then go to Step 10:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'for p in $(pgrep -f "raggio-bench/g-(build|facts|ensure-ivf|fanout)[.]sh"); do kill -TERM -- "-$p"; done; podman stop -t 60 --ignore bench-tv'
+lt() { local d p; for d in /proc/[0-9]*; do { read -r p < "$d/ppid"; } 2>/dev/null && [ "$p" = "$1" ] && lt "${d#/proc/}"; done; echo "$1"; }
+for d in /proc/[0-9]*; do [ "${d#/proc/}" = "$$" ] || case "$(tr '\0' ' ' 2>/dev/null < "$d/cmdline")" in *bench/dgx/deploy[.]sh*) lt "${d#/proc/}";; esac; done | sort -un | while read -r p; do echo "laptop: stopping $p"; kill "$p" 2>/dev/null; done
+ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+tree() { local c; for c in $(pgrep -P "$1"); do tree "$c"; done; echo "$1"; }
+for p in $(pgrep -f "raggio-bench/g-(build|facts|ensure-ivf|fanout)[.]sh"); do kill -TERM -- "-$p"; done
+pids=$(for r in $(pgrep -f "raggio/bench/dgx/setup[.]sh"); do tree "$r"; done | sort -un | grep -vx "$$")
+[ -z "$pids" ] || { ps -o pid=,args= -p "$(echo $pids | tr " " ,)" | cut -c1-100; kill -TERM $pids; }
+podman stop -t 60 --ignore bench-tv
+sleep 15
+pgrep -af "raggio-bench/g-(build|facts|ensure-ivf|fanout)[.]sh|raggio/bench/dgx/setup[.]sh|podman[ ]build -t localhost/raggio:|[u]v sync --frozen|[r]ustc --crate-name" || echo "gn100: none left"
+podman ps --format "{{.Names}} {{.Status}}"'
+for d in /proc/[0-9]*; do case "$(tr '\0' ' ' 2>/dev/null < "$d/cmdline")" in *bench/dgx/deploy[.]sh*|*bench/dgx/setup[.]sh*) echo "laptop: left ${d#/proc/}";; esac; done
 ```
 
-Each script was started with `setsid -f`, so it leads its own process group, and `kill -- -<pid>` also stops its `podman build` or `podman run` children. The `[.]` keeps the pattern from matching the remote shell that runs it.
+Expected:
+- a `laptop: stopping <pid>` line for each laptop process of a running deploy: Step 4's background command, its `deploy.sh`, and their descendants (the `git archive` and `ssh` of the unpack, or the `ssh` that runs `setup.sh`);
+- on gn100, the PID and command line of each process stopped with a `setup.sh`: `bash …/setup.sh <SHA>`, then `uv` or `podman build -t localhost/raggio:<SHA> .` and the build's children;
+- `gn100: none left`, then `podman ps` without a `bench-tv` line. `bench-wv`, if listed, keeps its status;
+- no `laptop: left` line.
+
+If a line is left, run the recipe once more. If it is still there, report its PID and command line to the user, and signal nothing else.
+
+The recipe never runs `pkill -f`: it finds the PIDs first, then kills by PID.
+- **The laptop first.** Git Bash has no `pgrep`, so the recipe reads each process's `/proc/<pid>/cmdline`, skips its own shell (`$$`), and finds Step 4's `deploy.sh` and the command running it. It stops them before the gn100 part: otherwise a deploy between its two ssh calls would start `setup.sh` after the gn100 part has run. `lt` adds their descendants from `/proc/<pid>/ppid` before anything is killed, because a killed `deploy.sh` does not take its children with it: a hung unpack's `git archive` and `ssh` would go on, and no `laptop: left` line would show them.
+- **The `g-` scripts.** Each was started with `setsid -f`, so it leads its own process group, and `kill -- -<pid>` also stops its `podman build` or `podman run` children.
+- **`setup.sh`.** It leads no group: `deploy.sh` runs it over ssh in the foreground, in the ssh session's group. So the recipe collects each `setup.sh` process and all of its descendants with `pgrep -P` (`uv sync`, `podman build` and the build's own children), leaves out the remote shell that runs the recipe (`$$`), prints them, and TERMs them by PID. The ssh session then ends, and so does the laptop's ssh, which the last line checks.
+- **Self-matching.** The `[.]` and `[ ]` keep the patterns from matching the shells that run the recipe, whose command lines hold the patterns themselves. So the recipe's code never names `deploy.sh` or `setup.sh` without the brackets.
+- **Other containers.** Only those process trees are signalled, so `bench-wv`, any other container, and a `podman build` of the user's own are never touched. The one container the recipe names is `bench-tv`, which it stops and does not remove. A stopped build may leave its intermediate container behind, listed by `podman ps -a --external`: leave it, since `podman rm -f` may only name `bench-tv`.
+- **Build steps left running.** The TERM may not reach a `RUN` step: its first process is the init of the build container's PID namespace, which ignores a TERM from outside unless it handles one. So the last `pgrep` also lists a `uv sync --frozen` or a `rustc --crate-name` that is still running. It lists them and never signals them, since such a process may also be the user's own: the rule above applies, so a line still there after the second run goes to the user.
+
+Step 6's failure procedure (6a–6g) runs nothing on gn100, so a request that comes during it does not cut it short: finish it on the laptop, through 6d's `next:` line with its commit, 6f's Park commit, or 6g's stop, and then go to Step 10 instead of restarting at Step 2. A later go-ahead (this step's question again) restarts this task at Step 2, with the SHA of `HEAD`. `p4-attempts.md` goes on counting from its last `## p4 build` entry: a build the stop cut short never reached 6a, so it is not in the log, and it simply runs again. A hung build's `## p4 hung build, not counted` entry is not counted either (Step 6, "If a deploy or build hung"). After a Park nothing restarts, and after 6g's stop the user decides (spec §3.1 G3).
 
 - [ ] **Step 2: Pin the commit and check the laptop side**
 
@@ -3133,7 +3407,7 @@ cat D:/DEV/_scratch/dgx/planG/g.env
 
 Expected:
 - `git status` prints nothing;
-- the log's newest commit is `Document the free-threaded image (ADR 0006)`;
+- the log's newest commit is `Document the free-threaded image (ADR 0006)`, or, after a probe p4 fix in Step 6, `Fix the turbovec cp314t build in the builder stage (p4, attempt <k>)`;
 - both suites are green;
 - the check ends with `Plan G DGX scripts OK in ...`;
 - `g.env` shows the SHA and the two flags.
@@ -3169,19 +3443,34 @@ Stop and ask the user, and never stop anything yourself, if:
 - `bench-tv` is up;
 - `g-active` exists.
 
-If there is no `bench-tv` volume, stop and ask. The 2.55M-row volume is a prerequisite, and re-ingesting it takes about 31 min, outside this window.
+If there is no `bench-tv` volume, stop and ask. The 2.55M-row volume is a prerequisite, and re-ingesting it takes about 31 min. This stop stays although Task 11 has no cap: a re-ingest is neither a build nor a fix, so Step 1's go-ahead does not cover it, and spec §6 would need its own go-ahead for it, with a time cap.
 
 - [ ] **Step 4: Deploy this commit (spec §6)**
 
-Run this from the repo root, in the background. It takes about 10 minutes; wait for it to exit:
+Run this from the repo root, in the background. It takes about 10 minutes; wait for it to exit. Its `echo` line starts the stall guard's clock:
 
 ```bash
 cd D:/DEV/raggio
+echo "0 $(date +%s)" > D:/DEV/_scratch/dgx/planG/deploy.stall
 bash bench/dgx/deploy.sh > D:/DEV/_scratch/dgx/planG/deploy.log 2>&1
 tail -n 3 D:/DEV/_scratch/dgx/planG/deploy.log
 ```
 
-Expected: the last line is `<ts> deployed <SHA> as localhost/raggio:<SHA>`, with the SHA from `g.env`. If it is not, read `deploy.log`, stop and report.
+While it runs, poll every 5 minutes with the stall guard, until the background command exits. `deploy.stall` holds the log's size and the time that size was first seen:
+
+```bash
+cd D:/DEV/_scratch/dgx/planG
+now=$(date +%s); size=$(stat -c %s deploy.log); read -r last since < deploy.stall
+[ "$size" = "$last" ] || since=$now
+echo "$size $since" > deploy.stall
+echo "deploy.log: $size bytes, no growth for $(( (now - since) / 60 )) min"
+[ $((now - since)) -lt 1800 ] || echo "STALLED: no log output for 30 min"
+tail -n 2 deploy.log
+```
+
+Expected while it runs: a `deploy.log:` line, and the log's last lines. `setup.sh`'s `podman build` streams its `STEP` lines through ssh into `deploy.log`; uv prints nothing while it compiles a Rust package, so a few quiet polls are normal. The guard is a clock, not a count of polls: it fires at the first poll that finds the size unchanged for 30 minutes or more, which at 5-minute polls is the sixth poll in a row without growth. That is not a time cap (spec §3.1 G4): a deploy whose log keeps growing runs as long as it needs. If a poll prints `STALLED: no log output for 30 min` before the command exits, the deploy is hung: go to "If a deploy or build hung" in Step 6, with `STEP=4`.
+
+Expected when the command exits: the last line is `<ts> deployed <SHA> as localhost/raggio:<SHA>`, with the SHA from `g.env`. If it is not, read `deploy.log`, stop and report.
 
 - [ ] **Step 5: Copy the scripts to gn100**
 
@@ -3198,22 +3487,34 @@ Expected: the eight files are listed, then `SYNTAX_OK`.
 
 - [ ] **Step 6: Probe p4: build B on aarch64, then C and D if asked for (detached, then poll)**
 
-This is spec §8's probe p4, and nothing later in this task runs unless it passes. B's build is the first time turbovec 1.0.0's sdist and `raggio_native` are compiled for cp314t on aarch64. Both are compiled in Plan E's builder stage, whose `PYO3_PYTHON` names the interpreter `PYTHON=3.14t` installed.
+This is spec §8's probe p4 on G's own tree, and nothing later in this task runs unless it passes. p4 already compiled turbovec 1.0.0's sdist for cp314t on aarch64, on 2026-09-28 at the 19a8a2e tree: `cp314-cp314t-linux_aarch64`, 0 builder-stage fixes, no build arg (`docs/superpowers/research/2026-09-28-dgx-probe-p4-freethreaded.md`). B's build is the first time `raggio_native` is compiled for cp314t on aarch64, and the first time G's real `check_image.py` runs on G's real Dockerfile there. turbovec and `raggio_native` are both compiled in Plan E's builder stage, whose `PYO3_PYTHON` names the interpreter `PYTHON=3.14t` installed.
 
 ```bash
 source D:/DEV/_scratch/dgx/planG/g.env
 ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 "setsid -f bash ~/raggio-bench/g-build.sh $SHA $WITH_C1 $WITH_D1 > ~/raggio-bench/g-build.log 2>&1 < /dev/null"
+echo "0 $(date +%s)" > D:/DEV/_scratch/dgx/planG/g-build.stall
 ```
 
-Poll every 5 minutes:
+The last line starts the stall guard's clock, as in Step 4. Poll every 5 minutes; each poll reads the log's tail, then its size, which `g-build.stall` compares with the size first seen:
 
 ```bash
+cd D:/DEV/_scratch/dgx/planG
 ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'tail -n 3 ~/raggio-bench/g-build.log'
+if size=$(ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'stat -c %s ~/raggio-bench/g-build.log'); then
+  now=$(date +%s); read -r last since < g-build.stall
+  [ "$size" = "$last" ] || since=$now
+  echo "$size $since" > g-build.stall
+  echo "g-build.log: $size bytes, no growth for $(( (now - since) / 60 )) min"
+  [ $((now - since)) -lt 1800 ] || echo "STALLED: no log output for 30 min"
+fi
 ```
 
-Stop polling on either status line:
+A failed `ssh` leaves `g-build.stall` as it was, so a network error neither resets the clock nor counts as a stall. uv prints nothing while it compiles turbovec and `raggio_native`, so quiet polls are normal; the guard fires only after 30 minutes without growth, at 5-minute polls the sixth poll in a row. That is not a time cap (spec §3.1 G4): a build whose log keeps growing runs as long as it needs.
+
+Stop polling on either status line, or on the stall:
 - `== BUILD_DONE`;
-- `== BUILD_FAILED <what>`. Go to "If the build failed" below.
+- `== BUILD_FAILED <what>`. Go to "If the build failed" below;
+- `STALLED: no log output for 30 min`, before either status line. The build is hung: go to "If a deploy or build hung" below, with `STEP=6`.
 
 On `== BUILD_DONE`, list the images and p4's lines:
 
@@ -3228,7 +3529,7 @@ Expected:
   - `Building turbovec==1.0.0` for B, and for C;
   - a `Building raggio-native` line for each of B and C. This is uv's progress wording, not a status line: if it is missing, `bm25=native` in the `check_image` line is enough;
   - `check_image: Python 3.14.<patch> free-threaded, GIL disabled, <n> extension modules imported, bm25=native` for B;
-  - `built localhost/raggio:<SHA>-py314t in <N> s`, and the same for C and D if they were built. B's `<N>` is p4's build time on gn100: note it for the report.
+  - `built localhost/raggio:<SHA>-py314t in <N> s`, and the same for C and D if they were built. B's `<N>` is p4's build time on gn100 with `raggio_native`: note it for the report, next to p4's 28.7 s [28.2..29.3] cold without it.
 
 `check_image` passing in B already proves the cp314t build of `raggio_native`. `check_native()` (Task 5) fails the build when the compiled module it imported is not `EXTENSION_SUFFIXES[0]`, which on 3.14t is `.cpython-314t-aarch64-linux-gnu.so`. Step 7 records the file name.
 
@@ -3237,12 +3538,12 @@ Expected:
 ```bash
 cd D:/DEV/_scratch/dgx/planG
 scp -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100:raggio-bench/g-build.log .
-grep -n -E "^STEP [0-9]+/[0-9]+:|Failed to build|check_image|BUILD_FAILED" g-build.log | tail -n 8
+grep -n -E "^(\[[0-9]+/[0-9]+\] )?STEP [0-9]+/[0-9]+:|Failed to build|check_image|BUILD_FAILED" g-build.log | tail -n 8
 grep -n -E "error(\[E[0-9]+\])?:" g-build.log | head -n 10
 ```
 
-The first `grep` gives the last `STEP` line before `== BUILD_FAILED`, and the uv or check lines under it. The second gives the first compiler or build errors. Report the stage, those errors, and the time used:
-- **``Failed to build `turbovec==1.0.0` ``**, under the builder's `RUN uv sync --frozen --no-install-project --no-dev --extra native`: turbovec's sdist does not build for cp314t on aarch64. That answers p4: stop here, and run nothing else in this window. Do not patch turbovec, fork it, vendor it, pin another version, or retry with other flags (D6). If the error names something raggio's own Dockerfile controls, such as the Rust version (`ARG RUST_VERSION`) or a missing system package in the builder, put that to the user as a question; do not change it in this window. ADR 0006 stays `Pending:`, and Task 12 does not run. Tasks 1–10 still stand, and the default 3.12 image is unaffected.
+The first `grep` gives the last `STEP` line before `== BUILD_FAILED` (podman prefixes a multi-stage build's steps with the stage, as in `[2/3] STEP <i>/<n>:`; the builder is stage 2 of 3), and the uv or check lines under it. The second gives the first compiler or build errors. Act on the stage; in every case but turbovec's, report the stage, those errors, and the time used:
+- **``Failed to build `turbovec==1.0.0` ``**, under the builder's `RUN uv sync --frozen --no-install-project --no-dev --extra native`: turbovec's sdist does not build for cp314t on aarch64. Do not run Steps 7–9; go to "turbovec's sdist did not build" below (spec §3.1 G2), which runs nothing on gn100 but 6d's rebuilds. Never patch turbovec, fork it, vendor it, or pin another turbovec version (D6). Tasks 1–10 still stand, and the default 3.12 image is unaffected.
 - **``Failed to build `raggio-native @ …` ``**: `raggio_native`'s cp314t build (PyO3 and maturin) failed. That is raggio's own code: stop and report. The fix is a new commit on the laptop, and then this task restarts from Step 2 with its new SHA.
 - **the `RUN /app/.venv/bin/python /tmp/check_image.py` step, with `check_image: FAILED: <reason>`**: both builds succeeded, but the check refused the venv. Either an import re-enabled the GIL, or the reason is `raggio_native is not built for this interpreter (.cpython-314t-aarch64-linux-gnu.so): [...]` and names a file that is not cp314t. Either one is a finding for ADR 0006: stop and report it.
 - **`== BUILD_FAILED deploy`**: `~/raggio` does not hold `SHA`. Go back to Step 4.
@@ -3251,6 +3552,263 @@ The first `grep` gives the last `STEP` line before `== BUILD_FAILED`, and the uv
 If `<what>` names C's or D's image, B built before it and p4 has passed: its `built … in <N> s` line is in the log. Stop and report, then ask the user whether to go on without that arm. If so, set its flag in `g.env` to 0 and continue at Step 7.
 
 The builds leave no container behind, so the stop needs no `podman` clean-up.
+
+**If a deploy or build hung.** The stall guard of Step 4 (`STEP=4`, `deploy.log`) or of this step (`STEP=6`, `g-build.log`) printed `STALLED: no log output for 30 min`: the log has not grown for 30 consecutive minutes, so the build is hung. This is not a time cap (spec §3.1 G4), and it is not a turbovec failure, so 6b does not classify it and nothing parks. Run Step 1's stop recipe first. It stops a running `deploy.sh` and `setup.sh`, or `g-build.sh`, together with their `podman build`. Then save the log and record the hang, with `STEP` set to the step that hung:
+
+```bash
+source D:/DEV/_scratch/dgx/planG/g.env
+cd D:/DEV/_scratch/dgx/planG
+STEP=6  # 4 if Step 4's deploy hung
+h=$(date -u +%Y%m%dT%H%MZ)
+if [ "$STEP" = 4 ]; then cp deploy.log "hung-$h.log"; else scp -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100:raggio-bench/g-build.log "hung-$h.log"; fi
+printf '\n## p4 hung build, not counted\n\n- time (UTC): %s\n- SHA: %s\n- step: Step %s\n- log: hung-%s.log, last line: %s\n- next: stop: build hung (no log output for 30 min)\n' "$(date -u +%Y-%m-%dT%H:%MZ)" "$SHA" "$STEP" "$h" "$(tail -n 1 "hung-$h.log")" >> p4-attempts.md
+grep -c "^## p4 build " p4-attempts.md
+tail -n 7 p4-attempts.md
+```
+
+Expected:
+- the `grep` prints the number of `## p4 build` entries, which this entry leaves unchanged: `0` if no turbovec build has failed yet;
+- the tail shows the new entry: the heading, the time, the SHA from `g.env`, the step, the log's name and last line, and `- next: stop: build hung (no log output for 30 min)`.
+
+Then go to 6g. The hung build uses none of the 3 attempts: its heading is not `## p4 build`, so 6a's count and 6c's bound skip it. A later go-ahead restarts this task at Step 2, as Step 1 says, and the build runs again under the same number.
+
+**turbovec's sdist did not build (spec §3.1 G2).** p4 built the same sdist for cp314t on gn100 with 0 fixes, so this path is unlikely; it stays, because G's tree, not 19a8a2e's, is what builds here. This is a bounded procedure: record the build, classify its cause from the log, then fix it in the Dockerfile's builder stage (at most 3 attempts), stop and ask the user when the attempts run out or no allowed line can express the fix (spec §3.1 G3), or, for a turbovec source cause only, draft an upstream issue and park. Every p4 build of B that fails at turbovec gets one entry in the task log `D:/DEV/_scratch/dgx/planG/p4-attempts.md`. Build 1 is the first, with no fix; fix attempt `<k>` follows the failed build `<k>` and makes build `<k>+1`. So at most 4 builds run. turbovec's own source is never patched, vendored or forked (D6), and no other turbovec version is pinned.
+
+6a. Record the build. The `scp` above fetched `g-build.log` into `D:/DEV/_scratch/dgx/planG/`:
+
+```bash
+source D:/DEV/_scratch/dgx/planG/g.env
+cd D:/DEV/_scratch/dgx/planG
+n=$(cat p4-attempts.md 2>/dev/null | grep -c "^## p4 build ")
+k=$((n + 1))
+cp g-build.log "g-build-p4-$k.log"
+printf '\n## p4 build %s\n\n- time (UTC): %s\n- SHA: %s\n- log: g-build-p4-%s.log\n' "$k" "$(date -u +%Y-%m-%dT%H:%MZ)" "$SHA" "$k" >> p4-attempts.md
+grep -E "^(\[[0-9]+/[0-9]+\] )?STEP [0-9]+/[0-9]+:" g-build.log | tail -n 1
+grep -n -E "Caused by|error(\[E[0-9]+\])?:|not found|No such file|could not find|requires rustc|rust-version|maturin|pyo3|PyO3|Py_GIL_DISABLED|free-threaded" g-build.log | grep -v -E "^[0-9]+:[[:space:]]*(Compiling|Downloaded|Downloading|Fresh|Checking) " | head -n 40
+tail -n 6 p4-attempts.md
+```
+
+Expected:
+- the `STEP` line is `[2/3] STEP <i>/<n>: RUN uv sync --frozen --no-install-project --no-dev --extra native`;
+- the second `grep` lists the build's error lines, without cargo's `Compiling pyo3 …`-style progress lines;
+- the tail shows `## p4 build <k>` with the time, the SHA from `g.env` and the log's name. `<k>` is 1 on the first failure.
+
+Then complete the entry with the Edit tool, below its `- log:` line:
+
+````markdown
+- builder-stage lines kept from earlier attempts: <none, or each line in backticks>
+- failing step: <the STEP line>
+- error excerpt:
+
+  ```text
+  <the error lines from the second grep, verbatim, at most 40>
+  ```
+
+- cause: <1, 2, 3 or 4, from the table in 6b>, because <the log line that shows it>
+- next: <one of: attempt <k>: adds <lines>, removes <lines or nothing> | stop: 3 attempts used | stop: no allowed line can express the fix | upstream draft and Park>
+````
+
+6b. Classify the cause. Read the error excerpt against this table. The first row that matches is the cause:
+
+| Cause | What the log shows | The fix, in the builder stage only |
+|---|---|---|
+| 1. A missing system build dependency | a tool, header or library that `rust:*-slim-trixie` lacks: `not found` for a command (`cc`, `pkg-config`, `cmake`, `protoc`), `No such file or directory` for a `.h` file, `could not find` a system library, or a `-l<name>` failing at link time | `RUN apt-get update && apt-get install -y --no-install-recommends <packages> && rm -rf /var/lib/apt/lists/*`, where `<packages>` are the Debian trixie package names that provide it, lowercase, separated by spaces |
+| 2. A Rust or maturin toolchain version | `requires rustc <version>`, or a `rust-version` newer than 1.98.1 in a crate turbovec builds; or maturin refusing its own version | Rust: `RUN rustup toolchain install <version> --profile minimal`, then `ENV RUSTUP_TOOLCHAIN=<version>`, with `<version>` a full `X.Y.Z`. Leave Plan E's global `ARG RUST_VERSION` as it is: CI's native job mirrors it. `RUSTUP_TOOLCHAIN` switches the compiler of every later builder step, `raggio_native`'s build included, in every image: the report names it. maturin: an `ENV UV_<NAME>=<value>` that constrains build dependencies, only if the uv check below prints a line and the value is a literal setting, not the path of a file the builder does not already hold |
+| 3. A missing interpreter-specific build flag or env | PyO3's or maturin's build script cannot configure the interpreter: an error that names a `PYO3_*`, `CARGO_*` or `MATURIN_*` variable, `Py_GIL_DISABLED` or the free-threaded build, and says what to set | `ENV <NAME>=<value>`, where `<NAME>` is `PYO3_*`, `CARGO_*`, `MATURIN_*`, `RUSTFLAGS`, or `UV_*` (the last only if the uv check below prints a line) |
+| 4. A turbovec source incompatibility | anything that only a change in turbovec's own files would fix: a Rust compile error (`error[E…]`) in turbovec's crate; a PyO3 or other crate version that turbovec's `Cargo.lock` pins and that does not support cp314t; an error that only an `UNSAFE_PYO3_*` override would silence; or a setting in turbovec's `Cargo.toml` or `pyproject.toml` | none: go to 6e. This is the only cause that parks without asking the user (spec §3.1 G3) |
+
+The uv check, for any `UV_*` line. It runs on the laptop, with the Dockerfile's uv version, and `<NAME>` is the variable's name:
+
+```bash
+uvx --from uv==0.12.19 uv sync --help | grep -F "[env: <NAME>="
+```
+
+Expected: one line, such as `[env: UV_NO_BINARY_PACKAGE=]` for the variable Task 6 uses. If nothing prints, `uv sync` does not read that variable, and the fix cannot be that line. A value that is the path of a file (a constraints file, for example) needs that file in the builder, and no allowed line adds one: such a fix cannot be expressed either.
+
+A fix changes only builder-stage lines of the shapes in the table; `pyproject.toml`, `uv.lock` and the runtime stage stay as they are (Global Constraints). The fix applies to every image built from the Dockerfile, A's included, so A and B stay built the same way. A cause 1–3 whose fix no line of these shapes can express (for example, one that needs a file copied into the builder) is not a change to turbovec's source, so it is not parked either (spec §3.1 G3): write `next: stop: no allowed line can express the fix` in the entry, and go to 6g.
+
+6c. Attempt a fix, for causes 1–3. First check the bound: if `<k>` is 4, the 3 attempts are used: write `next: stop: 3 attempts used` in the entry, and go to 6g. There is no time bound (spec §6, §3.1 G4): an attempt takes about 15 min, the fix and then Steps 2–6 again, and it runs whatever time has passed since Step 1. No clock stops its redeploy or rebuild: the stall guard of Steps 4 and 6 does, but only after 30 minutes without log output, and so does the user's request for gn100 back (Step 1).
+
+Otherwise, attempt `<k>` fixes build `<k>` in the builder stage, test first. If build `<k>` shows the same error as build `<k>-1`, the previous attempt's lines did not help: this attempt removes them, from the Dockerfile and from `P4_BUILDER_FIX`. Lines from an attempt that changed the error stay.
+
+6c.1. Write the failing test. On attempt 1, append this section to `tests/test_freethreading.py`. `_stages()` is Task 6's helper in this module, and `re` is imported at its top. `P4_BUILDER_FIX` holds the exact lines the fix adds, one string per Dockerfile line, without the comment line. The line below is an example of cause 1's shape: write the lines of your fix instead. On attempts 2 and 3 the section exists: edit only `P4_BUILDER_FIX`, adding the new lines and removing the ones this attempt removes.
+
+```python
+# ---- probe p4: turbovec's cp314t build fix, in the builder stage only (spec §3.1 G2, D6) ----
+
+P4_BUILDER_FIX = (  # the exact Dockerfile lines of the fix (the example is cause 1's shape)
+    "RUN apt-get update && apt-get install -y --no-install-recommends pkg-config"
+    " && rm -rf /var/lib/apt/lists/*",
+)
+P4_FIX_LINE = re.compile(  # build dependencies, a toolchain pin and build flags only
+    r"RUN apt-get update && apt-get install -y --no-install-recommends [a-z0-9][a-z0-9.+ -]*"
+    r" && rm -rf /var/lib/apt/lists/\*"
+    r"|RUN rustup toolchain install \d+\.\d+\.\d+ --profile minimal"
+    r"|ENV (PYO3_[A-Z0-9_]+|CARGO_[A-Z0-9_]+|MATURIN_[A-Z0-9_]+|UV_[A-Z0-9_]+|RUSTFLAGS"
+    r"|RUSTUP_TOOLCHAIN)=\S.*")
+
+
+def test_the_p4_turbovec_build_fix_stays_in_the_builder_stage():
+    dockerfile, builder, _ = _stages()
+    lines = builder.splitlines()
+    first_sync = lines.index("RUN uv sync --frozen --no-install-project --no-dev --extra native")
+    # only the shapes spec §3.1 G2 allows: never a change to turbovec's source (D6)
+    assert P4_BUILDER_FIX and not [ln for ln in P4_BUILDER_FIX if not P4_FIX_LINE.fullmatch(ln)]
+    for fix in P4_BUILDER_FIX:
+        assert dockerfile.splitlines().count(fix) == 1, fix  # once, so in no other stage
+        assert fix in lines[:first_sync], fix  # in the builder, before turbovec's build
+    code = [ln for ln in dockerfile.splitlines() if not ln.lstrip().startswith("#")]
+    assert not [ln for ln in code
+                if re.search(r"git clone|git apply|patch -p|cargo vendor|(COPY|ADD) .*turbovec", ln)]
+```
+
+6c.2. Run the test to verify it fails:
+
+```bash
+cd D:/DEV/raggio
+uv run pytest -q tests/test_freethreading.py
+UV_PROJECT_ENVIRONMENT=.venv-ft PYTHONWARNINGS="error:The global interpreter lock (GIL) has been enabled:RuntimeWarning" REQUIRE_NATIVE=1 uv run --no-sync pytest -q tests/test_freethreading.py
+```
+
+Expected: `1 failed, 25 passed, 4 skipped` on 3.12 and `1 failed, 29 passed` on 3.14t. `test_the_p4_turbovec_build_fix_stays_in_the_builder_stage` fails with an `AssertionError` that names the first line of `P4_BUILDER_FIX` not yet in the Dockerfile. If the first assert fails instead, a line is not one of the allowed shapes: it is not a builder-stage fix under spec §3.1 G2. Rewrite it in an allowed shape; if none can express the fix, undo this attempt's test edit with `git checkout -- tests/test_freethreading.py` (`git status --short --untracked-files=no` then prints nothing), and stop as the end of 6b says.
+
+6c.3. Implement. In the Dockerfile's builder stage, right after `ENV PYO3_PYTHON=/usr/local/bin/python3` and before `WORKDIR /app`, insert one comment line and then the lines of `P4_BUILDER_FIX`, in the same order and byte for byte. With the example above, the result is:
+
+```dockerfile
+ENV PYO3_PYTHON=/usr/local/bin/python3
+# probe p4 (ADR 0006, spec §3.1 G2): what turbovec 1.0.0's sdist needs to build for cp314t
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+```
+
+On attempts 2 and 3 the comment line exists: add and remove lines under it. The lines use `&&`, never a single `|`, so Plan E's `pipefail` assert holds; nothing else in the Dockerfile changes.
+
+6c.4. Run the tests to verify they pass:
+
+```bash
+cd D:/DEV/raggio
+uv run pytest -q tests/test_freethreading.py
+UV_PROJECT_ENVIRONMENT=.venv-ft PYTHONWARNINGS="error:The global interpreter lock (GIL) has been enabled:RuntimeWarning" REQUIRE_NATIVE=1 uv run --no-sync pytest -q tests/test_freethreading.py
+uv run pytest -q
+UV_PROJECT_ENVIRONMENT=.venv-ft PYTHONWARNINGS="error:The global interpreter lock (GIL) has been enabled:RuntimeWarning" REQUIRE_NATIVE=1 uv run --no-sync pytest -q
+```
+
+Expected: `26 passed, 4 skipped` and `30 passed`; then both full suites green, one test more than after Task 9 (sandbox: `308 passed, 4 skipped` and `303 passed, 2 skipped`). Plans A, E and F's Dockerfile tests stay green.
+
+Optionally, build the 3.14t image on the laptop's podman machine first (about 5 minutes): it catches a Dockerfile mistake before the DGX round trip, although it cannot reproduce an aarch64-only failure:
+
+```bash
+MSYS_NO_PATHCONV=1 podman build --build-arg PYTHON=3.14t -t raggio:p4-fix . 2>&1 | grep -E "check_image|Building turbovec"
+MSYS_NO_PATHCONV=1 podman rmi raggio:p4-fix
+```
+
+Expected: `Building turbovec==1.0.0`, then `check_image: Python 3.14.<patch> free-threaded, GIL disabled, <n> extension modules imported, bm25=native`.
+
+6c.5. Commit on G's branch, the branch Tasks 1–9 committed to:
+
+```bash
+cd D:/DEV/raggio
+git add Dockerfile tests/test_freethreading.py
+git commit -m "Fix the turbovec cp314t build in the builder stage (p4, attempt <k>)" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git status --short --untracked-files=no
+```
+
+Expected: `git status` prints nothing.
+
+6d. Record the attempt and rebuild. In `p4-attempts.md`, complete build `<k>`'s `next:` line: `attempt <k>: adds <lines>, removes <lines or nothing>, commit <short SHA>`. Then restart this task from Step 2, without asking Step 1's question again: Step 1's go-ahead covers every attempt, with no cap (spec §6, §3.1 G4), and its start time still holds for the report. If the user has asked for gn100 back meanwhile, go to Step 10 instead, as Step 1 says. Step 2 pins the new SHA in `g.env`; Step 4 deploys it, and rebuilds A from it too, so A and B stay one commit; Step 5 moves the old `g-*` files aside; Step 6 builds B again, as build `<k>+1`. Steps 4 and 6 run their stall guard as before: if the redeploy or the rebuild hangs, go to "If a deploy or build hung", which uses none of the attempts.
+
+6e. Cause 4: draft the upstream issue. Only a change to turbovec's own source would fix the build, so raggio cannot (D6). Write the draft for the maintainer to post (spec D7). Never post it: do not open an issue, a comment or a pull request anywhere. Run `mkdir -p D:/DEV/_scratch/upstream-drafts`, then create `D:/DEV/_scratch/upstream-drafts/turbovec-cp314t-build.md`, filling every `<...>` slot from `p4-attempts.md` and the build log:
+
+````markdown
+# turbovec 1.0.0: the sdist does not build for free-threaded CPython 3.14t (cp314t) on aarch64
+
+> Draft for the raggio maintainer to review and post (spec D7). Not posted.
+
+## Environment
+
+- turbovec 1.0.0, built from its sdist by uv 0.12.19 (`uv sync`, a PEP 517 build through
+  maturin): PyPI has only `cp39-abi3` wheels, and an abi3 wheel cannot load on a
+  free-threaded interpreter.
+- CPython <the 3.14.x version>t, free-threaded, installed by `uv python install 3.14t`.
+- Rust <the rustc version from the log>, in `docker.io/library/rust:1.98.1-slim-trixie`
+  (Debian trixie), on aarch64 (NVIDIA DGX, Grace CPU).
+
+## Error
+
+```text
+<the error excerpt of the last p4 build, verbatim>
+```
+
+## Reproduce
+
+```dockerfile
+FROM docker.io/library/rust:1.98.1-slim-trixie
+COPY --from=ghcr.io/astral-sh/uv:0.12.19 /uv /bin/uv
+ENV UV_PYTHON_INSTALL_DIR=/python
+RUN uv python install 3.14t
+RUN uv venv --python 3.14t /venv
+RUN VIRTUAL_ENV=/venv uv pip install --no-binary turbovec turbovec==1.0.0
+```
+
+This repro has not been built on its own: the error above comes from raggio's image build
+(`podman build --build-arg PYTHON=3.14t`) on the machine above.
+
+## Suspected cause
+
+<one paragraph: the file or setting in turbovec's source that the error points at, and why
+only a change there fixes it>
+
+## What would help
+
+A cp314t wheel on PyPI, or a source change that lets the sdist build for cp314t.
+````
+
+If earlier attempts kept builder-stage lines (`P4_BUILDER_FIX`), add them to the repro, in the same order, right before its last `RUN`, and name them in "Suspected cause". Then complete build `<k>`'s entry in `p4-attempts.md` with `next: upstream draft and Park`, and check the draft:
+
+```bash
+grep -c '^```' D:/DEV/_scratch/upstream-drafts/turbovec-cp314t-build.md
+```
+
+Expected: `4`, the error block and the repro, each opened and closed.
+
+6f. Park G in ADR 0006. With the Edit tool, in `docs/adr/0006-free-threaded-python.md`, replace the `Pending:` paragraph under `## Verification` (from `Pending:` to the end of the file) with the text below, filling its `<...>` slots:
+
+````markdown
+Probe p4, <YYYY-MM-DD> on gn100 (aarch64), commit `<SHA>`: turbovec 1.0.0's sdist does not
+build for cp314t, in the builder's `RUN uv sync --frozen --no-install-project --no-dev --extra native`.
+Cause: <one sentence: what in turbovec's own source the error points at>. Builder-stage
+fix attempts (spec §3.1 G2): <0 to 3>, <one clause per attempt: the lines it added, and what
+the next build showed>. No A/B ran.
+
+```text
+<the error excerpt of the last p4 build, verbatim, as in the upstream draft>
+```
+
+An upstream issue is drafted for the maintainer to post (spec D7). raggio never patches,
+vendors or forks turbovec (D6).
+
+### Decision
+
+**Park**: turbovec 1.0.0's sdist does not build for cp314t on aarch64, and only a change to
+turbovec's own source would fix it (spec §3.1 G2). The build arg and the CI job stay; no
+more measuring until a turbovec release builds for cp314t or ships a cp314t wheel.
+````
+
+Builder-stage lines that earlier attempts kept stay in the Dockerfile; the Park records them. Check and commit:
+
+```bash
+cd D:/DEV/raggio
+uv run pytest -q tests/test_freethreading.py -k docs_record
+uv run --group docs mkdocs build --strict -d "$(mktemp -d)"
+grep -c "^Pending:" docs/adr/0006-free-threaded-python.md
+git add docs/adr/0006-free-threaded-python.md
+git commit -m "Park the free-threaded evaluation at probe p4 (ADR 0006)" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git status --short --untracked-files=no
+```
+
+Expected: `1 passed, 28 deselected` (`1 passed, 29 deselected` if an attempt added the probe p4 test); `mkdocs` exits 0 with no warnings; `grep` prints `0`; `git status` prints nothing. Task 12 does not run.
+
+6g. Report and stop. Run nothing else on gn100, and go to Step 10. If 6b or 6c stopped (3 attempts used, or no allowed line can express the fix although turbovec's source needs no change), ADR 0006 stays `Pending:` until the user decides, and Task 12 does not run: report, and ask the user how to go on (spec §3.1 G3). A hung deploy or build ("If a deploy or build hung") ends the same way: ADR 0006 stays `Pending:`, Task 12 does not run, and the user is asked how to go on, with the step and the image that hung. None of these cases parks.
 
 - [ ] **Step 7: Record what each image runs, and the Unicode drift (detached, then poll)**
 
@@ -3266,14 +3824,14 @@ ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" 
 ```
 
 Expected on `== FACTS_DONE`:
-- A: `Python 3.12.<patch>, GIL enabled, turbovec 1.0.0 (cp39-abi3-manylinux_2_28_aarch64), raggio_native 0.1.0 (raggio_native.cpython-312-aarch64-linux-gnu.so), SQLite <A's>, OPENBLAS_NUM_THREADS 1, Unicode 15.0.0, raggio_native Unicode 15.0.0`;
-- B: `Python 3.14.<patch>t, GIL disabled, turbovec 1.0.0 (cp314-cp314t-linux_aarch64), raggio_native 0.1.0 (raggio_native.cpython-314t-aarch64-linux-gnu.so), SQLite <B's>, OPENBLAS_NUM_THREADS 1, Unicode 16.0.0, raggio_native Unicode 16.0.0`;
-- C, if built: `Python 3.14.<patch>, GIL enabled, turbovec 1.0.0 (cp314-cp314-linux_aarch64), raggio_native 0.1.0 (raggio_native.cpython-314-aarch64-linux-gnu.so), ...`;
+- A: `Python 3.12.<patch>, GIL enabled, turbovec 1.0.0 (cp39-abi3-manylinux_2_28_aarch64), raggio_native 0.1.0 (raggio_native.cpython-312-aarch64-linux-gnu.so), SQLite 3.53.1, OPENBLAS_NUM_THREADS 1, Unicode 15.0.0, raggio_native Unicode 15.0.0`;
+- B: `Python 3.14.<patch>t, GIL disabled, turbovec 1.0.0 (cp314-cp314t-linux_aarch64), raggio_native 0.1.0 (raggio_native.cpython-314t-aarch64-linux-gnu.so), SQLite 3.53.1, OPENBLAS_NUM_THREADS 1, Unicode 16.0.0, raggio_native Unicode 16.0.0`;
+- C, if built: `Python 3.14.<patch>, GIL enabled, turbovec 1.0.0 (cp39-abi3-linux_aarch64), raggio_native 0.1.0 (raggio_native.cpython-314-aarch64-linux-gnu.so), ...`;
 - D, if built: as B;
 - the drift line, `drift: 15.0.0 -> 16.0.0: 5812 newly assigned, 1 changed, 5053 with token drift`. These are the laptop's x86_64 numbers from Task 8, and aarch64 should give the same;
 - the scan line: a JSON object with `"rows": 2549619` and the rows that contain a drifted code point.
 
-The SQLite versions are the ones the uv-managed interpreters bundle. p2 measured PBS SQLite 3.50.4 in a uv interpreter; the 3.14t build's has never been read, since p4 never ran. Note both for the report. A difference is not a reason to stop, but it matters for the verdict: Task 12 counts a `Hybrid QPS concurrent` win only when A and B run the same `sqlite_version` (D15).
+The SQLite versions are the ones the uv-managed interpreters bundle. p4 read SQLite 3.53.1 in all three of uv 0.12.19's PBS interpreters (3.12.14, 3.14.7 and 3.14.7t), so A, B, C and D should all say 3.53.1. p2's scaling figures were measured on PBS SQLite 3.50.4 and not re-measured on 3.53.1. Note both versions for the report; another version than 3.53.1 is a finding. A difference is not a reason to stop, but it matters for the verdict: Task 12 counts a `Hybrid QPS concurrent` win only when A and B run the same `sqlite_version` (D15).
 
 A different drift line is a finding: note it for the report and go on. Stop and report if:
 - the status is `FACTS_FAILED`, for example a `RuntimeWarning` from the GIL guard;
@@ -3323,19 +3881,25 @@ Expected on `== FANOUT_DONE`: each of `g-fanout-A.txt` and `g-fanout-B.txt` ends
 - [ ] **Step 10: Report to the user**
 
 Report:
-- p4: B's build time (`built localhost/raggio:<SHA>-py314t in <N> s`), and whether turbovec's sdist and `raggio_native` built for cp314t on aarch64. If the task stopped at Step 6, this and the time used are the whole report;
+- p4: B's build time (`built localhost/raggio:<SHA>-py314t in <N> s`), against p4's 28.7 s [28.2..29.3] cold without `raggio_native` on 2026-09-28, and whether turbovec's sdist and `raggio_native` built for cp314t on aarch64. If the task stopped at Step 4 or Step 6, this, the items below on turbovec's build and on a hang, and the time used are the whole report;
+- if turbovec's sdist failed at least once (spec §3.1 G2), from `p4-attempts.md`:
+  - each build's number, SHA, cause (1–4) and first error line;
+  - each fix attempt's lines and commit, and whether the next build got further;
+  - which ended it: a build that passed, the Park (with the path `D:/DEV/_scratch/upstream-drafts/turbovec-cp314t-build.md`, which is not posted: the maintainer reviews and posts it, and I can build its repro Dockerfile on the laptop if asked), 3 attempts used, a fix no allowed line can express (name the fix it needs), or the user's request for gn100 back (Step 1's stop recipe; there is no cap, spec §6, §3.1 G4);
+  - any `RUSTUP_TOOLCHAIN` line a fix kept: it also changes the compiler that builds `raggio_native` in every image;
+- if a deploy or build hung (Steps 4 and 6), from the `## p4 hung build, not counted` entry: the step, the hung log's last line and its path `D:/DEV/_scratch/dgx/planG/hung-<UTC time>.log`, and that Step 1's stop recipe stopped it after 30 minutes without log output. It used none of the 3 attempts, and it is not a time cap (spec §3.1 G4);
 - the four image lines (or two), with each image's `raggio_native` file, SQLite version and `OPENBLAS_NUM_THREADS`, and whether A and B run the same SQLite;
 - the drift and scan lines, against the laptop's;
 - the two `GATE` lines, and the pool sizes the probe chose in each image;
-- the time used against the cap.
+- the time used since Step 1's start time (Task 11 has no cap, spec §6, §3.1 G4).
 
-Ask whether Task 12's ABAB should run now or in a later window. Task 12 must use these images, so the repo's HEAD must stay at `SHA` until then. No commit: `git status --short --untracked-files=no` prints nothing.
+Ask whether Task 12's ABAB should run now or in a later window; after a Park, a stop at Step 4 or Step 6, or Step 1's stop recipe, Task 12 does not run, so do not ask. After 6g's stop (3 attempts used, no allowed line can express the fix, or a hung deploy or build), ask the user how to go on instead; ADR 0006 stays `Pending:` until the user decides (spec §3.1 G3). Task 12 must use these images, so the repo's HEAD must stay at `SHA` until then. This step commits nothing: `git status --short --untracked-files=no` prints nothing. The only commits Task 11 makes are Step 6's, on p4's failure path.
 
 ---
 
 ### Task 12 (DGX, last): the ABAB, recorded in ADR 0006
 
-This task runs A1 B1 A2 B2, plus C1 and D1 if Task 11 built them, as one detached chain on gn100, on one boot. It renders the outputs into ADR 0006's Verification on gn100, then fetches them. It adds turbovec's PyPI record, and applies the decision rule ADR 0006 wrote down before the run. The test Task 10 prepared pins the result.
+This task runs A1 A1c16 B1 B1c16 A2 A2c16 B2 B2c16, plus C1 and D1 if Task 11 built them, as one detached chain on gn100, on one boot. Each `-c16` session repeats its arm session's runs on the same image at `CONCURRENCY=16` (spec §3.1 G7); every other session runs at `CONCURRENCY=8`. It renders the outputs into ADR 0006's Verification on gn100, then fetches them. It adds turbovec's PyPI record, and applies the decision rule ADR 0006 wrote down before the run. The test Task 10 prepared pins the result.
 
 The noise band follows spec §6:
 - every run gets a fresh 4 GiB container (Plan A's `session.sh`);
@@ -3345,7 +3909,7 @@ The noise band follows spec §6:
 
 Every table states its regime, memory cap, `sqlite_version` and `openblas_num_threads`. The SQLite-bound hybrid rows are read apart from the CPU-bound ones (D15).
 
-It needs Task 11's images, at the same commit, and the user's explicit go-ahead with a time cap. It runs only if Task 11's p4 passed. The DGX rules are those of Task 11 and the Global Constraints.
+It needs Task 11's images, at the same commit, and the user's explicit go-ahead with a time cap. It runs only if Task 11's p4 passed, on the first build or after a builder-stage fix (spec §3.1 G2); never after a Park at p4. The DGX rules are those of Task 11 and the Global Constraints.
 
 **Files:**
 - Modify: `docs/adr/0006-free-threaded-python.md`. The `Pending:` Verification is replaced with the recorded one, plus `### Upstream wheels` and `### Decision`.
@@ -3372,24 +3936,25 @@ It needs Task 11's images, at the same commit, and the user's explicit go-ahead 
     - `raggio_native` is `cpython-312-` in A and `cpython-314t-` in B, never abi3, and every image line gives `OPENBLAS_NUM_THREADS 1` and a SQLite version;
     - every session has `/healthz` samples and container logs;
     - the four pair tables have both gate rows, `QPS concurrent` and `Hybrid QPS concurrent`;
-    - every pair table has both Regime lines, with `openblas_num_threads=1` and a known `sqlite_version`. Cross-arm tables differ at most in `python` and `sqlite_version`, same-arm tables in nothing, and no table has Plan A's `Reported, not claimed` note;
+    - the `GIL and logs` table has a row for each of the eight arm sessions, the four `-c16` ones included, and `abab_decision` gates all of them (spec §3.1 G8);
+    - every pair table, the four `(c=16)` ones included, has both Regime lines, with `openblas_num_threads=1` and a known `sqlite_version`. Cross-arm tables differ at most in `python` and `sqlite_version`, same-arm tables in nothing, and no table has Plan A's `Reported, not claimed` note;
     - the fan-out and drift sections are present, and the scan covers 2,549,619 rows;
     - the turbovec record is present;
-    - the Decision section names exactly the outcome `abab_decision` computes, lists every cost, and states `A runs SQLite <a>, B runs SQLite <b>`.
+    - the Decision section names exactly the outcome `abab_decision` computes, lists every cost, and states `A runs SQLite <a>, B runs SQLite <b>`. `abab_decision` drops the `(c=16)` tables, so they are reported and never gate (spec §3.1 G7); it applies G5's hybrid p99 guard and its flat-run states (the rule text above).
 
 - [ ] **Step 1: Ask the user for a run window (time cap)**
 
 Ask, and wait for an explicit answer. Do not run anything on gn100 before it:
 
-> Plan G's ABAB needs a run window on gn100 of about 3.5 hours:
-> - four sessions, A1 (3.12), B1 (3.14t), A2, B2, one after another, about 50 min each;
+> Plan G's ABAB needs a run window on gn100 of about 7 hours:
+> - eight sessions, one after another, about 50 min each: A1 (3.12), B1 (3.14t), A2 and B2 at concurrency 8, each followed on the same image by a concurrency-16 session (A1c16, B1c16, A2c16, B2c16). p4 saw 3.14t's hybrid gain only at c=16, so the c=16 tables are recorded in ADR 0006, but they are reported and do not gate: the decision reads the c=8 tables (spec §3.1 G7);
 > - each session first rebuilds the IVF index at 4 GiB, then runs Plan A's IVF runs, the 8 GiB detach and the flat runs. The flat runs are `FLAT_RUNS=3`, each in a fresh container, so concurrent QPS has the 3 runs a side that spec §6 asks for;
 > - A1 → A2 and B1 → B2 measure the between-server noise that a free-threading win must clear. Both arms run `OPENBLAS_NUM_THREADS=1`, and every table records its `sqlite_version`, because the hybrid rows are bound by SQLite's mutex (D15).
 >
-> Each session is capped at 75 min, so the worst case is 5 hours. The chain stops at the first session that fails or reaches its cap.
+> Each session, the c=16 ones included, is capped at 90 min (spec §3.1 G1), so the worst case is 8 × 90 min = 12 hours, plus 90 min for each of C1 and D1: 15 hours with both. The chain stops at the first session that fails or reaches its cap.
 >
-> [If `WITH_C1=1`:] C1 (3.14 with the GIL, turbovec built from source) adds about 50 min.
-> [If `WITH_D1=1`:] D1 (3.14t with `GC_FREEZE=1`) adds about 50 min.
+> [If `WITH_C1=1`:] C1 (3.14 with the GIL, turbovec built locally from the same sdist with maturin, as an abi3 wheel, `cp39-abi3-linux_aarch64`, while B's is `cp314-cp314t`) adds about 50 min, at concurrency 8 only. It is not the same turbovec build as B: it separates the 3.12 → 3.14 interpreter effect and a local build from PyPI's manylinux wheel (maturin 1.14.1).
+> [If `WITH_D1=1`:] D1 (3.14t with `GC_FREEZE=1`) adds about 50 min, at concurrency 8 only.
 >
 > Only `bench-tv`, its volume and `~/raggio-bench/g-*` are used. `bench-wv` is not touched, `~/turborag` is read only through Plan A's corpus symlink, and nothing needs `sudo`. The machine should not reboot, and nothing else should run on it meanwhile: the result needs one boot.
 >
@@ -3451,21 +4016,21 @@ Plan A's `session.sh` refuses a label whose directory exists, and a stale `<labe
 ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'cd ~/raggio-bench && shopt -s nullglob && old=(g-[abcd][12]-* g-boot-*.txt g-abab.log g-verification.md) && if [ ${#old[@]} -gt 0 ]; then d=planG-prev-$(date +%Y%m%d-%H%M%S) && mkdir "$d" && mv "${old[@]}" "$d"/ && echo "moved ${#old[@]} to $d"; else echo "nothing to move"; fi'
 ```
 
-Expected: `nothing to move` on the first ABAB.
+Expected: `nothing to move` on the first ABAB. The pattern `g-[abcd][12]-*` covers the `-c16` sessions too, such as `g-a1-py312-c16.log`.
 
 - [ ] **Step 4: Start the ABAB (detached)**
 
 ```bash
 source D:/DEV/_scratch/dgx/planG/g.env
 ADOPT=0  # 1 only if Step 3 found no fingerprint
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 "ADOPT=$ADOPT setsid -f bash ~/raggio-bench/g-abab.sh $SHA 75m $WITH_C1 $WITH_D1 > ~/raggio-bench/g-abab.log 2>&1 < /dev/null"
+ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 "ADOPT=$ADOPT setsid -f bash ~/raggio-bench/g-abab.sh $SHA 90m $WITH_C1 $WITH_D1 > ~/raggio-bench/g-abab.log 2>&1 < /dev/null"
 sleep 60
 ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'cat ~/raggio-bench/g-abab.log; cat ~/raggio-bench/g-active'
 ```
 
 Expected:
-- `<ts> g-abab: <SHA>, 4 sessions, 75m each, boot <uuid>`, with 5 or 6 sessions if C1 or D1 are on;
-- `<ts> g-abab: g-a1-py312 (localhost/raggio:<SHA>)`;
+- `<ts> g-abab: <SHA>, 8 sessions, 90m each, boot <uuid>`, with 9 sessions if one of C1 and D1 is on, 10 if both are;
+- `<ts> g-abab: g-a1-py312 (localhost/raggio:<SHA>, c=8)`;
 - `g-a1-py312`, from the lock.
 
 - [ ] **Step 5: Poll until the chain ends**
@@ -3478,7 +4043,7 @@ ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" 
 
 The last line of `g-abab.log` ends the chain in one of two ways:
 - `<ts> g-abab: done`: go to Step 6.
-- `<ts> g-abab: <label> ended with '<last line>': stopping`: fetch `<label>.log`, which holds `g-ensure-ivf.sh`'s and `session.sh`'s output for that session, then go to the failure path. `g-session <label>: exit 124` means the session reached its 75 min cap.
+- `<ts> g-abab: <label> ended with '<last line>': stopping`: fetch `<label>.log`, which holds `g-ensure-ivf.sh`'s and `session.sh`'s output for that session, then go to the failure path. `g-session <label>: exit 124` means the session reached its 90 min cap (spec §3.1 G1).
 
 **Stop recipe**, for the user's time cap or on the user's request. It was validated in a container, with the real `g-abab.sh` and `g-session.sh` over stub sessions: the chain stops, the running session's `timeout` passes the TERM on, and no `g-session.sh` is left after 70 s. The 70 s wait covers `--kill-after=60`. Then `bench-tv` is stopped.
 
@@ -3541,7 +4106,7 @@ The section is Task 10's `t12-section.py`, already shown in full there. It adds:
 
 Run: `uv run pytest -q tests/test_freethreading.py -k adr_0006`
 
-Expected: `1 failed, 29 deselected`, with `AssertionError: Task 12 records the DGX ABAB`. The ADR still says `Pending:`.
+Expected: `1 failed, 29 deselected`, or `1 failed, 30 deselected` if Task 11 added the probe p4 test (spec §3.1 G2), with `AssertionError: Task 12 records the DGX ABAB`. The ADR still says `Pending:`.
 
 - [ ] **Step 11: Record the Verification and the decision**
 
@@ -3565,14 +4130,14 @@ It replaces everything after `## Verification` in `docs/adr/0006-free-threaded-p
 It prints the outcome, one line per reason, and `costs: [...]`.
 
 Read the new Verification before going on:
-- the four pair tables, and the Regime lines above each. Cross-arm tables differ at most in `python` and `sqlite_version`; same-arm tables differ in nothing; `openblas_num_threads=1` everywhere. The test checks this; read it anyway, to know what the report compares;
+- the eight pair tables (four c=8, four `(c=16)`), and the Regime lines above each. Cross-arm tables differ at most in `python` and `sqlite_version`; same-arm tables differ in nothing; `openblas_num_threads=1` everywhere. The test checks this; read it anyway, to know what the report compares;
 - the two gate rows in A1 → B1 and A2 → B2, read apart. `QPS concurrent` is CPU-bound, and free threading can move it. `Hybrid QPS concurrent` runs under SQLite's global memstatus mutex (D15). If it does not scale, or gets worse, it is SQLite-bound, not a free-threading failure; and if A and B run different `sqlite_version`s, a hybrid gain cannot be credited to free threading either;
 - whether the A1 → A2 or B1 → B2 table has a flat row `better` or `worse` beyond the band. Between two sessions of one arm, that is between-server variance (p2 saw identical code 6–7% apart at IVF warm p50, and vector concurrent QPS bimodal at 120–225). On a gate row it keeps B from winning; on any other row, say in the report that the band is too narrow to trust there;
-- the `GIL and logs` table: every B row has `gil_enabled false` equal to its `/healthz answers`, and every row has 0 `Traceback or GIL lines`.
+- the `GIL and logs` table: every B row has `gil_enabled false` equal to its `/healthz answers`, and every row, the `-c16` ones included, has 0 `Traceback or GIL lines`.
 
 - [ ] **Step 12: Run the tests to verify they pass**
 
-Run: `uv run pytest -q tests/test_freethreading.py`. Expected: `26 passed, 4 skipped`.
+Run: `uv run pytest -q tests/test_freethreading.py`. Expected: `26 passed, 4 skipped`, or `27 passed, 4 skipped` if Task 11 added the probe p4 test (spec §3.1 G2).
 
 Run:
 
@@ -3580,9 +4145,9 @@ Run:
 UV_PROJECT_ENVIRONMENT=.venv-ft PYTHONWARNINGS="error:The global interpreter lock (GIL) has been enabled:RuntimeWarning" REQUIRE_NATIVE=1 uv run --no-sync pytest -q tests/test_freethreading.py
 ```
 
-Expected: `30 passed`.
+Expected: `30 passed`, or `31 passed` with the probe p4 test.
 
-Run `uv run pytest -q`. Expected: all green (sandbox: `308 passed, 4 skipped`). Run the full 3.14t suite. Expected: all green (sandbox: `303 passed, 2 skipped`).
+Run `uv run pytest -q`. Expected: all green (sandbox: `308 passed, 4 skipped`; `309 passed, 4 skipped` with the probe p4 test). Run the full 3.14t suite. Expected: all green (sandbox: `303 passed, 2 skipped`; `304 passed, 2 skipped` with the probe p4 test).
 
 Run: `uv run --group docs mkdocs build --strict -d "$(mktemp -d)"`. Expected: it exits 0 with no warnings. The ADR's new tables and code blocks render.
 
@@ -3601,6 +4166,9 @@ Report:
 - the outcome (Continue, Hold or Park), the reasons and the costs, as `g-decide.py` printed them;
 - both gate rows of A1 → B1 and A2 → B2, `QPS concurrent` (CPU-bound) and `Hybrid QPS concurrent` (SQLite-bound, D15), each with medians, bands and verdicts, and kept apart;
 - the `sqlite_version` of each arm, and `OPENBLAS_NUM_THREADS=1` in both, from the Regime lines;
+- `Hybrid p99 under concurrency (ms)` in A1 → B1 and A2 → B2 (G5's guard: a hybrid QPS win needs it not `worse` in either), and CPU per query for every flat run, medians included, with each run's fast/slow state and the split per side (reported, never gated; if the split was uneven, or a state unknown, say that `QPS concurrent` and `p95 under concurrency (ms)` counted as neither win nor miss, spec §3.1 G9);
+- the four `(c=16)` tables, `A1 → B1 (c=16)` and the rest, each with medians, bands and verdicts. Their speed rows are reported, not gated (spec §3.1 G7). Say whether 3.14t's hybrid gain shows at c=16 as p4 saw, and whether its p99 came with it;
+- the `GIL and logs` table's eight rows, the four `-c16` ones included. Every session's checks gate (spec §3.1 G8), so any Traceback, GIL line or 3.14t `/healthz` answer without `gil_enabled` false in a `-c16` session is named as a Park reason;
 - the noise seen in A1 → A2 and B1 → B2;
 - any serial-latency cost, marked as not attributed: rootless podman cannot pin cores, and p3 measured a 2x serial gap between the X925 and A725 cores (D16). Attributing one needs both arms re-measured pinned with `os.sched_setaffinity`, which is a new run window;
 - the C1 and D1 tables, if they ran. They are recorded, not gated;
@@ -3641,39 +4209,53 @@ In any of these cases:
 | Spec item | Where | How it is checked |
 |---|---|---|
 | §1 item 4, §2 row 8: a `PYTHON=3.14t` build arg on the unified Dockerfile | Task 6 | The Dockerfile tests. In the sandbox, local podman builds of 3.12, 3.14t and 3.14 with the turbovec sdist all passed `check_image` |
-| §2 row 8: the turbovec sdist build in the builder stage | Tasks 6, 11 | `test_the_builder_can_build_turbovec_from_its_sdist`. `Building turbovec==1.0.0` appears in the 3.14t build log, and Task 11 records B's `cp314-cp314t-linux_aarch64` tag |
-| §8 probe p4: the 3.14t aarch64 build of turbovec's sdist and `raggio_native` (pending, never run) | Task 11 Step 6, the first DGX step after the deploy | `g-build.sh` logs `built <image> in <N> s`. On `== BUILD_FAILED`, Step 6 names the stage from the log (turbovec sdist, `raggio-native`, `check_image`, deploy). A failing turbovec sdist stops the task and is reported, with no patch or fork, and Task 12 does not run |
+| §2 row 8: the turbovec sdist build in the builder stage | Tasks 6, 11 | `test_the_builder_can_build_turbovec_from_its_sdist`. `Building turbovec==1.0.0` appears in the 3.14t build log, and Task 11 records B's `cp314-cp314t-linux_aarch64` tag, the tag p4 built on gn100 with no build arg |
+| §8 probe p4: the 3.14t aarch64 build of turbovec's sdist and `raggio_native` (p4 ran 2026-09-28 on 19a8a2e, without `raggio_native`: turbovec built `cp314-cp314t-linux_aarch64` with 0 fixes, 28.7 s cold, the GIL stayed off; `raggio_native`'s cp314t build and G's real `check_image.py` on G's Dockerfile are still open) | Task 11 Step 6, the first DGX step after the deploy | `g-build.sh` logs `built <image> in <N> s`, noted next to p4's 28.7 s [28.2..29.3]. On `== BUILD_FAILED`, Step 6 names the stage from the log (turbovec sdist, `raggio-native`, `check_image`, deploy). A failing turbovec sdist runs the bounded procedure of spec §3.1 G2 (6a–6g): each build is logged in `p4-attempts.md` and its cause classified; a build-dependency, toolchain or build-flag cause is fixed in the builder stage only, in at most 3 attempts, each pinned by `test_the_p4_turbovec_build_fix_stays_in_the_builder_stage`; a turbovec source cause gets the upstream draft and the Park, and Task 12 does not run; 3 failed attempts, or a fix no allowed line can express, stop and ask the user, with ADR 0006 left `Pending:` (spec §3.1 G3); no time cap bounds the build or the attempts (spec §6, §3.1 G4). A deploy or build whose log has not grown for 30 minutes is hung, not capped: the stall guard of Steps 4 and 6 prints `STALLED: no log output for 30 min`, Step 1's stop recipe stops it, the `## p4 hung build, not counted` entry records it with `next: stop: build hung (no log output for 30 min)`, and 6g stops and asks, using none of the 3 attempts |
 | §4.2: `raggio_native` built per interpreter, without abi3, `gil_used = false` | Tasks 5, 6, 11, 12 | `check_native()` in `check_image` fails the build when an imported `raggio_native` module is not `EXTENSION_SUFFIXES[0]` (`test_check_image_finds_every_compiled_module_it_can_import` pins `built_for_this_interpreter`). Task 6 asserts E's `uv python find "${PYTHON}"` link and `ENV PYO3_PYTHON=/usr/local/bin/python3`. Task 11 stops on a non-`cpython-314t-` file in B, and the Task 12 test requires `cpython-312-` in A, `cpython-314t-` in B, and no abi3 |
-| §3 D15: the SQLite memstatus mutex; every row records `sqlite_version`; G's verdict accounts for it | Tasks 9, 10, 11, 12 | ADR 0006's rule and `abab_decision`: two gate rows; `Hybrid QPS concurrent` wins only on equal `sqlite_version`s; `SQLITE_BOUND` costs never park. `g-check.py`'s `sqlite-bound`, `hybrid-win` and `hybrid-other-sqlite` scenarios. The Task 12 test requires a known `sqlite_version` in every Regime line, SQLite in every image line, and the Decision's `A runs SQLite <a>, B runs SQLite <b>` |
+| §3 D15: the SQLite memstatus mutex; every row records `sqlite_version`; G's verdict accounts for it | Tasks 9, 10, 11, 12 | ADR 0006's rule and `abab_decision`: two gate rows; `Hybrid QPS concurrent` wins only on equal `sqlite_version`s; `SQLITE_BOUND` costs never park. `g-check.py`'s `sqlite-bound`, `hybrid-win` and `hybrid-other-sqlite` scenarios. The Task 12 test requires a known `sqlite_version` in every Regime line, SQLite in every image line, and the Decision's `A runs SQLite <a>, B runs SQLite <b>`. p4 read SQLite 3.53.1 in uv 0.12.19's 3.12.14, 3.14.7 and 3.14.7t, so Task 11 Step 7 expects 3.53.1 in every image line, `g-check.py`'s fixtures use it, and another version is a finding; p2's 3.50.4 figures are quoted as p2's, not re-measured on 3.53.1 (ADR 0006's Context) |
 | §3 D16: `ENV OPENBLAS_NUM_THREADS=1` in the image; the same in both arms | Tasks 6, 10, 11, 12 | Task 6 Step 1 requires A's line on the base, and its test requires exactly one `ENV OPENBLAS_NUM_THREADS=1` in the runtime stage. Task 11 stops on any other value, and the Task 12 test requires `openblas_num_threads=1` in every Regime line and `OPENBLAS_NUM_THREADS 1` in every image line. `g-check.py`'s `blas-differs` scenario shows the test failing |
 | §6: the noise band (a fresh container per arm, >= 3 runs for concurrent QPS, between-server variance, a win only beyond the band) | Tasks 9, 10, 12 | Plan A's `session.sh` (a fresh container per run) with `FLAT_RUNS=3` from `g-session.sh`. `gate_rows` needs `better` in A1 → B1 and A2 → B2 and neither better nor worse in A1 → A2 and B1 → B2. `g-check.py`'s `noisy` and `thin` scenarios. p3's X925/A725 split is in ADR 0006's Noise paragraph: serial costs stay unattributed unless re-measured pinned with `os.sched_setaffinity` |
 | §2 row 8: the GIL guard | Tasks 3, 5, 6, 7 | The suite's guard tests, and `check_image`'s tests against a real extension that needs the GIL. Also `test_the_runtime_image_fails_loudly_on_a_gil_re_enable` and `test_ci_314t_job_turns_a_gil_re_enable_into_a_failure` |
 | §2 row 8, §4.2: `GC_FREEZE`, owner G | Tasks 2, 9 | The four `GC_FREEZE` tests (default, order, cycles, a frozen collection freed); the env-table row in `docs/getting-started.md` |
-| §2 row 8: the ABAB A/B on the DGX | Tasks 10, 11, 12 | `g-check.py`'s sixteen scenarios; the Task 12 test |
-| §3 D1: ADR 0006 | Tasks 9, 12 | `test_docs_record_the_evaluation_and_document_the_knob`; `test_adr_0006_records_the_dgx_abab_and_its_decision` |
-| §3 D2: one Dockerfile, no `Dockerfile.ft` | Task 6 | Only `Dockerfile` is edited, and the sandbox's `git diff --stat` has no new Dockerfile. `PYTHON=3.14 UV_NO_BINARY_PACKAGE=turbovec` builds the GIL control from the same file |
-| §3 D6: experimental; not the default until cp314t wheels; never fork turbovec | Tasks 6, 9, 11, 12 | `ARG PYTHON=3.12` is unchanged, and `pyproject.toml` and `uv.lock` are untouched. ADR 0006's rule has a **Hold** outcome for a win without a cp314t wheel, and Task 12 reads the wheels from PyPI. Task 11 stops on a failing turbovec sdist, and forbids a patch, fork, vendored copy or other pin |
+| §2 row 8: the ABAB A/B on the DGX | Tasks 10, 11, 12 | `g-check.py`'s twenty-three scenarios; the Task 12 test |
+| §3 D1: ADR 0006 | Tasks 9, 11 (p4 Park only), 12 | `test_docs_record_the_evaluation_and_document_the_knob`; `test_adr_0006_records_the_dgx_abab_and_its_decision` |
+| §3 D2: one Dockerfile, no `Dockerfile.ft` | Task 6 | Only `Dockerfile` is edited, and the sandbox's `git diff --stat` has no new Dockerfile. `PYTHON=3.14 UV_NO_BINARY_PACKAGE=turbovec` builds the GIL control from the same file (C1, a local abi3 turbovec build, spec §3.1 G6); 3.14t needs no build arg besides `PYTHON` (p4) |
+| §3 D6: experimental; not the default until cp314t wheels; never fork turbovec | Tasks 6, 9, 11, 12 | `ARG PYTHON=3.12` is unchanged, and `pyproject.toml` and `uv.lock` are untouched. ADR 0006's rule has a **Hold** outcome for a win without a cp314t wheel, and Task 12 reads the wheels from PyPI. Task 11 forbids a patch, fork, vendored copy or other pin of turbovec: a failing sdist may change only builder-stage lines of the allowed shapes (`P4_FIX_LINE`), and the p4 test also refuses `git clone`, `git apply`, `patch -p`, `cargo vendor` and a `COPY` or `ADD` of turbovec in the Dockerfile |
+| §3.1 G1: one DGX measurement (ABAB) session runs for up to 90 minutes | Tasks 10, 12; Global Constraints | Task 12 Step 4 passes `90m` to `g-abab.sh`, which hands it to every `g-session.sh`, which runs the session under `timeout`; Step 1's window text states the 90 min cap and the eight sessions' 12-hour worst case (8 × 90 min, the c=16 sessions included), plus 90 min each for C1 and D1; `exit 124` reads as the cap in Step 5 |
+| §3.1 G2: a failing turbovec sdist is fixed in the builder stage with flags and build dependencies only, never a fork; a source change is drafted upstream and G parks | Tasks 9, 11; Global Constraints | Task 11 Step 6's 6a–6g: the cause table (a cause 1–3 that no allowed line can express stops and asks, and is never parked, spec §3.1 G3), at most 3 attempts in `p4-attempts.md`, `test_the_p4_turbovec_build_fix_stays_in_the_builder_stage` per fix, the draft in `D:/DEV/_scratch/upstream-drafts/turbovec-cp314t-build.md` (never posted by the implementer, D7), and the Park in ADR 0006's Verification. ADR 0006's Decisions row and **Park** outcome state the rule (Task 9) |
+| §3.1 G3: 3 failed builder-stage attempts, or a fix no allowed Dockerfile line can express although turbovec's source needs no change, stop G and ask the maintainer; ADR 0006 stays Pending; only G2's source-change case parks without asking | Tasks 9, 11; Architecture; Global Constraints | The Architecture's native-code bullet, the Global Constraints' G2 summary, Task 11's intro, Step 1's window text, the opening of Step 6's failure procedure, 6b's cause 4 row and the paragraph after the table, 6c's bound, 6g and Step 10; ADR 0006's `Pending:` text records only the source-cause Park (Task 9). Both stops write their `next: stop: …` line, leave ADR 0006 `Pending:`, run no Task 12, and ask the user; only 6e–6f (cause 4) park, without asking. A hung deploy or build ends the same way through 6g, but it is not one of G3's cases: its entry is not a `## p4 build` entry, so it uses none of the 3 attempts |
+| §3.1 G4: build and fix windows (Task 11) have no time cap; the 90 min cap is for measurement sessions only | Task 11; Global Constraints | Task 11's intro and Step 1 ask for the go-ahead with no cap, as spec §6 exempts build and fix windows from its cap rule; the `p4-attempts.md` entry has no cap-based `next:` option, and 6c, 6d, 6g and Step 10 have no cap check. Besides the stops its steps name for failures, two early stops remain, and neither is a time cap: Step 1's stop recipe, on the user's request for gn100 back, kept because gn100 is shared; and the stall guard of Steps 4 and 6, which stops a deploy or build only after 30 minutes without log output, uses none of the 3 attempts, and asks the user (6g). A build whose log keeps growing runs as long as it needs. Only Task 12's `g-abab.sh` / `g-session.sh` take the `90m` cap (G1) |
+| §3.1 G5: a `Hybrid QPS concurrent` win counts only when the hybrid p99 under concurrency is present and not `worse` in either cross table (A1 → B1, A2 → B2); CPU per query is recorded for every run and classifies each flat run's fast/slow state, so an uneven split cannot fake a `QPS concurrent` win; CPU per query is reported, not gated | Tasks 9, 10, 12 | ADR 0006's rule text; `HYBRID_P99`, `HIGH_CPU`, `_flat_cpu`, `uneven_states` and `gate_rows` in `t12-section.py`; `g-render.py`'s `flat_cpu` json block. `g-check.py`'s `hybrid-p99-worse` (Park, the p99 named as a cost), `flat-split-uneven` (Park), `flat-split-uneven-worse` (Hold, spec §3.1 G9), `flat-split-even` (Hold) and `cpu-missing` (Park) scenarios. Run only against a stand-in `compare.py` (see Validated in the sandbox) |
+| §3.1 G7: a c=16 session after each ABAB arm session, on the same boot and image, with its own 90-minute cap; its `(c=16)` pair tables are reported in ADR 0006, not gated; C1 and D1 run at c=8 only | Tasks 10, 12; Global Constraints | `g-abab.sh`'s eight-session chain and `CONCURRENCY=16` for the `-c16` labels, `g-session.sh`'s pass-through, `g-render.py`'s four `(c=16)` `PAIRS`, `abab_decision` dropping every title that ends in ` (c=16)`; `g-check.py`'s `c16-not-gated` scenario (c=16 tables worse, decision unchanged); the Task 12 test's Regime asserts over the `(c=16)` tables; G8: `g-render.py`'s `gil_ran` gives every `-c16` session a `GIL and logs` row, `abab_decision` gates it, and `g-check.py`'s `c16-traceback` scenario parks; Step 1's window text counts eight sessions |
+| §3.1 G8: the c=16 sessions' GIL and log checks gate like the c=8 sessions'; `GIL and logs` has a row for every session, the c=16 ones included; a Traceback or GIL line in any session, or a 3.14t `/healthz` answer without `gil_enabled` false, parks B; only the c=16 speed tables are not gated | Tasks 9, 10, 12; Global Constraints | ADR 0006's rule text; `g-render.py`'s `gil_ran`, which gives every `-c16` session a row; `abab_decision`'s `_gil_rows` loop, which gates all eight; `synth`'s `traceback` knob (`True` or one session label); `g-check.py`'s `c16-traceback` scenario (Park); the Task 12 test's eight A/B arm rows |
+| §3.1 G9: an uneven or unknown fast/slow split fakes neither a win nor a loss; `QPS concurrent` and `p95 under concurrency (ms)` count as neither a win nor a miss then | Tasks 9, 10, 12; Global Constraints | ADR 0006's rule text; `FLAT_CONCURRENT` and `worse_in_both` in `t12-section.py`, which skip both rows when `uneven_states` is non-empty, called by `abab_decision`, the Task 12 test and `g-decide.py`; `synth`'s `lat_c` knob; `g-check.py`'s `flat-split-uneven-worse` scenario (Hold, no cost) |
+| §3.1 G6: the optional C1 arm is 3.14 with the GIL, turbovec built locally from the same sdist with maturin as an abi3 wheel (3.14t builds `cp314t`); it separates the 3.12 → 3.14 interpreter effect and a local build from PyPI's wheel, and is not B's turbovec build | Tasks 6, 9, 10, 11, 12 | Prose and fixtures, no test: ADR 0006's Decisions row for `PYTHON=3.14t` and its "Recorded, not gated" C1 (Task 9); Task 6's Interfaces bullet, test comment and Dockerfile comment; `g-check.py`'s C image line and Task 11 Step 7's expected C line, both `turbovec 1.0.0 (cp39-abi3-linux_aarch64)`; the C arm in Task 11 Step 1's prompt and C1 in Task 12 Step 1's. C1 stays recorded, not gated |
 | §3 D11: a non-blocking 3.14t CI job with the GIL guard | Task 7 | `test_ci_runs_the_suite_on_314t_without_blocking_the_workflow`, `test_ci_314t_job_turns_a_gil_re_enable_into_a_failure` |
 | §4.1: `/healthz` keys additive | Task 1 | `test_healthz_reports_whether_the_gil_is_enabled` checks that `status`, `resident_collections` and `bm25` stay |
 | §4.1: `bench/dgx/*` is Plan A's; others add only `bench/<name>_probe.py` | Tasks 8, 10 | G adds `bench/unicode_drift_probe.py`. The DGX helpers live outside the repo and call Plan A's scripts unchanged |
-| §4.1: the Dockerfile and `tests.yml` are shared | Tasks 6, 7 | Only the quoted lines are added: the `freethreaded` job, and 12 Dockerfile lines in the sandbox |
+| §4.1: the Dockerfile and `tests.yml` are shared | Tasks 6, 7, 11 (p4 fix only) | Only the quoted lines are added: the `freethreaded` job, and 12 Dockerfile lines in the sandbox. Only if probe p4 needs it, Task 11 adds builder-stage lines, and `test_the_p4_turbovec_build_fix_stays_in_the_builder_stage` keeps them in the builder stage before turbovec's build (spec §3.1 G2) |
 | §4.1: G adds nothing to the default lock | all | In the sandbox, the 14 changed files include neither `pyproject.toml` nor `uv.lock` |
-| §4.2: tests in their own module | Tasks 1–9, 12 | Everything is in `tests/test_freethreading.py` |
+| §4.2: tests in their own module | Tasks 1–9, 11 (p4 fix only), 12 | Everything is in `tests/test_freethreading.py` |
 | §4.3: single writer, per-thread read connections | Task 4 | Task 4 changes only the statement cache of the two meta.db connection sites. Both full suites stay green |
-| §6: the DGX protocol | Tasks 11, 12 | Deploy via Plan A's `deploy.sh`; `--limit 2549619`, fresh 4 GiB containers and the discarded run0 via Plan A's `session.sh`; `setsid -f` plus polling; the noise band via `compare.py`; seed 7 for the fan-out probe; no cold-start claim; each window asked for first, with a time cap; `bench-tv` only, no `sudo`, `~/turborag` read only through the corpus symlink. Every table's Regime lines give the regime, memory cap, `sqlite_version` and `openblas_num_threads` (Plan A's `compare.py`), and the Task 12 test requires them |
-| §7 G: the full suite green on 3.14t with the GIL guard | Tasks 3–9, 12 | From Task 3 on, every task's Step 4 runs the full suite on 3.14t with `PYTHONWARNINGS` set to the guard (sandbox: 303 passed, 2 skipped after Task 12) |
+| §6: the DGX protocol | Tasks 11, 12 | Deploy via Plan A's `deploy.sh`; `--limit 2549619`, fresh 4 GiB containers and the discarded run0 via Plan A's `session.sh`; `setsid -f` plus polling; the noise band via `compare.py`; seed 7 for the fan-out probe; no cold-start claim; each window asked for first, Task 12's with a time cap and Task 11's build and fix window without one (spec §6's exception for build and fix windows, §3.1 G4); each ABAB session capped at 90 min (spec §3.1 G1); `bench-tv` only, no `sudo`, `~/turborag` read only through the corpus symlink; stop recipes find the PIDs first, leave out their own shell, and kill by PID, never with a self-matching `pkill -f`. Every table's Regime lines give the regime, memory cap, `sqlite_version` and `openblas_num_threads` (Plan A's `compare.py`), and the Task 12 test requires them |
+| §7 G: the full suite green on 3.14t with the GIL guard | Tasks 3–9, 12 | From Task 3 on, every task's Step 4 runs the full suite on 3.14t with `PYTHONWARNINGS` set to the guard (sandbox: 303 passed, 2 skipped after Task 12; 304 if Task 11 added the probe p4 test) |
 | §7 G: a QPS/latency ABAB on one boot | Tasks 11, 12 | `g-abab.sh` records the boot id before and after. The Task 12 test requires them equal, and `g-check.py`'s `two-boots` scenario shows it failing |
 | §7 G: the report states whether to continue; the default is out of scope | Tasks 9, 12 | The Decision names exactly one of Continue, Hold or Park, the one `abab_decision` computes. ADR 0006 puts the default and `GC_FREEZE`'s default out of scope |
 
 ### Placeholder scan
 
-`grep -nE "TBD|TODO|FIXME|similar to Task|fill in" docs/superpowers/plans/2026-09-28-free-threaded-python.md` matches one line: this sentence, which quotes the pattern. The build script asserts that no `@@` marker is left unfilled and that every code fence is closed. The blocks that contain fences of their own use four backticks: ADR 0006, `t12-section.py`, `g-render.py` and `g-decide.py`.
+`grep -nE "TBD|TODO|FIXME|similar to Task|fill in" docs/superpowers/plans/2026-09-28-free-threaded-python.md` matches one line: this sentence, which quotes the pattern. The build script asserts that no `@@` marker is left unfilled and that every code fence is closed. The blocks that contain fences of their own use four backticks: ADR 0006, `t12-section.py`, `g-render.py` and `g-decide.py`, and in Task 11 Step 6 the `p4-attempts.md` entry, the upstream draft and the Park text.
 
 Angle-bracket tokens do appear, but only in these roles:
-- values that a command prints at run time and a later step reads back: `<SHA>`, `<ts>`, `<n>`, `<N>`, `<patch>`, `<uuid>`, `<label>`, `<what>`, `<reason>`, `<T>`, `<D>`, `<a>`, `<b>`, `<A's>`, `<B's>`, `<user>`, `<last line>`, `<status>`;
+- values that a command prints at run time and a later step reads back: `<SHA>`, `<ts>`, `<n>`, `<N>`, `<patch>`, `<uuid>`, `<label>`, `<what>`, `<reason>`, `<T>`, `<D>`, `<a>`, `<b>`, `<A's>`, `<B's>`, `<user>`, `<last line>`, `<status>`, and the process id `<pid>` in Task 11 Step 1's stop recipe output;
+- the UTC time `<UTC time>` in `hung-<UTC time>.log`, which Task 11 Step 6's "If a deploy or build hung" computes (`date -u +%Y%m%dT%H%MZ`) only if the stall guard fires;
 - the fields of a line format that a script prints, in the Interfaces lists: `<arm>`, `<image>`, `<version>`, `<wheel tags>`, `<compiled file>`, `<keys>`, `<engine>`, `<container id>`, `<pid>`;
 - usage lines of the scripts themselves;
-- `compare.py`'s table header.
+- `compare.py`'s table header;
+- Task 11 Step 6's probe p4 failure path (spec §3.1 G2), which runs only if turbovec's sdist does not build, so its values exist only then:
+  - the build and attempt number `<k>` (6a computes it from `p4-attempts.md`), and `<i>`, `<short SHA>`;
+  - the slots of the fix's line shapes, which 6b's classification of the build log fills: `<packages>`, `<version>`, `<NAME>`, `<value>`, `<name>`, `<lines>`, `<lines or nothing>`;
+  - the slots of the `p4-attempts.md` entry, the upstream draft and the Park text, filled from the build log and the entries: `<none, or each line in backticks>`, `<the STEP line>`, the error excerpt, the cause, `<YYYY-MM-DD>`, `<0 to 3>`, the versions, the suspected cause. 6c.1's `P4_BUILDER_FIX` shows an example line, marked as one, in place of a slot.
 
 Every step that needs one of these values computes it (Task 11 Step 2 writes `g.env`) or reads it from the previous step's output. The two optional arms are sentences in brackets in the Task 12 prompt, `[If WITH_C1=1:]`, and are kept only if their flag is 1.
 
@@ -3691,17 +4273,22 @@ Every step that needs one of these values computes it (Task 11 Step 2 writes `g.
 | `ARG PYTHON`, `ARG UV_NO_BINARY_PACKAGE`, `ENV PYTHONWARNINGS` | Task 6, `Dockerfile` | `g-build.sh` (images B, C and D) |
 | the `freethreaded` job | Task 7, `tests.yml` | its two tests |
 | `bench/unicode_drift_probe.py dump`, `diff A B`, `scan DRIFT --limit N` | Task 8 | Task 8's laptop drift, `g-facts.sh` |
-| ADR 0006 `## Verification` / `Pending:` | Task 9 | `g-decide.py`, the Task 12 test |
-| `GATE_BETTER = ("QPS concurrent", "Hybrid QPS concurrent")` (a tuple of the two gate rows), `GATE_NOT_WORSE`, `SQLITE_BOUND` (the seven hybrid timing labels), `CROSS_PAIRS = ("A1 → B1", "A2 → B2")`, `SAME_ARM_PAIRS = ("A1 → A2", "B1 → B2")`, `FREE_THREADED_ARMS`, `OUTCOMES` | Task 10's `t12-section.py`, appended in Task 12 | `gate_rows`, `abab_decision`, `g-decide.py`, `g-check.py`, the Task 12 test |
-| `abab_sections`, `worse_in_both`, `_regimes`, `_differ`, `sqlite_versions(sections) -> (str, str)`, `gate_rows(sections) -> (wins, misses)`, `abab_decision(sections) -> (outcome, reasons)` | Task 10's `t12-section.py`, appended in Task 12 | `g-decide.py` (imports `SQLITE_BOUND`, `abab_decision`, `abab_sections`, `gate_rows`, `sqlite_versions`, `worse_in_both`), `g-check.py`, the Task 12 test |
-| `synth(home, qps, hybrid, lat_p50, hit, a2_qps, b_sqlite="3.50.4", b_blas="1", flat_runs=3, ...)`, `JITTER = (-0.01, 0.0, 0.01)` | Task 10's `g-check.py` | its sixteen scenarios |
+| ADR 0006 `## Verification` / `Pending:` | Task 9 | `g-decide.py`, the Task 12 test; Task 11 Step 6's Park (6f), only on a turbovec source cause |
+| `GATE_BETTER = ("QPS concurrent", "Hybrid QPS concurrent")` (a tuple of the two gate rows), `GATE_NOT_WORSE`, `FLAT_CONCURRENT = ("QPS concurrent", "p95 under concurrency (ms)")`, `SQLITE_BOUND` (the seven hybrid timing labels), `CROSS_PAIRS = ("A1 → B1", "A2 → B2")`, `SAME_ARM_PAIRS = ("A1 → A2", "B1 → B2")`, `FREE_THREADED_ARMS`, `OUTCOMES`, `HYBRID_P99 = "Hybrid p99 under concurrency (ms)"` (G5's guard row), `HIGH_CPU = 1.5` (a flat run is high-CPU at >= 1.5x the lowest CPU per query in its cross pair), `C16 = " (c=16)"` (G7's title suffix) | Task 10's `t12-section.py`, appended in Task 12 | `gate_rows`, `abab_decision`, `g-decide.py`, `g-check.py`, the Task 12 test |
+| `abab_sections`, `worse_in_both`, `_flat_cpu(section) -> {"baseline"|"candidate": [ms|None]}`, `uneven_states(sections) -> [reason]`, `_regimes`, `_differ`, `sqlite_versions(sections) -> (str, str)`, `gate_rows(sections) -> (wins, misses)`, `abab_decision(sections) -> (outcome, reasons)` | Task 10's `t12-section.py`, appended in Task 12 | `g-decide.py` (imports `SQLITE_BOUND`, `abab_decision`, `abab_sections`, `gate_rows`, `sqlite_versions`, `worse_in_both`), `g-check.py`, the Task 12 test |
+| `synth(home, qps, hybrid, lat_p50, hit, a2_qps, b_sqlite="3.53.1", b_blas="1", flat_runs=3, ..., hybrid_c_p99=1.0, slow=None, cpu=True, c16=None, lat_c=1.0)`, `JITTER = (-0.01, 0.0, 0.01)`, `REASONS` | Task 10's `g-check.py` | its twenty-three scenarios |
 | the image line `Python …, GIL …, turbovec … (<wheel tags>), raggio_native <version> (<compiled file>), SQLite …, OPENBLAS_NUM_THREADS …, Unicode …, raggio_native Unicode …` | Task 10's `g-image-facts.py` | `g-facts.sh` (`g-images.txt`), `g-render.py`'s `Images`, `g-check.py`'s synthetic lines, Task 11 Step 7, the Task 12 test's `raggio_native \S+ \(([^)]*)\)` regex |
 | `built <image> in <N> s` | Task 10's `g-build.sh` | Task 11 Step 6 (p4's build time) |
 | image tags `localhost/raggio:<sha>`, `-py314t`, `-py314`, `-py314t-gcfreeze` | `deploy.sh` (A); Task 10's `g-build.sh` | `g-facts.sh`, `g-fanout.sh`, `g-abab.sh`, Tasks 11 and 12 |
-| session labels `g-a1-py312`, `g-b1-py314t`, `g-a2-py312`, `g-b2-py314t`, `g-c1-py314`, `g-d1-py314t-gcfreeze` | Task 10's `g-abab.sh` | `g-render.py`'s `SESSIONS` and `PAIRS`; Task 12's move-aside glob `g-[abcd][12]-*` |
-| Verification subsections `Images`, `GIL and logs`, `A1 → B1`, `A2 → B2`, `A1 → A2`, `B1 → B2`, `IVF fan-out`, `Unicode drift`, `Upstream wheels`, `Decision` | `g-render.py`, `g-decide.py` | `abab_sections` and the Task 12 test |
+| session labels `g-a1-py312`, `g-a1-py312-c16`, `g-b1-py314t`, `g-b1-py314t-c16`, `g-a2-py312`, `g-a2-py312-c16`, `g-b2-py314t`, `g-b2-py314t-c16`, `g-c1-py314`, `g-d1-py314t-gcfreeze` | Task 10's `g-abab.sh` | `g-render.py`'s `SESSIONS` and `PAIRS`; Task 12's move-aside glob `g-[abcd][12]-*` |
+| Verification subsections `Images`, `GIL and logs`, `A1 → B1`, `A2 → B2`, `A1 → A2`, `B1 → B2`, their four `(c=16)` twins, `IVF fan-out`, `Unicode drift`, `Upstream wheels`, `Decision` | `g-render.py`, `g-decide.py` | `abab_sections` and the Task 12 test |
 | status lines `== BUILD_*`, `== FACTS_*`, `== FANOUT_*`, `g-session <label>: exit <status>`, `g-abab: done` | Task 10's scripts | the polls in Tasks 11 and 12 |
 | `g.env`: `SHA`, `WITH_C1`, `WITH_D1` | Task 11 Step 2 | every later DGX step |
+| `p4-attempts.md` (one `## p4 build <k>` entry per failed build), `g-build-p4-<k>.log` | Task 11 Step 6 (6a), only if turbovec's sdist does not build | 6b–6g, Step 10's report, the upstream draft, the Park text |
+| `deploy.stall`, `g-build.stall` (one line: the log's size in bytes, and the epoch second that size was first seen), `STALLED: no log output for 30 min` | Task 11 Steps 4 and 6, the stall guard's launch and polls | Step 4's and Step 6's poll stops |
+| `hung-<UTC time>.log`, the `## p4 hung build, not counted` entry with `next: stop: build hung (no log output for 30 min)` | Task 11 Step 6, "If a deploy or build hung", only if the stall guard fires | 6g, Step 10's report; 6a's count and 6c's bound skip it |
+| `P4_BUILDER_FIX`, `P4_FIX_LINE`, `test_the_p4_turbovec_build_fix_stays_in_the_builder_stage` | Task 11 Step 6 (6c.1), only if probe p4 needs a builder-stage fix | the Dockerfile's builder stage (6c.3); Task 12 Steps 10 and 12's counts |
+| `D:/DEV/_scratch/upstream-drafts/turbovec-cp314t-build.md` | Task 11 Step 6 (6e), only for a turbovec source cause | the maintainer, who posts it (spec D7); Step 10's report |
 
 Commit subjects are unique:
 1. `Report gil_enabled in /healthz`
@@ -3713,9 +4300,11 @@ Commit subjects are unique:
 7. `Add the non-blocking 3.14t CI job`
 8. `Add the Unicode drift probe`
 9. `Document the free-threaded image (ADR 0006)`
-10. `Record the DGX ABAB in ADR 0006`
+10. `Fix the turbovec cp314t build in the builder stage (p4, attempt <k>)`, with `<k>` 1 to 3, so each attempt's subject is unique
+11. `Park the free-threaded evaluation at probe p4 (ADR 0006)`
+12. `Record the DGX ABAB in ADR 0006`
 
-Tasks 10 and 11 commit nothing.
+Task 10 commits nothing. Task 11 commits only on probe p4's failure path (spec §3.1 G2): one commit per builder-stage fix attempt (subject 10), or the Park (subject 11), after which Task 12 does not run.
 
 ### Validated in the sandbox
 
@@ -3725,7 +4314,7 @@ The sandbox base is 19a8a2e with the sandbox branches of Plans A, B, E and F mer
 - `built_for_this_interpreter` and `check_native` (Task 5), and their asserts in an existing test;
 - Task 6's Step 1 base check, and its asserts on A's `OPENBLAS_NUM_THREADS`, C's `MALLOC_TRIM_THRESHOLD_` and E's `uv python find`/`PYO3_PYTHON` lines. On the sandbox base, which lacks Plan C, the `MALLOC_TRIM_THRESHOLD_` assert would fail, and Step 1 would stop;
 - ADR 0006's new needles and rule text (Task 9);
-- `t12-section.py`'s two gate rows, `SQLITE_BOUND`, `gate_rows`, `sqlite_versions`, the Regime and image-line asserts, and `g-check.py`'s six new scenarios (sixteen in all), its deterministic `JITTER`, and the `regime.json`/`image.json` it writes (Task 10);
+- `t12-section.py`'s two gate rows, `SQLITE_BOUND`, `gate_rows`, `sqlite_versions`, the Regime and image-line asserts, and `g-check.py`'s six new scenarios (sixteen in all; the later G5 revision adds `hybrid-p99-worse`, `flat-split-uneven`, `flat-split-even` and `cpu-missing`, the G7 revision `c16-not-gated`, the G9 revision `flat-split-uneven-worse`, and the G8 revision `c16-traceback`, for twenty-three), its deterministic `JITTER`, and the `regime.json`/`image.json` it writes (Task 10);
 - `g-image-facts.py`'s `raggio_native`, SQLite and `OPENBLAS_NUM_THREADS` fields, and `g-build.sh`'s build-time line.
 
 Every code block in Tasks 1–9, and the Task 12 test section, was taken verbatim from the sandbox commits by the build script before this revision. The revised blocks were edited in this file by hand. The RED/GREEN counts below keep their values: the revision adds asserts to existing tests and no new test functions, but that the counts still hold is unverified.
@@ -3779,21 +4368,22 @@ Every code block in Tasks 1–9, and the Task 12 test section, was taken verbati
   - A: `Python 3.12.14, GIL enabled, turbovec 1.0.0 (cp39-abi3-manylinux_2_28_x86_64), Unicode 15.0.0, raggio_native Unicode 15.0.0`;
   - B: `Python 3.14.7t, GIL disabled, turbovec 1.0.0 (cp314-cp314t-linux_x86_64), Unicode 16.0.0, raggio_native Unicode 16.0.0`.
 - **The laptop drift (Task 8).** `15.0.0 -> 16.0.0`: 5,812 newly assigned, 1 changed, 5,053 with token drift.
-- **Task 10's pipeline, before the revision.** `g-check.py` was red without the scripts, then green over the ten scenarios it had then, in about 20 s. `bash -n` passes on the six shell scripts. The sixteen-scenario version has not run; Task 10 Step 4 expects about 30 s.
+- **Task 10's pipeline, before the revision.** `g-check.py` was red without the scripts, then green over the ten scenarios it had then, in about 20 s. `bash -n` passes on the six shell scripts. The sixteen-, twenty-, twenty-one-, twenty-two- and twenty-three-scenario versions have not run through `g-check.py`; Task 10 Step 4 expects about 50 s.
 - **Dry runs of the shell scripts,** in a Linux container with stub sessions:
   - `g-abab.sh`: all four sessions, all six, a failing B2 (the chain stops), and `ADOPT` going to the first session only;
   - `g-build.sh`, `g-facts.sh` and `g-fanout.sh`, with stubs;
-  - Task 11's process-group stop recipe;
+  - Task 11's stop recipe, as revised to stop a running `deploy.sh` or `setup.sh` too, for the stall guard. Its gn100 part ran, as ssh runs it (`bash -c`), in a Debian trixie container with procps and stubs for `podman`, `uv` and `rustc`, against two running `setup.sh` (one under a `bash -c` wrapper, as ssh starts it), a `setsid -f` `g-build.sh`, and two decoys, a `bench-wv` stand-in and the user's own `podman build -t localhost/mine`. It stopped both `setup.sh` trees and `g-build.sh`'s process group, printed `gn100: none left`, and left both decoys running. A second run added orphaned `uv sync --frozen` and `rustc --crate-name` stand-ins and another account's `podman build -t localhost/raggio:zzz`: the last `pgrep` listed all three instead of `gn100: none left`, and signalled none. Its laptop part ran in Git Bash against a stand-in `bench/dgx/deploy.sh`, in both phases. At the setup `ssh`, it stopped the background command, `deploy.sh`, the stand-in `ssh` and its child; at the unpack, also the pipeline's subshell and a native Windows stand-in for `git archive`. Both printed no `laptop: left` line. The first revision, which stopped only `deploy.sh` and the command running it, left the unpack's pair running and also printed no `laptop: left` line;
+  - the stall guard's state logic, against a local log: 0 min at launch, the clock reset when the log grew, `no growth for 29 min` without a stop, `STALLED: no log output for 30 min` at 30 min, and a reset on the next growth. "If a deploy or build hung"'s record step also ran, with `STEP=4`: it added the entry, and 6a's count skipped it;
   - Task 12's stop recipe, with the real `g-abab.sh` and `g-session.sh`.
 
 ### Not validatable in the sandbox, and why
 
 - **Everything measured on gn100:**
-  - spec §8's probe p4: whether turbovec 1.0.0's sdist and `raggio_native` build for cp314t on aarch64, and how long B's build takes. It has never run; Task 11 Step 6 runs it first;
-  - the SQLite version the uv-managed 3.14t interpreter bundles. p2 read PBS SQLite 3.50.4 in a uv interpreter, but not the 3.14t build's. If it differs from A's, `Hybrid QPS concurrent` cannot carry a win (D15), and only `QPS concurrent` can;
+  - spec §8's probe p4 on G's tree: whether `raggio_native` builds for cp314t on aarch64, whether G's real `check_image.py` passes on G's real Dockerfile, and how long B's build takes with `raggio_native`. Task 11 Step 6 runs it first. Probe p4 itself ran on gn100 on 2026-09-28, 19:00–20:10Z, at 19a8a2e, without `raggio_native` and with a stand-in check (`docs/superpowers/research/2026-09-28-dgx-probe-p4-freethreaded.md`): turbovec 1.0.0's sdist built as `cp314-cp314t-linux_aarch64` with no build arg and 0 fixes, the 3.14t image took 28.7 s [28.2..29.3] cold over 3 `--no-cache` builds (the 3.14 image 10.6 s), and the GIL stayed off at import, under pytest (46 passed, 1 warning, on every interpreter), under uvicorn load and in the race runs;
+  - the SQLite version of G's own images. p4 read SQLite 3.53.1 in uv 0.12.19's PBS 3.12.14, 3.14.7 and 3.14.7t, in its probe images; Task 11 Step 7 reads G's. p2's figures were measured on PBS SQLite 3.50.4 and not re-measured on 3.53.1. If A's and B's versions differ, `Hybrid QPS concurrent` cannot carry a win (D15), and only `QPS concurrent` can;
   - the ABAB numbers and the decision;
   - the fan-out gate in both images;
-  - the aarch64 wheel tags and `raggio_native` file names;
+  - the aarch64 `raggio_native` file names, and the wheel tags in G's images (p4's were turbovec `cp314-cp314t-linux_aarch64` on 3.14t and PyPI's `cp39-abi3-manylinux_2_28_aarch64` on 3.12);
   - whether aarch64 gives the laptop's drift.
 
   This plan's rules forbid touching the DGX outside Tasks 11 and 12's user-granted windows. `g-check.py` exercises the render, decide and test chain on synthetic sessions only.
@@ -3802,8 +4392,19 @@ Every code block in Tasks 1–9, and the Task 12 test section, was taken verbati
   - the six new `g-check.py` scenarios (`sqlite-bound`, `hybrid-win`, `hybrid-other-sqlite`, `noisy`, `blas-differs`, `thin`);
   - the new asserts in Tasks 5, 6 and 12;
   - the new `g-image-facts.py` fields.
+- **The G5 revision, run only against a stand-in.** It added `HYBRID_P99`, `HIGH_CPU`, `_flat_cpu`, `uneven_states` and their checks in `gate_rows`, `g-render.py`'s `flat_cpu` json block, and the scenarios `hybrid-p99-worse`, `flat-split-uneven`, `flat-split-even` and `cpu-missing` with `REASONS`. `bench/dgx/compare.py` is Plan A's and not in the repo yet, so the decision code ran on synthetic sessions against a stand-in `compare.py`, both with a min..max overlap verdict and with Plan A's rule (median gain beyond the larger max − min band). Under both, the sixteen scenarios that expect a decision gave the decisions, costs and reason texts of Task 10 Step 4. `g-check.py` itself, `g-decide.py` and the Task 12 test did not run, so the four scenarios that must fail that test are unchecked.
 
   The first task that runs each one is its check. Where a count or message differs from this plan, stop and fix the plan's code before going on.
+- **The spec §3.1 G1–G4 revision, not executed.** It was written without running anything:
+  - G1: the 90-min per-session cap (`g-abab.sh <SHA> 90m`, the `e.g. 90m` usage lines, Task 12's window text and its 6-hour worst case). Only the value changed; the scripts pass the cap through as before;
+  - G2: Task 11 Step 6's failure procedure (6a–6g), `P4_BUILDER_FIX`, `P4_FIX_LINE` and `test_the_p4_turbovec_build_fix_stays_in_the_builder_stage`, the uv `--help` check, Step 6's and 6a's `grep` lines (the `[2/3] STEP` prefix is podman's multi-stage format, as Plan A quotes it; no failing p4 log has been grepped), the upstream draft and its repro Dockerfile (never built on its own), the Park text, and ADR 0006's new G2 sentences (Task 9). The p4 test exists only if probe p4 needs a fix, so its counts (RED `1 failed, 25 passed, 4 skipped` and `1 failed, 29 passed`; GREEN `26 passed, 4 skipped` and `30 passed`; full suites one more) are expectations;
+  - G3 and G4: prose only. G3 names the two stop-and-ask cases and leaves ADR 0006 `Pending:`; G4 removed Task 11's time cap, its 30-min attempt rule and the `stop: under 30 min of the cap left` option, and turned Step 1's stop recipe into a stop on the user's request. No script or test changed: `g-build.sh`, `g-facts.sh`, `g-ensure-ivf.sh` and `g-fanout.sh` never took a cap. The stall guard (Steps 4 and 6) and the revised stop recipe ran only as the dry runs above: neither has run against the real `ssh`, `podman build` or `deploy.sh` on gn100, and whether a TERMed rootless `podman build` leaves an intermediate container, or its `RUN` step's `uv` or `rustc` running, is unobserved. The rule for that stop during 6a–6g (finish the laptop side, then Step 10; a later go-ahead restarts at Step 2 from `HEAD`) has not run.
+- **The probe p4 results revision, not executed.** It changed facts, comments and fixture values only, and no test or script logic: the SQLite version in `g-check.py`'s `synth` default, `image.json` and image lines (3.53.1), C's turbovec tag in `g-check.py` and Task 11 Step 7 (`cp39-abi3-linux_aarch64`), `FT_WHEEL`'s comment, Task 6's test and Dockerfile comments (the Dockerfile keeps its 12 lines), Task 11's time estimates and ADR 0006's Context, Decisions and Consequences. `g-check.py` has not run on the new values; Task 10 Step 4 runs it. Only a hand check ran: `synth` with the new values, with and without C1 and with `b_sqlite="3.51.0"`, fed the Task 12 test's image-line asserts (the `Images` regex, `abi3` for A, `cp314t` for B, the `raggio_native` files, `SQLite 3.`), and all passed; `image.json` gave 3.53.1 on every session but B's 3.51.0 in the last case.
+- **The G7 revision of `g-abab.sh` and `g-session.sh`, run only over stubs.** It adds the c=16 sessions and passes `CONCURRENCY` through. `bash -n` passes on both. A dry run with a stub `lib.sh` (`CONCURRENCY` defaulting to 8), a stub `g-session.sh` and a stub `session.sh` gave:
+  - `8 sessions` in the order A1 A1c16 B1 B1c16 A2 A2c16 B2 B2c16, and `10 sessions` with C1 and D1 at the end;
+  - `CONCURRENCY=16` reaching `session.sh` in the `-c16` sessions and 8 in the others, and `ADOPT` going to the first session only.
+
+  Neither Plan A's real `lib.sh` with the `CONCURRENCY` knob nor Task 12's stop recipe has run against the revised scripts. The stop recipe's patterns name neither labels nor the concurrency, and the wrapper's command line still starts `timeout --kill-after=60 <cap> bash -c`, the prefix the recipe matches.
 - **The real `ssh`, `scp`, `podman` and `deploy.sh` on gn100.** Plan A's `session.sh`, `deploy.sh` and `compare.py` were used as the sandbox's Plan A branch has them. Their behaviour on gn100 (the fingerprint, `ADOPT`, `session.sh`'s exit on TERM) is Plan A's. Plan A's `session.sh` holds no lock file; G's `pgrep` check for a running `session.sh` has not run on gn100.
 - **The 3.14t CI job on GitHub's runners.** Its YAML is tested structurally. Its steps (the 3.14t suite, `check_image`, the stress tests) were run on the laptop, and `check_image` also ran inside the Linux image builds. The job itself, including the `ubuntu-24.04-arm` leg, first runs on push.
 - **Task 4's zombie on Linux.** It was observed on Windows, where the open files block the delete. On Linux the same zombie keeps `-wal` and `-shm` in place. The test checks for those files, so it should be red there too, but that is unverified until the CI job runs.
@@ -3825,12 +4426,12 @@ Every code block in Tasks 1–9, and the Task 12 test section, was taken verbati
     - its refusal of an existing label;
     - its command line, `bash <path>/bench/dgx/session.sh <label>`, which G's `pgrep` check matches (A has no lock file);
     - its run order from an IVF start, and leaving `bench-tv` running.
-  - `compare.py`: `render` and `beyond_band`, the flat engine name `raggio`, and the metric labels, including Plan A Task 5's `Hybrid first 10 queries, slowest (ms)` and `Hybrid p99 without the first 10 (ms)`, which `SQLITE_BOUND` names.
+  - `compare.py`: `render` and `beyond_band`, the flat engine name `raggio`, and the metric labels, including Plan A Task 5's `Hybrid p99 under concurrency (ms)`, `CPU per query under concurrency (ms)` and `Hybrid CPU per query under concurrency (ms)` (all lower-is-better; the CPU rows are absent where `cpu.stat` is unreadable), `Hybrid first 10 queries, slowest (ms)` and `Hybrid p99 without the first 10 (ms)`, which `SQLITE_BOUND` names.
   - `compare.py`'s regime output (Plan A Task 4):
-    - the `Regime (baseline): …` and `Regime (candidate): …` lines, with the keys `page_cache`, `first_start`, `memory`, `memory_swap`, `python`, `sqlite_version`, `openblas_num_threads`, and `unknown` for a missing one;
+    - the `Regime (baseline): …` and `Regime (candidate): …` lines, with the keys `page_cache`, `first_start`, `memory`, `memory_swap`, `concurrency`, `python`, `sqlite_version`, `openblas_num_threads`, and `unknown` for a missing one;
     - `The arms differ in <keys>: …`, which leaves out `first_start`;
     - the `Reported, not claimed (spec §6 needs >= 3 runs per side; FLAT_RUNS=3): …` note, and `CLAIM_RUNS = {"qps_concurrent": 3}`.
-  - `session.sh` writing `regime.json` (`page_cache`, `first_start`, `memory`, `memory_swap`, `detach_memory`) and `image.json` (`python`, `sqlite_version`, `turbovec`, `openblas_num_threads`, read inside the image) into each session directory. `g-check.py` writes both for its synthetic sessions.
+  - `session.sh` writing `regime.json` (`page_cache`, `first_start`, `memory`, `memory_swap`, `detach_memory`, `concurrency`: `16` for the `-c16` labels, `8` otherwise) and `image.json` (`python`, `sqlite_version`, `turbovec`, `openblas_num_threads`, read inside the image) into each session directory. `g-check.py` writes both for its synthetic sessions.
   - `lib.sh`'s `FLAT_RUNS="${FLAT_RUNS:-2}"`, which `g-session.sh` overrides with `FLAT_RUNS=3`.
   - the runtime stage's `ENV OPENBLAS_NUM_THREADS=1` and its D16 comment, directly after `USER app` (Task 6 Step 1 checks it).
   - `deploy.sh`, `setup.sh` and `.deployed-sha`.

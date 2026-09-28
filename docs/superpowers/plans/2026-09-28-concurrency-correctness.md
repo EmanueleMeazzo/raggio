@@ -2,14 +2,16 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make raggio's shared SQLite connections, its collection lifecycle and its per-type counts safe under concurrent requests, backed by a concurrency test module that stays green 50/50 runs.
+**Goal:** Make raggio's shared SQLite connections, its collection lifecycle and its per-type counts safe under concurrent requests. A search racing `DELETE /collections/{name}` answers 404, never 500. A concurrency test module backs this and stays green 50/50 runs, and p4's race phase is re-run on gn100 after B lands.
 
 **Architecture:**
 - **Catalog.** Every statement on the manager's single catalog connection runs under `_catalog_lock`.
 - **Delete.** `delete_collection` evicts the collection and deletes its row under `_load_lock`, so a racing `touch()` cannot resurrect it.
 - **Stop.** `Collection.stop()` takes the RW write lock first. It then cancels the worker, syncs, and closes every connection under `db_lock`. `_rdb` refuses to register a read connection once the collection is closed.
 - **Counts.** `indexed_counts` becomes copy-on-write: writers rebind a fresh dict under `db_lock`.
-- **Tests.** One new module, `tests/test_concurrency.py`, pins each race with a deterministic reproduction where the GIL allows one, or structurally where it doesn't. It also runs a mixed-workload stress test that is checked after quiescence.
+- **Delete vs search.** `delete_collection` marks the resident collection `deleted` before `stop()`. A search queued for the read lock behind `stop()` then finds the collection closed and raises `CollectionDeletedError`. The search endpoint in `app.py` maps that one error to 404, the answer for a collection that does not exist (spec §3.1 B1).
+- **Tests.** One new module, `tests/test_concurrency.py`, pins each race with a deterministic reproduction where the GIL allows one, or structurally where it doesn't. It also runs a mixed-workload stress test that is checked after quiescence, and in-process concurrent HTTP tests at c=16 (spec §3.1 B2).
+- **DGX.** After merge, p4's race phase runs on gn100 against main before and after B, and both results are journaled (Task 8).
 
 **Tech Stack:** Python 3.12, FastAPI/Starlette (sync dependencies run on the AnyIO threadpool), asyncio, sqlite3 (pysqlite, WAL), turbovec `IdMapIndex`, pytest, httpx `ASGITransport`, uv.
 
@@ -19,33 +21,41 @@
 - §4.1 ownership rows: `CollectionManager.get_config` / `list_collections` / `delete_collection` locking, `Collection.stop()`, `indexed_counts`.
 - §4.2: new tests in their own module.
 - §4.3: single writer, per-thread read connections.
-- §7: "B: stress test green 50/50 runs; no performance claim".
+- §3.1 B1: a search in flight on a collection that `DELETE /collections/{name}` is removing returns 404, never 500; B may change `app.py` for the error-to-404 mapping only. B2: an in-process concurrent HTTP test, and p4's race phase re-run on gn100 after B lands, with the before/after numbers journaled.
+- §4.1: "The HTTP status of a search racing `DELETE /collections/{name}` (404, §3.1 B1)" belongs to B, in `app.py`, the error-to-404 mapping only.
+- §7: "B: stress test green 50/50 runs; no performance claim. The in-process concurrent HTTP test passes: 0×401 on valid collection keys and 0×500 at c=16, and only 200 or 404 for searches racing `DELETE` (§3.1 B1, B2). After B lands, p4's race phase on gn100 shows 0 failures".
 
 Briefs:
 - `docs/superpowers/research/2026-09-28-item4b-freethreading-code.md`: §2 race inventory R1, R3, R4; §7 stage 1; §8 orphaned `to_thread` hazard.
 - `docs/superpowers/research/2026-09-28-critic.md`: claim checks R1/R3/R4; cross-item dependencies (stop() with D2's flush, indexed_counts with 2a and item 1); the R1 framing decision.
+- `docs/superpowers/research/2026-09-28-dgx-probe-p4-freethreaded.md`: the R1 hammer at c=16 and the R1–R4 race stress on gn100 at 19a8a2e; Conclusions 10 and 11.
 
 ## Global Constraints
 
 - Base and branch: `main` @ 19a8a2e. Work on `git switch -c concurrency-correctness`; the plan ships as one PR (spec §2).
 - Python: 3.12 via `uv run`. No new dependency, no `uv.lock` or `pyproject.toml` change.
-- Files touched: `src/raggio/store.py`, the new `tests/test_concurrency.py`, and `docs/adr/0001-performance-optimization-decisions.md`. Nothing else: no `app.py`, no existing tests, no `bench/`.
-- Suite size: `uv run pytest -q` gives 46 passed on base. It grows to 50 / 52 / 57 / 60 / 62 passed after Tasks 1 / 2 / 3 / 4 / 5.
+- Files touched: `src/raggio/store.py`, `src/raggio/app.py` (Task 6: the search endpoint's error-to-404 mapping and its import, nothing else), the new `tests/test_concurrency.py`, and `docs/adr/0001-performance-optimization-decisions.md`. Nothing else in the PR: no existing tests, no `bench/`. After merge, Task 8 edits `docs/superpowers/journal/2026-09-performance-program.md` on a docs branch.
+- Suite size: `uv run pytest -q` gives 46 passed on base. It grows to 50 / 52 / 57 / 60 / 62 / 63 passed after Tasks 1 / 2 / 3 / 4 / 5 / 6, and stays at 63 after Task 7 (docs only).
 - Existing tests: all 46 keep passing at every commit. The one pre-existing Starlette deprecation warning stays.
 - Test-only stress knobs are env vars read by the test module, not `Settings` fields:
   - `RAGGIO_STRESS_SECONDS`, default `3`;
   - `RAGGIO_STRESS_CLIENTS`, default `16`.
-- Acceptance (§7): `tests/test_concurrency.py` green in 50 of 50 consecutive runs. No performance claim anywhere (commit messages, ADR, PR).
+- Acceptance (§7):
+  - `tests/test_concurrency.py` green in 50 of 50 consecutive runs, re-run after Task 6;
+  - the in-process HTTP tests pass: 0×401 on valid collection keys and 0×500 at c=16 (Tasks 1 and 6), and only 200 or 404 for searches racing `DELETE` (Task 6);
+  - after merge, p4's race phase on gn100 shows 0 failures on main with B (Task 8).
+  - No performance claim anywhere (commit messages, ADR, PR, journal).
 - Lock kinds: `_catalog_lock` and `db_lock` are `threading.Lock`, which is not reentrant; neither is ever held across an `await`. `_load_lock` is an `asyncio.Lock`.
 - Lock order: `_load_lock` before `_catalog_lock`; `lock.write()` before `db_lock`.
 - Encoding: new comments and the whole test module are ASCII. `store.py` and the ADR stay UTF-8 (they contain em dashes); edit them with a UTF-8 aware editor, never a Windows cp1252 shell redirect.
 - Ownership boundaries (spec §4.1):
   - B edits only the `indexed_counts` lines inside `_upsert_rows`/`_delete_doc_rows` (D owns the rest of `_upsert_rows`, and `_run_worker`/`enqueue`);
-  - B does not touch `_allow_cache`, `_vector_ids` or `_IvfIndex` (F owns them, with R2/R2b), nor `touch()` construction (C).
+  - B does not touch `_allow_cache`, `_vector_ids` or `_IvfIndex` (F owns them, with R2/R2b), nor `touch()` construction (C);
+  - B edits `Collection.search` only for the `_closed` check at the top of its read section, and `app.py` only for the search endpoint's `CollectionDeletedError` → 404 mapping (§3.1 B1, §4.1).
 - Commit trailer: every commit message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
-- DGX: no DGX task. This plan makes no performance claim, so there is nothing to measure there.
+- DGX: one task, Task 8, after B merges. It re-runs p4's race phase on gn100 as a correctness check (§3.1 B2, §7), not a measurement: no performance claim. It follows spec §6: a run window first, `setsid -f` into a log that is polled, never `pkill -f`, no sudo, never `bench-wv` or `~/turborag`, and nobody's DGX work stopped unasked.
 - If a reviewer asks for a latency check of B's locks (for example, "did `_catalog_lock` or the `stop()` section slow the server?"), it is an A/B of the preceding main against main + B, both built from the same Dockerfile. It is reported, not claimed, and follows spec §6:
-  - Both arms run on the same SQLite build and the same memstatus state. B merges at order 1, before A's PR 2 base migration, so both arms are on the Debian SQLite 3.40.1 image with memstatus on. Never compare a B arm on that image against a post-A PBS SQLite 3.50.4 arm (D15).
+  - Both arms run on the same SQLite build and the same memstatus state. B merges at order 1, before A's PR 2 base migration, so both arms are on the Debian SQLite 3.40.1 image with memstatus on. Never compare a B arm on that image against a post-A arm on the PBS interpreter, which bundles SQLite 3.53.1 (p4, D15).
   - Every row records `sqlite3.sqlite_version` (read inside the container), `OPENBLAS_NUM_THREADS`, the memory cap and the page-cache regime. A's `bench/dgx/session.sh` (PR 1, order 0, so it is on main before B) already writes these into `image.json`/`regime.json`, and `compare.py` prints the arms' regimes above the table.
   - Concurrent hybrid at c=8 has a p99 of 3-7 s on Debian SQLite 3.40.1 with no Python lock involved (p2: 7.1 s IVF and 6.9 s flat, from SQLite's global memstatus malloc mutex). A p99 of that size is the SQLite convoy, not a regression of B's locks. Attribute a difference to B only if it exceeds the between-server band of two fresh containers of the same image.
 
@@ -82,8 +92,11 @@ The spec implies five failure modes that no behaviour test in the original R1/R3
   - `CollectionManager`: catalog locking, `delete_collection` under `_load_lock`, `shutdown`.
   - `Collection.stop()`, the new `Collection._close_conns()`, and `Collection._rdb()`.
   - The `indexed_counts` writers in `_upsert_rows` and `_delete_doc_rows`.
-- `tests/test_concurrency.py` (create): one section per task, in this order: R1, delete_collection, R3, R4, stress. Shared helpers sit at the top.
+  - The new `CollectionDeletedError`, `Collection.deleted`, the `_closed` check at the top of `Collection.search`'s read section, and `delete_collection` marking the collection before its eviction.
+- `src/raggio/app.py` (modify): the `store` import line, and the search endpoint's `except CollectionDeletedError` → 404. Nothing else.
+- `tests/test_concurrency.py` (create): one section per task, in this order: R1, delete_collection, R3, R4, stress, HTTP searches (B1/B2). Shared helpers sit at the top.
 - `docs/adr/0001-performance-optimization-decisions.md` (modify): the `## Addendum 2026-09 — concurrency correctness` section is appended at the end.
+- After merge, on a docs branch: `docs/superpowers/journal/2026-09-performance-program.md` (modify, Task 8): the before and after entries of the gn100 race re-run.
 
 ---
 
@@ -285,8 +298,9 @@ def test_concurrent_collection_key_checks_are_consistent(tmp_path, monkeypatch, 
                     r = await c.get(f"/collections/{target}", headers={"x-api-key": "keyB"})
                     seen[f"{target}:{r.status_code}"] += 1
 
-                for _ in range(20):
-                    await asyncio.gather(*(hit(i) for i in range(64)))
+                # 16 concurrent requests x 80 rounds: c=16, as in p4's R1 hammer on gn100
+                for _ in range(80):
+                    await asyncio.gather(*(hit(i) for i in range(16)))
         return seen
 
     assert asyncio.run(run()) == {"A:401": 640, "B:200": 640}
@@ -319,10 +333,12 @@ Run: `uv run pytest tests/test_concurrency.py -v`
 Expected: `3 failed, 1 passed`.
 - `test_every_catalog_statement_runs_under_the_catalog_lock` fails with `AssertionError: catalog touched outside _catalog_lock`.
 - `test_concurrent_catalog_reads_return_the_requested_row` fails with `assert [...] == []`. The list holds wrong rows such as `('c6', None)` or `('c0', 'c3')`, or `InterfaceError(...)` / `IndexError` reprs; the mix varies per run.
-- `test_concurrent_collection_key_checks_are_consistent` fails with `assert Counter({...}) == {'A:401': 640, 'B:200': 640}`. The Counter carries `A:500`/`B:500` (InterfaceError), spurious `B:401`, and sometimes `A:200`, meaning A accepted B's key.
+- `test_concurrent_collection_key_checks_are_consistent` fails with `assert Counter({...}) == {'A:401': 640, 'B:200': 640}`. The Counter carries `A:500`/`B:500`, spurious `B:401`, and usually `A:200`, meaning A accepted B's key. At c=16 on base it failed 16 of 16 sandbox runs, with `B:401` 26–61, `B:500` 12–49 and `A:500` 11–34 per run, and `A:200` in 15 of the 16.
+  - The 500s are the pair that p4 logged on gn100 at 19a8a2e: `sqlite3.InterfaceError: bad parameter or other API misuse` at store.py:1631 in `get_config`, and `IndexError: tuple index out of range` on `row[7]` at store.py:1639. The `IndexError` means another statement's row, shorter than the 8 columns `get_config` selects, came back on the shared cursor.
+  - The spurious 401s are silent wrong-row decisions: no traceback is logged.
 - `test_no_threading_lock_is_held_across_an_await` PASSES. It is the RF4 pin that guards Tasks 2-3 and the later plans.
 
-The two thread-race tests are probabilistic but failed on every sandbox run (3/3). `busy_switching` forces a thread switch every ~1 µs, so the interleavings happen at statement granularity.
+The two thread-race tests are probabilistic but failed on every sandbox run: 3/3, and 16/16 for the key check at c=16. `busy_switching` forces a thread switch every ~1 µs, so the interleavings happen at statement granularity.
 
 - [ ] **Step 3: Minimal implementation**
 
@@ -398,6 +414,7 @@ git commit -m "Serialize every catalog statement under _catalog_lock" -m "Co-Aut
 - Produces:
   - `CollectionManager.delete_collection(name: str) -> None`, signature unchanged. A `touch(name)` that races it either finishes loading first, and is then evicted, or raises `KeyError` (404) once the row is gone.
   - Plan C's off-loop construction builds on this.
+  - Task 6 marks the resident collection `deleted` inside the same `_load_lock` section, before `_evict`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -799,7 +816,7 @@ Run: `uv run pytest -q`. Expected: `57 passed, 1 warning`.
 
 ```bash
 git add src/raggio/store.py tests/test_concurrency.py
-git commit -m "Stop collections under the write lock and close connections under db_lock" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git commit -m "Stop collections under the write lock, closing connections under db_lock" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -1242,15 +1259,240 @@ git commit -m "Add mixed-workload concurrency stress test" -m "Co-Authored-By: C
 
 ---
 
-### Task 6: ADR 0001 addendum
+### Task 6: Searches racing a collection delete answer 404 (B1, B2)
+
+**Files:**
+- Modify: `src/raggio/store.py`: a new `CollectionDeletedError` directly above `class Collection:`, `Collection.__init__` (one attribute), `Collection.search` (the top of its read section) and `CollectionManager.delete_collection`.
+- Modify: `src/raggio/app.py:12` (the `store` import) and `:278-280` (the search endpoint's `except` clauses). Tasks 1-5 leave `app.py` untouched, so these are base line numbers.
+- Modify: `tests/test_concurrency.py` (append a section)
+
+**Interfaces:**
+- Consumes:
+  - Task 2's `delete_collection`, which evicts and deletes the row under `_load_lock`;
+  - Task 3's `stop()`, which sets `_closed = True` inside the write lock, and `_rdb`'s `RuntimeError: collection '<name>' is closed`;
+  - `_RWLock`'s writer preference: readers wait while `_writing or _writers_waiting`, so a queued `stop()` runs before the readers queued with it.
+- Produces:
+  - `store.CollectionDeletedError(Exception)`. `Collection.search` raises it, with the collection name, when it enters the read section of a collection that `delete_collection` closed;
+  - `Collection.deleted: bool`, `False` until `delete_collection` sets it, before `stop()`;
+  - `POST /collections/{name}/search` answers 404 `collection '<name>' not found` for it, the answer a root-key request gets once the row is gone. A collection-key request that arrives after that gets 401, since its key can no longer be checked; that is unchanged.
+  - Nothing else changes status. A search on a collection that an LRU or idle eviction closed still raises `RuntimeError` (500): that collection exists, so 404 would be wrong. No SQLite error is ever mapped to 404: on a live collection it is a real fault.
+
+**Why a 500 is left after Tasks 1-5.** In probe p4 on gn100 at 19a8a2e, searches racing `DELETE /collections/{name}` got 171–704 500s per run. The logged errors (`unable to open database file`, `no such table`, `disk I/O error`, a `FileNotFoundError` on the IVF directory) are those of a collection working on deleted files. That is either the resurrected collection that Task 2 removes, or a search that reopened a read connection on a stopped collection, which Task 3 makes fail closed. p4 did not separate the two. One interleaving survives Tasks 2 and 3:
+1. A search already holds the `Collection` and is queued for the read lock behind a writer: the ingest worker's write section, a metadata PATCH, a document delete or an index swap.
+2. `DELETE` arrives. `stop()` queues for the write lock too.
+3. The writer finishes. Writer preference runs `stop()` before the queued readers, and it closes the collection.
+4. The readers enter the closed collection. `_rdb` raises `RuntimeError: collection 'x' is closed`, a 500.
+
+A vector or hybrid query sent as text (no supplied vector) takes the same path when its embedding call completes after `stop()`'s write section and before the embedder closes. Task 6 turns these into 404. The paths still left at 500 are in the ADR's Deferred row (Task 7).
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `tests/test_concurrency.py`:
+
+```python
+# ---- B1/B2: searches over HTTP at c=16, and racing DELETE /collections/{name} ----
+
+
+def test_http_searches_at_c16_and_racing_a_collection_delete(tmp_path, monkeypatch):
+    # spec 3.1 B2, in process: (1) 16 clients search, half with the collection
+    # key: every one 200 (R1: no 401 on a valid key, no 500); (2) 16 clients search
+    # while DELETE /collections/x lands behind a writer: 200 before it, 404 after
+    # it, never 500 (B1)
+    monkeypatch.setenv("ROOT_API_KEY", "root-key")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
+    app = create_app(embedder_factory=lambda cfg: FakeEmbedder())
+    key = {"x-api-key": "key-x"}
+    inside, release, gate = threading.Event(), threading.Event(), {}
+    real_patch = Collection._patch_rows
+
+    def gated_patch(self, *args):  # holds a PATCH inside its write section
+        gate["col"] = self
+        inside.set()
+        release.wait(5)
+        return real_patch(self, *args)
+
+    def body(i):
+        mode = ("vector", "text", "hybrid")[i % 3]
+        q = {} if mode == "vector" else {"text": f"w{i % 7} w{i % 5}"}
+        if mode != "text":
+            q["vector"] = vec(i)
+        return {"query": q, "mode": mode, "k": 5}
+
+    async def run():
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+                r = await c.post("/collections", headers=ROOT,
+                                 json={"name": "x", "collection_key": "key-x"})
+                assert r.status_code == 201, r.text
+                docs = [{"doc_id": f"d{i}", "chunks": [
+                    {"id": f"d{i}c{j}", "text": f"w{i % 7} w{j}", "vector": vec(10 * i + j)}
+                    for j in range(3)]} for i in range(40)]
+                r = await c.post("/collections/x/documents", headers=ROOT, json={"documents": docs})
+                job = r.json()["job_id"]
+                for _ in range(500):
+                    r = await c.get(f"/collections/x/jobs/{job}", headers=ROOT)
+                    if r.json()["status"] == "done":
+                        break
+                    await asyncio.sleep(0.01)
+                phase1, phase2 = collections.Counter(), collections.Counter()
+
+                async def client(t):  # phase 1: 20 searches each, alternating keys
+                    for n in range(20):
+                        hdr, who = (key, "key") if n % 2 else (ROOT, "root")
+                        r = await c.post("/collections/x/search", headers=hdr, json=body(t + n))
+                        phase1[f"{who}:{r.status_code}"] += 1
+
+                await asyncio.gather(*(client(t) for t in range(16)))
+
+                async def looper(t):  # phase 2: search until the delete reaches us
+                    for n in range(10_000):
+                        r = await c.post("/collections/x/search", headers=ROOT, json=body(t + n))
+                        phase2[r.status_code] += 1
+                        if r.status_code != 200:
+                            return
+
+                monkeypatch.setattr(Collection, "_patch_rows", gated_patch)
+                loopers = [asyncio.create_task(looper(t)) for t in range(16)]
+                await asyncio.sleep(0.05)
+                patch = asyncio.create_task(c.patch("/collections/x/documents/d0", headers=ROOT,
+                                                    json={"metadata": {"g": 1}}))
+                assert await asyncio.to_thread(inside.wait, 5)
+                await asyncio.sleep(0.1)  # the loopers' next searches queue behind it
+                delete = asyncio.create_task(c.delete("/collections/x", headers=ROOT))
+                for _ in range(500):  # until stop() waits for the write lock too
+                    if gate["col"].lock._writers_waiting:
+                        break
+                    await asyncio.sleep(0.01)
+                release.set()
+                statuses = [(await patch).status_code, (await delete).status_code]
+                await asyncio.gather(*loopers)
+                r = await c.post("/collections/x/search", headers=ROOT, json=body(0))
+                statuses.append(r.status_code)
+        return dict(phase1), sorted(phase2), phase2[404], statuses
+
+    assert asyncio.run(run()) == (
+        {"key:200": 160, "root:200": 160}, [200, 404], 16, [200, 200, 404])
+```
+
+- The searches use supplied vectors in vector and hybrid mode, so `FakeEmbedder` is never awaited while the collection closes.
+- `gated_patch` holds a PATCH inside its write section, on a pool thread, until `stop()` is queued for the write lock (`_writers_waiting`). Every looper's next search then queues behind both writers, as in step 1 of the interleaving above.
+- The expected tuple is `(phase 1, the phase 2 statuses seen, loopers that ended on 404, [PATCH, DELETE, a search after the DELETE])`.
+
+- [ ] **Step 2: Run it to verify it fails**
+
+Run: `uv run pytest tests/test_concurrency.py -v -k racing_a_collection_delete`
+
+Expected: `1 failed`, with `At index 1 diff: [200, 500] != [200, 404]`. The 16 searches queued behind the PATCH ran after `stop()` and got 500s (`RuntimeError: collection 'x' is closed`). Phase 1 already passes: Task 1 fixed R1. The failure is deterministic: 3/3 in the sandbox.
+
+- [ ] **Step 3: Minimal implementation**
+
+In `src/raggio/store.py`, insert this class directly above `class Collection:`, followed by two blank lines:
+
+```python
+class CollectionDeletedError(Exception):
+    """A request reached a collection that DELETE /collections/{name} removed while
+    it waited; the app answers 404, as for a name that never existed (spec 3.1 B1)."""
+```
+
+In `Collection.__init__`, add two lines after the `self._closed = False` comment block, so it reads:
+
+```python
+        self._closed = False  # set by stop(); makes stale searches fail closed instead
+        # of resurrecting connections on a dead collection (leaks the handle and, on
+        # Windows, keeps the deleted collection dir undeletable)
+        self.deleted = False  # set by delete_collection before stop(); a search that
+        # then finds the collection closed raises CollectionDeletedError (404)
+```
+
+In `Collection.search`, add the check as the first statement of the read section, so its start reads:
+
+```python
+        n = max(HYBRID_DEPTH, k) if mode == "hybrid" else k  # per-leg depth so RRF sees the tail
+        async with self.lock.read():
+            if self._closed:  # queued for the read lock behind stop()'s write section
+                if self.deleted:
+                    raise CollectionDeletedError(self.cfg.name)
+                raise RuntimeError(f"collection '{self.cfg.name}' is closed")
+            if mode == "vector":
+                ids, scores = await self._vector_ids(qvec, n, scope, filt, nprobe)
+```
+
+The eviction case keeps `_rdb`'s message, so Task 5's `_CLOSED` pattern still matches it.
+
+Replace `delete_collection` (Task 2's version) with:
+
+```python
+    async def delete_collection(self, name: str) -> None:
+        # evict + catalog delete under _load_lock, like touch() and housekeeping's
+        # evictions: stop() yields, and a touch() landing there would reload the
+        # collection from the still-present row and files (a resident zombie on
+        # deleted files that would also shadow a re-created collection of the same
+        # name). Once the row is gone a racing touch() raises KeyError (404), so the
+        # rmtree can run unlocked.
+        async with self._load_lock:
+            c = self.resident.get(name)
+            if c is not None:  # its queued searches answer 404 once stop() closes it
+                c.deleted = True
+            await self._evict(name)
+            with self._catalog_lock:
+                self.catalog.execute("DELETE FROM collections WHERE name=?", (name,))
+                self.catalog.commit()
+        await asyncio.to_thread(shutil.rmtree, self._dir(name), True)
+```
+
+In `src/raggio/app.py`, change line 12 to:
+
+```python
+from .store import CollectionDeletedError, CollectionManager, _normalize, hash_key
+```
+
+and add an `except CollectionDeletedError` clause after `except ValueError` in the search endpoint (the `try` block at lines 270-280), so the block reads:
+
+```python
+        try:
+            qvec = None
+            if body.mode != "text":
+                # in hybrid mode a supplied vector skips the embedding call
+                vec = q.vector if q.vector is not None else (await c.embedder.embed([q.text]))[0]
+                qvec = _normalize(np.array([vec], dtype=np.float32))
+            hits = await c.search(body.mode, qvec, q.text, body.k, body.scope, body.filter,
+                                  body.expand, body.nprobe)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        except CollectionDeletedError:  # DELETE /collections/{name} landed first
+            raise HTTPException(404, f"collection '{c.cfg.name}' not found")
+        return {"hits": hits}
+```
+
+Map nothing else. `sqlite3` errors and the eviction `RuntimeError` keep their 500.
+
+- [ ] **Step 4: Run the new test and the full suite**
+
+Run: `uv run pytest tests/test_concurrency.py -v`. Expected: `17 passed`, in about 14 s.
+Run: `uv run pytest -q`. Expected: `63 passed, 1 warning`.
+
+Re-run Task 5's acceptance loop (Step 4 there) on the final module, in the background or as two batches of 25. Expected: `PASS=50 FAIL=0`, in about 12-15 minutes.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/raggio/store.py src/raggio/app.py tests/test_concurrency.py
+git commit -m "Answer 404 to searches racing a collection delete" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 7: ADR 0001 addendum
 
 **Files:**
 - Modify: `docs/adr/0001-performance-optimization-decisions.md` (append after line 50, the end of "## Standing constraints these decisions respect")
 
 **Interfaces:**
 - Consumes:
-  - the fixes and test names from Tasks 1-5;
-  - the Task 5 acceptance result, `PASS=50 FAIL=0`.
+  - the fixes and test names from Tasks 1-6;
+  - the acceptance result of Task 5's loop, re-run after Task 6: `PASS=50 FAIL=0`.
 - Produces:
   - the section `## Addendum 2026-09 — concurrency correctness`;
   - plans C and D append their own `## Addendum 2026-09 — <topic>` sections after it (spec D1).
@@ -1271,7 +1513,7 @@ Run the command above. Expected: it prints `0` and exits with status 1.
 
 Append this block to the end of the ADR, keeping one blank line after the last bullet of "Standing constraints". The file is UTF-8 with em dashes and `×`/`·`, so append with the editor, not a shell redirect.
 
-If the Task 5 loop result differs from 50/50, write the measured count in the stress-test row. Do not merge the plan until it reads 50/50 (§7).
+If the loop result after Task 6 differs from 50/50, write the measured count in the stress-test row. Do not merge the plan until it reads 50/50 (§7).
 
 ```markdown
 ## Addendum 2026-09 — concurrency correctness
@@ -1280,18 +1522,19 @@ Date: 2026-09-28 · Plan B of the 2026-09-28 performance program (`docs/superpow
 
 | Decision | Verdict | Evidence / rationale |
 |---|---|---|
-| Every catalog statement (reads too: `get_config`, `list_collections`, the close in `shutdown`) runs under `_catalog_lock` | **Accepted (correctness)** | `require_collection` is a sync FastAPI dependency, so `get_config` runs on threadpool threads, concurrently with each other and with the loop's catalog writes, on one pysqlite connection. A 16-thread hammer on 3.12 (item 4b brief) got 11,895 wrong rows and 1,962 `InterfaceError`s in 5 s. Over HTTP (64 concurrent requests × 20 rounds), a collection key drew 500s and spurious 401s. The key check also sometimes ran against another collection's row: in 2 of 3 sandbox runs, one or two requests to collection A were accepted with collection B's key. After the fix: the exact 401/200 split, with 0 errors. `async def require_collection` was not adopted; it would rely on every catalog caller staying on the loop, while the lock holds wherever the caller runs |
+| Every catalog statement (reads too: `get_config`, `list_collections`, the close in `shutdown`) runs under `_catalog_lock` | **Accepted (correctness)** | `require_collection` is a sync FastAPI dependency, so `get_config` runs on threadpool threads, concurrently with each other and with the loop's catalog writes, on one pysqlite connection. A 16-thread hammer on 3.12 (item 4b brief) got 11,895 wrong rows and 1,962 `InterfaceError`s in 5 s. Over HTTP at c=16 (16 concurrent requests × 80 rounds), a collection key drew 500s and spurious 401s in 16 of 16 sandbox runs (per run, of 640 each: `B:401` 26–61, `B:500` 12–49, `A:500` 11–34). The key check also ran against another collection's row: in 15 of the 16 runs, requests to collection A were accepted with collection B's key. On gn100 at 19a8a2e (probe p4, c=16), collection-key requests failed at 5.4–6.8 % on the GIL builds and 0.46 % on 3.14t: `InterfaceError` at store.py:1631, `IndexError: tuple index out of range` on `row[7]` at store.py:1639 (another statement's row came back), and silent 401s on valid keys. After the fix: the exact 401/200 split, with 0 errors, and 0×401/0×500 for collection-key searches at c=16. `async def require_collection` was not adopted; it would rely on every catalog caller staying on the loop, while the lock holds wherever the caller runs |
 | `delete_collection` evicts the collection and deletes its catalog row under `_load_lock` | **Accepted (bug fix)** | Eviction's `stop()` yields. A `touch()` that landed there reloaded the collection from the still-present row and files. The result was a resident collection on deleted files, which also shadowed a re-created collection of the same name. When the delete landed during a load, the result was a 500 (`unable to open database file`). The rmtree stays outside the lock: once the row is gone, a racing `touch()` gets a 404 |
 | `Collection.stop()` takes the write lock, then cancels the worker, syncs, and closes every connection under `db_lock` (`_close_conns`). `_rdb` re-checks `_closed` under `db_lock` before it registers a connection | **Accepted (bug fix)** | Cancelling the worker first released the write lock mid-upsert while the orphaned `to_thread` body kept running (asyncio locks don't bind threads). That body committed `indexed=1` rows the index never received, until the job's replay re-upserted them. A filtered search in that window raised turbovec `KeyError: allowlist contains id(s) not present in index`; this was seen in 1 of 50 stress runs of an interim fix that kept the cancel-first order. Closing outside `db_lock` pulled `self.db` out from under an in-flight write transaction. A read connection opened during `stop()` was never closed, which leaked a handle and, on Windows, left the directory undeletable. The worker can now be cancelled only outside its write section. Plan D2's batched-sync flush goes in the same section, before `_close_conns` |
+| A search racing `DELETE /collections/{name}` answers 404: `delete_collection` sets `Collection.deleted` before `stop()`, a search that enters the closed collection raises `CollectionDeletedError`, and the search endpoint maps that one error to 404 | **Accepted (availability, spec §3.1 B1)** | On gn100 at 19a8a2e (probe p4), searches racing `DELETE` got 171–704 500s per run on every build, with the errors of a collection working on deleted files: `unable to open database file`, `no such table`, `disk I/O error`, and an IVF `FileNotFoundError`. The `_load_lock` row removes the resurrected collection, and the `stop()` row makes a stopped collection fail closed. After those two fixes, a search queued for the read lock behind a writer (ingest, PATCH, document delete, index swap) still ran after `stop()`, because writer preference lets `stop()` go first, and got a 500 on the closed collection. Only `CollectionDeletedError` is mapped. Broad SQLite errors are never turned into 404: on a live collection they are real faults. The in-process HTTP test gives 0×401 and 0×500 for 320 searches at c=16, half with the collection key, and only 200 or 404 for 16 searches queued behind a PATCH when `DELETE` lands. The gn100 re-run of p4's race phase is journaled after merge (plan B, Task 8) |
 | `indexed_counts` is copy-on-write: writers copy, update and rebind it under `db_lock`, and readers read the attribute once | **Accepted (free-threading readiness)** | An in-place insert of a new type key races `sum(indexed_counts.values())` on reader threads under free-threading ("dictionary changed size during iteration"). With the GIL, `sum()` is one C call and can't fail, so the tests pin the discipline structurally: an identity check, a `db_lock` spy, and a source tripwire. Pre-seeding the key set (the item 4b option) was not adopted: copy-on-write also gives readers one consistent version of all counts and needs no list of types |
 | Mixed-workload stress test: 16 clients × 3 s of searches (15% cancelled mid-flight), upserts and re-upserts, metadata patches, deletes and unlocked reads, plus a `stop()` mid-storm | **Accepted (regression guard)** | Checked after quiescence: the vector index size equals the number of indexed rows, `indexed_counts` equals `GROUP BY type`, and `stop()` fails closed (only "collection is closed" or "closed database" errors) and closes every connection it opened. After the fixes above: 50/50 green runs (Windows, 3.12) plus one 60 s soak (`RAGGIO_STRESS_SECONDS=60`) |
-| Orphaned `to_thread` work from cancelled searches (stale allowlist R2, IVF id cache R2b), and the request reads that take no RW lock (`list_records`, `get_document`, job status), which fail with "closed database" 500s during an eviction | **Deferred** | R2 and R2b belong to plan F, together with `_allow_cache` and `_IvfIndex`. The unlocked reads fail closed (an error, never a wrong answer). Whether they should take the RW read lock is an open review question |
+| Orphaned `to_thread` work from cancelled searches (stale allowlist R2, IVF id cache R2b); the request reads that take no RW lock (`list_records`, `get_document`, job status), which fail with "closed database" 500s during an eviction; and the requests other than a queued search that race `DELETE /collections/{name}` | **Deferred** | R2 and R2b belong to plan F, together with `_allow_cache` and `_IvfIndex`. Probe p4 did not observe R2 over HTTP on gn100: 0 stale documents in 6 runs. The 404 row above covers only a search that reaches the read lock after `stop()`. These still answer 500: writes racing the delete (ingest, metadata PATCH, document delete, index requests); an embedding call still in flight when `stop()` closes the embedder, which fails after about 7 s of retries; the unlocked reads; and a search on a collection that an LRU or idle eviction closed, which stays a `RuntimeError` 500 and never becomes a 404, because that collection still exists. All of them fail closed (an error, never a wrong answer). Whether they should take the RW lock, or map to 404 or 503, is an open review question |
 ```
 
 - [ ] **Step 4: Run the new test and the full suite**
 
 Run the `grep -c` command from Step 1. Expected: `1`.
-Run: `uv run pytest -q`. Expected: `62 passed, 1 warning`.
+Run: `uv run pytest -q`. Expected: `63 passed, 1 warning`.
 
 - [ ] **Step 5: Commit**
 
@@ -1302,6 +1545,189 @@ git commit -m "Record the concurrency fixes in an ADR 0001 addendum" -m "Co-Auth
 
 ---
 
+### Task 8: Re-run p4's race phase on gn100 after B lands (B2)
+
+This task runs once B's PR has merged into `main`. It re-runs probe p4's race stress (`docs/superpowers/research/2026-09-28-dgx-probe-p4-freethreaded.md`, "Race stress, R1–R4") on gn100 against two images built from the repository's `Dockerfile`: `pre`, which is main just before B, and `post`, which is main with B. It is a correctness check with no performance claim. p4's run at 19a8a2e is the reference, and `pre` repeats it on the same main that B merged onto. The DGX rules of spec §6 hold throughout:
+- `ssh gn100` below stands for spec §6's access command. Spell it out in full in each command you run.
+- No sudo.
+- Nothing touches `bench-tv` or `bench-wv` (container or volume), `~/raggio` or `~/turborag`. The task works in its own `~/probe/planB-race` and runs one container at a time: p4's `probe-p4-race`.
+- No `podman rm -f`: the copied script removes `probe-p4-race` with `podman rm --ignore` instead.
+- Builds and runs are detached with `setsid -f` into a log that is polled. Nothing kills processes by a `pkill -f` pattern.
+- Nobody's DGX work is stopped or deleted without asking.
+
+**Files:**
+- Modify, after merge, on the docs branch `docs/planB-race-rerun`: `docs/superpowers/journal/2026-09-performance-program.md`. It gets a before entry and an after entry in §2 Timeline, a dated note under §5.15 and a dated note in R-B2's Status cell.
+- Outside the repo:
+  - gn100 `~/probe/planB-race/`: the two source trees, the copied scripts, `build.sh`, `logs/` and `out/race/`;
+  - two images, `localhost/raggio:planB-pre-<sha7>` and `localhost/raggio:planB-post-<sha7>`, kept and recorded in the journal;
+  - `D:/DEV/_scratch/dgx/planB-race/`: the fetched `logs/` and `out/`.
+
+**Interfaces:**
+- Consumes:
+  - p4's scripts on gn100, `~/probe/p4-freethreaded-build/scripts/` (`racestress.sh`, `racestress.py`, `srvwrap.py`), and its driver venv `~/probe/p4-freethreaded-build/drv` (httpx and numpy);
+  - p4's figures at 19a8a2e (the p4 note's "Race stress, R1–R4"; journal §4.7 and §5.15);
+  - `main` with B merged.
+- Produces:
+  - the before and after numbers per arm, rep and phase, in the journal;
+  - the §7 B verdict: 0 failures on `post`.
+
+- [ ] **Step 1: Ask for the run window**
+
+The run takes about 15 minutes: two image builds, then 4 race runs of about 65 s each (2 reps, `pre` and `post` alternating). `timeout` caps the race script at 20 minutes, and the task stays within a 30-minute window.
+
+If the executing session already holds the maintainer's go-ahead for DGX work (such as the standing "you can continue the DGX tasks too with no limits" for this program, 09-28 01:11:33Z, journal §7.7 and register W-2), cite it in the before entry, with the 30-minute cap. Otherwise send this, and run nothing on gn100 until the answer:
+
+> Plan B's race re-run needs gn100 for about 15 minutes, capped at 30. It builds two images (main before and after B), then runs p4's race stress, 2 reps per image, in its own `~/probe/planB-race` directory and `probe-p4-race` container. It does not touch `bench-tv`, `bench-wv`, `~/raggio` or `~/turborag`, and it keeps the two images. When may it run?
+
+If the maintainer declines, stop here and report Task 8 as not run.
+
+- [ ] **Step 2: Laptop checks**
+
+Run, in Git Bash from the repo root, right after B merges:
+
+```bash
+git switch main && git pull --ff-only
+POST=$(git rev-parse --short=7 HEAD)
+PRE=$(git rev-parse --short=7 HEAD^1)
+echo "pre=$PRE post=$POST"
+git diff --stat $PRE $POST -- src
+git grep -c CollectionDeletedError $POST -- src
+git grep -c CollectionDeletedError $PRE -- src || echo "none at pre"
+```
+
+Expected:
+- `pre=<sha7> post=<sha7>`, two different SHAs;
+- the diff stat lists only `src/raggio/app.py` and `src/raggio/store.py`, ending `2 files changed`;
+- `<post sha7>:src/raggio/app.py:2` and `<post sha7>:src/raggio/store.py:3`, then `none at pre`.
+
+`HEAD^1` is main before B after a merge or squash commit. After a rebase merge, set `PRE` to the parent of B's first commit. If another PR landed after B, set `POST` to B's last commit on main. Either way the three checks above must hold.
+
+- [ ] **Step 3: Read-only preflight on gn100**
+
+Run:
+
+```bash
+ssh gn100 '
+uptime; free -m
+podman ps -a --format "{{.Names}} | {{.Status}} | {{.Image}}"
+ls ~/probe/p4-freethreaded-build/scripts/racestress.sh ~/probe/p4-freethreaded-build/scripts/racestress.py ~/probe/p4-freethreaded-build/scripts/srvwrap.py
+~/probe/p4-freethreaded-build/drv/bin/python -c "import httpx, numpy" && echo "driver ok"
+ls -d ~/probe/planB-race 2>/dev/null || echo "no planB-race yet"'
+```
+
+Expected:
+- no container named `probe-p4-race`;
+- the three script paths, then `driver ok`;
+- `no planB-race yet`;
+- `free -m` showing at least 8 GB available: each run caps the server at 4 GiB.
+
+If `probe-p4-race` exists, or a bench or probe is running, it is someone's work: stop, report what you saw, and ask. Do not stop it. If p4's scripts or driver venv are gone, stop and report; restoring them is outside this task.
+
+- [ ] **Step 4: Stage the scripts, sources and images**
+
+Run, in Git Bash from the repo root, with `PRE` and `POST` from Step 2:
+
+```bash
+ssh gn100 'mkdir -p ~/probe/planB-race/logs && cd ~/probe/planB-race &&
+cp -r ~/probe/p4-freethreaded-build/scripts scripts && chmod -R a+rX scripts &&
+ln -s ~/probe/p4-freethreaded-build/drv drv &&
+sed -i -e "s#^P=~/probe/p4-freethreaded-build\$#P=~/probe/planB-race#" \
+  -e "s#podman rm -f probe-p4-race#podman rm --ignore probe-p4-race#" scripts/racestress.sh &&
+grep -c "^P=~/probe/planB-race$" scripts/racestress.sh; grep -c "rm -f" scripts/racestress.sh'
+for s in $PRE $POST; do
+  git archive $s | ssh gn100 "mkdir ~/probe/planB-race/src-$s && tar -x -C ~/probe/planB-race/src-$s"
+done
+ssh gn100 'cat > ~/probe/planB-race/build.sh' <<'EOF'
+#!/bin/bash
+# plan B race re-run: build the pre- and post-B images from their git archives
+# usage: setsid -f bash build.sh "pre=<sha7> post=<sha7>" </dev/null >logs/build.log 2>&1
+set -u
+cd ~/probe/planB-race || exit 1
+for spec in $1; do
+  arm=${spec%%=*} sha=${spec#*=}
+  echo "== BUILD $arm $sha start $(date -Is)"
+  podman build -t "localhost/raggio:planB-$arm-$sha" "src-$sha" > "logs/build-$arm.log" 2>&1
+  rc=$?
+  echo "rc=$rc $(podman image inspect "localhost/raggio:planB-$arm-$sha" --format '{{.Id}} {{.Size}}' 2>/dev/null)"
+done
+echo "== BUILD_DONE $(date -Is)"
+EOF
+ssh gn100 "cd ~/probe/planB-race && setsid -f bash build.sh 'pre=$PRE post=$POST' </dev/null >logs/build.log 2>&1"
+```
+
+Expected: `1`, then `0` (no `podman rm -f` left in the copy). Nothing else prints.
+
+Every 1-2 minutes, run `ssh gn100 'tail -n 4 ~/probe/planB-race/logs/build.log'` until the last line is `== BUILD_DONE <time>`. Expected: two `rc=0` lines, each with an image id and size. On any other `rc`, read `logs/build-<arm>.log`, stop and report.
+
+- [ ] **Step 5: Journal the before entry**
+
+Before the launch, add an entry to `docs/superpowers/journal/2026-09-performance-program.md` §2 Timeline, under the run's date heading (`### <YYYY-MM-DD>`; add the heading if it is a new day). Follow the journal's entry convention: UTC time, what happens, the alternatives, evidence with conditions and its source file, who decided, status. It says:
+- **`<HH:MM>Z. Plan B's race re-run on gn100 (DGX Spark) starts.`** B merged as `<post sha7>` onto `<pre sha7>`. The images are `localhost/raggio:planB-pre-<sha7>` and `localhost/raggio:planB-post-<sha7>`, from the repository `Dockerfile`.
+- The go-ahead used (Step 1) and the 30-minute cap.
+- The conditions: p4's scripts unchanged except the directory and `podman rm --ignore`; `--memory 4g`; `OPENBLAS_NUM_THREADS=1`; a fresh data directory per run; 45 s mixed phase; 2 reps, `pre` and `post` alternating.
+- The reference at 19a8a2e (p4): collection-key requests failed at 5.4–6.8 % on the GIL builds and 0.46 % on 3.14t; base312's mixed-phase searches got 61 and 66 401s and 33 and 47 500s; searches racing `DELETE` got 464–704 500s on base312 and 171–704 on every build; R2 and R4 were not observed. Source: [the p4 note](../research/2026-09-28-dgx-probe-p4-freethreaded.md), "Race stress, R1–R4".
+- Alternatives: none; spec §3.1 B2 prescribes this re-run.
+- The expectation (spec §7 B): 0 failures on `post`.
+- Status: running.
+
+- [ ] **Step 6: Launch the race runs and poll**
+
+Run:
+
+```bash
+ssh gn100 "cd ~/probe/planB-race && setsid -f timeout 20m bash scripts/racestress.sh 'pre=localhost/raggio:planB-pre-$PRE post=localhost/raggio:planB-post-$POST' 45 </dev/null >logs/racestress.log 2>&1; sleep 5; head -n 2 logs/racestress.log"
+```
+
+Expected: `== RACE start <time>`, usually followed by `== pre-race-r1 <time>`.
+
+Every minute, run `ssh gn100 'grep -E "^== |^!! |RUN_FAILED" ~/probe/planB-race/logs/racestress.log | tail -n 3'`. The runs go `pre-race-r1`, `post-race-r1`, `pre-race-r2`, `post-race-r2`, then `== RACE_DONE <time>`, about 5 minutes after the start. If there is no `== RACE_DONE` after 20 minutes, `timeout` has ended the script: that is a finding (a possible deadlock), not something to retry. Record it, stop the task's own container with `ssh gn100 'podman stop -t 30 probe-p4-race; podman rm --ignore probe-p4-race'`, and go to Step 7.
+
+Then fetch the logs and read the results:
+
+```bash
+mkdir -p /d/DEV/_scratch/dgx/planB-race
+ssh gn100 'cd ~/probe/planB-race && tar -c logs out' | tar -x -C /d/DEV/_scratch/dgx/planB-race
+cat /d/DEV/_scratch/dgx/planB-race/logs/racestress.log
+grep -hF "[srvwrap] python" /d/DEV/_scratch/dgx/planB-race/logs/srv/race/*.log
+```
+
+Expected, for both `post` reps (lines `[post-race-r1] …` and `[post-race-r2] …`):
+- `mixed:` has the one key `http200`: 0×401 and 0×500 on valid keys (R1), 0 transport errors;
+- `mixed-writes:` only `ingest:http202`, `delete:http200`, `delete:http404`, `patch:http200` and `patch:http404`. A 404 is a document whose 202 ingest had not landed yet;
+- `mixed-list:` only `http200`;
+- `stale-check:` only `http200`, plus possibly `late_ingest_of_404_deleted_doc(expected)`. R2 is not B's (spec §2 row 6): a `STALE_deleted200_doc_returned` or `stale_ids` above 0 is recorded for F and does not fail B;
+- `delete-under-load:` only `http200`, `http404` and `http401`: no `http500`, `RemoteProtocolError` or `ReadError`. A 401 there is a collection-key reader whose key can no longer be checked once the row is gone; R1 is judged in the mixed phase;
+- `delete_collection=200 healthz_after=200 body500=''`;
+- `state: exit=0 oomkilled=false`, and nothing after `server exceptions:`;
+- no `changed size`, `Segmentation`, `Fatal Python` or `deadlock` line (R4), and no `!! driver rc=` line.
+
+Expected, for both `pre` reps: failures like p4's base312 at 19a8a2e, that is 401s and 500s in `mixed:` and hundreds of `http500` in `delete-under-load:`. If `pre` shows none, the journal says the before arm did not reproduce; the verdict on `post` stands.
+
+The four `srvwrap` lines print the same `python=` and `sqlite=`: 3.40.1 on the Debian image while B precedes A's PR 2, or 3.53.1 if A's PR 2 (the PBS interpreter) has landed. If `pre` and `post` differ, stop: the arms are not comparable (D15).
+
+§7 B needs 0 failures only in the classes B owns: R1 in the mixed phase, 500s and dropped connections on searches racing `DELETE`, and R4. Any of those on `post` fails §7 B. An R2 stale read is journalled as a finding for F (spec §2 row 6) and does not fail B. Journal a failure with the server log excerpt, open an issue (`docs/agents/issue-tracker.md`), and do not re-tune or re-run until B is fixed.
+
+- [ ] **Step 7: Journal the after entry**
+
+Add to the journal:
+- **§2 Timeline:** `**<HH:MM>Z. Plan B's race re-run on gn100 (DGX Spark) done.**` Give per arm and rep: the `mixed:`, `mixed-writes:`, `stale-check:` and `delete-under-load:` counts; `delete_collection` and `healthz_after`; the server exceptions; the `sqlite=` version. Set them against p4's 19a8a2e figures from the before entry. State the §7 B verdict (0 failures on `post`, or the failures). State that p4 observed neither R2 (a deleted document returned stale) nor R4 (a "changed size" `RuntimeError`) and whether this run did. Name the kept images with their ids, and the source: the logs in `~/probe/planB-race/logs/` on gn100. Status: done.
+- **§5.15:** a dated note, `(Dated note, <YYYY-MM-DD HH:MM>Z: after B, …)`, with the `post` result in one or two sentences.
+- **Register R-B2:** a dated note in its Status cell pointing to the §2 entry.
+
+Keep every earlier entry as it is: the journal is append-only.
+
+- [ ] **Step 8: Commit the journal**
+
+```bash
+git switch -c docs/planB-race-rerun
+git add docs/superpowers/journal/2026-09-performance-program.md
+git commit -m "Journal plan B's race re-run on gn100" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+Expected: `1 file changed`. The PR from this branch is the maintainer's call.
+
+---
+
 ## Self-Review
 
 **Spec coverage**
@@ -1309,7 +1735,7 @@ git commit -m "Record the concurrency fixes in an ADR 0001 addendum" -m "Co-Auth
 | Spec requirement | Source | Task(s) | Pinned by |
 |---|---|---|---|
 | R1: `get_config` and `list_collections` under `_catalog_lock` | §2 order 1, §4.1, brief 4b §2 R1 | 1 | lock spy, 16-thread hammer, HTTP key check |
-| R1 is framed as a correctness/availability fix | §3 D4 | 1 (comment), 6 (ADR row) | — |
+| R1 is framed as a correctness/availability fix | §3 D4 | 1 (comment), 7 (ADR row) | — |
 | `delete_collection` takes `_load_lock` | §2, §4.1 | 2 | racing-touch test, RF3 |
 | C's off-loop construction builds on B's locking | §4.1 | 2 | RF3 (delete during an in-flight load) |
 | R3: `stop()` closes under `db_lock`, after the write-lock acquire | §4.1, brief 4b §2 R3, critic claim checks | 3 | orphaned `_finish_job`, late reader, RF1 close spy |
@@ -1317,34 +1743,42 @@ git commit -m "Record the concurrency fixes in an ADR 0001 addendum" -m "Co-Auth
 | No orphaned worker write behind a released lock (found by the stress run) | §4.3 single writer, brief 4b §8 | 3 | write-section test |
 | R4: `indexed_counts` copy-on-write; readers take one reference | §4.1, brief 4b §2 R4 | 4 | identity test, tripwire, reader audit table |
 | D moves the update after commit and keeps copy-on-write | §4.1 | 4 | RF2 (published under `db_lock`) |
-| New tests in their own module | §4.2 | 1-5 | `tests/test_concurrency.py` |
+| New tests in their own module | §4.2 | 1-6 | `tests/test_concurrency.py` |
 | Single writer; per-thread read connections | §4.3 | 1, 3 | RF4, RF5 |
-| Stress test green 50/50; no performance claim | §7 | 5 | 50-run loop |
-| ADR 0001 addendum | §3 D1 | 6 | heading check |
-| R2/R2b stay out of scope (plan F) | §4.1 | — | ADR "Deferred" row |
+| Stress test green 50/50; no performance claim | §7 | 5, re-run in 6 | 50-run loop |
+| B1: a search racing `DELETE /collections/{name}` answers 404, never 500; `app.py` changes only for the error-to-404 mapping; broad SQLite errors are never mapped | §3.1 B1, §4.1 | 6, 7 (ADR row) | HTTP delete-race test |
+| B2 (1): in-process concurrent HTTP test: 0×401 on valid collection keys and 0×500 at c=16, only 200 or 404 for searches racing `DELETE` | §3.1 B2, §7 | 1 (key check at c=16), 6 | HTTP key check, HTTP delete-race test |
+| B2 (2): p4's race phase re-run on gn100 after B lands, 0 failures, before and after journaled | §3.1 B2, §7 | 8 | the `post` arm's race log |
+| ADR 0001 addendum | §3 D1 | 7 | heading check |
+| R2/R2b stay out of scope (plan F); the other requests racing `DELETE` stay 500 | §4.1, §3.1 B1 | — | ADR "Deferred" row |
 
 **Placeholder scan:**
 - No TBD, TODO, "similar to Task N", or elided code.
 - The only `...` / `(...)` left are pytest's own truncated reprs, quoted in expected-failure lines whose exact contents vary per run.
+- In Task 8, `<sha7>`, `<time>`, `<HH:MM>`, `<YYYY-MM-DD>` and `…` stand for values that exist only at run time (SHAs, times, the logged counts), as in plan C's DGX task.
 - Every test and implementation step carries complete code.
 - Every run step names the command and the expected result.
 
 **Type and name consistency:**
-- Every test named in Review Focus and in the Step 2 lists exists in the module text of Tasks 1-5.
-- Names are spelled identically throughout: `_close_conns`, `_catalog_lock`, `_load_lock`, `db_lock`, `indexed_counts`, `lock._writing`, `RAGGIO_STRESS_SECONDS` and `RAGGIO_STRESS_CLIENTS`.
+- Every test named in Review Focus and in the Step 2 lists exists in the module text of Tasks 1-6.
+- Names are spelled identically throughout: `_close_conns`, `_catalog_lock`, `_load_lock`, `db_lock`, `indexed_counts`, `lock._writing`, `lock._writers_waiting`, `CollectionDeletedError`, `Collection.deleted`, `RAGGIO_STRESS_SECONDS` and `RAGGIO_STRESS_CLIENTS`.
+- The Task 8 names match p4's scripts: `racestress.sh`, `racestress.py`, `srvwrap.py`, the `probe-p4-race` container, the phase keys `mixed`, `mixed-writes`, `mixed-list`, `stale-check` and `delete-under-load`, and the `pre-race-r1` style labels.
 - `make_collection` builds `CollectionConfig("t", DIM, 4, None, None, None)`, which fills its six required fields (`name, dim, bit_width, model, base_url, key_hash`).
-- The module totals 16 tests (4 + 2 + 5 + 3 + 2), which with 46 existing gives 62.
+- The module totals 17 tests (4 + 2 + 5 + 3 + 2 + 1), which with 46 existing gives 63.
 
 **Validated in a sandbox:** an archive of `main` @ 19a8a2e, with the tasks applied cumulatively.
 - Each task's new tests fail with the messages quoted in its Step 2, and pass after its Step 3.
-- The full suite gives 50 / 52 / 57 / 60 / 62 passed.
-- The module was green 50/50: two parallel batches of 25, which is harder than sequential runs because they compete for CPU.
+- The full suite gives 50 / 52 / 57 / 60 / 62 / 63 passed.
+- Task 1's key check at c=16 failed 16/16 on base, and passed in every run with Task 1 applied.
+- Task 6's test failed 3/3 on the Task 5 code with `[200, 500] != [200, 404]`, and the 500 was `RuntimeError: collection 'x' is closed` from `_rdb`. It passed 3/3 after Task 6's Step 3.
+- The Task 5 module was green 50/50: two parallel batches of 25, which is harder than sequential runs because they compete for CPU. The final module, with Task 6 (17 tests), was green 50/50 again in sequential runs: `PASS=50 FAIL=0` in 743 s. A verifier's 12 further sequential runs gave `PASS=12 FAIL=0`.
 - One 60 s soak passed.
 - Both planted bugs in Task 5 fail as quoted.
 - The ADR addendum appends cleanly (UTF-8, 4 pipes per table row).
 
 **Not validated in the sandbox, and why:**
-- Only Windows 11 / CPython 3.12 was run. There is no Linux or aarch64 run (no DGX task, by design) and no CI run (A creates CI). The timing gates (0.05-0.1 s sleeps, 5 s event waits) are generous but were tuned on one machine.
+- Only Windows 11 / CPython 3.12 was run. There is no Linux or aarch64 run of the suite and no CI run (A creates CI).
+- Task 8 was not run: it needs B merged. Its commands reuse p4's scripts, which ran on gn100 at 19a8a2e; the copy, the two `sed` edits, `build.sh` and the expected lines were checked against those scripts, not executed. The timing gates (0.05-0.1 s sleeps, 5 s event waits) are generous but were tuned on one machine.
 - Free-threaded 3.14t behaviour of R4 is plan G's suite run.
 - The commit steps were not executed verbatim: the sandbox committed with scratch messages.
-- The HTTP key-check RED is probabilistic. It failed 3/3 in the sandbox, with a different Counter each time.
+- The HTTP key-check RED is probabilistic. It failed 16/16 at c=16 in the sandbox, with a different Counter each time.

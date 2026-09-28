@@ -99,7 +99,7 @@ The following are harness and repository rules:
 - DGX access is only through `ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100`.
 - On the DGX: never touch `~/turborag` (read-only use of its corpus symlink target, as §6 prescribes, is allowed), and no `sudo`.
 - Line numbers are those of base 19a8a2e. After A and B they shift, so every Modify step names the function and quotes the exact text it replaces.
-- **Suite count.** Before Task 1, run `uv run pytest -q` on the branch base and record the pass count as `N0`. After Plans A and B it is 175 (`175 passed, 1 warning`: A's 159 plus B's 16, per Plan A's suite-count note), so after Task 9 it is 239. Each task states its expected total as `N0 + k`; the one Starlette deprecation warning stays throughout.
+- **Suite count.** Before Task 1, run `uv run pytest -q` on the branch base and record the pass count as `N0`. After Plans A and B it is 188 (`188 passed, 1 warning`: A's 162+9 = 171 plus B's 17, per Plan A's suite-count note), so after Task 9 it is 252. Each task states its expected total as `N0 + k`; the one Starlette deprecation warning stays throughout.
 - Every commit ends with `-m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"`.
 
 ## Review Focus
@@ -171,7 +171,7 @@ These are the five input classes or failure modes most likely to slip through. E
 
 - [ ] **Step 0: Record the suite baseline**
 
-Run: `uv run pytest -q`. Write down the pass count as `N0`; every later task states its expected total relative to it. (After Plans A and B it is `175 passed, 1 warning`. If it differs, record what you see: only the relative `N0 + k` counts matter.)
+Run: `uv run pytest -q`. Write down the pass count as `N0`; every later task states its expected total relative to it. (After Plans A and B it is `188 passed, 1 warning`. If it differs, record what you see: only the relative `N0 + k` counts matter.)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1212,7 +1212,7 @@ with
         self.resident[name] = c
 ```
 
-The fast path reads `resident` without the lock. That is safe because `_evict` pops the entry synchronously before its first `await`, so a collection that is being evicted or deleted (B's `delete_collection` holds `_load_lock`) is never returned from the dict. A caller that took the reference just before the pop sees the same `closed` error it could already get on main after `touch()` returned.
+The fast path reads `resident` without the lock. That is safe because `_evict` pops the entry synchronously before its first `await`, so a collection that is being evicted or deleted (B's `delete_collection` holds `_load_lock`) is never returned from the dict. A caller that took the reference just before the pop of an eviction sees the `closed` error it could already get on main after `touch()` returned. If the pop was B's `delete_collection`, a search gets B's 404 `collection '<name>' not found` (`CollectionDeletedError`, plan B Task 6, spec 3.1 B1) instead of a 500.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -2801,11 +2801,11 @@ def check_probe(tmp):
 
 def synthetic(hwm=3646, pinned=True):
     """Rows shaped like c_session.sh's, with p1's values: all ten lines pass."""
-    lab = {"sqlite_version": "3.50.4", "openblas_num_threads": "1",
+    lab = {"sqlite_version": "3.53.1", "openblas_num_threads": "1",
            "image": "localhost/raggio:0000000"}
     rows = [
         {"kind": "session", "label": "check", "date": "2026-09-28T00:00:00Z",
-         "image_id": "sha256:" + "0" * 64, "python": "3.12.11", "turbovec": "1.0.0"},
+         "image_id": "sha256:" + "0" * 64, "python": "3.12.14", "turbovec": "1.0.0"},
         {"kind": "migrate", "regime": "true-cold", "cap": "4g", "create_s": 40.8,
          "first_migration": True, "growth_mb": 96.0, "covering_mb": 96.1, "freelist_mb": 86.0},
         {"kind": "migrate", "regime": "host-warm", "cap": "4g", "create_s": 1.7,

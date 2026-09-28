@@ -4,7 +4,7 @@
 
 **Goal:** Make raggio's ingest path fast and failure-safe without any API change.
 - **D1:** a binary side-table job journal; payload encode/decode, flattening and matrix building off the event loop; a set-based upsert that rolls back cleanly and publishes `indexed_counts` after commit; a bounded vacuum policy; and `bench/ingest_probe.py`.
-- **D2:** a batched index sync that closes on N jobs, T ms, an idle queue, an index-job barrier or `stop()`. It has done-after-sync semantics, a claim cursor, a removal cap, retry on sync failure, and a flush in `stop()`.
+- **D2:** a batched index sync that closes on N jobs, T ms, an idle queue, an index-job barrier or `stop()`. It has done-after-sync semantics, a claim cursor, a removal cap, retry on sync failure, and a flush in `stop()`. If that flush's sync fails, `stop()` logs it, finishes no job and still completes the shutdown without raising (spec §3.1 D2). A dead worker's exception and a finish that fails after that sync landed are logged the same way (spec §3.1 D3). A failure in any of `stop()`'s three close steps (the SQLite connections, the embedder's HTTP client, F's shard pool) is logged too, and the steps after it still run (spec §3.1 D4). `stop()` therefore never raises an `Exception` from its worker, its final sync, a finish or a close step, and `shutdown()` reaches every collection and the catalog. `CancelledError` and other `BaseException`s that are not `Exception`s still propagate.
 
 Working notes for this plan: outline `D:/DEV/_scratch/plan-d/outline.md`, rationale `D:/DEV/_scratch/plan-d/design.md`.
 
@@ -31,9 +31,9 @@ Research: `docs/superpowers/research/2026-09-28-item2a-ingest-path.md` (primary)
 - D2: branch `ingest-path-d2`, base = `main` after D1, E and F. Tasks 7-10. D2 re-derives D1's code from D1's commits and anchors every edit on quoted text, never on line numbers.
 
 **Suite counts (N0):**
-- **N0** is the full-suite pass count of `uv run pytest -q` on D1's branch base, that is, after Plan C. Expected: `240 passed, 1 warning`. That is Plan A's 159 + Plan B's 16 = 175, plus Plan C's 65 (its Task 12 DGX acceptance test is the 65th). It is 239 if C's Task 12 test did not land.
-- The count also assumes Git Bash on the host (Plan A's 14 `needs_bash` tests skip without it) and `uv sync --group bench` (tests that import `bench.py` `importorskip("orjson")`).
-- Record N0 on the branch base before Task 1. Do not hard-code 240. Every D1 task states its expected total as `N0 + k`.
+- **N0** is the full-suite pass count of `uv run pytest -q` on D1's branch base, that is, after Plan C. Expected: `253 passed, 1 warning`. That is Plan A's 162+9 = 171 + Plan B's 17 = 188, plus Plan C's 65 (its Task 12 DGX acceptance test is the 65th). It is 252 if C's Task 12 test did not land.
+- The count also assumes Git Bash on the host (Plan A's 21 `needs_bash` tests, 14 from its Task 3, 6 from its Task 4 and 1 from its Task 5, skip without it) and `uv sync --group bench` (tests that import `bench.py` `importorskip("orjson")`).
+- Record N0 on the branch base before Task 1. Do not hard-code 253. Every D1 task states its expected total as `N0 + k`.
 - **N0'** is the same count re-recorded on D2's branch base (after D1, E and F) before Task 7. Every D2 task states `N0' + k`.
 - The one pre-existing Starlette deprecation warning stays throughout.
 
@@ -49,6 +49,10 @@ Spec, quoted verbatim:
 - §4.1, `Collection.stop()`: "D2 adds its sync flush inside that same critical section, before the connections close." That is after the worker cancel and before `_closed = True` / `_close_conns`; F's `_shard_pool.close` stays last, outside the lock.
 - §4.1, `indexed_counts`: "D moves the update after commit, keeping copy-on-write."
 - §3 D8: "A job stays `processing`, payload kept, until the index sync covering it lands. Batches are bounded by N jobs or T ms. Flush in `stop()`. Crashes recover through the existing replay."
+- §3.1 D1: "The seed-7 tuning may change the `SYNC_BATCH_JOBS=8` / `SYNC_BATCH_MS=1000` defaults. Seed 42 confirms the chosen values, and the PR states them." Task 10 Step 10 moves them, the publish runs at them, and Step 19's report states them for the PR.
+- §3.1 D2: "If the final sync in `stop()` fails, it is logged and shutdown completes. The jobs stay `processing` with their payloads kept, and the startup replay recovers them (D8). Nothing is raised." Task 9 catches that `Exception` inside `_sync_and_finish`, so `stop()` keeps its order (`lock.write()`, worker cancel, sync, `_closed = True`, `_close_conns` under `db_lock`, then the embedder's `aclose()` and F's `_shard_pool.close`) and differs from B and F only by that swapped line, D3's `except Exception` clause and D4's `close_step` wrapping (next two bullets). `CancelledError` and `KeyboardInterrupt` still propagate.
+- §3.1 D3: "Follow-up to D2: `stop()` never raises, so shutdown always completes and closes every collection. Two more errors are logged and not raised: a dead worker's exception, and a failure to finish jobs after the final sync succeeded. In both cases the affected jobs stay `processing` and the startup replay (D8) recovers them." Task 9 logs the dead worker's exception in an `except Exception` clause on `stop()`'s await of the worker, and a failed finish inside `_sync_and_finish`, both through `_log.exception` with the D2 path's `(name, jobs)` args. `stop()` keeps the close order above. Only `Exception` is caught.
+- §3.1 D4: "Follow-up to D3: every close step in `stop()` logs its own `Exception` and moves on to the next. This covers the embedder's HTTP client, the SQLite connections (`_close_conns`) and F's shard pool. So `shutdown()` always reaches every collection and the catalog, and each failure is an ERROR log with its traceback. `CancelledError` and other `BaseException`s are still not caught." Task 9 awaits each of the three steps through `close_step`, a helper local to `stop()` that logs an `Exception` through `_log.exception` with the args `(collection name, step)` and returns. The order stays B's and F's: `_closed = True`, then `_close_conns` (under `db_lock`, inside `lock.write()`), then the embedder's `aclose()`, then F's `_shard_pool.close`, last and outside the lock.
 - §4.2: "Deployment knobs: unprefixed environment variables read in `raggio.config.Settings`, following the existing style, and passed down through `CollectionManager` into `Collection`. Algorithm constants stay module-level in `store.py`, where tests monkeypatch them." D2 adds the knobs `SYNC_BATCH_JOBS` (default 8) and `SYNC_BATCH_MS` (default 1000). The constants `VACUUM_FREELIST_PAGES`, `VACUUM_CHUNK_PAGES`, `SYNC_MAX_REMOVALS`, `SYNC_RETRY_MIN_S` and `SYNC_RETRY_MAX_S` stay module-level in `store.py`.
 - §6: "Any DGX run over about 5 minutes needs the user's explicit go-ahead in the session, with a time cap." / "Tunables (pool size, batch N/T, candidate depth) are chosen on an independent sample (seed 7 ...) and published on seed 42." / "Never pass `--reingest` except in an ingest-measurement run, which comes last because it rewrites and compacts files."
 - §7: "D: ingest vec/s beyond the noise band on the IVF and flat paths, and no lost or unsynced job under the crash/replay tests." D1 compares against `main` after C; D2 against `main` after D1, E and F (the re-baselined preceding main). D1's gates need `better` on both the flat and the IVF probe. D2's gates need `better` on IVF, but only `better` or `within band` on flat and on the bench reingest. The reason is item2a: a flat append-only sync is 7-9 ms, 2-5% of a job, so batching has almost nothing to save there. This reading of §7 for D2 is flagged for the user in the Self-Review.
@@ -97,7 +101,10 @@ Five failure modes, most damaging first. Each is pinned by a test in the task th
    - Pins: `test_mixed_legacy_and_binary_queue_in_order` (Task 2), plus the base `test_persistence_and_crash_replay` left unchanged.
 4. **RF4: `stop()` loses the open batch or flushes outside B's critical section.**
    - Implied by §4.1 (`Collection.stop()` row) and §3 D8 ("Flush in `stop()`"). The flush must sync and finish the open batch inside `lock.write()`, after the worker cancel and before `_close_conns`.
-   - Pins: `test_stop_flushes_the_open_batch` (Task 9), plus B's `test_stop_closes_connections_inside_the_write_lock_and_under_db_lock` (Plan B, Task 3), which stays green.
+   - Spec §3.1 D2: if that sync fails, `stop()` logs it, finishes no job and still closes the collection without raising. The batch's jobs keep `'processing'` and their payloads, and the next open replays them.
+   - Spec §3.1 D3: a dead worker's exception and a finish that fails after the sync landed are logged the same way, `stop()` still closes, and the jobs left unfinished replay on the next open.
+   - Spec §3.1 D4: each close step (the SQLite connections, the embedder's HTTP client, F's shard pool) logs its own `Exception` with its traceback, and the steps after it still run. With D2 and D3, no `Exception` from the worker, the final sync, a finish or a close step leaves `stop()`, so `shutdown()` reaches every collection and the catalog. `CancelledError` and other non-`Exception` `BaseException`s still propagate.
+   - Pins: `test_stop_flushes_the_open_batch`, `test_stop_with_a_failing_sync_logs_it_and_still_closes`, `test_a_failed_stop_sync_replays_on_the_next_open`, `test_stop_logs_a_dead_workers_exception_and_still_closes`, `test_a_failed_finish_in_stop_is_logged_and_replays`, `test_a_failing_embedder_close_is_logged_and_stop_goes_on`, `test_a_failing_close_conns_is_logged_and_the_later_steps_run`, `test_a_failing_shard_pool_close_is_logged` and `test_shutdown_closes_every_collection_after_a_failed_stop` (Task 9), plus B's `test_stop_closes_connections_inside_the_write_lock_and_under_db_lock` (Plan B, Task 3), which stays green.
 5. **RF5: one sync carries removals from several jobs past the full-rewrite cliff.**
    - Implied by item2a: turbovec full-rewrites the index file once a header holds more than 1024 ops, which is extrapolated at about 20 s under `lock.write` at 2.55M rows.
    - Pin: `test_removal_cap_syncs_before_crossing_the_cap` (Task 7). No sync may carry more than `SYNC_MAX_REMOVALS = 512` removals accumulated across jobs. The check runs before `_unindex`: if the counter is non-zero and adding this job's replaced rows would pass the cap, sync first. A single job that alone exceeds the cap is not split, as at base.
@@ -114,7 +121,7 @@ Five failure modes, most damaging first. Each is pinned by a test in the task th
 - `src/raggio/store.py` (modify), D2:
   - Task 7: `SYNC_MAX_REMOVALS = 512`. `Collection.__init__` gains `sync_batch_jobs: int = 8, sync_batch_ms: float = 1000.0` after `ivf_search_threads`, and `CollectionManager._construct` passes both. Also `_CLAIM_SQL` gains `INDEXED BY idx_jobs_open` and `AND id > ?`, `_claim_next(after=0)`, `_process_job(payload, *, sync=True)`, and `Collection._removed_since_sync`, counted in `_unindex` and reset in `_sync_index`.
   - Task 8: `Collection._unsynced` and `_batch_t0`; a `_run_worker` rewrite with a local claim cursor; a new `_flush_unsynced`.
-  - Task 9: `SYNC_RETRY_MIN_S = 1.0` and `SYNC_RETRY_MAX_S = 30.0`; retry with doubling backoff in `_flush_unsynced`; a new `_sync_and_finish`. In `stop()`, only the `_sync_index` line is swapped.
+  - Task 9: `SYNC_RETRY_MIN_S = 1.0` and `SYNC_RETRY_MAX_S = 30.0`; retry with doubling backoff in `_flush_unsynced`; a new `_sync_and_finish`, which logs a failed sync and returns without finishing any job, so `stop()` still closes (spec §3.1 D2), and logs a finish that fails after the sync landed the same way (spec §3.1 D3). In `stop()`, the `_sync_index` line is swapped, the worker await gains an `except Exception` clause that logs a dead worker's exception (spec §3.1 D3), and the three close steps run through a local `close_step` helper that logs each one's `Exception` and goes on (spec §3.1 D4).
 - `src/raggio/config.py` (modify, Task 7): `Settings.sync_batch_jobs` (`SYNC_BATCH_JOBS`, default 8) and `Settings.sync_batch_ms` (`SYNC_BATCH_MS`, default 1000), appended after F's `ivf_search_threads` line. `ValueError` if jobs < 1 or ms < 0.
 - `tests/test_ingest_path.py` (create in Task 1, append in every later task): the shared helpers `make_collection`, `vec`, `docs_payload` and `drain` sit at the top, then one `# ---- <topic>` section per task, in task order.
 - `bench/ingest_probe.py` (create in Task 5; Task 7 adds `--batch-jobs` / `--batch-ms`): an in-process drain benchmark for flat and IVF ingest that also runs in the base tree.
@@ -127,7 +134,7 @@ Five failure modes, most damaging first. Each is pinned by a test in the task th
 
 ## Phase D1 (branch `ingest-path-d1`, base = `main` after Plans A, B and C)
 
-Before Task 1: `git switch main && git pull && git switch -c ingest-path-d1`, then run `uv run pytest -q` and write down the pass count as **N0** (expected `240 passed, 1 warning`; see "Suite counts" above).
+Before Task 1: `git switch main && git pull && git switch -c ingest-path-d1`, then run `uv run pytest -q` and write down the pass count as **N0** (expected `253 passed, 1 warning`; see "Suite counts" above).
 
 ### Task 1: Binary payload codec and job_payloads table
 
@@ -553,7 +560,7 @@ Expected: `8 passed`.
 
 Run: `uv run pytest -q`
 
-Expected: `N0 + 8 passed, 1 warning` (`248 passed, 1 warning` when N0 is 240). No existing test changes: nothing calls the codec yet, and the new table only adds a `sqlite_master` row. These must stay green:
+Expected: `N0 + 8 passed, 1 warning` (`261 passed, 1 warning` when N0 is 253). No existing test changes: nothing calls the codec yet, and the new table only adds a `sqlite_master` row. These must stay green:
 - `test_fresh_meta_db_has_incremental_autovacuum` (the pragma order in `open_meta_db` is untouched);
 - Plan C's `test_fresh_meta_db_has_the_covering_and_partial_indexes` and `test_open_job_queries_use_the_partial_index`;
 - Plan A's `test_orjson_is_a_bench_only_dependency` (the codec uses `json` and `struct` only).
@@ -1157,7 +1164,7 @@ Expected: all pass, with the same counts as on the branch base. In particular:
 
 Run: `uv run pytest -q`
 
-Expected: `N0 + 17 passed, 1 warning` (`257 passed, 1 warning` when N0 is 240). No existing test changes. Plan A's `test_orjson_is_a_bench_only_dependency` stays green: no new import, and the word does not appear in `store.py`.
+Expected: `N0 + 17 passed, 1 warning` (`270 passed, 1 warning` when N0 is 253). No existing test changes. Plan A's `test_orjson_is_a_bench_only_dependency` stays green: no new import, and the word does not appear in `store.py`.
 
 - [ ] **Step 6: Commit**
 
@@ -1750,7 +1757,7 @@ Expected: all pass, with the same counts as on the branch base. In particular:
 
 Run: `uv run pytest -q`
 
-Expected: `N0 + 22 passed, 1 warning` (`262 passed, 1 warning` when N0 is 240). No existing test changes.
+Expected: `N0 + 22 passed, 1 warning` (`275 passed, 1 warning` when N0 is 253). No existing test changes.
 
 - [ ] **Step 6: Commit**
 
@@ -2015,7 +2022,7 @@ Expected: all pass, with the same counts as on the branch base. In particular:
 
 Run: `uv run pytest -q`
 
-Expected: `N0 + 24 passed, 1 warning` (`264 passed, 1 warning` when N0 is 240). No existing test changes.
+Expected: `N0 + 24 passed, 1 warning` (`277 passed, 1 warning` when N0 is 253). No existing test changes.
 
 - [ ] **Step 6: Commit**
 
@@ -2492,7 +2499,7 @@ Expected: exit status 2 with `error: 1 re-upsert jobs of 20 rows need --prefill 
 
 Run: `uv run pytest -q`
 
-Expected: `N0 + 27 passed, 1 warning` (`267 passed, 1 warning` when N0 is 240). No existing test changes. pytest does not collect `bench/ingest_probe.py`, because its name does not match `test_*.py`.
+Expected: `N0 + 27 passed, 1 warning` (`280 passed, 1 warning` when N0 is 253). No existing test changes. pytest does not collect `bench/ingest_probe.py`, because its name does not match `test_*.py`.
 
 - [ ] **Step 6: Commit**
 
@@ -2607,7 +2614,7 @@ Pending: the gn100 A/B of Plan D Task 6 has not run yet.
 Check that Plan C's ADR test still passes, since its section now ends at this new `## ` heading:
 
 Run: `uv run pytest tests/test_cold_start.py -v -k acceptance_run`
-Expected: `1 passed, 64 deselected`. If Plan C's Task 12 test did not land (N0 = 239), this prints `64 deselected` with no test run; that is fine.
+Expected: `1 passed, 64 deselected`. If Plan C's Task 12 test did not land (N0 = 252), this prints `64 deselected` with no test run; that is fine.
 
 Run: `uv run pytest -q`
 Expected: `N0 + 27 passed, 1 warning`. This step adds no test.
@@ -3502,7 +3509,7 @@ Expected: `1 passed, 64 deselected`, unchanged from Step 2. Plan C's section sti
 - [ ] **Step 16: Run the full suite**
 
 Run: `uv run pytest -q`
-Expected: `N0 + 28 passed, 1 warning` (`268 passed, 1 warning` when N0 is 240). Only this task's test is new.
+Expected: `N0 + 28 passed, 1 warning` (`281 passed, 1 warning` when N0 is 253). Only this task's test is new.
 
 - [ ] **Step 17: Commit, then report to the user**
 
@@ -4250,7 +4257,7 @@ Goal: the worker defers the index sync over a batch of jobs and finishes each jo
   - Plan F: `_IvfIndex.dirty_shards -> frozenset[int]` and `_IvfIndex.sync(directory) -> int`, which writes each dirty shard through `shard.sync(str(path))`. Only the IVF test uses them, and it skips without Plan F.
   - Test helpers `make_collection`, `docs_payload`, `vec`, `drain`.
 - Produces:
-  - `Collection._unsynced: list[tuple[int, str, str | None]]`: the open batch, one `(job_id, status, error)` per job processed and not yet finished. Task 9's `stop()` finishes it.
+  - `Collection._unsynced: list[tuple[int, str, str | None]]`: the open batch, one `(job_id, status, error)` per job processed and not yet finished. Task 9's `stop()` finishes it once its own sync lands. It leaves the whole batch `'processing'` for the replay if that sync fails (spec §3.1 D2), and the failing job and every job after it if a finish fails (spec §3.1 D3).
   - `Collection._batch_t0: float | None`: the `time.monotonic()` at which the open batch's first job joined, or `None` when no batch is open.
   - `async Collection._flush_unsynced(self) -> None`: one `_sync_index` under `lock.write()`, then each queued job's `_finish_job`, popped before its await. Task 9 adds the retry loop to it.
   - `Collection._run_worker(self) -> None`: batched. Ingest jobs run through `_process_job(payload, sync=False)`, and index jobs through `_process_job(payload)`.
@@ -4796,7 +4803,7 @@ Expected: `12 failed, 38 passed` (`12 failed, 37 passed` if Task 6's gate test n
 - `test_index_jobs_are_batch_barriers`: differs at index 0, `('sync', ['d101']) != ('job', 'd101')`.
 - `test_calibration_crossing_inside_one_batch_matches_per_job`: `assert (5, 5) == (5, 1)`.
 - `test_crash_window_replays_without_loss[mid_batch]`, `[before_sync]` and `[after_sync_before_finish]`: `AssertionError: the mid_batch crash point never occurred` (likewise `before_sync`, `after_sync_before_finish`).
-- `test_batched_ivf_sync_writes_each_dirty_shard_once`: `assert 4 == 1`, with `where 4 = len([...])`. On a tree without Plan F it is skipped instead: `11 failed, 1 skipped, 38 passed`.
+- `test_batched_ivf_sync_writes_each_dirty_shard_once`: `assert 4 == 1`, with `where 4 = len([...])`. On a tree without Plan F it is skipped instead: `11 failed, 38 passed, 1 skipped`.
 
 - [ ] **Step 3: Implement the batched worker**
 
@@ -5002,17 +5009,22 @@ EOF
 
 Goal: a failing index sync never finishes a job and never ends the worker, and `stop()` finishes the open batch (spec §3 D8: "Flush in `stop()`"; §4.1 `Collection.stop()` row).
 - `_flush_unsynced` retries a sync that raises. It waits `SYNC_RETRY_MIN_S`, then twice as long after each failure, up to `SYNC_RETRY_MAX_S`, and logs each failure. The batch's jobs stay `'processing'` meanwhile, and the worker claims nothing new. The wait runs outside the write lock, so searches, deletes and `stop()` are not held up.
-- `stop()` swaps its one `_sync_index` line for `_sync_and_finish`: the same sync, then the open batch's finishes, in the same write-locked section, after the worker cancel and before `_close_conns`. Nothing else in `stop()` moves. F's `_shard_pool.close` stays last, outside the lock.
-- If `stop()`'s own sync raises, nothing is finished, and the exception leaves `stop()` as it does at B. The batch's jobs stay `'processing'` and replay on the next open.
+- `stop()` swaps its one `_sync_index` line for `_sync_and_finish`: the same sync, then the open batch's finishes, in the same write-locked section, after the worker cancel and before `_close_conns`. The other changes to `stop()` are an `except Exception` clause on its await of the worker (spec §3.1 D3, below) and a local `close_step` helper that its three close steps run through (spec §3.1 D4, below). Nothing in `stop()` moves. F's `_shard_pool.close` stays last, outside the lock.
+- If `stop()`'s own sync raises an `Exception`, `_sync_and_finish` logs it once through `_log.exception`, finishes nothing and returns, so `stop()` still sets `_closed` and runs its three close steps, and the failed sync does not leave `stop()` (spec §3.1 D2). The batch's jobs stay `'processing'` with their payloads and replay on the next open (spec D8). `CancelledError` and `KeyboardInterrupt` are not `Exception`s, so they still propagate. At B, the exception left `stop()` before the connections closed.
+- Two more errors no longer leave `stop()` (spec §3.1 D3). They go through `_log.exception` in the D2 path's style, with `(collection name, jobs in the batch)` as the args, and `stop()` still sets `_closed` and runs its three close steps:
+  - a dead worker's exception, which B's `stop()` re-raised at `await self._worker`. `stop()` then flushes the open batch as usual. A job the worker held when it died (popped for a finish that raised) stays `'processing'` with its payload and replays, unless that finish left its transaction open (Step 3, "Why this shape");
+  - a `_finish_job` that raises in `_sync_and_finish` after the sync landed. No later job is tried: the failing job and the rest of the batch stay `'processing'` with their payloads, and the replay re-applies their rows, which rewrites the same rows.
+- Each close step logs its own `Exception` and moves on to the next (spec §3.1 D4). The steps are `_close_conns` (the SQLite connections, under `db_lock`, still inside `lock.write()`), the embedder's `aclose()` (its HTTP client) and F's `_shard_pool.close`, in that order, all after `_closed = True`. Each runs through `close_step`, a helper local to `stop()`, which logs through `_log.exception` with `(collection name, step)` as the args, so each failure is one ERROR record with its traceback. At B and F, a close step that raised left `stop()` and skipped every later step, and `shutdown()` then left every later collection and the catalog open.
+- Only `Exception` is caught: D3 and D4 add no handler for `CancelledError` or any other `BaseException`.
 - Task 7's removal-cap pre-sync inside `_process_job` runs after the job's commit and before its removals and adds. Until now a failure there raised out of the job, which then ended `'error'` with committed rows the index never got, and it never replayed. Task 9 logs that failure and lets the job go on; the batch's own sync, with its retry, writes everything.
 
 **Files:**
 - Modify `src/raggio/store.py` (base 19a8a2e line numbers, orientation only; anchor on the quoted text):
   - module constants `SYNC_RETRY_MIN_S = 1.0` and `SYNC_RETRY_MAX_S = 30.0`, directly below Task 7's `SYNC_MAX_REMOVALS = 512`;
   - `Collection._flush_unsynced` (Task 8's text, between `_run_worker`, base line 723, and `_process_job`, base line 742): rewritten with the retry loop. The new `Collection._sync_and_finish` goes directly below it;
-  - `Collection.stop()` (base lines 655-668, as Plans B and F left it): the single line `await asyncio.to_thread(self._sync_index)` becomes `await asyncio.to_thread(self._sync_and_finish)`;
+  - `Collection.stop()` (base lines 655-668, as Plans B and F left it), replaced whole: the single line `await asyncio.to_thread(self._sync_index)` becomes `await asyncio.to_thread(self._sync_and_finish)`, the worker await's `except asyncio.CancelledError:` clause gets an `except Exception:` sibling that logs (spec §3.1 D3), and a local `close_step` helper at its head wraps the three close steps, `_close_conns`, the embedder's `aclose()` and F's `_shard_pool.close` (spec §3.1 D4);
   - `Collection._process_job` (base lines 742-803): Task 7's removal-cap pre-sync gets a `try` / `except Exception` that logs and goes on.
-- Modify `tests/test_ingest_path.py`: one import-block edit (`logging`), then the section `# ---- batched sync: failure and shutdown` appended at the end (4 helpers, 4 tests).
+- Modify `tests/test_ingest_path.py`: one import-block edit (`logging`), then the section `# ---- batched sync: failure and shutdown` appended at the end (10 helpers, 12 tests).
 - Test: `uv run pytest tests/test_ingest_path.py -v`.
 
 **Interfaces:**
@@ -5020,15 +5032,19 @@ Goal: a failing index sync never finishes a job and never ends the worker, and `
   - Task 8: `Collection._unsynced: list[tuple[int, str, str | None]]`, `Collection._batch_t0: float | None`, and `async Collection._flush_unsynced(self) -> None`, whose sync runs under `lock.write()` and whose finishes pop each job before their await. Test helpers `fingerprint(col)`, `reference(tmp_path, payloads, **kw)` and `run_batched(col, payloads, timeout=30)`.
   - Task 7: `Collection(..., sync_batch_jobs: int = 8, sync_batch_ms: float = 1000.0)`, and `_process_job(self, payload: dict, *, sync: bool = True)`, which the worker calls with `sync=False`. `SYNC_MAX_REMOVALS` and the removal-cap pre-sync. `_sync_index` resets `_removed_since_sync` only after a sync that returns.
   - Task 4: `_finish_job(self, job_id, status, error)`, which takes `db_lock` itself and runs the vacuum policy.
+  - Task 2: `_finish_job` deletes a job's `job_payloads` row only when the job finishes `done`, so an unfinished job keeps its payload for the replay.
   - Plan C: `_log = logging.getLogger("uvicorn.error")` in `store.py`.
-  - Plan B: `stop()`'s write-locked section (cancel the worker, sync, `_closed = True`, `_close_conns()` under `db_lock`), and its tests `test_stop_waits_for_a_write_transaction_its_cancelled_worker_left_running` and `test_stop_closes_connections_inside_the_write_lock_and_under_db_lock`.
-  - Plan F: `stop()` ends with `await asyncio.to_thread(self._shard_pool.close)`; `_IvfIndex.sync` leaves a shard whose write failed dirty, so a retry writes it again, and a clean index syncs nothing (`test_reload_then_stop_writes_no_shards`).
+  - Plan B: `stop()`'s write-locked section (cancel the worker, sync, `_closed = True`, `_close_conns()` under `db_lock`), and its tests `test_stop_waits_for_a_write_transaction_its_cancelled_worker_left_running` and `test_stop_closes_connections_inside_the_write_lock_and_under_db_lock`. `_close_conns()` closes `self.db` and every read connection in `_read_conns`, and leaves `_read_conns` empty.
+  - Base: `Collection._embedder`, `None` until the first `embedder` access, and `Embedder.aclose()`, which closes its `httpx.AsyncClient`. `stop()` awaits it only when `_embedder` is not `None`, after the write-locked section.
+  - Plan F: `stop()` ends with `await asyncio.to_thread(self._shard_pool.close)`, and `_ShardPool.close()` sets `_ShardPool._closed = True` under the pool's lock before it joins the pool's threads; `_IvfIndex.sync` leaves a shard whose write failed dirty, so a retry writes it again, and a clean index syncs nothing (`test_reload_then_stop_writes_no_shards`).
+  - Plan B: `CollectionManager.shutdown()` evicts the resident collections in insertion order, awaiting each one's `stop()`, then closes the catalog under `_catalog_lock`. At B a `stop()` that raised ended that loop.
+  - Task 7: the test module's `Settings` and `CollectionManager` imports, and the manager set-up of `test_manager_passes_sync_batch_knobs_to_collection` (`DATA_DIR` set to `tmp_path`, `CollectionManager(Settings(), embedder_factory=lambda cfg: None)`, `create_collection(name, 8, 4, None, None, None)`, `touch`).
   - Test helpers `make_collection`, `docs_payload`, `drain`, `fetch`, `index_ids`.
 - Produces:
   - `SYNC_RETRY_MIN_S = 1.0` and `SYNC_RETRY_MAX_S = 30.0`: module-level algorithm constants in seconds (spec §4.2), read at call time, so tests monkeypatch them on `raggio.store`.
   - `async Collection._flush_unsynced(self) -> None`: retries a failed sync until one returns, then finishes the batch. It logs each failure through `_log.exception` with the args `(collection name, jobs in the batch, delay in seconds)`. Only `CancelledError` ends it early, and that leaves `_unsynced` intact.
-  - `Collection._sync_and_finish(self) -> None`: a thread body, and the caller holds `lock.write()`. It calls `self._sync_index()`, then pops and finishes each job of `_unsynced` in claim order through `self._finish_job`. If the sync raises, nothing is finished and the exception propagates.
-  - `Collection.stop()`: syncs and finishes the open batch before `_closed = True` and `_close_conns()`.
+  - `Collection._sync_and_finish(self) -> None`: a thread body, and the caller holds `lock.write()`. It calls `self._sync_index()`, then finishes each job of `_unsynced` in claim order through `self._finish_job`, popping it once its finish returns. If the sync raises an `Exception`, it logs it once through `_log.exception` with the args `(collection name, jobs in the batch)`, finishes nothing, leaves `_unsynced` intact and returns normally (spec §3.1 D2). If a finish raises an `Exception` after the sync landed, it logs it once the same way, with the args `(collection name, jobs left in _unsynced)`, tries no later job and returns normally (spec §3.1 D3). Anything that is not an `Exception` propagates.
+  - `Collection.stop()`: syncs and finishes the open batch before `_closed = True` and `_close_conns()`. If that sync fails, `stop()` still sets `_closed` and runs its three close steps, and the failure does not leave `stop()`. The batch's jobs stay `'processing'` with their payloads and replay on the next open (spec §3.1 D2). A worker that died of an `Exception` is logged through `_log.exception` with the args `(collection name, jobs in the open batch)`, and the flush and the close then run as usual (spec §3.1 D3). Each close step, `_close_conns`, the embedder's `aclose()` and F's `_shard_pool.close`, runs through the local `close_step`: an `Exception` it raises is logged through `_log.exception` with the args `(collection name, step)`, where step is `"the SQLite connections"`, `"the embedder's HTTP client"` or `"the IVF shard pool"`, and the next step runs (spec §3.1 D4). So no `Exception` from the worker, the final sync, a finish or a close step leaves `stop()`; `CancelledError` and other non-`Exception` `BaseException`s propagate.
   - `Collection._process_job`: a removal-cap pre-sync that raises is logged, and the job goes on to its removals and adds. The signature is unchanged.
 
 - [ ] **Step 1: Write the failing tests**
@@ -5048,7 +5064,7 @@ import logging
 import shutil
 ```
 
-(b) Append this section at the end of the file, below Task 8's `# ---- batched sync: worker` section. The helpers come first.
+(b) Append this section at the end of the file, below Task 8's `# ---- batched sync: worker` section. The shared helpers come first; the four helpers of the failed `stop()` sync sit with their two tests after the removal-cap test, then `flaky_finish` with two spec §3.1 D3 tests, then `EmbedderStub` with the three spec §3.1 D4 tests, and last the shutdown test, which covers D3 and D4.
 
 The failure tests read the retry delays from the log records' arguments, not from a patched `asyncio.sleep`. Patching `asyncio.sleep` would hit every caller in the process, `drain()` included, and the sleep itself is too short to time: on Windows the event loop's clock resolution is about 15 ms. The logger is `uvicorn.error` (Plan C's `_log`). The handler sits on that logger itself, so the test does not depend on propagation, which uvicorn's logging config turns off at `"uvicorn"` once any test in the session has built a `uvicorn.Config`.
 
@@ -5182,7 +5198,7 @@ def test_stop_during_sync_backoff_finishes_the_batch(tmp_path, monkeypatch):
         asyncio.run(reopened.stop())
 ```
 
-Last, the `stop()` flush:
+Then the `stop()` flush:
 
 ```python
 def test_stop_flushes_the_open_batch(tmp_path):
@@ -5279,19 +5295,435 @@ def test_failed_removal_cap_presync_does_not_fail_the_job(tmp_path, monkeypatch)
     assert len(logs.records) == 1 and logs.records[0].exc_info[0] is OSError
 ```
 
+Then `stop()` with a failing sync of its own (spec §3.1 D2). The helpers come first. `stop_with_open_batch` builds the open batch as `test_stop_flushes_the_open_batch` does, and calls its `fail` argument only once job 4 is parked, so the failure it installs hits `stop()` alone. `stop_with_failing_sync` passes `failing_sync`, so the one sync that fails is `stop()`'s own: jobs 1-3 ran with `sync=False` and replaced no row, so nothing synced before. The spec §3.1 D3 finish test below reuses `stop_with_open_batch` with a failing finish, and the three spec §3.1 D4 tests with a failing close step. On a failed run the exception leaves the helper, and the collection stays open, which is harmless there.
+
+```python
+def closed_state(col):
+    """What a completed stop() leaves: the closed flag, whether the writer connection
+    still answers, how many read connections stay registered, and whether Plan F's
+    shard pool is closed (True on a tree without Plan F, which has no pool)."""
+    try:
+        col.db.execute("SELECT 1")
+        writer_open = True
+    except sqlite3.ProgrammingError:  # Cannot operate on a closed database.
+        writer_open = False
+    pool = getattr(col, "_shard_pool", None)
+    return col._closed, writer_open, len(col._read_conns), pool is None or pool._closed
+
+
+def disk_rows(directory, sql):
+    """Rows of a stopped collection's meta.db, read on a fresh connection."""
+    db = sqlite3.connect(Path(directory) / "meta.db")
+    try:
+        return db.execute(sql).fetchall()
+    finally:
+        db.close()
+
+
+def stop_with_open_batch(directory, fail):
+    """Jobs 1-3 wait in the open batch for their sync, and job 4 is claimed and parked
+    before its write section, as in test_stop_flushes_the_open_batch. Then fail(col)
+    installs a failure and returns its call list, and stop() runs. Returns those calls,
+    the open batch's job ids as stop() began, the ERROR records logged and the stopped
+    collection. A stop() that raises leaves this function."""
+    col = make_collection(directory, sync_batch_jobs=100, sync_batch_ms=60_000)
+    real_process = col._process_job
+    logs = LogRecords()
+
+    async def go():
+        parked, gate = asyncio.Event(), asyncio.Event()
+
+        async def process(payload, **kw):
+            if payload["documents"][0]["doc_id"] == "d4":
+                parked.set()
+                await gate.wait()  # never set: stop() cancels the worker here
+            await real_process(payload, **kw)
+
+        col._process_job = process
+        for j in range(1, 5):
+            await asyncio.to_thread(col._enqueue_row, docs_payload([j]))
+        col.start_worker()
+        await asyncio.wait_for(parked.wait(), 10)
+        batch = [job[0] for job in col._unsynced]
+        calls = fail(col)  # from here on only stop() syncs and finishes
+        await col.stop()
+        return calls, batch
+
+    store._log.addHandler(logs)
+    try:
+        calls, batch = asyncio.run(go())
+    finally:
+        store._log.removeHandler(logs)
+    return calls, batch, logs.records, col
+
+
+def stop_with_failing_sync(directory):
+    """stop_with_open_batch where stop()'s own index sync (the first since the open)
+    fails. The calls returned are the sync calls."""
+    return stop_with_open_batch(directory, lambda col: failing_sync(col, 1)[0])
+```
+
+Then the two tests, one for the shutdown and one for the replay:
+
+```python
+def test_stop_with_a_failing_sync_logs_it_and_still_closes(tmp_path):
+    # spec 3.1 D2: when stop()'s own index sync fails, stop() logs it once, completes
+    # the shutdown and raises nothing. It finishes no job: the open batch keeps
+    # 'processing' and its payloads, so the next open replays it
+    live, normal = tmp_path / "live", tmp_path / "normal"
+    live.mkdir()
+    normal.mkdir()
+    calls, batch, records, col = stop_with_failing_sync(live)  # before: OSError here
+    stopped = make_collection(normal)
+    asyncio.run(stopped.stop())  # a normal stop, to compare with
+    assert batch == [1, 2, 3]
+    assert calls == [1]  # stop()'s one sync, and it failed
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.levelno == logging.ERROR and "index sync failed in stop()" in rec.getMessage()
+    assert rec.exc_info[0] is OSError and rec.exc_info[2] is not None  # with its traceback
+    assert rec.args == ("t", 3)  # the collection, and the batch's jobs left 'processing'
+    # closed as a normal stop() closes: _closed set, the writer connection and every
+    # read connection closed, Plan F's shard pool closed
+    assert closed_state(col) == closed_state(stopped) == (True, False, 0, True)
+    assert job_states(live) == [(j, "processing") for j in range(1, 5)]
+    assert disk_rows(live, "SELECT job_id FROM job_payloads ORDER BY job_id") == [
+        (1,), (2,), (3,), (4,)]
+
+
+def test_a_failed_stop_sync_replays_on_the_next_open(tmp_path):
+    # the jobs a failed stop() sync left 'processing' replay on the next open (D8) and
+    # end 'done', with their rows in the index: none lost, no ghost
+    live = tmp_path / "live"
+    live.mkdir()
+    stop_with_failing_sync(live)  # before: OSError here
+    again = make_collection(live, sync_batch_jobs=100, sync_batch_ms=60_000)
+
+    async def replay():
+        try:
+            before = index_ids(again)  # the failed sync wrote none of the batch's rows
+            again.start_worker()
+            await drain(again)
+            return (before, fetch(again, "SELECT id, status FROM jobs ORDER BY id"),
+                    fetch(again, "SELECT COUNT(*) FROM job_payloads"), index_ids(again),
+                    fetch(again, "SELECT id FROM records WHERE indexed=1 ORDER BY id"),
+                    fingerprint(again))
+        finally:
+            await again.stop()
+
+    before, jobs, payload_rows, ids, indexed, got = asyncio.run(replay())
+    assert before == []
+    assert jobs == [(j, "done") for j in range(1, 5)]
+    assert payload_rows == [(0,)]
+    assert ids == [r[0] for r in indexed] and len(ids) == 4  # no ghost, none missing
+    assert got == reference(tmp_path, [docs_payload([j]) for j in range(1, 5)])
+```
+
+Then spec §3.1 D3: the two other errors `stop()` now logs instead of raising. `flaky_finish` comes first. It raises before the real finish runs, so the job stays `'processing'` with its payload, as when a finish's transaction fails and rolls back. The dead-worker test lets the worker's own flush fail its first finish, which ends the worker as at base; `asyncio.wait` waits for that without re-raising. `closed_state`, `job_states` and `disk_rows` read the stopped collection as in the D2 tests, and the replay follows `test_a_failed_stop_sync_replays_on_the_next_open`.
+
+```python
+def flaky_finish(col, fail_on):
+    """Make col._finish_job raise sqlite3.OperationalError (meta.db full) on the calls
+    numbered in fail_on, counting from 1, before the real finish runs; every other call
+    runs it. Returns the calls, one job id per call."""
+    calls, real = [], col._finish_job
+
+    def finish(job_id, status, error):
+        calls.append(job_id)
+        if len(calls) in fail_on:
+            raise sqlite3.OperationalError(f"database or disk is full (finish {len(calls)})")
+        real(job_id, status, error)
+
+    col._finish_job = finish
+    return calls
+
+
+def test_stop_logs_a_dead_workers_exception_and_still_closes(tmp_path):
+    # spec 3.1 D3: the batch [1, 2, 3] syncs, then the worker's finish of job 1 raises,
+    # which ends the worker (as at base). stop() logs that exception once instead of
+    # re-raising it, still flushes the rest of the batch and closes as usual. Job 1
+    # stays 'processing' with its payload, and the next open replays it
+    live = tmp_path / "live"
+    live.mkdir()
+    payloads = [docs_payload([j]) for j in range(1, 4)]
+    col = make_collection(live, sync_batch_jobs=3, sync_batch_ms=60_000)
+    calls = flaky_finish(col, {1})
+    logs = LogRecords()
+
+    async def go():
+        for p in payloads:
+            await asyncio.to_thread(col._enqueue_row, p)
+        col.start_worker()
+        done, _ = await asyncio.wait({col._worker}, timeout=10)  # never re-raises
+        assert done, "the worker is still running after 10 s"
+        left = [job[0] for job in col._unsynced]
+        await col.stop()  # before: sqlite3.OperationalError here
+        return left
+
+    store._log.addHandler(logs)
+    try:
+        left = asyncio.run(go())
+    finally:
+        store._log.removeHandler(logs)
+    assert left == [2, 3]  # job 1 was popped for its finish, which raised
+    assert calls == [1, 2, 3]  # the worker's failed finish, then stop()'s two
+    assert len(logs.records) == 1
+    rec = logs.records[0]
+    assert rec.levelno == logging.ERROR and "ingest worker had died" in rec.getMessage()
+    assert rec.exc_info[0] is sqlite3.OperationalError and rec.exc_info[2] is not None
+    assert rec.args == ("t", 2)  # the collection, and the open batch stop() flushes
+    assert closed_state(col) == (True, False, 0, True)  # what a normal stop() leaves
+    assert job_states(live) == [(1, "processing"), (2, "done"), (3, "done")]
+    assert disk_rows(live, "SELECT job_id FROM job_payloads ORDER BY job_id") == [(1,)]
+    again = make_collection(live)
+
+    async def replay():
+        try:
+            before = index_ids(again)  # the worker's sync wrote the whole batch
+            again.start_worker()
+            await drain(again)
+            return (before, fetch(again, "SELECT id, status FROM jobs ORDER BY id"),
+                    fetch(again, "SELECT COUNT(*) FROM job_payloads"), index_ids(again),
+                    fetch(again, "SELECT id FROM records WHERE indexed=1 ORDER BY id"),
+                    fingerprint(again))
+        finally:
+            await again.stop()
+
+    before, jobs, payload_rows, ids, indexed, got = asyncio.run(replay())
+    assert before == [1, 2, 3]
+    assert jobs == [(j, "done") for j in range(1, 4)]  # job 1 replayed
+    assert payload_rows == [(0,)]
+    assert ids == [r[0] for r in indexed] and len(ids) == 3  # no ghost, none missing
+    assert got == reference(tmp_path, payloads)
+```
+
+Then the finish that fails after `stop()`'s own sync landed, through `stop_with_open_batch`:
+
+```python
+def test_a_failed_finish_in_stop_is_logged_and_replays(tmp_path):
+    # spec 3.1 D3: stop()'s own sync lands, then its finish of job 1 raises (meta.db
+    # full). stop() logs it once, tries no later finish, closes as usual and raises
+    # nothing. Jobs 1-3 keep 'processing' and their payloads although the index file
+    # holds their rows, so the next open re-applies them: the same rows, no ghost
+    live = tmp_path / "live"
+    live.mkdir()
+    calls, batch, records, col = stop_with_open_batch(live, lambda c: flaky_finish(c, {1}))
+    assert batch == [1, 2, 3]
+    assert calls == [1]  # job 1's finish raised, and no later job was tried
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.levelno == logging.ERROR and "finishing jobs failed in stop()" in rec.getMessage()
+    assert rec.exc_info[0] is sqlite3.OperationalError and rec.exc_info[2] is not None
+    assert rec.args == ("t", 3)  # the collection, and the batch's jobs left 'processing'
+    assert closed_state(col) == (True, False, 0, True)  # what a normal stop() leaves
+    assert job_states(live) == [(j, "processing") for j in range(1, 5)]
+    assert disk_rows(live, "SELECT job_id FROM job_payloads ORDER BY job_id") == [
+        (1,), (2,), (3,), (4,)]
+    again = make_collection(live, sync_batch_jobs=100, sync_batch_ms=60_000)
+
+    async def replay():
+        try:
+            before = index_ids(again)  # stop()'s sync wrote the batch's rows
+            again.start_worker()
+            await drain(again)
+            return (before, fetch(again, "SELECT id, status FROM jobs ORDER BY id"),
+                    fetch(again, "SELECT COUNT(*) FROM job_payloads"), index_ids(again),
+                    fetch(again, "SELECT id FROM records WHERE indexed=1 ORDER BY id"),
+                    fingerprint(again))
+        finally:
+            await again.stop()
+
+    before, jobs, payload_rows, ids, indexed, got = asyncio.run(replay())
+    assert before == [1, 2, 3]
+    assert jobs == [(j, "done") for j in range(1, 5)]  # 1-3 re-applied, 4 replayed
+    assert payload_rows == [(0,)]
+    assert ids == [r[0] for r in indexed] and len(ids) == 4  # no ghost, none missing
+    assert got == reference(tmp_path, [docs_payload([j]) for j in range(1, 5)])
+```
+
+Then spec §3.1 D4: each close step logs its own failure and the next one runs. `EmbedderStub` comes first. `make_collection` has no embedder (`_embedder` stays `None`, so `stop()` skips that step), and a test that needs the step puts a stub there with `monkeypatch`. Each test fails one step through `stop_with_open_batch`, so `stop()` also flushes the open batch first: jobs 1-3 end `done` and job 4 stays `'processing'`, as in `test_stop_flushes_the_open_batch`. `closed_state` and `job_states` read what the close left.
+
+```python
+class EmbedderStub:
+    """Stands in for a collection's embedder in stop(), which only calls aclose().
+    Records each call, one number per call; with fail=True the call then raises
+    OSError, as an HTTP client whose transport fails to close does."""
+
+    def __init__(self, fail):
+        self.fail, self.calls = fail, []
+
+    async def aclose(self):
+        self.calls.append(len(self.calls) + 1)
+        if self.fail:
+            raise OSError(f"embedder transport close failed (close {len(self.calls)})")
+
+
+def test_a_failing_embedder_close_is_logged_and_stop_goes_on(tmp_path, monkeypatch):
+    # spec 3.1 D4: the embedder's HTTP client raises as it closes. stop() logs it once
+    # and still closes F's shard pool after it; the flush and the connections before
+    # it ran as in a normal stop()
+    live = tmp_path / "live"
+    live.mkdir()
+    client = EmbedderStub(fail=True)
+
+    def fail(col):
+        monkeypatch.setattr(col, "_embedder", client)
+        return client.calls
+
+    calls, batch, records, col = stop_with_open_batch(live, fail)  # before: OSError here
+    assert batch == [1, 2, 3]
+    assert calls == [1]  # stop() closed the client once, and that raised
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.levelno == logging.ERROR
+    assert rec.getMessage() == (
+        "collection t: closing the embedder's HTTP client failed in stop(); the shutdown goes on")
+    assert rec.exc_info[0] is OSError and rec.exc_info[2] is not None  # with its traceback
+    assert rec.args == ("t", "the embedder's HTTP client")
+    assert closed_state(col) == (True, False, 0, True)  # connections and shard pool closed
+    assert job_states(live) == [(1, "done"), (2, "done"), (3, "done"), (4, "processing")]
+```
+
+Then the connections, which fail before they close. The test closes them itself afterwards, with B's real `_close_conns`, so the files are released:
+
+```python
+def test_a_failing_close_conns_is_logged_and_the_later_steps_run(tmp_path, monkeypatch):
+    # spec 3.1 D4: closing the SQLite connections raises. stop() logs it once, has set
+    # _closed before it, and still closes the embedder's client and F's shard pool
+    live = tmp_path / "live"
+    live.mkdir()
+    client = EmbedderStub(fail=False)
+
+    def fail(col):
+        calls = []
+
+        def close_conns():
+            calls.append(col.lock._writing)
+            raise sqlite3.OperationalError(
+                "unable to close due to unfinalized statements or unfinished backups")
+
+        monkeypatch.setattr(col, "_close_conns", close_conns)
+        monkeypatch.setattr(col, "_embedder", client)
+        return calls
+
+    calls, batch, records, col = stop_with_open_batch(live, fail)  # before: OperationalError here
+    try:
+        assert batch == [1, 2, 3]
+        assert calls == [True]  # called once, inside stop()'s write lock as at B
+        assert len(records) == 1
+        rec = records[0]
+        assert rec.levelno == logging.ERROR and "failed in stop()" in rec.getMessage()
+        assert rec.exc_info[0] is sqlite3.OperationalError and rec.exc_info[2] is not None
+        assert rec.args == ("t", "the SQLite connections")
+        assert client.calls == [1]  # the next step ran: the embedder's client closed
+        closed, writer_open, _, pool_closed = closed_state(col)
+        assert (closed, writer_open, pool_closed) == (True, True, True)  # meta.db still open
+    finally:
+        Collection._close_conns(col)  # B's real close
+    assert closed_state(col) == (True, False, 0, True)
+    assert job_states(live) == [(1, "done"), (2, "done"), (3, "done"), (4, "processing")]
+```
+
+Then F's shard pool, the last step. The test needs Plan F's pool, so it skips without it, as Task 8's IVF test does:
+
+```python
+@pytest.mark.skipif(not hasattr(store, "_ShardPool"),
+                    reason="needs Plan F's shard pool")
+def test_a_failing_shard_pool_close_is_logged(tmp_path, monkeypatch):
+    # spec 3.1 D4: F's shard pool, the last close step, raises as it closes. stop()
+    # logs it once and returns; every earlier step ran as in a normal stop()
+    live = tmp_path / "live"
+    live.mkdir()
+    client = EmbedderStub(fail=False)
+
+    def fail(col):
+        calls = []
+
+        def close():
+            calls.append(col._closed)
+            raise RuntimeError("cannot join current thread")
+
+        monkeypatch.setattr(col._shard_pool, "close", close)
+        monkeypatch.setattr(col, "_embedder", client)
+        return calls
+
+    calls, batch, records, col = stop_with_open_batch(live, fail)  # before: RuntimeError here
+    assert batch == [1, 2, 3]
+    assert calls == [True]  # called once, after _closed, as F requires
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.levelno == logging.ERROR and "failed in stop()" in rec.getMessage()
+    assert rec.exc_info[0] is RuntimeError and rec.exc_info[2] is not None
+    assert rec.args == ("t", "the IVF shard pool")
+    assert client.calls == [1]  # the steps before it ran
+    # the pool stays open (its close raised); a flat collection's pool starts no thread
+    assert closed_state(col) == (True, False, 0, False)
+    assert job_states(live) == [(1, "done"), (2, "done"), (3, "done"), (4, "processing")]
+```
+
+Last, the shutdown that depends on D3 and D4, through Task 7's manager set-up. Collection a's worker dies, and a's embedder client fails to close:
+
+```python
+def test_shutdown_closes_every_collection_after_a_failed_stop(tmp_path, monkeypatch):
+    # spec 3.1 D3 and D4: no Exception leaves stop(), so shutdown() goes on past a
+    # collection whose worker died and whose embedder client fails to close, and it
+    # closes the next one and the catalog. Before, a's stop() re-raised the worker's
+    # exception, and b and the catalog stayed open
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    logs = LogRecords()
+    client = EmbedderStub(fail=True)
+
+    async def go():
+        mgr = CollectionManager(Settings(), embedder_factory=lambda cfg: None)
+        await mgr.create_collection("a", 8, 4, None, None, None)
+        await mgr.create_collection("b", 8, 4, None, None, None)
+        a, b = await mgr.touch("a"), await mgr.touch("b")  # resident, and shut, in this order
+        flaky_finish(a, {1})
+        monkeypatch.setattr(a, "_embedder", client)  # a's second close step raises
+        await a.enqueue(docs_payload([1]))  # its flush syncs, then the finish raises
+        done, _ = await asyncio.wait({a._worker}, timeout=10)
+        assert done, "a's worker is still running after 10 s"
+        await mgr.shutdown()  # before: sqlite3.OperationalError here
+        return mgr, a, b
+
+    store._log.addHandler(logs)
+    try:
+        mgr, a, b = asyncio.run(go())
+    finally:
+        store._log.removeHandler(logs)
+    assert closed_state(a) == closed_state(b) == (True, False, 0, True)
+    assert mgr.resident == {}
+    with pytest.raises(sqlite3.ProgrammingError):  # the catalog is closed too
+        mgr.catalog.execute("SELECT 1")
+    assert client.calls == [1]
+    assert len(logs.records) == 2  # a's dead worker, then a's embedder; b stopped cleanly
+    died, closing = logs.records
+    assert died.exc_info[0] is sqlite3.OperationalError and "worker had died" in died.getMessage()
+    assert died.args == ("a", 0)  # the worker had popped job 1, the batch's only job
+    assert closing.exc_info[0] is OSError and "failed in stop()" in closing.getMessage()
+    assert closing.args == ("a", "the embedder's HTTP client")  # then a's pool closed
+```
+
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `uv run pytest tests/test_ingest_path.py -v`
 
-Expected: `4 failed, 50 passed` (`4 failed, 49 passed` if Task 6's gate test never landed). The retry constants are patched with `raising=False`, so no failure is an `AttributeError`:
-- `test_sync_failure_keeps_batch_processing_and_retries`: `OSError: disk full (sync 1)`. Task 8's flush lets the first failed sync end the worker. `drain()` re-raises it, and the `finally`'s `stop()` raises it once more when it awaits the dead worker, since Plan B's `stop()` only swallows `CancelledError`.
+Expected: `12 failed, 50 passed` (`12 failed, 49 passed` if Task 6's gate test never landed). On a tree without Plan F, `test_a_failing_shard_pool_close_is_logged` and Task 8's `test_batched_ivf_sync_writes_each_dirty_shard_once` are skipped instead: `11 failed, 49 passed, 2 skipped` (`11 failed, 48 passed, 2 skipped` without the gate test too). The retry constants are patched with `raising=False`, so no failure is an `AttributeError`:
+- `test_sync_failure_keeps_batch_processing_and_retries`: `OSError: disk full (sync 1)`. Task 8's flush lets the first failed sync end the worker. `drain()` re-raises it, and the `finally`'s `stop()` raises it once more when it awaits the dead worker, since Plan B's `stop()` only swallows `CancelledError`. (That exception comes from the dead worker, not from `stop()`'s own sync. After this task the retry keeps the worker alive, and a `stop()` that did find a dead worker would log its exception instead, spec §3.1 D3.)
 - `test_stop_during_sync_backoff_finishes_the_batch`: `OSError: disk full (sync 1)`, re-raised by `wait_for_retries`. The test never reaches `stop()`, and leaving that collection open is harmless in a failing run.
 - `test_stop_flushes_the_open_batch`: `AssertionError: assert [(1, 'processing'), (2, 'processing'), (3, 'processing'), (4, 'processing')] == [(1, 'done'), (2, 'done'), (3, 'done'), (4, 'processing')]`. Task 8's `stop()` syncs but finishes nothing. The first assert passes: Task 8 already keeps jobs 1-3 in `_unsynced`.
 - `test_failed_removal_cap_presync_does_not_fail_the_job`: `AssertionError: assert [(1, 'done', None), (2, 'done', None), (3, 'error', 'disk full (sync 1)')] == [(1, 'done', None), (2, 'done', None), (3, 'done', None)]`. The first assert passes: the failed pre-sync and the idle flush are the two syncs either way.
+- `test_stop_with_a_failing_sync_logs_it_and_still_closes` and `test_a_failed_stop_sync_replays_on_the_next_open`: `OSError: disk full (sync 1)`, raised out of `stop()` inside `stop_with_failing_sync` by Task 8's plain `_sync_index` line, which Plan B's `stop()` does not catch. That collection stays open, which is harmless in a failing run.
+- `test_stop_logs_a_dead_workers_exception_and_still_closes`: `sqlite3.OperationalError: database or disk is full (finish 1)`, re-raised by `await col.stop()` when Plan B's `stop()` awaits the dead worker. The asserts before it pass: the worker's flush synced and popped job 1 as at Task 8.
+- `test_a_failed_finish_in_stop_is_logged_and_replays`: `AssertionError: assert [] == [1]`. Task 8's `stop()` syncs but finishes nothing, so `flaky_finish` sees no call. The first assert passes.
+- `test_a_failing_embedder_close_is_logged_and_stop_goes_on`: `OSError: embedder transport close failed (close 1)`, raised out of `stop()` inside `stop_with_open_batch` by Plan B's plain `await self._embedder.aclose()`. F's shard pool stays open, which is harmless in a failing run.
+- `test_a_failing_close_conns_is_logged_and_the_later_steps_run`: `sqlite3.OperationalError: unable to close due to unfinalized statements or unfinished backups`, raised out of `stop()` inside `stop_with_open_batch` by Plan B's plain `await asyncio.to_thread(self._close_conns)`. The test's `try` is never reached, so the connections stay open, which is harmless in a failing run.
+- `test_a_failing_shard_pool_close_is_logged`: `RuntimeError: cannot join current thread`, raised out of `stop()` inside `stop_with_open_batch` by Plan F's plain `await asyncio.to_thread(self._shard_pool.close)`.
+- `test_shutdown_closes_every_collection_after_a_failed_stop`: `sqlite3.OperationalError: database or disk is full (finish 1)`, raised out of `mgr.shutdown()` by a's `stop()` when it awaits the dead worker, before it reaches a's embedder. b and the catalog stay open, which is harmless in a failing run.
 
 - [ ] **Step 3: Implement the retry and the stop() flush**
 
-All three edits are in `src/raggio/store.py`. `_log` and `logging` are already there (Plan C, Task 1).
+All four edits, (a) to (d), are in `src/raggio/store.py`. `_log` and `logging` are already there (Plan C, Task 1).
 
 (a) Module constants. Task 7 left this line at the end of its comment block, directly below Task 4's `VACUUM_CHUNK_PAGES = 2_048`:
 
@@ -5369,15 +5801,41 @@ Replace it with the retrying version plus the new `_sync_and_finish` below it:
 
     def _sync_and_finish(self) -> None:
         """stop()'s flush, run in a thread while stop() holds lock.write() and the
-        worker is already cancelled: sync the index, then finish every job of the open
-        batch in claim order. If the sync raises, nothing is finished and the exception
-        leaves stop(); the jobs stay 'processing' and replay on the next open."""
-        self._sync_index()
+        worker is already cancelled or dead: sync the index, then finish every job of
+        the open batch in claim order. A sync that raises an Exception is logged, and
+        nothing is finished: the jobs keep 'processing' and their payloads, and the next
+        open replays them. A finish that raises an Exception after the sync landed is
+        logged too, and no later job is tried; those jobs replay the same way. It then
+        returns normally, so stop() still closes the collection."""
+        try:
+            self._sync_index()
+        except Exception:
+            # never raised to stop()'s caller, so shutdown, eviction and delete complete
+            # (spec 3.1 D2). Only Exception: a KeyboardInterrupt or SystemExit propagates
+            _log.exception(
+                "collection %s: index sync failed in stop(), %d jobs stay 'processing'"
+                " for the replay on the next open",
+                self.cfg.name, len(self._unsynced),
+            )
+            return
         self._batch_t0 = None
         while self._unsynced:
-            # popped first, as in _flush_unsynced: a finish that raises leaves its job
-            # 'processing' for the replay, and no job is finished twice
-            self._finish_job(*self._unsynced.pop(0))
+            try:
+                self._finish_job(*self._unsynced[0])
+            except Exception:
+                # spec 3.1 D3: the sync landed, but this job and the rest stay
+                # 'processing' with their payloads; the replay re-applies their rows,
+                # which rewrites the same rows. Only Exception, as above
+                _log.exception(
+                    "collection %s: finishing jobs failed in stop(), %d jobs stay"
+                    " 'processing' for the replay on the next open",
+                    self.cfg.name, len(self._unsynced),
+                )
+                return
+            # popped only once finished, so if a later finish fails, _unsynced holds
+            # that job and every job after it: the ones left for the replay. No worker
+            # runs now, so no other finish can take the same job
+            self._unsynced.pop(0)
 ```
 
 (c) `Collection._process_job`, Task 7's removal-cap pre-sync. Task 7 wrote, inside `if replaced:` under the job's `async with self.lock.write():`:
@@ -5409,25 +5867,7 @@ Replace those three lines with:
 
 The following `await asyncio.to_thread(self._unindex, replaced)` line and the rest of the job are unchanged. A direct `_process_job(payload)` call (`sync=True`) still ends with its own sync, which raises if the disk is still failing, as at base.
 
-(d) `Collection.stop()`. Plan B's write-locked section, with Plan F's two lines after it, is unchanged by D1 and Tasks 7-8. It has:
-
-```python
-                except asyncio.CancelledError:
-                    pass
-            await asyncio.to_thread(self._sync_index)
-            self._closed = True
-```
-
-Replace those four lines with:
-
-```python
-                except asyncio.CancelledError:
-                    pass
-            await asyncio.to_thread(self._sync_and_finish)
-            self._closed = True
-```
-
-`stop()` then reads, in full:
+(d) `Collection.stop()`. The whole method as Plans B and F left it, unchanged by D1 and Tasks 7-8 (the last two lines are Plan F's Task 1 Step 3j):
 
 ```python
     async def stop(self) -> None:
@@ -5441,7 +5881,7 @@ Replace those four lines with:
                     await self._worker
                 except asyncio.CancelledError:
                     pass
-            await asyncio.to_thread(self._sync_and_finish)
+            await asyncio.to_thread(self._sync_index)
             self._closed = True
             # still write-locked, so no search is mid-query on a read connection
             await asyncio.to_thread(self._close_conns)
@@ -5451,15 +5891,77 @@ Replace those four lines with:
         await asyncio.to_thread(self._shard_pool.close)
 ```
 
+Replace the whole method with the version below. Every step of B and F stays, in the same order, and every other line stays word for word. The changes are the `close_step` helper at its head (spec §3.1 D4), the `except Exception:` clause on the worker await (spec §3.1 D3), the `_sync_and_finish` line (the D8 flush, with the spec §3.1 D2 and D3 catches inside it), and the three close steps, each now awaited through `close_step` (spec §3.1 D4):
+
+```python
+    async def stop(self) -> None:
+        async def close_step(what, step):
+            # spec 3.1 D4: a close step that raises an Exception is logged with its
+            # traceback and stop() goes on to the next one, so shutdown() still
+            # reaches every collection and the catalog. Only Exception: a cancel
+            # of stop(), a KeyboardInterrupt or a SystemExit propagates
+            try:
+                await step
+            except Exception:
+                _log.exception(
+                    "collection %s: closing %s failed in stop(); the shutdown goes on",
+                    self.cfg.name, what,
+                )
+
+        async with self.lock.write():
+            # cancel the worker only once write-locked: it is then outside its write
+            # section (upsert -> index add -> sync), so no orphaned to_thread body is
+            # left committing rows the index never receives behind a released lock
+            if self._worker:
+                self._worker.cancel()
+                try:
+                    await self._worker
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    # spec 3.1 D3: a worker that died of an exception (a finish or a
+                    # claim that raised) is logged, never re-raised, and stop() goes on
+                    # to flush and close. Any job the worker held stays 'processing'
+                    _log.exception(
+                        "collection %s: the ingest worker had died; stop() flushes its"
+                        " open batch of %d jobs, and any job it held stays 'processing'"
+                        " for the replay on the next open",
+                        self.cfg.name, len(self._unsynced),
+                    )
+            await asyncio.to_thread(self._sync_and_finish)
+            self._closed = True
+            # still write-locked, so no search is mid-query on a read connection
+            await close_step("the SQLite connections", asyncio.to_thread(self._close_conns))
+        if self._embedder is not None:
+            await close_step("the embedder's HTTP client", self._embedder.aclose())
+        # after _closed: an orphaned search still running falls back to the serial loop
+        await close_step("the IVF shard pool", asyncio.to_thread(self._shard_pool.close))
+```
+
+On a tree without Plan F (the spec's §2 order runs F at step 6, before D2 at step 7, so this should not happen), B's method ends at the embedder's `aclose()`: leave out the last `close_step` line and its comment. F's Task 1 Step 3j then appends its pool line as `await close_step("the IVF shard pool", asyncio.to_thread(self._shard_pool.close))`, not as its plain `await asyncio.to_thread(self._shard_pool.close)`, and `test_a_failing_shard_pool_close_is_logged` stops skipping.
+
 Why this shape:
 - The wait runs outside `lock.write()`, so searches and deletes go on during a backoff, and `stop()` takes the lock at once. `test_stop_during_sync_backoff_finishes_the_batch` would take 30 s otherwise.
-- The retry never gives up. Giving up could only mean ending the worker (Task 8's behaviour) or finishing jobs whose rows are not in the index file, and the journal invariant allows neither. Under a lasting failure, every attempt logs at ERROR with the batch size, at most `SYNC_RETRY_MAX_S` apart. `pending_jobs()` stays above 0, so the LRU eviction leaves the collection resident. Shutdown and delete call `stop()`, which tries one more sync and raises if that fails too.
+- The retry never gives up. Giving up could only mean ending the worker (Task 8's behaviour) or finishing jobs whose rows are not in the index file, and the journal invariant allows neither. Under a lasting failure, every attempt logs at ERROR with the batch size, at most `SYNC_RETRY_MAX_S` apart. `pending_jobs()` stays above 0, so the LRU eviction leaves the collection resident. Shutdown and delete call `stop()`, which tries one more sync. If that fails too, `stop()` logs it and still closes, and the jobs replay on the next open (spec §3.1 D2).
 - `delay` is local, so every flush starts again at `SYNC_RETRY_MIN_S`. Both constants are read at call time, so tests can monkeypatch them.
 - `CancelledError` is not an `Exception`, so the retry loop never swallows `stop()`'s cancel. The cancel lands in one of three places:
   - the sleep, with `_unsynced` intact;
   - a retry's wait for the write lock, also with `_unsynced` intact;
   - a finish's thread. That job is already popped and belongs to the orphaned thread, and `_close_conns` waits for it under `db_lock`. This is B's `test_stop_waits_for_a_write_transaction_its_cancelled_worker_left_running`, where `_unsynced` is then empty.
 - `_sync_and_finish` runs in one thread, under `stop()`'s `lock.write()`. The lock order stays `lock.write()` then `db_lock` (inside each `_finish_job`), and no `await` sits under `db_lock`. It calls `self._sync_index` and `self._finish_job` through `self`, so instance spies in tests see both calls.
+- The catch for spec §3.1 D2 sits in `_sync_and_finish`, not in `stop()`, so `stop()` keeps B's and F's text and order and differs from them only by the one swapped line, D3's `except Exception:` clause and D4's `close_step` (both below). It catches `Exception` only: a cancel of `stop()` lands on its `await`, outside the thread, and a `KeyboardInterrupt` or `SystemExit` still propagates. It logs as `_flush_unsynced` does, with `(name, jobs)` as the args, and finishes nothing, since no job may be `done` before a sync covers it. Raising helped no caller: `CollectionManager._evict` has already popped the collection when it awaits `stop()`, and a raise in `shutdown()`'s loop left that collection, every later one and the catalog open. B's `stop()` tests never fail the final sync, so none of them changes.
+- Spec §3.1 D3 closes the two other ways out of `stop()`, with the same pattern: `_log.exception`, `(name, jobs)` as the args, `Exception` only, and no change to the close order. `_closed`, `_close_conns()` under `db_lock` inside `lock.write()`, then the embedder's `aclose()` and F's `_shard_pool.close` outside it, run on every path:
+  - A worker that died of an exception (a `_finish_job` in its flush that raised, say) re-raised it at `await self._worker`. The new `except Exception:` sibling of B's `except asyncio.CancelledError:` logs it with the open batch's size and goes on. The job the worker was finishing was popped before its failed finish and stays `'processing'` with its payload, unless its failed transaction was left open (next bullet but one). The rest of the batch is in `_unsynced`: `_sync_and_finish` syncs again and finishes them, which the journal invariant allows, since that sync covers them. The logged count is the batch `stop()` flushes; the job the dead worker held is not in it, and counting it would take a query.
+  - A finish that raises after `stop()`'s sync landed ended `_sync_and_finish` and left `stop()` before `_closed`. It now pops each job only once its `_finish_job` returns and stops at the first failure, so `_unsynced` and the logged count hold the failing job and every job after it. It stops there because meta.db is failing, and a later finish would most likely fail the same way. Those jobs replay on the next open and rewrite the rows the index file already holds, as Task 8's `after_sync_before_finish` crash point does.
+  - A finish in `_sync_and_finish` that raised inside its transaction leaves nothing half-done: no statement runs on the writer connection after it, `_close_conns` closes that connection, and SQLite rolls back the open transaction. The finish that killed a worker can differ: `_finish_job` has no rollback, so its transaction may still be open, and the next commit on that connection takes it along, whether an enqueue's before `stop()` or the first finish in `_sync_and_finish`. That job then ends with the status its finish set instead of `'processing'`, and a `done` one keeps its `job_payloads` row if the delete is what failed, which costs disk only. The worker finishes a job only after its covering sync (Task 8), so the journal invariant holds. A finish that raised after its commit (in `_vacuum_after_finish`) left its job `done` and still counts in the log; the replay skips it, so that is harmless.
+  - `except Exception` leaves `CancelledError`, `KeyboardInterrupt` and `SystemExit` to propagate, as the D2 catch does. The cancel `stop()` sends a live worker comes back as `CancelledError` and still meets B's clause, so the new one sees only a worker that had already died of an `Exception`.
+- Spec §3.1 D4 closes the last way out, the three close steps. Each is awaited through `close_step`, which logs a failure with `_log.exception` and `(name, step)` as the args, catches `Exception` only, and returns, so the next step runs. At B and F, a step that raised left `stop()` and skipped every later step, and `shutdown()`'s loop skipped every later collection and the catalog. The order and the locks do not change:
+  - `_closed = True` is set before the first close step, so no failed step can leave the collection open to new work. A search that takes the read lock after the close stops at B's `_closed` check (plan B Task 6: 404 when `DELETE` closed the collection, spec §3.1 B1, and the `closed` error otherwise), `_rdb` raises for any other reader, and only an orphaned search still running in its thread reaches F's pool after the close, where it runs the serial loop.
+  - `_close_conns` still runs in a thread under `db_lock`, inside `lock.write()`. Its failure is caught inside the `async with`, so `lock.write()` is released the normal way, and a request waiting on it finds the collection closed.
+  - A failed step leaves whatever it did not close to the garbage collector. B's `_close_conns` empties `_read_conns` before its first `close()`, so a read connection it did not reach is closed when its last reference, the thread-local of the thread that opened it, is freed, and `self.db` when the collection is. D4 does not wrap each `close()` in `_close_conns`: that is B's method, and a single failed close is already logged with its traceback. An embedder whose `aclose()` failed, or a pool whose join failed, is left the same way; F's `_ShardPool.close()` sets its `_closed` under its lock before it joins its threads, so a failed join still sends every later search to the serial loop.
+  - `close_step` takes an awaitable, not a callable. `asyncio.to_thread(...)` and `Embedder.aclose()` are coroutine functions, so building their coroutine at the call site runs nothing, and all the work, the failing part included, happens inside `close_step`'s `try`. It is nested in `stop()` because nothing else uses it, so `Collection` gains no method.
+  - A cancel of `stop()` during a close step is a `CancelledError`, not an `Exception`: it propagates and skips the later steps, as at B and F. So do `KeyboardInterrupt` and `SystemExit`.
+  - B's `test_stop_closes_connections_inside_the_write_lock_and_under_db_lock` still pins the order and the locks. Its close spy records the lock state inside `close()` and the test asserts only after `stop()` returns, so `close_step`'s catch never meets a failed assertion. No B or F test makes a close step raise.
 - With an empty batch, `_sync_and_finish` is `_sync_index` alone. B's `test_stop_closes_connections_inside_the_write_lock_and_under_db_lock` and F's `test_reload_then_stop_writes_no_shards` (a clean IVF index writes nothing) see the same calls as before.
 - In B's `test_stop_does_not_cancel_the_worker_inside_its_write_section`, `stop()` now finishes the one job as `done` where Task 8 left it `'processing'`. The test checks only the reopened rows and index, `(1, 1)`.
 - `_removed_since_sync` resets only after a sync that returns (Task 7). A failed sync, the pre-sync included, keeps the count, and the sync that lands resets it.
@@ -5468,7 +5970,7 @@ Why this shape:
 
 Run: `uv run pytest tests/test_ingest_path.py -v`
 
-Expected: `54 passed`, or `53 passed` without Task 6's gate test.
+Expected: `62 passed`, or `61 passed` without Task 6's gate test. On a tree without Plan F, `test_a_failing_shard_pool_close_is_logged` and Task 8's IVF test are skipped: `60 passed, 2 skipped` (`59 passed, 2 skipped` without the gate test too).
 
 Then run the suites that pin the worker, `stop()` and the code around them:
 
@@ -5482,11 +5984,13 @@ Expected: all pass, with the same counts as after Task 8. In particular:
 
 In `tests/test_ingest_path.py`, Task 7's `test_removal_cap_syncs_before_crossing_the_cap` sees the same pre-syncs, since none of them fails. Task 8's `test_crash_window_replays_without_loss` is unchanged too: its batches flush before `stop()`, so `stop()` finds `_unsynced` empty.
 
+No test in the base suite or in Plans B, C, E and F expects `stop()` or `shutdown()` to raise, and none makes a close step fail (their embedder stubs' `aclose()` returns), so spec §3.1 D3 and D4 change none of them. The helpers here that surface a dead worker, `drain()` and `wait_for_retries`, re-raise its exception through `col._worker.result()`, not through `stop()`, so they fail a test as before.
+
 - [ ] **Step 5: Run the full suite**
 
 Run: `uv run pytest -q`
 
-Expected: `N0' + 26 passed, 1 warning`. No existing test changes.
+Expected: `N0' + 34 passed, 1 warning`. No existing test changes.
 
 - [ ] **Step 6: Commit**
 
@@ -5502,7 +6006,15 @@ batch's jobs stay 'processing' meanwhile, so none is 'done' before a
 sync covers it. stop() now runs _sync_and_finish in place of its plain
 _sync_index: the same sync inside the write-locked section, then the
 open batch's finishes, before the connections close. If that sync
-raises, nothing is finished and the jobs replay on the next open. A
+fails, it is logged, nothing is finished, and stop() still closes the
+collection without raising; the jobs stay 'processing' with their
+payloads and replay on the next open (spec 3.1 D2). A dead worker's
+exception and a finish that fails after the final sync landed are
+logged the same way, and their jobs replay too (spec 3.1 D3). Each
+close step (connections, embedder client, shard pool) logs its own
+failure and the next one still runs (spec 3.1 D4). So no Exception
+from the worker, the final sync, a finish or a close step leaves
+stop(), and shutdown closes every collection and the catalog. A
 removal-cap pre-sync that fails inside a job is logged and the job
 goes on, so its committed rows still reach the index.
 
@@ -5510,18 +6022,20 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
 ```
 
-**Review Focus for Task 9:** RF4 (`stop()` loses the open batch or flushes outside B's critical section) is pinned here by `test_stop_flushes_the_open_batch`, together with Plan B's `test_stop_closes_connections_inside_the_write_lock_and_under_db_lock`, which stays green. When reviewing, check that:
-- `stop()` differs from Plans B and F by the one swapped line. `_sync_and_finish` runs after the worker's cancel and await and before `_closed = True` and `_close_conns()`, all inside `lock.write()`. F's `_shard_pool.close` stays last, outside the lock;
-- `_sync_and_finish` finishes nothing when its sync raises, and pops each job right before that job's `_finish_job`;
+**Review Focus for Task 9:** RF4 (`stop()` loses the open batch or flushes outside B's critical section) is pinned here by `test_stop_flushes_the_open_batch`, together with Plan B's `test_stop_closes_connections_inside_the_write_lock_and_under_db_lock`, which stays green. Spec §3.1 D2 (a failed final sync is logged and the shutdown completes) is pinned by `test_stop_with_a_failing_sync_logs_it_and_still_closes` and `test_a_failed_stop_sync_replays_on_the_next_open`. Spec §3.1 D3 (a dead worker and a failed finish are logged) is pinned by `test_stop_logs_a_dead_workers_exception_and_still_closes` and `test_a_failed_finish_in_stop_is_logged_and_replays`. Spec §3.1 D4 (a failed close step is logged and the next one runs) is pinned by `test_a_failing_embedder_close_is_logged_and_stop_goes_on`, `test_a_failing_close_conns_is_logged_and_the_later_steps_run` and `test_a_failing_shard_pool_close_is_logged`. `test_shutdown_closes_every_collection_after_a_failed_stop` pins D3 and D4 together: no `Exception` from the worker, the final sync, a finish or a close step leaves `stop()`. When reviewing, check that:
+- `stop()` differs from Plans B and F by the one swapped line, the `except Exception:` clause on the worker await and the `close_step` helper around each of the three close steps, nothing else. `_sync_and_finish` runs after the worker's cancel and await and before `_closed = True` and `_close_conns()`, all inside `lock.write()`. The embedder's `aclose()` follows outside the lock, and F's `_shard_pool.close` stays last;
+- `_sync_and_finish` catches only an `Exception` from its sync, logs it once through `_log.exception` and finishes nothing, so `stop()` still sets `_closed` and runs its three close steps, and the sync's failure does not leave it (spec §3.1 D2). On a sync that lands, it pops each job once its `_finish_job` returns; a finish that raises an `Exception` is logged once with the jobs still in `_unsynced`, and no later job is tried (spec §3.1 D3);
+- a worker that died of an `Exception` is logged once through `_log.exception` at `await self._worker`, with `(name, jobs in the open batch)`, and `stop()` then flushes and closes as usual. `CancelledError` still meets B's clause, and nothing but `Exception` is caught (spec §3.1 D3);
+- `close_step` awaits its step inside `try`, catches `Exception` only and logs it once through `_log.exception` with `(name, step)`, so the next step runs. Each step is passed as an unstarted coroutine (`asyncio.to_thread(...)`, `aclose()`), so no part of it runs before the `try`. `_closed = True` is set before the first step, and a failure in `_close_conns` is caught inside `lock.write()`, which is then released the normal way (spec §3.1 D4);
 - the retry's `asyncio.sleep` sits outside `async with self.lock.write()`, and the handler catches `Exception`, never `BaseException`, so a cancel always passes through. No path finishes a job of the batch before a sync returns;
 - the delay starts at `SYNC_RETRY_MIN_S` in every flush, doubles, and never exceeds `SYNC_RETRY_MAX_S`. Each failure is logged with `_log.exception`, and the traceback goes with it;
 - the pre-sync guard in `_process_job` only logs: the job goes on to `_unindex` and its adds, and the removal counter is not reset;
-- out of scope: a `stop()` whose own sync raises still raises and leaves the connections open (Plan B's behaviour). A `_finish_job` that raises inside the worker still ends it, as at base. The docs and the D2 benchmark are Task 10's.
+- out of scope: a `_finish_job` that raises inside the worker still ends it, as at base; spec §3.1 D3 covers what `stop()` does after that, not the worker. A failed `_close_conns` leaves the connections it did not reach to the garbage collector: D4 wraps B's method as one step and does not change it. The docs and the D2 benchmark are Task 10's.
 
 ### Task 10: Docs, env rows, DGX tuning and publish
 
 Goal: document D2's batched index sync and its two knobs, choose N and T on seed 7, and publish D2 against its base on seed 42 (spec §6: "Tunables (pool size, batch N/T, candidate depth) are chosen on an independent sample (seed 7 ...) and published on seed 42"; §7 D). There are two gn100 launches, both through Task 6's driver:
-- **tuning** (`planD-ab.sh d2tune`): the D2 tree only, `bench/ingest_probe.py --seed 7`, flat and `--ivf 256`, over the pairs (`SYNC_BATCH_JOBS`, `SYNC_BATCH_MS`) in {(1, 0), (8, 1000), (32, 1000), (32, 4000)}. Per mode there is one discarded warm-up, then 3 rounds, each round running the four pairs in turn. (1, 0) syncs after every job and is the reference. If the rule in Step 3b picks a pair other than (8, 1000), the defaults, their two pins and the docs change in one commit before the publish (Step 10);
+- **tuning** (`planD-ab.sh d2tune`): the D2 tree only, `bench/ingest_probe.py --seed 7`, flat and `--ivf 256`, over the pairs (`SYNC_BATCH_JOBS`, `SYNC_BATCH_MS`) in {(1, 0), (8, 1000), (32, 1000), (32, 4000)}. Per mode there is one discarded warm-up, then 3 rounds, each round running the four pairs in turn. (1, 0) syncs after every job and is the reference. If the rule in Step 3b picks a pair other than (8, 1000), the defaults, their two pins and the docs change in one commit before the publish (Step 10; spec §3.1 D1 allows it, seed 42 confirms the chosen values, and the PR states them);
 - **publish** (`planD-ab.sh d2`): Task 6's A/B unchanged, seed 42, base = `main` after D1, E and F (the parent of Task 7's commit) against D2 at its defaults, 3 interleaved rounds per mode after a discarded base warm-up, and the bench reingests last, only if the window allows.
 
 A declined window leaves the D2 results `Pending:` (Step 2 is committed either way), and no test is appended.
@@ -5545,7 +6059,7 @@ A declined window leaves the D2 results `Pending:` (Step 2 is committed either w
 - Consumes:
   - Task 6: `planD-ab.sh <mode> <base sha> <cand sha> <reingest 0|1> <cap minutes>` with its `probe`, `reingest`, `fail` and `ts` functions and `$PY`/`$OUT`. From `planD-summary.py`: `DASH`, `FENCE`, `MODES`, `ARMS`, `ROUNDS`, `PROBE_REGIME`, `PROBE_CMD`, `NOT_RUN`, `read`, `start_facts(d) -> (date, base_sha, cand_sha, finished)`, `stats(base, cand)`, `probe_part(d)`, `bench_part(d)`, `row(...)`, and its module-level `compare` import. From `planD-check.py`: `check_text()`, which already checks the text of `planD-ab.sh`. Also Task 6's D1 results subsection, `Pending:` or measured, and its `adr_d1_results()` slice, which ends at the next `\n### `.
   - Task 7: `Settings.sync_batch_jobs` / `sync_batch_ms` (defaults 8 and 1000.0), `Collection(..., sync_batch_jobs: int = 8, sync_batch_ms: float = 1000.0)`, and the probe's `--batch-jobs N --batch-ms T` with the result keys `sync_batch_jobs` / `sync_batch_ms` (`None` on a tree without the knobs). Also its commit subject `Add batched-sync plumbing: knobs, claim cursor, sync flag, removal cap`, which finds D2's base.
-  - Tasks 8 and 9: the behaviour the docs describe (batch bounds, idle flush, index-job barrier, claim cursor, removal cap, `SYNC_RETRY_MIN_S = 1.0` / `SYNC_RETRY_MAX_S = 30.0`, and the `stop()` flush).
+  - Tasks 8 and 9: the behaviour the docs describe (batch bounds, idle flush, index-job barrier, claim cursor, removal cap, `SYNC_RETRY_MIN_S = 1.0` / `SYNC_RETRY_MAX_S = 30.0`, and the `stop()` flush, which logs a failed final sync and still closes, spec §3.1 D2; a dead worker's exception and a failed finish are logged too, spec §3.1 D3, and so is a failed close step, after which the next one still runs, spec §3.1 D4).
   - Plan A: `bench/dgx/compare.py` `summary`, `verdict` (`"better"`, `"worse"`, `"within band"`) and `RESOLUTION["ingest_vps"]` (1 vec/s).
   - The test module head: `json`, `Path`, `Settings`.
 - Produces:
@@ -5570,7 +6084,7 @@ Ask, and wait for an explicit answer. Steps 2-5 are laptop-only and may proceed 
 > May I run them? If so: tuning and publish in one window or two; the publish probe-only or with the reingests; and until what time? Is anything else running on gn100 in that window?
 
 Record the answer, the start time and the caps:
-- If the user declines, do Step 2 only (the D2 results stay `Pending:`), then stop. The suite count stays at `N0' + 26`.
+- If the user declines, do Step 2 only (the D2 results stay `Pending:`), then stop. The suite count stays at `N0' + 34`.
 - `TUNE_CAP=150` for the tuning launch (Step 8). A shorter grant cannot cover the grid: ask again rather than trimming the grid.
 - `REINGEST=0 PUB_CAP=85` for a probe-only publish, or `REINGEST=1 PUB_CAP=270` with the reingests (Step 12). For a shorter grant, `PUB_CAP` is the minutes left after the builds.
 - If the grant covers only the tuning, stop after Step 10. The publish (Steps 11-19) is a new window and a new question.
@@ -5605,7 +6119,7 @@ Date: 2026-09-28 · Plan D, phase D2. It replaces the "Deferred to D2" row above
 | Claim cursor: the claim adds `AND id > ?` to its `INDEXED BY idx_jobs_open` query, so the worker never re-claims its own `processing` jobs | **Accepted** | A batch's jobs stay `processing` until its sync |
 | Removal cap: no sync carries more than `SYNC_MAX_REMOVALS` (512) removals accumulated across a batch's jobs. The job that would pass it syncs first, after its own commit. A lone job over the cap is not split | **Accepted** | Removals pile up as header ops; past 1024 ops the sync becomes a full-file rewrite, extrapolated at about 20 s under the collection's write lock at 2.55M rows |
 | A failed sync is logged and retried after `SYNC_RETRY_MIN_S` (1 s), doubling up to `SYNC_RETRY_MAX_S` (30 s). Meanwhile the batch's jobs stay `processing` and the worker claims nothing new; the wait holds no lock. A failed removal-cap pre-sync is logged, and the job goes on | **Accepted (bug fix)** | Before, a sync that raised failed its job as `error`: terminal, never replayed, with committed rows missing from the index file |
-| `stop()` syncs the open batch and finishes its jobs. If that sync raises, nothing is finished and the jobs replay on the next open | **Accepted** | A clean shutdown finishes what it synced |
+| `stop()` syncs the open batch and finishes its jobs. If that sync fails, `stop()` logs it and completes the shutdown without raising: it finishes nothing, the jobs stay `processing` with their payloads, and the next open replays them. A dead worker's exception, and a finish that fails after that sync landed, are logged the same way, and their jobs replay too. A failure to close the SQLite connections, the embedding client or the IVF shard pool is logged, and the next close step still runs | **Accepted** | A clean shutdown finishes what it synced; a failing index file, meta.db or close step never stops a shutdown half-way, so every collection and the catalog close, and the journal carries the unfinished jobs to the next open |
 | Several jobs per SQLite transaction | **Still rejected** | Each job keeps its own transaction and its own finish; only the index sync is shared |
 
 ### Results — DGX A/B (D2)
@@ -5647,7 +6161,14 @@ with:
 After a crash, any `pending` or `processing` job is replayed on boot. A
 crash before a batch's sync lands leaves all of the batch's jobs
 `processing`, so the whole batch replays; a crash while its jobs finish
-replays only the ones not yet `done`.
+replays only the ones not yet `done`. A shutdown whose last index sync
+fails (a full disk, say) logs the error and still closes; that batch's
+jobs stay `processing` and replay the same way. The same holds when the
+shutdown finds the ingest worker stopped by an error, or cannot mark
+synced jobs `done`: the error is logged, every collection still closes,
+and the unfinished jobs replay. A collection whose database connections,
+embedding client or IVF thread pool fail to close logs the error, and
+the shutdown goes on to its next close step and the next collection.
 ```
 
 In `## Backup`, replace the line:
@@ -5682,13 +6203,13 @@ In `docs/getting-started.md`, insert directly below the row that starts with `` 
 `_run_worker` (Task 8) closes a batch once `(time.monotonic() - self._batch_t0) * 1000.0 >= self.sync_batch_ms`, so `0` does close each batch at its first job. Plan F's test only looks for its own row, and Plan E's test finds `NATIVE_BM25` by `startswith`, so neither sees the new rows.
 
 Run: `uv run pytest -q`
-Expected: `N0' + 26 passed, 1 warning`. Step 2 adds no test. `N0'` is the suite count on D2's branch base, recorded before Task 7 (the Phase D2 note).
+Expected: `N0' + 34 passed, 1 warning`. Step 2 adds no test. `N0'` is the suite count on D2's branch base, recorded before Task 7 (the Phase D2 note).
 
 Run: `uv run pytest tests/test_cold_start.py -q -k acceptance_run`
 Expected: `1 passed, 64 deselected`, or `64 deselected` if Plan C's Task 12 test did not land. Plan C's section still ends at `## Addendum 2026-09 — ingest path`.
 
 Run: `uv run pytest tests/test_ingest_path.py -q -k adr_ingest_path_d1`
-Expected: `1 passed, 53 deselected` if Task 6's run landed, or `53 deselected` if it did not. Either way the D1 section is unchanged.
+Expected: `1 passed, 61 deselected` if Task 6's run landed, or `61 deselected` if it did not. Either way the D1 section is unchanged.
 
 ```bash
 git add docs/adr/0001-performance-optimization-decisions.md docs/storage.md README.md docs/getting-started.md
@@ -5700,7 +6221,10 @@ are batched, and "Batched sync (D2)" records the batch bounds,
 done-after-sync, the claim cursor, the removal cap, the sync retry
 and the stop() flush. The gn100 results are Pending until Task 10's
 run. docs/storage.md: a job is done only after the sync that covers
-it, a crash before a batch's sync replays the whole batch, and the backup note
+it, a crash before a batch's sync replays the whole batch, so does a
+shutdown whose last sync fails (logged, and the shutdown completes),
+and so do the jobs of a dead worker or of a failed finish at shutdown;
+a close that fails is logged and the shutdown goes on. The backup note
 no longer says index.tvim is rewritten on every sync. README and
 Getting started list SYNC_BATCH_JOBS and SYNC_BATCH_MS.
 
@@ -6309,7 +6833,7 @@ Expected:
 If `T7` is empty or a tracked file is modified, stop and ask.
 
 Run: `uv run pytest -q`
-Expected: `N0' + 26 passed, 1 warning`
+Expected: `N0' + 34 passed, 1 warning`
 
 Write the env file with the caps from Step 1: `TUNE_CAP=150`, and `REINGEST=1 PUB_CAP=270` or `REINGEST=0 PUB_CAP=85`:
 
@@ -6466,7 +6990,7 @@ Run: `uv run pytest tests/test_ingest_path.py -q -k "sync_batch_knobs or accepts
 Expected: `2 passed` and the rest deselected.
 
 Run: `uv run pytest -q`
-Expected: `N0' + 26 passed, 1 warning`
+Expected: `N0' + 34 passed, 1 warning`
 
 ```bash
 git add src/raggio/config.py src/raggio/store.py tests/test_ingest_path.py README.md docs/getting-started.md docs/adr/0001-performance-optimization-decisions.md
@@ -6755,10 +7279,10 @@ From here on, `planD-d2-check.py` fails its `check_adr` (the real ADR no longer 
 - [ ] **Step 17: Run the test to verify that it passes**
 
 Run: `uv run pytest tests/test_ingest_path.py -v -k adr_ingest_path_d2`
-Expected: `PASSED tests/test_ingest_path.py::test_adr_ingest_path_d2_results_pass_the_gates`, then `1 passed` and the rest deselected (`54 deselected` if Task 6's test landed, `53 deselected` if it did not).
+Expected: `PASSED tests/test_ingest_path.py::test_adr_ingest_path_d2_results_pass_the_gates`, then `1 passed` and the rest deselected (`62 deselected` if Task 6's test landed, `61 deselected` if it did not).
 
 Run: `uv run pytest tests/test_ingest_path.py -q -k adr_ingest_path_d1`
-Expected: `1 passed, 54 deselected` if Task 6's run landed, or `54 deselected` if it did not. The D1 slice still ends at `\n### Batched sync (D2)`.
+Expected: `1 passed, 62 deselected` if Task 6's run landed, or `62 deselected` if it did not. The D1 slice still ends at `\n### Batched sync (D2)`.
 
 Run: `uv run pytest tests/test_cold_start.py -q -k acceptance_run`
 Expected: `1 passed, 64 deselected`, or `64 deselected` if Plan C's Task 12 test did not land, unchanged from Step 2.
@@ -6766,7 +7290,7 @@ Expected: `1 passed, 64 deselected`, or `64 deselected` if Plan C's Task 12 test
 - [ ] **Step 18: Run the full suite**
 
 Run: `uv run pytest -q`
-Expected: `N0' + 27 passed, 1 warning`. Only this task's test is new.
+Expected: `N0' + 35 passed, 1 warning`. Only this task's test is new.
 
 - [ ] **Step 19: Commit, then report to the user**
 
@@ -6798,7 +7322,7 @@ EOF
 ```
 
 Then report to the user:
-- the seed-7 tuning table and the choice, and whether Step 10 moved the defaults;
+- the seed-7 tuning table and the choice, and whether Step 10 moved the defaults. State the shipped `SYNC_BATCH_JOBS` / `SYNC_BATCH_MS` values in one line that D2's PR description can quote, since the PR states them (spec §3.1 D1);
 - the seed-42 flat and IVF probe medians, gains and bands;
 - the bench reingest rows, or that they did not run;
 - the `sqlite_version` per arm, and `OPENBLAS_NUM_THREADS=1` everywhere;
@@ -6813,7 +7337,7 @@ Then report to the user:
 - Step 10 moves every default site in one commit before the images are built: `config.py`, `store.py`, both of Task 7's pins, both env rows and the ADR's knob row. The D2 test re-pins the `Settings` and `Collection` defaults and both env rows to the recorded choice, so a later default change without a new tuning fails the suite;
 - the publish gates: `D2-ivf256` needs `better`; `D2-flat` and `D2-bench` need `better` or `within band`; `D2-jobs` needs 0 payload rows in both arms, because D2's base already has D1's `job_payloads` (Task 6's `None` rule does not apply), and bench jobs only `done`; the fingerprints must be equal. A `FAIL` records nothing, and no threshold is loosened. The test recomputes the bands from the same rounded values the JSON stores;
 - every row, the tuning rows included, names its regime (`host-warm, uncapped host process` for the probes, `host-warm` for the bench), its cap (none, or `4g`), its `sqlite_version` and `OPENBLAS_NUM_THREADS`;
-- the docs match the code: a job turns `done` only after its covering sync, a crash before a batch's sync replays the whole batch and one during its finishes replays only the jobs not yet `done`, the Backup sentence also covers the shard files under `ivf/`, and the README and getting-started rows agree on names, defaults and meaning. `adr_d1_results()` still ends at `\n### Batched sync (D2)`, and `#### Measurements (D2)` does not end the slice of `adr_d2_results()`;
+- the docs match the code: a job turns `done` only after its covering sync, a crash before a batch's sync replays the whole batch and one during its finishes replays only the jobs not yet `done`, a shutdown whose last sync fails logs it, still closes and replays that batch (the storage.md sentence and the ADR's `stop()` row, spec §3.1 D2), and so does one that finds a dead worker or fails a finish (the same two places, spec §3.1 D3), a close step that fails is logged and the shutdown goes on to the next step and the next collection (the same two places, spec §3.1 D4), the Backup sentence also covers the shard files under `ivf/`, and the README and getting-started rows agree on names, defaults and meaning. `adr_d1_results()` still ends at `\n### Batched sync (D2)`, and `#### Measurements (D2)` does not end the slice of `adr_d2_results()`;
 - declined, tuning-only and probe-only windows are handled. The D2 results keep `Pending:` when the window is declined, when only the tuning ran, and on `NO CHOICE` or a gate `FAIL`. A probe-only publish records `Not run: the bench reingest ...` with `- SKIP: D2-bench`.
 
 ## Self-Review
@@ -6835,6 +7359,10 @@ The plan was checked against the spec (`docs/superpowers/specs/2026-09-28-raggio
 | §2 row 7 (D2) | the change at ADR 0001:50 | Task 10 |
 | §3 D1 (ADR numbering) | no new ADR number; one `## Addendum 2026-09 — ingest path` in ADR 0001; the 0001:50 lever note | Task 6 (addendum, D1 results), Task 10 (D2 subsections, :50 note) |
 | §3 D8 | job stays `processing` with its payload until its covering sync; N-job / T-ms bounds; `stop()` flush; crash replay | Task 8 (bounds, done-after-sync, crash-window test), Task 9 (retry, `stop()` flush) |
+| §3.1 D1 | the seed-7 tuning may move the `SYNC_BATCH_JOBS` / `SYNC_BATCH_MS` defaults; seed 42 confirms the chosen values; the PR states them | Task 10 (Steps 3b and 10, the publish at the chosen defaults, and Step 19's report line for the PR) |
+| §3.1 D2 | a failed final sync in `stop()` is logged, the shutdown completes, nothing is raised, and the jobs stay `processing` with their payloads and replay | Task 9 (`_sync_and_finish`, `test_stop_with_a_failing_sync_logs_it_and_still_closes`, `test_a_failed_stop_sync_replays_on_the_next_open`), Task 10 (the ADR's `stop()` row, the storage.md replay paragraph) |
+| §3.1 D3 | a dead worker's exception and a finish that fails after the final sync landed are logged, the shutdown completes, and the jobs stay `processing` and replay | Task 9 (the `except Exception:` clause in `stop()`, the finish catch in `_sync_and_finish`, `test_stop_logs_a_dead_workers_exception_and_still_closes`, `test_a_failed_finish_in_stop_is_logged_and_replays`, `test_shutdown_closes_every_collection_after_a_failed_stop`), Task 10 (the ADR's `stop()` row, the storage.md replay paragraph) |
+| §3.1 D4 | each close step in `stop()` (`_close_conns` under `db_lock`, the embedder's `aclose()`, F's `_shard_pool.close`) logs its own `Exception` with its traceback, and the next step still runs; only `Exception` is caught | Task 9 (`close_step` in `stop()`, `test_a_failing_embedder_close_is_logged_and_stop_goes_on`, `test_a_failing_close_conns_is_logged_and_the_later_steps_run`, `test_a_failing_shard_pool_close_is_logged`, and the embedder close that fails in `test_shutdown_closes_every_collection_after_a_failed_stop`), Task 10 (the ADR's `stop()` row, the storage.md replay paragraph) |
 | §3 D15 / D16 | every DGX row records `sqlite_version` and `OPENBLAS_NUM_THREADS` | Task 5 (probe output), Tasks 6 and 10 (`*-labels` gates) |
 | §4.1 `Collection.stop()` | flush inside B's `lock.write()` / `db_lock` section, before the connections close | Task 9 |
 | §4.1 `indexed_counts` | update after commit, keep B's copy-on-write rebind | Task 3 |
@@ -6872,6 +7400,8 @@ Every name below is spelled the same way in each task that defines or uses it, a
 | `SYNC_MAX_REMOVALS = 512`, `Collection._removed_since_sync`, `_process_job(payload, *, sync=True)` | Task 7 | Tasks 8, 9 |
 | `Collection._unsynced`, `Collection._batch_t0`, `_flush_unsynced` | Task 8 | Task 9 |
 | `SYNC_RETRY_MIN_S = 1.0`, `SYNC_RETRY_MAX_S = 30.0`, `_sync_and_finish` | Task 9 | Task 10 (docs) |
+| `close_step(what, step)`, local to `stop()`, and its three step names `"the SQLite connections"`, `"the embedder's HTTP client"`, `"the IVF shard pool"` (the log's second arg) | Task 9 | Task 9 (the D4 tests and the shutdown test assert the args) |
+| Task 9's ten test helpers: `LogRecords`, `failing_sync`, `wait_for_retries`, `job_states`, `closed_state`, `disk_rows`, `stop_with_open_batch`, `stop_with_failing_sync`, `flaky_finish`, `EmbedderStub(fail)` (`aclose()`, `calls`) | Task 9 | Task 9 |
 | Knobs: env `SYNC_BATCH_JOBS` / `SYNC_BATCH_MS` (spec §4.2); `Settings.sync_batch_jobs` / `sync_batch_ms`; `Collection(..., sync_batch_jobs=8, sync_batch_ms=1000.0)` | Task 7 | Task 10 (env rows, tuning, default moves) |
 | Probe: `bench/ingest_probe.py`, `--batch-jobs` / `--batch-ms`, result keys `sync_batch_jobs` / `sync_batch_ms` | Task 5 (file), Task 7 (flags) | Tasks 6, 10 |
 | Test module `tests/test_ingest_path.py`, one `# ---- <topic>` section per task, helpers `make_collection`, `vec`, `docs_payload`, `drain` | Task 1 | every task |
@@ -6882,18 +7412,18 @@ Every name below is spelled the same way in each task that defines or uses it, a
 
 Names D takes from other plans, checked against those plans' text:
 - A: `bench.py --limit 2549619 --caps-note --host --fingerprint-dir ~/raggio-bench/state --engine raggio --reingest --out`, the move of `results-partial.json`, and `compare.py`'s `summary`, `verdict` and `RESOLUTION["ingest_vps"]` (1.0). 2,549,119 is the ingested row count and is never passed as `--limit`.
-- B: `lock.write()`, `db_lock`, `_closed`, `_close_conns`, the `stop()` body, and `_delete_doc_rows` as B leaves it.
-- C: `idx_jobs_open` and the claim text; `_construct` via `asyncio.to_thread`; the `malloc_trim(0)` `finally` in `_process_job`.
+- B: `lock.write()`, `db_lock`, `_closed`, `_close_conns` (which empties `_read_conns`), the `stop()` body, and `_delete_doc_rows` as B leaves it.
+- C: `idx_jobs_open` and the claim text; `_construct` via `asyncio.to_thread`; the `malloc_trim(0)` `finally` in `_process_job`; `_log = logging.getLogger("uvicorn.error")`.
 - E: the `native_bm25` keyword in `Collection.__init__` and `_construct`; the `Settings.native_bm25` line.
-- F: `ivf_search_threads`, `_shard_pool`, `_IvfIndex.sync(directory) -> int`, `dirty_shards`, `_invalidate_allow`, and the tests `test_one_row_job_syncs_one_shard` and `test_reload_then_stop_writes_no_shards`.
+- F: `ivf_search_threads`, `_shard_pool` (a `_ShardPool` whose `close()` sets `_closed = True`), `_IvfIndex.sync(directory) -> int`, `dirty_shards`, `_invalidate_allow`, and the tests `test_one_row_job_syncs_one_shard` and `test_reload_then_stop_writes_no_shards`.
 
 ### Cross-plan check (merge order A, B, C, D1, E, F, D2, G)
 
 - **A.** Tasks 6 and 10 call `bench.py` only with A's flags, and move `results-partial.json` as A does. The band rule is `compare.py`'s `verdict` with `RESOLUTION["ingest_vps"] = 1.0`. D adds `bench/ingest_probe.py` and does not edit `bench.py` (spec §4.1).
-- **B.** D2's `stop()` text is B's body plus F's additions, word for word. Task 9 swaps only its `_sync_index` line for `_sync_and_finish`. That call stays inside `lock.write()`, after the worker cancel and before `_closed` and `_close_conns` (spec §4.1). A failing sync propagates out of `stop()`, as it does in B. D's `_delete_doc_rows` anchor is B's text, and B's spy test still sees `[True, True]`.
+- **B.** D2's `stop()` text is B's body plus F's additions, word for word and in the same order, except for three changes in Task 9: its `_sync_index` line is swapped for `_sync_and_finish`, the worker await's `except asyncio.CancelledError:` gains an `except Exception:` sibling that logs, and each of the three close steps is awaited through the local `close_step` helper. The call stays inside `lock.write()`, after the worker cancel and before `_closed` and `_close_conns` (spec §4.1). A failing sync no longer propagates out of `stop()` as it did in B: `_sync_and_finish` logs it and returns, so `stop()` completes its close (spec §3.1 D2). Neither does a dead worker's exception nor a failed finish (spec §3.1 D3), nor a close step that fails, after which the next step still runs (spec §3.1 D4). So no `Exception` from the worker, the final sync, a finish or a close step leaves `stop()`, and B's `shutdown()` loop reaches every later collection and the catalog; `CancelledError` and other non-`Exception` `BaseException`s still propagate. B's `stop()` tests never fail that sync, kill the worker, fail a finish in `stop()` or fail a close, and none expects `stop()` to raise, so they pass unchanged. B's close-order spy records the lock state inside `close()` and is asserted after `stop()` returns, so `close_step` cannot hide a failure there. D's `_delete_doc_rows` anchor is B's text, and B's spy test still sees `[True, True]`.
 - **C.** D1's `_CLAIM_SQL` is C's claim text byte for byte. D2 adds only `INDEXED BY idx_jobs_open` after the table name and `AND id > ?` after the predicate, and the predicate is unchanged. C must not add `INDEXED BY` itself, because D owns the claim text. C's claim test (`_claim_next()[0]` on a legacy `"{}"` payload) still holds with D2's default cursor `after=0`. D does not touch `resume_pending` or `pending_jobs`. D also leaves alone C's `_require_headroom` placement in `_attach_index` / `_detach_index`, the `malloc_trim(0)` `finally` in `_process_job`, and `_construct`'s `asyncio.to_thread` call; D2 only appends keyword arguments to it.
 - **E.** E anchors nothing in `_upsert_rows`, `_delete_doc_rows`, `_sync_index` or `_process_job`. E's tests call `_process_job({"documents": [...]})` without the optional keys, and `_payload_rows` reads those keys with `.get`, as base does. Task 3 publishes `indexed_counts` with B's copy-on-write rebind after the commit, still under `db_lock`. So the `N` that E passes to `_bm25_rescore` is always a committed count, and D changes nothing on E's read side.
-- **F, both orders.** At the spec's order F merges before D2. D2 syncs only through `_sync_index`, so F's dirty-shard `_IvfIndex.sync` writes each dirty shard once per batch (`test_batched_ivf_sync_writes_each_dirty_shard_once`). D2 does not use `sync()`'s `int` return. If D2 ever merged first, that test skips (it checks for `dirty_shards`), and the flat and whole-index sync paths behave as at base. F's own clause for "D2 first" covers its side. F's `test_one_row_job_syncs_one_shard` still holds, because the removal-cap pre-sync does not fire at counter 0. So does `test_reload_then_stop_writes_no_shards`: `_sync_and_finish` on an empty batch writes no shard. F's `_allow_cache.clear()` to `_invalidate_allow()` edit is on lines D2 does not touch.
+- **F, both orders.** At the spec's order F merges before D2. D2 syncs only through `_sync_index`, so F's dirty-shard `_IvfIndex.sync` writes each dirty shard once per batch (`test_batched_ivf_sync_writes_each_dirty_shard_once`). D2 does not use `sync()`'s `int` return. If D2 ever merged first, that test skips (it checks for `dirty_shards`), and the flat and whole-index sync paths behave as at base. F's own clause for "D2 first" covers its side. F's `test_one_row_job_syncs_one_shard` still holds, because the removal-cap pre-sync does not fire at counter 0. So does `test_reload_then_stop_writes_no_shards`: `_sync_and_finish` on an empty batch writes no shard. Task 9's `closed_state` helper reads F's `_shard_pool` through `getattr` and counts a missing pool as closed, so the spec §3.1 D2, D3 and D4 tests also hold if D2 merged first, and `test_a_failing_shard_pool_close_is_logged` skips (it checks for `_ShardPool`). In that order, D2's `stop()` has no pool step, and F's Task 1 Step 3j appends its plain `await asyncio.to_thread(self._shard_pool.close)`, which F's plan does not know to wrap: whoever applies F after D2 must append it as `await close_step("the IVF shard pool", asyncio.to_thread(self._shard_pool.close))` (Task 9 Step 3 (d)). A plain line would let a failing pool close raise out of `stop()` again, and `test_a_failing_shard_pool_close_is_logged`, which stops skipping once `_ShardPool` exists, would fail on it. F's plan is not edited for this, since the spec's order runs F first. F's `_allow_cache.clear()` to `_invalidate_allow()` edit is on lines D2 does not touch.
 - **G.** G has no shared-state audit list, so D has nothing to add to one. D adds no `sqlite3.connect` site, so G's `cached_statements=` edit covers D's queries, `_CLAIM_SQL` included. G's Plan D expectation (G's cross-plan list: the `stop()` flush runs before the meta.db connections close) holds, per Task 9. See the next section for the free-threading check.
 - **ADR numbering (spec D1).** D takes no new ADR number. Task 6 appends `## Addendum 2026-09 — ingest path` after C's addendum and its `### Acceptance run` block. Task 10 adds D2's subsections at the file's end and rewrites the line-50 lever note. F edits ADR 0001 lines 30, 48 and 49 in place and adds nothing after D1's addendum, so line 50 is D's alone.
 - **Knobs (spec §4.2).** `SYNC_BATCH_JOBS` and `SYNC_BATCH_MS` are unprefixed and read in `Settings`, after F's `ivf_search_threads` line. `CollectionManager._construct` passes them into `Collection`. Algorithm constants (`VACUUM_*`, `SYNC_MAX_REMOVALS`, `SYNC_RETRY_*`) stay module-level in `store.py`.
@@ -6911,7 +7441,7 @@ Fixes made during this check:
 ### Free-threading (Plan G)
 
 G merges last and runs the suite on 3.14t. D's new shared state is safe without the GIL, because each item has exactly one writer at a time and a happens-before edge:
-- `Collection._unsynced` and `Collection._batch_t0` (Task 8) are read and written only by the worker coroutine on the event loop thread. `_finish_job` runs in a thread but gets the job's fields, not the list. The one other user is `stop()`'s `_sync_and_finish` (Task 9), a thread that runs under `lock.write()` after the worker has been cancelled. From then on the worker only unwinds: its only handler is `except asyncio.CancelledError: raise`, and it does not touch either attribute again. A job that `_flush_unsynced` already popped belongs to the orphaned finish thread, and it is not in the list any more. The `asyncio.to_thread` submit and the future's result give happens-before in both directions.
+- `Collection._unsynced` and `Collection._batch_t0` (Task 8) are read and written only by the worker coroutine on the event loop thread. `_finish_job` runs in a thread but gets the job's fields, not the list. The one other user is `stop()`'s `_sync_and_finish` (Task 9), a thread that runs under `lock.write()` after the worker has been cancelled or has died (spec §3.1 D3), and `stop()` has awaited it. From then on the worker has ended: its only handler is `except asyncio.CancelledError: raise`, and it does not touch either attribute again. A job that `_flush_unsynced` already popped belongs to the orphaned finish thread, and it is not in the list any more. The `asyncio.to_thread` submit and the future's result give happens-before in both directions.
 - `Collection._removed_since_sync` (Task 7) is written only under `lock.write()`: counted in `_unindex`, reset in `_sync_index`, and read by `_process_job`'s cap check. `__init__` writes it once, single-threaded. Consecutive write sections run in different pool threads, and the lock handoff on the loop orders them.
 - `indexed_counts` (Task 3) keeps B's copy-on-write rebind and is published after the commit, under `db_lock`. Readers take one local reference.
 - `_encode_payload` and `_decode_payload` are pure functions. `_CLAIM_SQL`, `VACUUM_*`, `SYNC_MAX_REMOVALS` and `SYNC_RETRY_*` are immutable module constants.
@@ -6920,7 +7450,7 @@ G merges last and runs the suite on 3.14t. D's new shared state is safe without 
 ### Validation status
 
 - Nothing in this plan has been executed. This self-review, and the earlier review passes over Tasks 1-6 (D1) and Tasks 7-10 (D2), were done by reading: every anchor was compared with the base `store.py` and with the text of Plans A, B, C, E and F that it quotes. Each test's expected failure message, pass count (`N0 + k`, `N0' + k`) and deselection count was traced by hand. No `pytest`, `py_compile` or shell step ran.
-- N0 and N0' are measured on each branch base before the first task, and are never hard-coded. N0 is 240, or 239 if Plan C's Task 12 test did not land.
+- N0 and N0' are measured on each branch base before the first task, and are never hard-coded. N0 is 253, or 252 if Plan C's Task 12 test did not land.
 - The DGX results are `Pending:` by design until the user grants a window: Task 6 for D1, Task 10 for D2. Tasks 6 and 10 hold the gates, and no threshold can be loosened afterwards.
 - To confirm on the first run:
   - Task 7's `test_claim_query_never_scans_the_journal` checks that `INDEXED BY idx_jobs_open` plans as one `SEARCH` on the SQLite the suite runs with. The DGX rows record each arm's `sqlite_version`. SQLite rejects a statement whose `INDEXED BY` cannot be honoured, so a wrong plan fails loudly rather than slowly;
@@ -6930,7 +7460,7 @@ G merges last and runs the suite on 3.14t. D's new shared state is safe without 
 
 1. **D2's flat and bench gates.** Spec §7 asks for ingest vec/s "beyond the noise band on the IVF and flat paths". D1 gates flat, IVF and the bench reingest on `better`. D2 gates IVF on `better`, but flat and the bench reingest only on `better` or `within band`. The reason: a flat sync is append-only and costs 7-9 ms, 2-5% of a job (item2a), so batching has almost nothing to save there. Either accept this reading of §7 for D2, or require `better` on flat. Requiring it would likely leave D2's results unpublishable.
 2. **D1 window.** If the long bench-reingest part of the D1 window (about 3.5 h in total) is declined, is a probe-only result (`- SKIP: D1-bench`) an acceptable D1 claim?
-3. **D2 defaults.** Task 10 lets the seed-7 tuning move the defaults off (8, 1000) in one commit, before the seed-42 publish. Confirm that the tuning may change the shipped defaults.
+3. **D2 defaults.** Decided (spec §3.1 D1): the seed-7 tuning may change the `SYNC_BATCH_JOBS=8` / `SYNC_BATCH_MS=1000` defaults, seed 42 confirms the chosen values, and the PR states them. Task 10 moves them in one commit (Step 10) before the seed-42 publish, and Step 19's report gives the line for D2's PR description.
 4. **Downgrade.** A database written by D1 or later keeps the payloads of open jobs as binary rows in `job_payloads`, which older code cannot replay. The plan documents "drain the queue before downgrading" but does not enforce it.
 5. **Finish transactions.** D2 keeps one `_finish_job` transaction per job, which keeps B's pinned behaviour and job-level replay. item2a suggested one finish transaction per batch, which means fewer commits but replays the whole batch after a crash during the finishes.
-6. **`stop()` on a failing sync.** D2 keeps B's semantics: the exception propagates out of `stop()`, and the batch stays `processing` and replays on the next open. The alternative is to log the error and close.
+6. **`stop()` on a failing sync.** Decided (spec §3.1 D2): the failure is logged and the shutdown completes, nothing is raised, and the jobs stay `processing` with their payloads and replay on the next open (D8). Task 9's `_sync_and_finish` does this. Also decided (spec §3.1 D3): a dead worker's exception (logged in `stop()`'s `except Exception:` clause) and a finish that fails after the final sync landed (logged in `_sync_and_finish`) are handled the same way, and their jobs replay. And decided (spec §3.1 D4): each close step (`_close_conns` under `db_lock`, the embedder's `aclose()`, F's `_shard_pool.close`) logs its own failure through `close_step`, and the next step still runs. So `stop()` never raises an `Exception` from its worker, its final sync, a finish or a close step, and `shutdown()` reaches every collection and the catalog. Only `Exception` is caught: `CancelledError`, `KeyboardInterrupt` and `SystemExit` propagate. A failed `_close_conns` leaves the connections it did not reach to the garbage collector; D4 does not make B's method close each connection on its own.

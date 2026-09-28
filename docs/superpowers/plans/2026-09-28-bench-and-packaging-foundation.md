@@ -13,12 +13,15 @@
   - It gains `--adopt`, `--fingerprint-dir` and `--state-timeout` (900 s).
   - `raggio-ivf` builds its index through its own `build_index` step on the flat collection's data.
   - The committed email-corpus fingerprints are untracked.
+  - It reports the concurrent hybrid p99 (`hybrid_c_p99`) and, with `--cpu-container NAME`, the server's CPU per query in both concurrent phases (`cpu_ms_per_q_c`, `hybrid_cpu_ms_per_q_c`), read from the container's cgroup `cpu.stat`. With no cgroup read, the CPU rows are absent, never 0, and one log line says why (spec §3.1 G5).
 - **DGX runbook.** `bench/dgx/` holds the runbook scripts:
   - `deploy.sh` (workstation), with `unpack.sh` and `setup.sh` on the DGX side;
   - `session.sh`, one measurement session of one image in the spec §6 order;
   - `lib.sh`, the shared settings and guard rails;
   - `compare.py`, the median / max − min noise band and the A/B verdicts.
   - `session.sh` also writes `regime.json` and `image.json`, and `compare.py` prints them for each side. It flags arms whose regimes differ and marks concurrent-QPS rows with fewer than 3 runs as "reported, not claimed".
+  - `CONCURRENCY` (default 8) is every run's `--concurrency`, recorded in `regime.json`, so `compare.py` flags arms that ran at different concurrency (spec §3.1 G7).
+  - `IVF_BUILDS=2` makes a flat-start session build the IVF index a second time after its measured runs: the 8 GiB detach, then a build at 4 GiB (`build2-raggio-ivf`). `compare.py` counts only that run's build time, so the build row gets two values per side, a median and a band (spec §3.1 A1).
 - **Packaging.**
   - orjson moves to a `bench` dependency group. The runtime stays on stdlib JSON (ADR 0001:31).
   - `[tool.uv] required-version = ">=0.12"`, and `uv.lock` is re-locked with uv 0.12.19.
@@ -34,15 +37,16 @@
 **Spec:** `docs/superpowers/specs/2026-09-28-raggio-performance-design.md`
 - §2: order 0 (bench tasks, equivalence re-baseline) and order 2 (the rest, new reference baseline).
 - §3: D2, D5, D11, D15, D16.
+- §3.1: A1 (the IVF build gate: two builds per arm), A2 (the deploy keeps the previous bench files), G5 (the concurrent hybrid p99 and CPU per query rows) and G7 (the `CONCURRENCY` session knob).
 - §4.1: ownership of `bench/bench.py`, `bench/dgx/*.sh`, `pyproject.toml` groups, `uv.lock`, `required-version`, `Dockerfile` and `tests.yml`.
-- §4.2: `OPENBLAS_NUM_THREADS=1` is an image `ENV`; each plan uses its own test modules.
+- §4.2: `OPENBLAS_NUM_THREADS=1` is an image `ENV`; each plan uses its own test modules; the bench rows for G5 and the session knob for G7 land in A's PR 1.
 - §5.3: bench fragility.
 - §6: the DGX benchmark protocol.
 
 **Ships as two PRs, in spec §2 order:**
 - **PR 1:** Tasks 1–6 on `git switch -c bench-hardening` from `main` @ 19a8a2e.
 - **PR 2:** Tasks 7–10 on `git switch -c packaging-foundation` from `main`, once PR 1 and Plan B have merged.
-- **Suite counts.** Counts are given for A's tests alone: 46 on base, then 101 / 109 / 139 / 147 / 149 after Tasks 1 / 2 / 3 / 4 / 5, and 154 / 156 / 159 after Tasks 7 / 8 / 9. Plan B adds 16 tests (46 → 62), so on PR 2's branch every count is 16 higher: 170 / 172 / 175. The one Starlette deprecation warning stays throughout.
+- **Suite counts.** Counts are given for A's tests alone: 46 on base, then 101 / 109 / 139 / 150 / 161 after Tasks 1 / 2 / 3 / 4 / 5, and 166 / 168 / 171 after Tasks 7 / 8 / 9. Plan B adds 17 tests (46 → 63), so on PR 2's branch every count is 17 higher: 183 / 185 / 188. The one Starlette deprecation warning stays throughout.
 
 **Validation status:**
 - **Sandbox.** `D:/DEV/_scratch/plan-sandbox/plan-A-final` @ cd633f5, whose base d9f2c77 equals `main` @ 19a8a2e. The replay log is `D:/DEV/_scratch/plan-sandbox/plan-A-tools/verify_final.out`, run on Windows 11 with CPython 3.12 and uv 0.12.19.
@@ -58,7 +62,7 @@
   - a Linux CI simulation with uv 0.12.19 on an earlier revision of the test set;
   - an end-to-end `bench.py` run against a local raggio server, covering every reuse, abort, adopt, build-index and reingest path of Tasks 1–2.
 - **Not executed in the sandbox, and labelled so where they appear:**
-  - Tasks 4, 5, 6 and 10 in full;
+  - Tasks 4, 5, 6 and 10 in full (Task 5's two-file RED and GREEN counts were replayed on the workstation outside the sandbox, as Task 5 says);
   - Task 7 Step 3 (the dev-box uv upgrade);
   - the D16 line and its test in Task 9;
   - every suite count after Task 3, which are derived by adding the new tests to the last replayed count.
@@ -70,12 +74,14 @@ These are copied from the spec, one requirement per line:
 - "Every plan ships as its own branch/PR. It must leave `uv run pytest -q` green and must not depend on a later plan." (§2)
 - "Before each plan's DGX A/B, the preceding `main` is re-baselined; A/Bs compare against that, never against the step-0 numbers." (§2)
 - "Harden `bench/bench.py`. Commit the DGX runbook scripts. The baseline of 19a8a2e was already captured on 2026-09-28 with a scratch-patched bench (`research/2026-09-28-dgx-baseline.md`). A's DGX step is an **equivalence re-baseline**: the hardened bench on the same image must land inside the baseline's noise band." (§2, order 0)
-- "uv ≥ 0.12 + `required-version`, re-lock, orjson → `bench` group, minimal CI, Dockerfile base migration (see §4.2) plus `ENV OPENBLAS_NUM_THREADS=1` (D16). The DGX step records a **new reference baseline** for the PBS interpreter, SQLite 3.50.4 and single-threaded BLAS (D15, D16). The IVF build time and the flat vector rows must not regress beyond the band. Hybrid rows and IVF concurrent/filtered rows are expected to move and are reported." (§2, order 2)
+- "uv ≥ 0.12 + `required-version`, re-lock, orjson → `bench` group, minimal CI, Dockerfile base migration (see §4.2) plus `ENV OPENBLAS_NUM_THREADS=1` (D16). The DGX step records a **new reference baseline** for the PBS interpreter, SQLite 3.53.1 and single-threaded BLAS (D15, D16). The IVF build time and the flat vector rows must not regress beyond the band. Hybrid rows and IVF concurrent/filtered rows are expected to move and are reported." (§2, order 2)
 - "One parameterized multi-stage Dockerfile. `ARG PYTHON=3.12` and `ARG UV_VERSION` pinned. uv binary from `ghcr.io/astral-sh/uv:<UV_VERSION>`. `uv python install` into `/python`. Runtime `debian:trixie-slim`. The bookworm uv tags are frozen at 0.9.30. No separate `Dockerfile.ft`. A migrates the base, E adds the Rust builder stage, G adds the 3.14t/turbovec-sdist path." (D2)
 - "Move to a `bench` dependency group, no bump. Runtime JSON stays stdlib (ADR 0001:31)." (D5)
 - "A minimal `tests.yml`: 3.12 running the Python-fallback suite, plus a native job once E lands. A non-blocking 3.14t job with the GIL guard is added by G." (D11)
 - "A's base migration is itself a performance change, so A records a **new reference baseline** after it and does not claim equivalence on hybrid rows. Every DGX row records `sqlite3.sqlite_version`." (D15)
 - "Set `ENV OPENBLAS_NUM_THREADS=1` in the image." "Owner A, as part of the base migration, so the one new reference baseline (D15) absorbs it. A's DGX step checks that the IVF build (k-means + attach) and the ingest-free rows do not regress beyond the band; p3 did not measure these. If the build regresses, the fallback is to limit BLAS threads on the search path only with threadpoolctl, still owned by A." (D16)
+- "The IVF build-time gate builds **twice per arm** and compares medians, against the band. There is no single-build tolerance and no rerun rule. The threadpoolctl fallback (D16) is added only if this gate fails." (§3.1 A1)
+- "The deploy may replace `~/raggio` on gn100 after moving the previous bench files to `~/raggio-bench/pre-deploy-<UTC time>/`. It never touches `bench-wv` or `~/turborag`." (§3.1 A2)
 - "`bench/bench.py`, `bench/dgx/*.sh` runbook: A. Add new probe files only (`bench/<name>_probe.py`); never edit bench.py." (§4.1)
 - "`pyproject.toml` groups, `uv.lock`, `required-version`: A first." (§4.1)
 - "`.github/workflows/tests.yml`: A creates it. E adds the native job, G the 3.14t job." (§4.1)
@@ -119,7 +125,7 @@ These are the five input classes most likely to slip past the plan, most likely 
    - The committed email-corpus `bench/fingerprint-raggio.json` is the case, and so is `--adopt` overriding a fingerprint that is on file.
    - Pins: `test_adopt_never_overrides_a_fingerprint_on_file` and `test_unreadable_fingerprint_never_matches` (Task 1), and `test_legacy_unkeyed_fingerprint_is_not_trusted` (Task 2).
 4. **RF4: an A/B across two regimes is read as a same-regime result.**
-   - Examples: baseline on SQLite 3.40.1 with default BLAS against a candidate on 3.50.4 with `OPENBLAS_NUM_THREADS=1`, or a swapless arm against a default-swap arm, or 2 flat runs claiming concurrent QPS.
+   - Examples: baseline on SQLite 3.40.1 with default BLAS against a candidate on 3.53.1 with `OPENBLAS_NUM_THREADS=1`, or a swapless arm against a default-swap arm, or 2 flat runs claiming concurrent QPS.
    - Pins: `test_compare_flags_arms_that_differ_in_regime`, `test_compare_reports_thin_concurrent_qps_as_not_claimed`, `test_session_records_the_regime_labels` and `test_image_facts_snippet_reports_sqlite_and_blas_threads` (Task 4).
 5. **RF5: a later Dockerfile or lock edit (C, E, G) silently drops the image contract.**
    - At risk: the uv pin, 3.12 on trixie, uid 1000, `LANG`, the CMD, `OPENBLAS_NUM_THREADS=1`, or the lock matching the groups.
@@ -133,17 +139,17 @@ These are the five input classes most likely to slip past the plan, most likely 
 |---|---|---|---|
 | `bench/bench_reuse.py` | Create | 1 | Reuse-or-ingest decision: `BenchAbort`, `EngineState`, engine state reads, `wait_idle`, keyed atomic fingerprints, `decide`, `prepare_engine`. Stdlib + httpx only. |
 | `tests/test_bench_reuse.py` | Create | 1 | 55 tests of the decision, with `httpx.MockTransport` engines. |
-| `bench/bench.py` | Modify | 2, 5, 7 | Task 2: `preflight` before ground truth, `build_parser()`, `main(argv=None)`, `ENGINES` `fp` / `build_index` keys, `build_ivf_index()`, the new flags, `BenchAbort` → `SystemExit`. Task 5: the first-hybrid-pass rows and the warm-cache note. Task 7: the docstring's `--group bench`. |
-| `tests/test_bench_harness.py` | Create (2), append (5) | 2, 5 | bench.py wiring: preflight order, flags, keyed fingerprints; then the Task 5 rows. |
+| `bench/bench.py` | Modify | 2, 5, 7 | Task 2: `preflight` before ground truth, `build_parser()`, `main(argv=None)`, `ENGINES` `fp` / `build_index` keys, `build_ivf_index()`, the new flags, `BenchAbort` → `SystemExit`. Task 5: the first-hybrid-pass rows and the warm-cache note; `hybrid_c_p99`, and `cpu_ms_per_q_c` / `hybrid_cpu_ms_per_q_c` from the cgroup `cpu.stat` (`cpu_stat_path`, `read_usage_usec`, `cpu_phase`, `--cpu-container`), absent when unreadable. Task 7: the docstring's `--group bench`. |
+| `tests/test_bench_harness.py` | Create (2), append (5) | 2, 5 | bench.py wiring: preflight order, flags, keyed fingerprints; then the Task 5 rows, the cgroup CPU reads and the absent CPU rows. |
 | `.gitignore` | Modify | 2 | Ignore `bench/fingerprint-*.json` and `bench/results-partial.json`. |
 | `bench/fingerprint-raggio.json`, `bench/fingerprint-weaviate.json` | Untrack | 2 | Email-corpus fingerprints: renamed locally to `*-553015.json`, never committed again. |
 | `docs/benchmark.md`, `docs/benchmark-arxiv.md` | Modify | 2, 7 | The preflight, `--adopt` / `--reingest`, then `--group bench`. |
 | `.gitattributes` | Create | 3 | `*.sh text eol=lf`. |
-| `bench/dgx/lib.sh` | Create (3), modify (4) | 3, 4 | Shared settings (`LIMIT`, `CONTAINER`, `VOLUME`, `MEMORY`, …), `log`, `run`. Task 4: `FLAT_RUNS`, `MEMORY_SWAP` and `FIRST_START` become overridable. |
+| `bench/dgx/lib.sh` | Create (3), modify (4, 5) | 3, 4, 5 | Shared settings (`LIMIT`, `CONTAINER`, `VOLUME`, `MEMORY`, …), `log`, `run`. Task 4: `FLAT_RUNS`, `MEMORY_SWAP` and `FIRST_START` become overridable, and `IVF_BUILDS` (1 or 2) is added. Task 5: `CONCURRENCY` (default 8). |
 | `bench/dgx/deploy.sh`, `bench/dgx/unpack.sh`, `bench/dgx/setup.sh` | Create | 3 (setup.sh modified in 7) | Workstation → DGX deploy of `HEAD`; keep the old checkout's results; corpus link, ground truth, `uv sync`, `podman build`, `.deployed-sha`. |
-| `bench/dgx/session.sh` | Create (3), modify (4) | 3, 4 | One session of one image in the §6 order. Task 4: `regime.json`, `image.json`, the swapless gate, the first-start label. |
-| `bench/dgx/compare.py` | Create (3), modify (4, 5) | 3, 4, 5 | Median / max − min band, verdicts, `render`, `beyond_band`. Task 4: `regime()`, regime lines, the arms-differ line, the thin-QPS note. Task 5: the two new metric rows. |
-| `tests/test_bench_dgx.py` | Create (3), append (4) | 3, 4 | Runbook: syntax, LF, guard rails, dry runs, unpack, compare. |
+| `bench/dgx/session.sh` | Create (3), modify (4, 5) | 3, 4, 5 | One session of one image in the §6 order. Task 4: `regime.json`, `image.json`, the swapless gate, the first-start label, the second IVF build (`IVF_BUILDS=2`). Task 5: `--concurrency "$CONCURRENCY" --cpu-container "$CONTAINER"` on every run, and the regime's `concurrency` label. |
+| `bench/dgx/compare.py` | Create (3), modify (4, 5) | 3, 4, 5 | Median / max − min band, verdicts, `render`, `beyond_band`. Task 4: `regime()`, regime lines, the arms-differ line, the thin-QPS note, `BUILD_FILE` (a second build adds only its build time). Task 5: the five new metric rows (all lower-is-better; absent rows print `-`) and the `concurrency` regime key. |
+| `tests/test_bench_dgx.py` | Create (3), append (4, 5) | 3, 4, 5 | Runbook: syntax, LF, guard rails, dry runs, unpack, compare. Task 5: the `CONCURRENCY` knob, the concurrency regime label, absent CPU rows in compare. |
 | `pyproject.toml`, `uv.lock` | Modify | 7 | `bench = ["orjson>=3.12.0"]`, `[tool.uv] required-version = ">=0.12"`, re-lock with uv 0.12.19 (lock revision 3). |
 | `README.md`, `docs/getting-started.md`, `bench/floor_probe.py`, `bench/prep_arxiv.py` | Modify | 7 | `--group bench` in every orjson script's run line; the uv floor note. |
 | `tests/test_packaging.py` | Create (7), append (8, 9) | 7, 8, 9 | Groups, uv floor, lock, docs, CI, Dockerfile contract, D16. |
@@ -1996,9 +2002,17 @@ EOF
 
 ---
 
-### Task 4: Every row states its regime; thin concurrent QPS is not claimed (not executed in the sandbox)
+### Task 4: Every row states its regime; thin concurrent QPS is not claimed; the IVF build can run twice (not executed in the sandbox)
 
-This task implements spec §6's labelling rules on top of Task 3. None of it was run in the sandbox. The code, the RED and GREEN counts and the suite count are derived from Task 3's replayed state plus the 8 new tests.
+This task implements spec §6's labelling rules on top of Task 3. It also adds the second IVF build that spec §3.1 A1 requires: "The IVF build-time gate builds **twice per arm** and compares medians, against the band."
+- With `IVF_BUILDS=2`, a flat-start session runs its measured runs as before. Then it detaches the index in the transient 8 GiB container and runs `build2 raggio-ivf` at 4 GiB, which builds the index from flat again.
+- The measured runs therefore keep the session's one IVF ↔ flat transition. The extra detach and build come after all of them.
+- `compare.py` counts only `build2`'s one-shot build time, next to run0's. Its query metrics never count. The build row then has two values per side, a median and a band, and a verdict like every other row.
+- An IVF-start session with `IVF_BUILDS=2` stops before its first bench run. It would need a second transition before the extra build.
+
+Task 6 does not use `IVF_BUILDS`. Its equivalence gate does not gate the build time: baseline3 holds one build, and Task 6 already treats the build row's `no band` and `-` as non-failures. Only Task 10's Gate 1 is the IVF build-time gate of spec §3.1 A1.
+
+This task lands in PR 1, so both of Task 10's arms can build twice: `a-main` runs `main`'s `session.sh` (PR 1 and Plan B merged), and `a-ref` runs PR 2's. None of it was run in the sandbox. The code, the RED and GREEN counts and the suite count are derived from Task 3's replayed state plus the 11 new tests.
 
 **Files:**
 - Modify: `bench/dgx/lib.sh:9-11`.
@@ -2008,8 +2022,10 @@ This task implements spec §6's labelling rules on top of Task 3. None of it was
   - lines 46-49 (`FIELD` / `EXTRA`);
   - after `index_type`;
   - `fresh_container` lines 94-100;
-  - lines 143-145 (after the facts block).
-- Modify: `bench/dgx/compare.py`: the docstring, the constants after `RUN_FILE`, `regime()` after `load`, and `render`.
+  - line 121 (the `detach_index` comment);
+  - lines 143-145 (after the facts block);
+  - lines 148-162 (the `case "$START_INDEX"` block).
+- Modify: `bench/dgx/compare.py`: the docstring, the constants after `RUN_FILE`, `load` and `values`, `regime()` after `load`, and `render`.
 - Test: `tests/test_bench_dgx.py` (append).
 
 **Interfaces:**
@@ -2018,17 +2034,19 @@ This task implements spec §6's labelling rules on top of Task 3. None of it was
   - `session.sh` environment:
     - `FLAT_RUNS=<n>` (default 2);
     - `MEMORY_SWAP=<size>` (default empty = podman's default; `4g` = the swapless gate, applied to every 4 GiB start, never the 8 GiB detach);
-    - `FIRST_START=host-warm|true-cold` (default `host-warm`; anything else exits 1 before the label directory is created).
-  - `~/raggio-bench/<label>/regime.json` = `{"page_cache": "host-warm", "first_start": …, "memory": "4g", "memory_swap": "<size>|host-default", "detach_memory": "8g"}`.
+    - `FIRST_START=host-warm|true-cold` (default `host-warm`; anything else exits 1 before the label directory is created);
+    - `IVF_BUILDS=1|2` (default 1; anything else exits 1 before the label directory is created). With 2, a flat-start session ends with the 8 GiB detach and `build2 raggio-ivf`: a bench run at 4 GiB that finds a flat index and builds it, as run0 did, and writes `~/raggio-bench/<label>/build2-raggio-ivf.{md,json}`. The session still ends IVF. An IVF-start session with 2 exits 1 after the first start, before any bench run.
+  - `~/raggio-bench/<label>/regime.json` = `{"page_cache": "host-warm", "first_start": …, "memory": "4g", "memory_swap": "<size>|host-default", "detach_memory": "8g"}`. Task 5 appends `"concurrency": "<n>"`.
   - `~/raggio-bench/<label>/image.json` = `{"python", "sqlite_version", "turbovec", "openblas_num_threads"}`, read inside the image under test. It is absent if the probe fails.
   - In `compare.py`:
     - `REGIME_KEYS`, and `SAME_REGIME` (`REGIME_KEYS` minus `first_start`);
     - `CLAIM_RUNS = {"qps_concurrent": 3}`;
-    - `regime(session_dir) -> {key: str}`, where a missing label is `"unknown"`.
+    - `regime(session_dir) -> {key: str}`, where a missing label is `"unknown"`;
+    - `BUILD_FILE = re.compile(r"build([1-9]\d*)-(raggio-ivf)\.json")`. `load` stores a `build<N>` file as run `-N` of `raggio-ivf`, and `values` counts it for the `ONE_SHOT` metrics only, after the runs. The build row of an `IVF_BUILDS=2` session therefore has two values (run0's, then build2's), a median, a band and a verdict. `values` is unchanged for sessions without a `build<N>` file, which is every Plan D and Plan G caller.
   - `render` prints `Regime (session): …`, or `Regime (baseline): …` and `Regime (candidate): …`, as the lines after the title.
     - When `SAME_REGIME` labels differ, it adds `The arms differ in <keys>: a re-baseline across them, not a same-regime A/B (spec §6).`
     - If any vector concurrent-QPS row has fewer than 3 counted runs on a side, the last line is `Reported, not claimed (spec §6 needs >= 3 runs per side; FLAT_RUNS=3): <engine> <label>, …`.
-  - Verdicts and `beyond_band` are unchanged. The table rows keep 7 cells (A/B) or 5 cells (one session).
+  - `verdict`, `summary` and `beyond_band` are unchanged. With two build values per side, the build row gets `better`, `within band` or `worse` like every other row, and `beyond_band` lists `('raggio-ivf', 'index_build_s')` when it is worse (Task 10's Gate 1, spec §3.1 A1). The table rows keep 7 cells (A/B) or 5 cells (one session).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2043,7 +2061,7 @@ REGIME = {"page_cache": "host-warm", "first_start": "host-warm", "memory": "4g",
           "memory_swap": "host-default", "detach_memory": "8g"}
 BOOKWORM = {"python": "3.12.11", "sqlite_version": "3.40.1", "turbovec": "1.0.0",
             "openblas_num_threads": "unset"}
-TRIXIE = {"python": "3.12.12", "sqlite_version": "3.50.4", "turbovec": "1.0.0",
+TRIXIE = {"python": "3.12.14", "sqlite_version": "3.53.1", "turbovec": "1.0.0",
           "openblas_num_threads": "1"}
 
 
@@ -2158,19 +2176,88 @@ def test_compare_reports_thin_concurrent_qps_as_not_claimed(tmp_path):
     assert compare.render(thin).splitlines()[-1] == note
     assert compare.render(thin, cand).splitlines()[-1] == note
     assert "Reported, not claimed" not in compare.render(full, cand)
+
+
+# ---- the second IVF build (Task 4): spec §3.1 A1, the build gate builds twice per arm ----
+
+@needs_bash
+def test_a_second_ivf_build_runs_after_every_measured_run(tmp_path):
+    home, cmds = dry_session(tmp_path, ("DRY_INDEX", "flat"), ("IVF_BUILDS", "2"))
+    out = (home / "s1").as_posix()
+    runs = [(i, *re.search(r"--out \S+/(\w+)-(raggio-ivf|raggio)\.md", c).groups())
+            for i, c in enumerate(cmds) if c.startswith(BENCH_CMD)]
+    assert [(tag, engine) for _, tag, engine in runs] == [
+        ("run0", "raggio"), ("run1", "raggio"), ("run2", "raggio"),
+        ("run0", "raggio-ivf"), ("run1", "raggio-ivf"), ("run2", "raggio-ivf"), ("run3", "raggio-ivf"),
+        ("build2", "raggio-ivf")]
+    # the measured runs keep the one transition (run0's build); the extra detach comes after them
+    (d,) = [i for i, c in enumerate(cmds) if "-X DELETE" in c]
+    assert runs[6][0] < d < runs[7][0]
+    assert cmds[d - 5:d + 1] == [STOP, RM, podman_run("8g"), STARTED, IDLE, DETACH]
+    assert [c for c in cmds if "--memory 8g" in c] == [podman_run("8g")]
+    # build2 builds from flat in a fresh 4 GiB container, like any bench run
+    b = runs[7][0]
+    assert cmds[b - 6:b] == [STOP, RM, podman_run("4g"), STARTED, IDLE, "rm -f bench/results-partial.json"]
+    assert "--engine raggio-ivf " in cmds[b] and cmds[b].endswith(f"--out {out}/build2-raggio-ivf.md")
+    assert cmds[b + 1] == f"mv bench/results-partial.json {out}/build2-raggio-ivf.json"
+
+
+@needs_bash
+def test_ivf_builds_is_validated_and_needs_a_flat_start(tmp_path):
+    home, raggio = tmp_path / "bench-home", tmp_path / "raggio"
+    raggio.mkdir()
+    (raggio / ".deployed-sha").write_text("abc1234\n")
+    env = {**os.environ, "DRY_RUN": "1", "BENCH_HOME": home.as_posix(), "RAGGIO_DIR": raggio.as_posix()}
+    session = [BASH, (DGX / "session.sh").resolve().as_posix()]
+    r = subprocess.run([*session, "s1"], env={**env, "IVF_BUILDS": "3"}, capture_output=True, text=True)
+    assert r.returncode != 0 and "IVF_BUILDS=3: use 1 or 2" in r.stderr
+    assert not (home / "s1").exists()
+    # an IVF start would need a second IVF <-> flat transition before the extra build
+    r = subprocess.run([*session, "s2"], env={**env, "IVF_BUILDS": "2", "DRY_INDEX": "ivf"},
+                       capture_output=True, text=True)
+    assert r.returncode != 0 and "IVF_BUILDS=2 needs a flat start" in r.stderr
+    assert BENCH_CMD not in r.stdout
+
+
+def ivf_builds(d, first, second):
+    """An IVF_BUILDS=2 session: run0 builds the index, build2 builds it again after the runs."""
+    write_session(d, {
+        "run0-raggio-ivf": {"index_build_s": first, "lat_p50": 15.5},
+        "run1-raggio-ivf": {"lat_p50": 11.0}, "run2-raggio-ivf": {"lat_p50": 12.0},
+        "build2-raggio-ivf": {"index_build_s": second, "lat_p50": 30.0}})
+
+
+def test_the_second_ivf_build_counts_for_the_build_row_only(tmp_path):
+    base, cand, cand2 = tmp_path / "main", tmp_path / "cand", tmp_path / "cand2"
+    ivf_builds(base, 213.0, 221.0)
+    ivf_builds(cand, 227.0, 233.0)
+    ivf_builds(cand2, 215.0, 225.0)
+    runs = compare.load(base)["raggio-ivf"]
+    assert compare.values(runs, "index_build_s") == [213.0, 221.0]  # run0's build, then build2's
+    assert compare.values(runs, "lat_p50") == [11.0, 12.0]  # build2's queries never count
+    assert "| raggio-ivf | IVF index build (s) | 213 / 221 | 217 | 8 |" in compare.render(base)
+    # medians against the band (spec §3.1 A1): 230 - 217 = 13 is beyond the wider band of 8
+    assert "| raggio-ivf | IVF index build (s) | 217 | 8 | 230 | 6 | worse |" in compare.render(base, cand)
+    assert compare.beyond_band(base, cand) == {"better": [], "worse": [("raggio-ivf", "index_build_s")]}
+    # 220 - 217 = 3 is inside the candidate's band of 10: no single-build tolerance decides it
+    assert "| raggio-ivf | IVF index build (s) | 217 | 8 | 220 | 10 | within band |" in compare.render(base, cand2)
+    assert compare.beyond_band(base, cand2) == {"better": [], "worse": []}
 ```
 
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `uv run pytest tests/test_bench_dgx.py -q`
 
-Expected (derived, not executed): `8 failed, 30 passed`.
+Expected (derived, not executed): `11 failed, 30 passed`.
 - `test_session_records_the_regime_labels`: `FileNotFoundError` for `regime.json`.
 - The swapless test: its first `assert` fails because no start carries `--memory-swap`.
 - The `FIRST_START` test: `assert r.returncode != 0` fails, because a dry run ignores the variable.
 - The `FLAT_RUNS` test: the hard-coded `FLAT_RUNS=2` gives `run0`–`run2` only.
 - The snippet test: `ValueError: not enough values to unpack (expected 1, got 0)`.
-- The three compare tests: `AssertionError` on the missing regime lines and the missing note.
+- The three regime compare tests: `AssertionError` on the missing regime lines and the missing note.
+- `test_a_second_ivf_build_runs_after_every_measured_run`: `AssertionError` on the run list, which ends at raggio-ivf `run3` because the session ignores `IVF_BUILDS`.
+- `test_ivf_builds_is_validated_and_needs_a_flat_start`: `assert r.returncode != 0` fails for `IVF_BUILDS=3`.
+- `test_the_second_ivf_build_counts_for_the_build_row_only`: `AssertionError`, `[213.0] == [213.0, 221.0]`: Task 3's `load` skips `build2-raggio-ivf.json`.
 
 - [ ] **Step 3: Minimal implementation**
 
@@ -2190,9 +2277,10 @@ MEMORY_SWAP="${MEMORY_SWAP:-}"           # empty: podman's default swap; 4g = th
 FIRST_START="${FIRST_START:-host-warm}"  # host-warm, or true-cold after a reboot or an fadvise eviction (D12)
 DETACH_MEMORY=8g      # IVF -> flat detach: refused at 4 GiB until plan C releases build memory
 FLAT_RUNS="${FLAT_RUNS:-2}"  # measured flat runs after run0; 3 when a concurrent-QPS row is claimed (spec §6)
+IVF_BUILDS="${IVF_BUILDS:-1}"  # IVF builds of a flat-start session; 2 = one more after the measured runs (spec §3.1 A1)
 ```
 
-3b. `bench/dgx/session.sh` has six edits.
+3b. `bench/dgx/session.sh` has eight edits.
 
 (1) Replace the header lines 20-23
 
@@ -2212,6 +2300,8 @@ with
 # MEMORY_SWAP=4g: the swapless memory gate (--memory-swap on every 4 GiB start, not the detach).
 # FIRST_START=true-cold: label the first start true-cold (host rebooted, or the volume's files
 # fadvise-evicted, before the session); default host-warm.
+# IVF_BUILDS=2 (flat start only): after every measured run, detach at 8 GiB and build the IVF
+# index once more at 4 GiB (build2-raggio-ivf); compare.py counts only its build time (spec §3.1 A1).
 # regime.json (page cache, first start, memory, swap) and image.json (python, sqlite,
 # turbovec, OPENBLAS_NUM_THREADS inside the image) label every row; compare.py prints them.
 # DRY_RUN=1: print the commands without running them; DRY_INDEX=ivf|flat is the index
@@ -2224,6 +2314,10 @@ with
 case "$FIRST_START" in
   host-warm|true-cold) ;;
   *) echo "FIRST_START=$FIRST_START: use host-warm or true-cold" >&2; exit 1 ;;
+esac
+case "$IVF_BUILDS" in
+  1|2) ;;
+  *) echo "IVF_BUILDS=$IVF_BUILDS: use 1 or 2" >&2; exit 1 ;;
 esac
 if [ -n "$MEMORY_SWAP" ]; then CAPS="$CAPS Swap capped too: --memory-swap $MEMORY_SWAP."; fi
 ```
@@ -2305,7 +2399,58 @@ printf '{"page_cache": "host-warm", "first_start": "%s", "memory": "%s", "memory
 fresh_container "first start ($FIRST_START)" "$MEMORY"
 ```
 
-3c. `bench/dgx/compare.py` has four edits.
+(7) Replace the `detach_index` line
+
+```bash
+detach_index() {  # the session's one IVF -> flat transition
+```
+
+with
+
+```bash
+detach_index() {  # IVF -> flat: the session's one transition, or the detach before build2 (IVF_BUILDS=2)
+```
+
+(8) In the `case "$START_INDEX" in` block, replace the `ivf)` and `flat)` branches
+
+```bash
+  ivf)
+    engine_group raggio-ivf "$IVF_RUNS"
+    detach_index
+    engine_group raggio "$FLAT_RUNS"
+    ;;
+  flat)
+    engine_group raggio "$FLAT_RUNS"
+    engine_group raggio-ivf "$IVF_RUNS"  # run0 builds the index: index_build_s at 4 GiB
+    ;;
+```
+
+with
+
+```bash
+  ivf)
+    if [ "$IVF_BUILDS" = 2 ]; then
+      log "IVF_BUILDS=2 needs a flat start (run0 builds, then build2 once more): leave the volume flat first" >&2
+      exit 1
+    fi
+    engine_group raggio-ivf "$IVF_RUNS"
+    detach_index
+    engine_group raggio "$FLAT_RUNS"
+    ;;
+  flat)
+    engine_group raggio "$FLAT_RUNS"
+    engine_group raggio-ivf "$IVF_RUNS"  # run0 builds the index: index_build_s at 4 GiB
+    if [ "$IVF_BUILDS" = 2 ]; then
+      # after every measured run, so they keep the one transition; only build2's build time counts
+      detach_index
+      bench_run build2 raggio-ivf  # finds a flat index and builds it again at 4 GiB
+    fi
+    ;;
+```
+
+With the default `IVF_BUILDS=1`, the printed commands are the same as Task 3's, so Task 3's session tests keep passing.
+
+3c. `bench/dgx/compare.py` has six edits.
 
 (1) In the docstring, replace
 
@@ -2322,11 +2467,16 @@ Each side's regime (regime.json and image.json from session.sh, "unknown" when a
 printed above the table. Arms that differ in a label of the measured rows get a line saying
 the A/B is a re-baseline, not a same-regime comparison, and a vector concurrent-QPS row with
 fewer than 3 counted runs on a side is listed as reported, not claimed (spec §6).
+
+A build<N>-raggio-ivf.json (session.sh IVF_BUILDS=2) is an extra IVF build after the measured
+runs: only its one-shot metrics count, after run0's, so the build row gets two values per
+side, a median and a band (spec §3.1 A1).
 ```
 
 (2) After the line `RUN_FILE = re.compile(r"run(\d+)-(raggio-ivf|raggio|weaviate)\.json")`, insert:
 
 ```python
+BUILD_FILE = re.compile(r"build([1-9]\d*)-(raggio-ivf)\.json")  # IVF_BUILDS=2: a build after the runs
 # spec §6: every row states its page-cache regime, memory cap, sqlite3.sqlite_version and
 # OPENBLAS_NUM_THREADS; the arms of one A/B share them (the first start is not a measured row)
 REGIME_KEYS = ["page_cache", "first_start", "memory", "memory_swap", "python", "sqlite_version",
@@ -2394,13 +2544,43 @@ def render(base_dir, cand_dir=None):
     return "\n".join(lines)
 ```
 
+(5) Replace the whole `load` function with:
+
+```python
+def load(session_dir):
+    """{engine: {run number: {metric: value}}} from a session directory. A build<N> file
+    (IVF_BUILDS=2) is stored as run -N: only its one-shot metrics count (values)."""
+    runs = {}
+    for p in sorted(Path(session_dir).iterdir()):
+        m, sign = RUN_FILE.fullmatch(p.name), 1
+        if m is None:
+            m, sign = BUILD_FILE.fullmatch(p.name), -1
+        if m:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            runs.setdefault(m.group(2), {})[sign * int(m.group(1))] = data.get(m.group(2), {})
+    if not runs:
+        raise SystemExit(f"{session_dir}: no run<N>-<engine>.json files")
+    return runs
+```
+
+(6) Replace the whole `values` function with:
+
+```python
+def values(engine_runs, key):
+    """The values that count for one engine's metric: the runs in order, then the extra builds."""
+    return [engine_runs[n][key] for n in sorted(engine_runs, key=lambda n: (n < 0, abs(n)))
+            if key in engine_runs[n] and (n >= 1 or key in ONE_SHOT)]
+```
+
+A negative run number fails `n >= 1`, so a `build<N>` file adds only `ONE_SHOT` values. Without one, the order is Task 3's.
+
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/test_bench_dgx.py -q`
-Expected (derived): `38 passed`.
+Expected (derived): `41 passed`.
 
 Run: `uv run pytest -q`
-Expected (derived): `147 passed, 1 warning`.
+Expected (derived): `150 passed, 1 warning`.
 
 - [ ] **Step 5: Commit**
 
@@ -2416,6 +2596,11 @@ FLAT_RUNS=3 gives concurrent QPS its third run. compare.py prints both
 sides' regime, flags arms that differ, and lists thin concurrent-QPS rows
 as reported, not claimed.
 
+IVF_BUILDS=2 builds the IVF index a second time after a flat-start
+session's measured runs (8 GiB detach, build2-raggio-ivf at 4 GiB), and
+compare.py counts only that run's build time, so the build row gets a
+median and a band (spec §3.1 A1).
+
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
 )"
@@ -2423,31 +2608,55 @@ EOF
 
 ---
 
-### Task 5: The first hybrid pass is reported on its own (not executed in the sandbox)
+### Task 5: The first hybrid pass, the concurrent hybrid p99 and server CPU per query are reported; the `CONCURRENCY` knob (not executed in the sandbox)
 
 Spec §6 says: "Report the first hybrid pass after a load separately: its first ~10 queries take 470–980 ms." It also says: "Report the concurrent phase as repeating the same 500 queries (warm caches)." bench.py's serial hybrid phase is the first text query after the container start: the vector, concurrent and filtered phases before it never touch FTS5. So its first 10 queries are that warm-up, and its p99 includes them.
 
-This task adds two keys and a note. It changes no existing key, so baseline3 and every Task 3/4 session stay comparable: the new rows read `missing` on a side that lacks them.
+Spec §4.2 names two more things for A to own, which Plan G reads and sets:
+- **Bench rows for §3.1 G5.**
+  - `hybrid_c_p99`, "Hybrid p99 under concurrency (ms)": the p99 of the hybrid concurrent phase. G5's p99 guard reads it; bench.py's `hybrid_p99` is a serial row.
+  - `cpu_ms_per_q_c`, "CPU per query under concurrency (ms)", and `hybrid_cpu_ms_per_q_c`, "Hybrid CPU per query under concurrency (ms)". Each is the server container's cgroup `cpu.stat` `usage_usec` delta over that concurrent phase, divided by the phase's requests. The cgroup is found as DGX probe p4 did: `/sys/fs/cgroup` plus `podman inspect <container> --format '{{.State.CgroupPath}}'`. p4 measured 50.8–56.8 ms per vector query in the fast state at c=8, and 115.9–117.6 ms in the slow state; G5 uses this row to classify each flat run's state.
+  - Where `cpu.stat` is not readable (no `--cpu-container`, a laptop, a failed inspect or read), the CPU rows are absent, never 0: no key in the results JSON, a `—` cell in the report for an engine without one, and no report row at all when no engine has one. bench.py logs one line saying why.
+- **Session knob for §3.1 G7.** `CONCURRENCY` is read from the environment like `FLAT_RUNS`, with default 8. `session.sh` passes it to every bench.py run as `--concurrency "$CONCURRENCY"`, together with `--cpu-container "$CONTAINER"`. G's c=16 sessions set `CONCURRENCY=16`. `regime.json` records it, so compare.py flags arms that ran at different concurrency.
 
-This task was not run in the sandbox. The counts are derived from Task 4's state plus 2 tests.
+This task adds five keys, a flag, a knob, a regime label and a note. It changes no existing key, so baseline3 and every Task 3/4 session stay comparable: the new rows read `-` on a side that lacks them, and they get no verdict.
+
+This task was not run in the sandbox. The counts are derived from Task 4's state plus 11 tests (2 for the first hybrid pass, 9 for G5 and G7), and 2 Task 4 tests that gain the `concurrency` label. The two-file RED and GREEN counts (Steps 2 and 4) were replayed on the workstation, in a scratch directory, against `bench.py`, `bench_reuse.py`, `compare.py` and the `bench/dgx/*.sh` scripts assembled from this plan's text for Tasks 1–5. The suite count is derived.
 
 **Files:**
 - Modify: `bench/bench.py`:
+  - after `podman_disk` (lines 127-130);
   - after `pct` (lines 325-326);
+  - the concurrent phase (lines 413-417);
   - the hybrid phase (lines 424-427);
-  - `ROWS` (line 453);
-  - the Notes in `report` (lines 475-476).
-- Modify: `bench/dgx/compare.py`: `METRICS`, after the `hybrid_p99` line (line 43).
+  - the hybrid concurrent phase (lines 434-436);
+  - `ROWS` (lines 450, 453 and 455);
+  - the Notes in `report` (lines 475-476);
+  - `build_parser`, after `--concurrency` (Task 2's parser).
+- Modify: `bench/dgx/compare.py`: `METRICS`, after the `lat_c_p95`, `hybrid_p99` and `hybrid_qps_concurrent` lines, and Task 4's `REGIME_KEYS`.
+- Modify: `bench/dgx/lib.sh`: after Task 4's `FLAT_RUNS` line.
+- Modify: `bench/dgx/session.sh`: `bench_run`'s bench.py line, and Task 4's `regime.json` `printf`.
 - Test: `tests/test_bench_harness.py` (append).
+- Test: `tests/test_bench_dgx.py` (append, and two Task 4 tests gain the `concurrency` label).
 
 **Interfaces:**
-- Consumes: Task 2's `bench.py`, and Task 3's `compare.METRICS`. `test_compare_covers_every_bench_metric` pins `METRICS` to `bench.ROWS` in order, label and format, so both files change together.
+- Consumes: Task 2's `bench.py` (`build_parser`, and `bench_engine`'s head with `prepare_engine` and `engine_state`), Task 3's `compare.METRICS` and `bench_run`, and Task 4's `lib.sh`, `regime.json` and `REGIME_KEYS`. `test_compare_covers_every_bench_metric` pins `METRICS` to `bench.ROWS` in order, label and format, so both files change together.
 - Produces:
   - `bench.hybrid_first_pass(lat_h, n=10) -> dict`. It returns `{"hybrid_first10_max_ms": max(lat_h[:n]), "hybrid_p99_after10": pct(lat_h[n:], 99)}`, or `{}` when there are fewer than `n + 2` latencies (`statistics.quantiles` needs 2 points).
   - "First 10, slowest" is the definition Plan E's hybrid driver uses (`first10_max`). A and E report the same quantity.
   - `hybrid_p99_after10` is the warm-pass p99 that spec §7's prune-arm gate names ("hybrid p99 (warm pass)").
   - Two new `ROWS` entries and two new `compare.METRICS` entries, straight after `hybrid_p99`. Both are lower-is-better, and Task 3's band and verdict rules apply unchanged.
   - The report's Notes gain two sentences: the concurrent phases repeat the serial queries, and the first hybrid queries include the text index's warm-up.
+  - `bench.cpu_stat_path(container) -> str`: `/sys/fs/cgroup` + `podman inspect <container> --format '{{.State.CgroupPath}}'` + `/cpu.stat`. It raises `OSError` when podman is missing, the inspect fails or prints no absolute path.
+  - `bench.read_usage_usec(path) -> int`: the `usage_usec` line of a cgroup v2 `cpu.stat`. It raises `OSError` when the file or the line is missing.
+  - `async bench.cpu_phase(name, key, container, phase) -> (phase's result, dict)`. It reads `usage_usec` just before and just after `await phase()`. The dict is `{key: delta / 1000 / requests}` (ms per request; requests = `len(result[0])`), or `{}` with one printed line `[<name>] <key> absent: <why>` when `container` is empty, is not `ENGINES[name]["container"]`, or a read fails. It never returns 0 or `None` for a missing read.
+  - `bench.py --cpu-container NAME` (default none): the container whose cgroup CPU the two concurrent phases read. `session.sh` passes `"$CONTAINER"` (`bench-tv`).
+  - Three new result keys and `ROWS` entries, each with its `compare.METRICS` entry in the same place, all lower-is-better:
+    - `cpu_ms_per_q_c`, "CPU per query under concurrency (ms)", after `lat_c_p95`;
+    - `hybrid_c_p99`, "Hybrid p99 under concurrency (ms)", then `hybrid_cpu_ms_per_q_c`, "Hybrid CPU per query under concurrency (ms)", after `hybrid_qps_concurrent`.
+  - `hybrid_c_p99` is present in every run. The two CPU keys are present only when the reads succeed. compare.py already handles a row that one or both sides lack: `_rows` skips a row neither side has, a one-sided row prints `-` cells and the verdict `-`, and `beyond_band` ignores `-`.
+  - `session.sh` environment: `CONCURRENCY=<n>` (default 8), passed to every bench.py run as `--concurrency "$CONCURRENCY" --cpu-container "$CONTAINER"`. It is not validated, like `FLAT_RUNS`.
+  - `regime.json` gains `"concurrency": "<n>"` after `detach_memory`, and `compare.REGIME_KEYS` gains `concurrency` after `memory_swap`. `SAME_REGIME` follows, so arms at different concurrency get Task 4's `The arms differ in concurrency: …` line. A session directory without the label reads `unknown`, as Task 4 does for every label.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2472,15 +2681,268 @@ def test_report_says_the_concurrent_phase_repeats_the_queries():
     assert "| Hybrid first 10 queries, slowest (ms) | 612.3 |" in text
     assert "| Hybrid p99 without the first 10 (ms) | — |" in text
     assert "The concurrent phases repeat the serial phases' queries (warm caches)." in text
+
+
+# ---- spec §3.1 G5 rows (Task 5): the concurrent hybrid p99 and the server CPU per query ----
+
+import subprocess
+
+N = 100  # requests per phase in these tests
+
+
+def cpu_stat(path, usage_usec):
+    """A cgroup v2 cpu.stat as the kernel writes it."""
+    path.write_text(f"usage_usec {usage_usec}\nuser_usec {usage_usec // 2}\n"
+                    f"system_usec {usage_usec // 2}\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\n")
+
+
+def test_cpu_stat_path_is_the_containers_cgroup(monkeypatch):
+    seen = []
+
+    def inspect(stdout, code=0):
+        def run(cmd, **kw):
+            seen.append(cmd)
+            return subprocess.CompletedProcess(cmd, code, stdout=stdout, stderr="")
+        monkeypatch.setattr(bench.subprocess, "run", run)
+
+    inspect("/user.slice/libpod-abc123.scope\n")
+    assert bench.cpu_stat_path("bench-tv") == "/sys/fs/cgroup/user.slice/libpod-abc123.scope/cpu.stat"
+    assert seen == [["podman", "inspect", "bench-tv", "--format", "{{.State.CgroupPath}}"]]
+    inspect("", 125)  # no such container
+    with pytest.raises(OSError, match="gave no cgroup path"):
+        bench.cpu_stat_path("bench-tv")
+
+    def no_podman(cmd, **kw):
+        raise FileNotFoundError("podman")
+
+    monkeypatch.setattr(bench.subprocess, "run", no_podman)
+    with pytest.raises(OSError):
+        bench.cpu_stat_path("bench-tv")
+
+
+def test_read_usage_usec_reads_cpu_stat(tmp_path):
+    stat = tmp_path / "cpu.stat"
+    cpu_stat(stat, 123_456_789)
+    assert bench.read_usage_usec(stat) == 123_456_789
+    stat.write_text("user_usec 1\nsystem_usec 2\n")
+    with pytest.raises(OSError, match="no usage_usec line"):
+        bench.read_usage_usec(stat)
+    with pytest.raises(OSError):  # a laptop: no such cgroup file
+        bench.read_usage_usec(tmp_path / "missing" / "cpu.stat")
+
+
+def test_cpu_rows_are_absent_never_zero(monkeypatch, tmp_path, capsys):
+    stat = tmp_path / "cpu.stat"
+    monkeypatch.setattr(bench, "cpu_stat_path", lambda container: str(stat))
+
+    def phase(usec=0, delete=False):
+        async def run():
+            if delete:
+                stat.unlink()
+            elif usec:
+                cpu_stat(stat, bench.read_usage_usec(stat) + usec)
+            return [5.0] * N, 1.0, [["r0"]] * N
+        return run
+
+    def measure(container, run):
+        out, cpu = asyncio.run(bench.cpu_phase("raggio", "cpu_ms_per_q_c", container, run))
+        assert out[0] == [5.0] * N  # the phase's own result, untouched
+        return cpu
+
+    cpu_stat(stat, 1_000_000)
+    assert measure("bench-tv", phase(usec=50_800 * N)) == {"cpu_ms_per_q_c": pytest.approx(50.8)}
+    assert capsys.readouterr().out == ""
+    assert measure(None, phase()) == {}  # no --cpu-container
+    assert measure("bench-wv", phase()) == {}  # not the engine's container
+    assert measure("bench-tv", phase(delete=True)) == {}  # cpu.stat went away mid-phase
+    assert measure("bench-tv", phase()) == {}  # no cpu.stat at all
+    stat.write_text("user_usec 1\n")
+    assert measure("bench-tv", phase()) == {}  # no usage_usec line
+
+    def no_cgroup(container):
+        raise OSError(f"podman inspect {container} gave no cgroup path (exit 125)")
+
+    monkeypatch.setattr(bench, "cpu_stat_path", no_cgroup)
+    assert measure("bench-tv", phase()) == {}
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 6 and all(ln.startswith("[raggio] cpu_ms_per_q_c absent: ") for ln in lines)
+    assert lines[0] == "[raggio] cpu_ms_per_q_c absent: no --cpu-container"
+    assert lines[1] == "[raggio] cpu_ms_per_q_c absent: --cpu-container bench-wv is not raggio's container"
+    assert lines[5] == "[raggio] cpu_ms_per_q_c absent: podman inspect bench-tv gave no cgroup path (exit 125)"
+
+
+def test_bench_engine_measures_both_concurrent_phases(monkeypatch, tmp_path, capsys):
+    stat, usage = tmp_path / "cpu.stat", [1_000_000]
+    cpu_stat(stat, usage[0])
+
+    async def run_queries(engine, queries, concurrency, headers, filt=None, k=10, texts=None):
+        n = len(queries)
+        if concurrency > 1:  # server CPU per request, p4's c=8 figures: 50.8 ms flat, 343.0 hybrid
+            usage[0] += (343_000 if texts else 50_800) * n
+            cpu_stat(stat, usage[0])
+        lat = [10.0] * (n - 1) + [500.0] if texts and concurrency > 1 else [5.0] * n
+        return lat, 1.0, [[f"r{i}"] for i in range(n)]
+
+    async def nothing(*a, **kw):
+        return {}
+
+    for attr, fake in [("cpu_stat_path", lambda container: str(stat)), ("run_queries", run_queries),
+                       ("prepare_engine", nothing), ("ensure_no_index", nothing), ("engine_state", nothing),
+                       ("podman_mem", lambda container: 512.0), ("podman_disk", lambda volume: 100.0),
+                       ("cold_start", lambda *a: 4.2)]:
+        monkeypatch.setattr(bench, attr, fake)
+    rows, paths = list(range(N)), [f"p{i}" for i in range(N)]
+
+    def measure(*argv):
+        args = bench.build_parser().parse_args(list(argv))
+        return asyncio.run(bench.bench_engine("raggio", None, paths, [2000] * N, rows, [None] * N,
+                                              [[i] for i in rows], ["text"] * N, paths, args))
+
+    res = measure("--cpu-container", "bench-tv")
+    assert res["cpu_ms_per_q_c"] == pytest.approx(50.8)
+    assert res["hybrid_cpu_ms_per_q_c"] == pytest.approx(343.0)
+    assert res["hybrid_c_p99"] == pytest.approx(495.1)  # the hybrid concurrent phase's own p99
+    assert res["hybrid_p99"] == 5.0  # the serial row is unchanged
+    assert "absent" not in capsys.readouterr().out
+    res = measure()  # no --cpu-container: the CPU keys are absent, the p99 is not
+    assert "cpu_ms_per_q_c" not in res and "hybrid_cpu_ms_per_q_c" not in res
+    assert res["hybrid_c_p99"] == pytest.approx(495.1)
+    out = capsys.readouterr().out
+    assert "[raggio] cpu_ms_per_q_c absent: no --cpu-container" in out
+    assert "[raggio] hybrid_cpu_ms_per_q_c absent: no --cpu-container" in out
+
+
+def test_concurrent_rows_sit_next_to_their_siblings():
+    keys = [key for _, key, _ in bench.ROWS]
+    at = keys.index("lat_c_p95")
+    assert keys[at + 1] == "cpu_ms_per_q_c"
+    at = keys.index("hybrid_qps_concurrent")
+    assert keys[at + 1: at + 3] == ["hybrid_c_p99", "hybrid_cpu_ms_per_q_c"]
+    args = bench.build_parser().parse_args([])
+    assert args.cpu_container is None and args.concurrency == 8
+    text = bench.report({"raggio": {"hybrid_c_p99": 612.3}}, args, 1000)
+    assert "| Hybrid p99 under concurrency (ms) | 612.3 |" in text
+    # no engine has a CPU read: the rows are absent, never 0.0
+    assert "| CPU per query under concurrency (ms) |" not in text
+    assert "| Hybrid CPU per query under concurrency (ms) |" not in text
+    text = bench.report({"raggio": {"cpu_ms_per_q_c": 50.8}, "weaviate": {}}, args, 1000)
+    assert "| CPU per query under concurrency (ms) | 50.8 | — |" in text
+    assert "| Hybrid CPU per query under concurrency (ms) |" not in text
+```
+
+Append to `tests/test_bench_dgx.py`:
+
+```python
+
+
+# ---- spec §3.1 G7 knob and G5 rows (Task 5): CONCURRENCY in every run and in the regime ----
+
+def test_lib_reads_the_concurrency_from_the_environment():
+    lib = (DGX / "lib.sh").read_text(encoding="utf-8")
+    session = (DGX / "session.sh").read_text(encoding="utf-8")
+    assert 'CONCURRENCY="${CONCURRENCY:-8}"' in lib
+    assert '--concurrency "$CONCURRENCY" --cpu-container "$CONTAINER"' in session
+    assert '"concurrency": "%s"' in session
+
+
+@needs_bash
+def test_session_passes_the_concurrency_and_the_cpu_container(tmp_path):
+    home, cmds = dry_session(tmp_path)
+    runs = [c for c in cmds if c.startswith(BENCH_CMD)]
+    assert len(runs) == 7 and all(" --concurrency 8 --cpu-container bench-tv " in r for r in runs)
+    assert json.loads((home / "s1" / "regime.json").read_text())["concurrency"] == "8"
+    c16 = tmp_path / "c16"  # a spec §3.1 G7 c=16 session
+    c16.mkdir()
+    home, cmds = dry_session(c16, ("CONCURRENCY", "16"))
+    runs = [c for c in cmds if c.startswith(BENCH_CMD)]
+    assert len(runs) == 7 and all(" --concurrency 16 --cpu-container bench-tv " in r for r in runs)
+    assert json.loads((home / "s1" / "regime.json").read_text())["concurrency"] == "16"
+
+
+def test_compare_flags_arms_that_ran_at_different_concurrency(tmp_path):
+    base, cand = tmp_path / "main", tmp_path / "cand"
+    flat_session(base, (23.0, 24.0))
+    flat_session(cand, (23.5, 23.5))
+    write_labels(base, REGIME, BOOKWORM)
+    write_labels(cand, {**REGIME, "concurrency": "16"}, BOOKWORM)
+    ab = compare.render(base, cand)
+    assert ("The arms differ in concurrency: a re-baseline across them, not a same-regime A/B "
+            "(spec §6).") in ab
+    assert "memory_swap=host-default, concurrency=16, python=3.12.11" in ab.splitlines()[2]
+    # a session recorded before the label existed reads "unknown", which differs too
+    write_labels(cand, {k: v for k, v in REGIME.items() if k != "concurrency"}, BOOKWORM)
+    assert "The arms differ in concurrency: " in compare.render(base, cand)
+
+
+def test_compare_leaves_absent_cpu_rows_out_of_the_verdicts(tmp_path):
+    base, cand, none = tmp_path / "main", tmp_path / "cand", tmp_path / "none"
+    write_session(base, {"run1-raggio": {"lat_p50": 23.0, "hybrid_c_p99": 900.0},
+                         "run2-raggio": {"lat_p50": 24.0, "hybrid_c_p99": 950.0}})
+    write_session(cand, {
+        "run1-raggio": {"lat_p50": 23.5, "hybrid_c_p99": 700.0, "cpu_ms_per_q_c": 50.8,
+                        "hybrid_cpu_ms_per_q_c": 365.1},
+        "run2-raggio": {"lat_p50": 23.5, "hybrid_c_p99": 720.0, "cpu_ms_per_q_c": 116.0,
+                        "hybrid_cpu_ms_per_q_c": 361.9}})
+    write_session(none, {"run1-raggio": {"lat_p50": 23.0}, "run2-raggio": {"lat_p50": 24.0}})
+    ab = compare.render(base, cand)
+    # one side lacks the CPU rows (a laptop, or a session before Task 5): "-", never 0, no verdict
+    assert "| raggio | CPU per query under concurrency (ms) | - | - | 83.4 | 65.2 | - |" in ab
+    assert "| raggio | Hybrid CPU per query under concurrency (ms) | - | - | 363.5 | 3.2 | - |" in ab
+    assert "| raggio | Hybrid p99 under concurrency (ms) | 925.0 | 50.0 | 710.0 | 20.0 | better |" in ab
+    assert compare.beyond_band(base, cand) == {"better": [("raggio", "hybrid_c_p99")], "worse": []}
+    # neither side has them: no row at all
+    assert "CPU per query" not in compare.render(base, none)
+    assert "CPU per query" not in compare.render(none)
+    # all three are lower-is-better: p4's fast state (50.8-56.8 ms) beats its slow one (115.9-117.6)
+    assert [compare.HIGHER_IS_BETTER[k] for k in
+            ("cpu_ms_per_q_c", "hybrid_c_p99", "hybrid_cpu_ms_per_q_c")] == [False] * 3
+    assert compare.verdict("cpu_ms_per_q_c", [115.9, 117.6], [50.8, 56.8]) == "better"
+```
+
+In Task 4's block of `tests/test_bench_dgx.py`, the regime gains the label. Replace
+
+```python
+REGIME = {"page_cache": "host-warm", "first_start": "host-warm", "memory": "4g",
+          "memory_swap": "host-default", "detach_memory": "8g"}
+```
+
+with
+
+```python
+REGIME = {"page_cache": "host-warm", "first_start": "host-warm", "memory": "4g",
+          "memory_swap": "host-default", "detach_memory": "8g", "concurrency": "8"}
+```
+
+and, in `test_compare_prints_each_sides_regime`, replace
+
+```python
+        "Regime (session): page_cache=host-warm, first_start=host-warm, memory=4g, "
+        "memory_swap=host-default, python=3.12.11, sqlite_version=3.40.1, openblas_num_threads=unset")
+```
+
+with
+
+```python
+        "Regime (session): page_cache=host-warm, first_start=host-warm, memory=4g, "
+        "memory_swap=host-default, concurrency=8, python=3.12.11, sqlite_version=3.40.1, "
+        "openblas_num_threads=unset")
 ```
 
 - [ ] **Step 2: Run them to verify they fail**
 
-Run: `uv run pytest tests/test_bench_harness.py -q`
+Run: `uv run pytest tests/test_bench_harness.py tests/test_bench_dgx.py -q`
 
-Expected (derived, not executed): `2 failed, 8 passed`.
-- The first test fails with `AttributeError: module 'bench' has no attribute 'hybrid_first_pass'`.
-- The second fails with `AssertionError`, because the row is not in the report.
+Expected (replayed in the scratch directory): `13 failed, 47 passed`. `test_bench_harness.py` has 7 failed and 8 passed; `test_bench_dgx.py` has 6 failed and 39 passed.
+- `test_first_hybrid_pass_is_reported_separately` fails with `AttributeError: module 'bench' has no attribute 'hybrid_first_pass'`.
+- `test_report_says_the_concurrent_phase_repeats_the_queries` fails with `AssertionError`, because the row is not in the report.
+- `test_cpu_stat_path_is_the_containers_cgroup` and `test_read_usage_usec_reads_cpu_stat` fail with `AttributeError: module 'bench' has no attribute 'cpu_stat_path'` and `… 'read_usage_usec'`.
+- `test_cpu_rows_are_absent_never_zero` and `test_bench_engine_measures_both_concurrent_phases` fail in `monkeypatch.setattr` with `AttributeError: <module 'bench' …> has no attribute 'cpu_stat_path'`.
+- `test_concurrent_rows_sit_next_to_their_siblings` fails with `AssertionError`: the row after `lat_c_p95` is `lat_filtered_p50`.
+- `test_lib_reads_the_concurrency_from_the_environment` and `test_session_passes_the_concurrency_and_the_cpu_container` fail with `AssertionError`: lib.sh has no `CONCURRENCY`, and no bench.py command carries `--concurrency`.
+- `test_compare_flags_arms_that_ran_at_different_concurrency` fails with `AssertionError`: `REGIME_KEYS` has no `concurrency`, so no line says the arms differ.
+- `test_compare_leaves_absent_cpu_rows_out_of_the_verdicts` fails with `AssertionError`: `METRICS` has no CPU row.
+- The two Task 4 tests with the new label fail with `AssertionError`. `test_session_records_the_regime_labels` reads a `regime.json` without `concurrency`, and `test_compare_prints_each_sides_regime` reads a regime line without `concurrency=8`.
+- `test_compare_covers_every_bench_metric` still passes: neither `ROWS` nor `METRICS` has changed yet.
 
 - [ ] **Step 3: Minimal implementation**
 
@@ -2550,7 +3012,25 @@ with
               "Weaviate = Go, HNSW approximate index, uncompressed vectors. All queried via REST with "
               "client-supplied vectors; identical stored payloads. The concurrent phases repeat the "
               "serial phases' queries (warm caches). The first 10 serial hybrid queries are also "
-              "reported on their own: after a container start they include the text index's warm-up."]
+              "reported on their own: after a container start they include the text index's warm-up. "
+              "CPU per query is the server container's cgroup CPU time over a concurrent phase, "
+              "divided by its requests; its rows are absent where the cgroup is not readable."]
+```
+
+In the same function, replace
+
+```python
+    for label, key, fmt in ROWS:
+        vals = [fmt.format(results[n][key]) if key in results[n] else "—" for n in names]
+```
+
+with
+
+```python
+    for label, key, fmt in ROWS:
+        if key in CPU_KEYS and not any(key in results[n] for n in names):
+            continue  # no cgroup read on this host: the row is absent, never 0
+        vals = [fmt.format(results[n][key]) if key in results[n] else "—" for n in names]
 ```
 
 3e. `bench/dgx/compare.py`. In `METRICS`, replace
@@ -2567,25 +3047,261 @@ with
     ("hybrid_p99_after10", "Hybrid p99 without the first 10 (ms)", "{:.1f}", False),
 ```
 
+3f. `bench/bench.py`: the cgroup CPU helpers. After `podman_disk`, that is after the line `    return int(out.split()[0]) / 1e6  # MB`, insert:
+
+```python
+
+
+CGROUP_ROOT = "/sys/fs/cgroup"
+CPU_KEYS = {"cpu_ms_per_q_c", "hybrid_cpu_ms_per_q_c"}  # absent, never 0, without a cgroup read
+
+
+def cpu_stat_path(container):
+    """The container's cgroup v2 cpu.stat, found as DGX probe p4 did: /sys/fs/cgroup plus
+    `podman inspect --format {{.State.CgroupPath}}`. OSError when podman or the inspect fails."""
+    r = subprocess.run(["podman", "inspect", container, "--format", "{{.State.CgroupPath}}"],
+                       capture_output=True, text=True)
+    cgroup = r.stdout.strip()
+    if r.returncode != 0 or not cgroup.startswith("/"):
+        raise OSError(f"podman inspect {container} gave no cgroup path (exit {r.returncode})")
+    return f"{CGROUP_ROOT}{cgroup}/cpu.stat"
+
+
+def read_usage_usec(path):
+    """usage_usec (the cgroup's total CPU time, microseconds) from a cgroup v2 cpu.stat."""
+    for line in Path(path).read_text().splitlines():
+        field, _, value = line.partition(" ")
+        if field == "usage_usec":
+            return int(value)
+    raise OSError(f"{path} has no usage_usec line")
+
+
+async def cpu_phase(name, key, container, phase):
+    """Run one concurrent phase and read the server container's cgroup CPU around it (spec §3.1
+    G5). Returns (the phase's result, {key: CPU ms per request}); the dict is empty, with one
+    line saying why, when --cpu-container is unset or another engine's, or a read fails."""
+    before = why = None
+    if not container:
+        why = "no --cpu-container"
+    elif container != ENGINES[name]["container"]:
+        why = f"--cpu-container {container} is not {name}'s container"
+    else:
+        try:
+            path = cpu_stat_path(container)
+            before = read_usage_usec(path)
+        except (OSError, ValueError) as e:
+            why = str(e)
+    out = await phase()
+    if why is None:
+        try:
+            return out, {key: (read_usage_usec(path) - before) / 1000 / len(out[0])}
+        except (OSError, ValueError) as e:
+            why = str(e)
+    print(f"[{name}] {key} absent: {why}")
+    return out, {}
+```
+
+The blocking `podman inspect` runs before the phase starts, so it is outside the phase's timed window. The second read follows the last response.
+
+3g. In `bench_engine`, the vector concurrent phase. Replace
+
+```python
+    lat_c, wall_c, _ = await run_queries(name, queries, args.concurrency, e["hdrs"])
+    res.update(qps_concurrent=len(lat_c) / wall_c, lat_c_p95=pct(lat_c, 95),
+               mem_under_load_mb=await mem_probe)
+```
+
+with
+
+```python
+    (lat_c, wall_c, _), cpu = await cpu_phase(
+        name, "cpu_ms_per_q_c", args.cpu_container,
+        lambda: run_queries(name, queries, args.concurrency, e["hdrs"]))
+    res.update(qps_concurrent=len(lat_c) / wall_c, lat_c_p95=pct(lat_c, 95),
+               mem_under_load_mb=await mem_probe, **cpu)
+```
+
+`mem_probe` still starts when the phase's first request yields, as before.
+
+3h. The hybrid concurrent phase. Replace
+
+```python
+    lat_hc, wall_hc, _ = await run_queries(name, queries, args.concurrency, e["hdrs"], texts=hybrid_texts)
+    res["hybrid_qps_concurrent"] = len(lat_hc) / wall_hc
+```
+
+with
+
+```python
+    (lat_hc, wall_hc, _), cpu = await cpu_phase(
+        name, "hybrid_cpu_ms_per_q_c", args.cpu_container,
+        lambda: run_queries(name, queries, args.concurrency, e["hdrs"], texts=hybrid_texts))
+    res.update(hybrid_qps_concurrent=len(lat_hc) / wall_hc, hybrid_c_p99=pct(lat_hc, 99), **cpu)
+```
+
+3i. In `ROWS`, replace
+
+```python
+        ("QPS concurrent", "qps_concurrent", "{:.0f}"), ("p95 under concurrency (ms)", "lat_c_p95", "{:.1f}"),
+```
+
+with
+
+```python
+        ("QPS concurrent", "qps_concurrent", "{:.0f}"), ("p95 under concurrency (ms)", "lat_c_p95", "{:.1f}"),
+        ("CPU per query under concurrency (ms)", "cpu_ms_per_q_c", "{:.1f}"),
+```
+
+and replace
+
+```python
+        ("Hybrid QPS concurrent", "hybrid_qps_concurrent", "{:.1f}"),
+```
+
+with
+
+```python
+        ("Hybrid QPS concurrent", "hybrid_qps_concurrent", "{:.1f}"),
+        ("Hybrid p99 under concurrency (ms)", "hybrid_c_p99", "{:.1f}"),
+        ("Hybrid CPU per query under concurrency (ms)", "hybrid_cpu_ms_per_q_c", "{:.1f}"),
+```
+
+3j. In `build_parser`, after the line `    ap.add_argument("--concurrency", type=int, default=8)`, insert:
+
+```python
+    ap.add_argument("--cpu-container", metavar="NAME",
+                    help="container whose cgroup cpu.stat gives the server CPU per query of the "
+                         "concurrent phases (the DGX runbook passes bench-tv); without it, or when "
+                         "the cgroup is not readable, the CPU rows are absent")
+```
+
+3k. `bench/dgx/compare.py`. In `METRICS`, replace
+
+```python
+    ("lat_c_p95", "p95 under concurrency (ms)", "{:.1f}", False),
+```
+
+with
+
+```python
+    ("lat_c_p95", "p95 under concurrency (ms)", "{:.1f}", False),
+    ("cpu_ms_per_q_c", "CPU per query under concurrency (ms)", "{:.1f}", False),
+```
+
+and replace
+
+```python
+    ("hybrid_qps_concurrent", "Hybrid QPS concurrent", "{:.1f}", True),
+```
+
+with
+
+```python
+    ("hybrid_qps_concurrent", "Hybrid QPS concurrent", "{:.1f}", True),
+    ("hybrid_c_p99", "Hybrid p99 under concurrency (ms)", "{:.1f}", False),
+    ("hybrid_cpu_ms_per_q_c", "Hybrid CPU per query under concurrency (ms)", "{:.1f}", False),
+```
+
+Then replace Task 4's
+
+```python
+REGIME_KEYS = ["page_cache", "first_start", "memory", "memory_swap", "python", "sqlite_version",
+               "openblas_num_threads"]
+```
+
+with
+
+```python
+REGIME_KEYS = ["page_cache", "first_start", "memory", "memory_swap", "concurrency", "python",
+               "sqlite_version", "openblas_num_threads"]
+```
+
+`_rows`, `render`, `verdict` and `beyond_band` need no change. A row neither side has is skipped, and a row one side lacks prints `-` and gets the verdict `-`, which `beyond_band` ignores.
+
+3l. `bench/dgx/lib.sh`: after Task 4's line `FLAT_RUNS="${FLAT_RUNS:-2}"  # measured flat runs after run0; 3 when a concurrent-QPS row is claimed (spec §6)`, insert:
+
+```bash
+CONCURRENCY="${CONCURRENCY:-8}"  # bench.py --concurrency of every run; G's c=16 sessions set 16 (spec §3.1 G7)
+```
+
+3m. `bench/dgx/session.sh` has three edits.
+
+(1) In the header, replace Task 4's
+
+```bash
+# regime.json (page cache, first start, memory, swap) and image.json (python, sqlite,
+# turbovec, OPENBLAS_NUM_THREADS inside the image) label every row; compare.py prints them.
+```
+
+with
+
+```bash
+# CONCURRENCY=16: bench.py --concurrency of every run (default 8; spec §3.1 G7). Every run also
+# passes --cpu-container bench-tv, for the server CPU per query of the concurrent phases.
+# regime.json (page cache, first start, memory, swap, concurrency) and image.json (python,
+# sqlite, turbovec, OPENBLAS_NUM_THREADS inside the image) label every row; compare.py prints them.
+```
+
+(2) In `bench_run`, replace
+
+```bash
+  run .venv/bin/python -u bench/bench.py --limit "$LIMIT" --caps-note "$CAPS" --host "$HOST_NOTE" \
+    --engine "$engine" --fingerprint-dir "$STATE" --out "$OUT/$tag-$engine.md" "${EXTRA[@]}"
+```
+
+with
+
+```bash
+  run .venv/bin/python -u bench/bench.py --limit "$LIMIT" --caps-note "$CAPS" --host "$HOST_NOTE" \
+    --engine "$engine" --concurrency "$CONCURRENCY" --cpu-container "$CONTAINER" \
+    --fingerprint-dir "$STATE" --out "$OUT/$tag-$engine.md" "${EXTRA[@]}"
+```
+
+Task 3's run test still holds: the command keeps `--limit 2549619 ` and `--fingerprint-dir <state> `, and ends with `--out <out>/<tag>-<engine>.md`.
+
+(3) Replace Task 4's `regime.json` line
+
+```bash
+printf '{"page_cache": "host-warm", "first_start": "%s", "memory": "%s", "memory_swap": "%s", "detach_memory": "%s"}\n' \
+  "$FIRST_START" "$MEMORY" "${MEMORY_SWAP:-host-default}" "$DETACH_MEMORY" > "$OUT/regime.json"
+```
+
+with
+
+```bash
+printf '{"page_cache": "host-warm", "first_start": "%s", "memory": "%s", "memory_swap": "%s", "detach_memory": "%s", "concurrency": "%s"}\n' \
+  "$FIRST_START" "$MEMORY" "${MEMORY_SWAP:-host-default}" "$DETACH_MEMORY" "$CONCURRENCY" > "$OUT/regime.json"
+```
+
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/test_bench_harness.py tests/test_bench_dgx.py -q`
-Expected (derived): `48 passed` (10 + 38). `test_compare_covers_every_bench_metric` is among them.
+Expected (replayed in the scratch directory): `60 passed` (15 + 45). `test_compare_covers_every_bench_metric` is among them, so `ROWS` and `METRICS` agree on all five new rows. On a host without bash, the `needs_bash` tests skip instead; this task adds one.
 
 Run: `uv run pytest -q`
-Expected (derived): `149 passed, 1 warning`.
+Expected (derived): `161 passed, 1 warning`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add bench/bench.py bench/dgx/compare.py tests/test_bench_harness.py
+git add bench/bench.py bench/dgx/compare.py bench/dgx/lib.sh bench/dgx/session.sh \
+  tests/test_bench_harness.py tests/test_bench_dgx.py
 git commit -m "$(cat <<'EOF'
-bench: report the first hybrid pass on its own (spec §6)
+bench: report warm-up, concurrent p99 and CPU per query (spec §6, G5)
 
 The serial hybrid phase is the first text query after a container start;
 its first 10 queries carry the FTS warm-up. bench.py and compare.py gain
 the slowest of the first 10 and the p99 of the rest (the warm pass), and
 the report notes that the concurrent phases repeat the serial queries.
+
+For spec §3.1 G5, bench.py adds the hybrid concurrent phase's p99 and,
+with --cpu-container, the server container's cgroup CPU per request of
+both concurrent phases. Without a readable cpu.stat the CPU rows are
+absent, never 0, and one log line says why.
+
+For G7, session.sh passes CONCURRENCY (default 8) and --cpu-container to
+every run, and regime.json records it, so compare.py flags arms that ran
+at different concurrency.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
@@ -2658,6 +3374,14 @@ Expected:
 - the five `results-baseline3-{run1-raggio,run2-raggio,run1-raggio-ivf,run2-raggio-ivf,run3build-raggio-ivf}.json` files;
 - `no runbook state yet`.
 
+Checked read-only on 2026-09-28 at 20:55:
+- `localhost/raggio:baseline` was `66aadc92a7b1`;
+- `results-baseline3-run{1,2}-raggio{,-ivf}.{json,md}` were in `~/raggio/bench`;
+- `~/raggio-bench` did not exist yet;
+- uv was 0.12.5, from the standalone installer, with its receipt present.
+
+That check did not list `results-baseline3-run3build-raggio-ivf.json`. If this step's `ls` does not show it, Step 4's `cp` stops at that file, and Step 4's fallback applies.
+
 Stop and ask the user if any of these holds:
 - a bench process is running;
 - `bench-tv` is running an image other than a `localhost/raggio` tag;
@@ -2697,7 +3421,7 @@ cp -p "$src/results-baseline3-run2-raggio.json" "$dst/run2-raggio.json"
 cp -p "$src/results-baseline3-run1-raggio-ivf.json" "$dst/run0-raggio-ivf.json"
 cp -p "$src/results-baseline3-run2-raggio-ivf.json" "$dst/run1-raggio-ivf.json"
 cp -p "$src/results-baseline3-run3build-raggio-ivf.json" "$dst/run2-raggio-ivf.json"
-printf "{\"page_cache\": \"host-warm\", \"first_start\": \"mostly-cold\", \"memory\": \"4g\", \"memory_swap\": \"host-default\", \"detach_memory\": \"8g\"}\n" > "$dst/regime.json"
+printf "{\"page_cache\": \"host-warm\", \"first_start\": \"mostly-cold\", \"memory\": \"4g\", \"memory_swap\": \"host-default\", \"detach_memory\": \"8g\", \"concurrency\": \"8\"}\n" > "$dst/regime.json"
 cp -p "$src/baseline3.log" "$dst/facts.txt" || echo "no baseline3.log: facts.txt left out"
 ls "$dst"'
 ```
@@ -2706,10 +3430,12 @@ Expected: `facts.txt regime.json run0-raggio-ivf.json run1-raggio-ivf.json run1-
 
 The first start is labelled `mostly-cold`: 128 s, with 6.1 GB cached against a 15.1 GB meta.db. It is neither of session.sh's two values, and compare.py prints it as-is. `first_start` is not in `SAME_REGIME`, so it does not trigger the arms-differ line.
 
+baseline3 ran bench.py at its default `--concurrency 8`, so its label is `"concurrency": "8"`, the value a-equiv records with the default `CONCURRENCY`. Without the label, baseline3 would read `unknown` and compare.py would print `The arms differ in concurrency`.
+
 If the pre-deploy copy lacks the files, build the directory locally, then copy it:
 1. Run `uv run python D:/DEV/_scratch/plan-sandbox/plan-A-tools/b3convert.py D:/DEV/_scratch/dgx/baseline3-session`.
 2. Write the same `regime.json` into that directory.
-3. Run `ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'mkdir ~/raggio-bench/baseline3'`.
+3. Run `ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'mkdir -p ~/raggio-bench/baseline3'`. The `-p` matters: a Step 4 that stopped at a missing file has already created the directory and copied part of it. scp in the next step overwrites those files with the same content.
 4. Run `scp -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes /d/DEV/_scratch/dgx/baseline3-session/* gn100:raggio-bench/baseline3/`. The local path is in the `/d/…` form: Git Bash's scp reads `D:/…` as a host named `D`.
 
 - [ ] **Step 5: Launch the session, detached**
@@ -2744,6 +3470,7 @@ The session is done when the last line is `<UTC time> session a-equiv done`, abo
 - If the volume started IVF, the log shows `index at start: ivf`, then raggio-ivf run0–run3, `IVF detach at 8g took <s> s`, and raggio run0–run3.
 - A flat start runs raggio run0–run3 first, then raggio-ivf run0, whose build is measured, then run1–run3.
 - A line starting `bench aborted:` or `pending_jobs=… giving up` ends the session early. Read the log, and ask the user before relaunching; a relaunch needs a new label.
+- A line `[raggio] cpu_ms_per_q_c absent: <why>`, `[raggio-ivf] hybrid_cpu_ms_per_q_c absent: <why>` or the like means bench.py could not read `bench-tv`'s cgroup `cpu.stat`. The CPU rows must be present on gn100, because spec §3.1 G5 classifies Plan G's flat runs by them. Stop the session at the first such line, report the `<why>` to the user, and fix the cause in PR 1 before relaunching: redeploy (Step 3), then use a new label (`a-equiv2`) within the agreed window, or ask for a new one.
 - To stop it early: `kill -TERM -- -"$(cat ~/raggio-bench/a-equiv/session.pgid)"`, run in the same ssh form. Never use a `pkill -f` pattern.
 
 - [ ] **Step 7: Give baseline3 its image labels**
@@ -2761,19 +3488,29 @@ cat ~/raggio-bench/a-equiv/image.json ~/raggio-bench/a-equiv/regime.json'
 
 Expected:
 - `{"python": "3.12.<n>", "sqlite_version": "3.40.1", "turbovec": "1.0.0", "openblas_num_threads": "unset"}`;
-- then `{"page_cache": "host-warm", "first_start": "host-warm", "memory": "4g", "memory_swap": "host-default", "detach_memory": "8g"}`.
+- then `{"page_cache": "host-warm", "first_start": "host-warm", "memory": "4g", "memory_swap": "host-default", "detach_memory": "8g", "concurrency": "8"}`.
 
 If the python version is not 3.12.x or sqlite is not 3.40.1, the image is not the one baseline3 ran. Stop and report.
 
-- [ ] **Step 8: Compare, and apply the gate**
+- [ ] **Step 8: Check the G5 rows, compare, and apply the gate**
+
+The command first checks that every raggio and raggio-ivf run file holds the three spec §3.1 G5 keys, and that no bench.py run logged an absent CPU row. Then it compares.
 
 ```bash
 ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+cd ~/raggio-bench/a-equiv
+for f in run*-raggio*.json; do
+  for k in hybrid_c_p99 cpu_ms_per_q_c hybrid_cpu_ms_per_q_c; do grep -q "\"$k\"" "$f" || echo "$f: no $k"; done
+done
+ls run*-raggio*.json | wc -l
+grep -h " absent: " ~/raggio-bench/a-equiv.log || echo "no absent row"
 cd ~/raggio && .venv/bin/python bench/dgx/compare.py ~/raggio-bench/baseline3 ~/raggio-bench/a-equiv \
   | tee ~/raggio-bench/a-equiv/compare-baseline3.txt'
 ```
 
-Expected shape:
+Expected from the check: `8` (raggio and raggio-ivf run0–run3), then `no absent row`, with no `<file>: no <key>` line before them. Any `no <key>` line or `absent:` line means the G5 rows are missing on gn100. Stop there, whatever the table says: report it, and fix it in PR 1 as Step 6 says, because Plan G's G5 needs these rows.
+
+Expected shape of the comparison:
 - `A/B: baseline … vs candidate …`.
 - Two `Regime (…)` lines that differ only in `first_start`. There is no `The arms differ` line.
 - The 7-cell table.
@@ -2784,7 +3521,7 @@ Expected shape:
 - a row named in the `Reported, not claimed` note;
 - a `raggio-ivf` memory row. baseline3's counted IVF runs mix a disk-loaded and a just-built index (1.51 vs 2.72 GB, spec §5 finding 4).
 
-Any other row outside the band fails the gate. A verdict of `-` is not a failure: it marks a row one side lacks. These are the build, when the session started IVF, and the two first-hybrid rows, which baseline3 predates. `no band` and `not claimable` rows are not failures either.
+Any other row outside the band fails the gate. A verdict of `-` is not a failure: it marks a row one side lacks. These are the build, when the session started IVF, and the rows baseline3 predates: the two first-hybrid rows, `Hybrid p99 under concurrency (ms)`, `CPU per query under concurrency (ms)` and `Hybrid CPU per query under concurrency (ms)`. The three G5 rows have no baseline3 counterpart, so they are reported, not gated. `no band` and `not claimable` rows are not failures either.
 
 If the gate fails, do not merge PR 1:
 1. Read both `facts.txt` for host differences: load average, cached pages, other containers.
@@ -2807,7 +3544,8 @@ Put `compare-baseline3.txt` in PR 1's description under a `DGX equivalence re-ba
 - the image id;
 - the index state at start;
 - the detach time, when the session started IVF;
-- the first-hybrid-pass values (`Hybrid first 10 queries, slowest`: the first A measurement of spec §6's 470–980 ms).
+- the first-hybrid-pass values (`Hybrid first 10 queries, slowest`: the first A measurement of spec §6's 470–980 ms);
+- a-equiv's three G5 rows, `Hybrid p99 under concurrency`, `CPU per query under concurrency` and `Hybrid CPU per query under concurrency`, marked reported, not gated. Note per flat run whether its CPU per query sits near p4's c=8 fast state (50.8–56.8 ms) or slow state (115.9–117.6 ms): this is the first gn100 read of the classifier G5 uses.
 
 ---
 
@@ -3146,9 +3884,10 @@ Run: `uv run pytest tests/test_packaging.py -q`
 Expected (replayed): `5 passed`.
 
 Run: `uv run pytest -q`
-- Expected: `154 passed, 1 warning` for A's tests alone, and `170 passed, 1 warning` on this branch with Plan B's 16.
+- Expected: `166 passed, 1 warning` for A's tests alone, and `183 passed, 1 warning` on this branch with Plan B's 17.
 - The sandbox, without Tasks 4–5, replayed `144 passed, 1 warning`.
 - The bench-harness tests run rather than skip, because the `bench` group is synced.
+- The one warning is Starlette's `StarletteDeprecationWarning`: "Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead." The re-lock keeps the same 54 packages, so it stays. DGX probe p4 saw it on every interpreter: `46 passed, 1 warning` on Debian 3.12.12, PBS 3.12.14, 3.14.7 and 3.14.7t. Moving the tests to httpx2 is not part of this plan.
 
 - [ ] **Step 7: Commit**
 
@@ -3290,7 +4029,7 @@ Expected (replayed): `7 passed`.
 
 Run: `uv run pytest -q`
 Expected:
-- `156 passed, 1 warning` for A's tests alone, and `172 passed, 1 warning` with Plan B's 16.
+- `168 passed, 1 warning` for A's tests alone, and `185 passed, 1 warning` with Plan B's 17.
 - The sandbox, without Tasks 4–5, replayed `146 passed, 1 warning`.
 
 - [ ] **Step 5: Commit**
@@ -3319,7 +4058,7 @@ When PR 2 is pushed, the workflow runs on the pull request. Its `test` job must 
 This task was replayed in the sandbox as its Dockerfile step (section `===== T6` of `verify_final.out`), and the image was built with podman (`D:/DEV/_scratch/plan-sandbox/plan-A-tools/img5_build.out`, exit 0). Some parts were not executed in the sandbox:
 - the D16 line `ENV OPENBLAS_NUM_THREADS=1` and its comment;
 - the test `test_image_runs_blas_single_threaded`;
-- the counts that include them (RED 3 failed, GREEN 10 passed, suite 159);
+- the counts that include them (RED 3 failed, GREEN 10 passed, suite 171);
 - the image checks in Steps 5 and 6.
 
 **Files:**
@@ -3484,7 +4223,7 @@ Expected: `10 passed`. The sandbox replayed `9 passed` without the D16 test.
 
 Run: `uv run pytest -q`
 Expected:
-- `159 passed, 1 warning` for A's tests alone, and `175 passed, 1 warning` with Plan B's 16.
+- `171 passed, 1 warning` for A's tests alone, and `188 passed, 1 warning` with Plan B's 17.
 - The sandbox, without Tasks 4–5 and the D16 test, replayed `148 passed, 1 warning`.
 
 - [ ] **Step 5: Build the image and read its interpreter, SQLite, BLAS setting and uid**
@@ -3499,9 +4238,10 @@ Run (not executed in the sandbox):
 podman run --rm raggio-a python -c "import os, sqlite3, sys; print(sys.version.split()[0], sqlite3.sqlite_version, os.environ['OPENBLAS_NUM_THREADS'], os.getuid(), os.environ['LANG'])"
 ```
 
-Expected: `3.12.<patch> 3.50.4 1 1000 C.UTF-8`.
-- `<patch>` is whatever 3.12 build uv 0.12.19 installs.
-- SQLite 3.50.4 is the version the spec (D15) expects from the PBS build. If the image reports another version, record it in the PR 2 description. Task 10's `image.json` records it too.
+Expected: `3.12.14 3.53.1 1 1000 C.UTF-8`.
+- 3.12.14 is the 3.12 build that `uv python install 3.12` gave with uv 0.12.19 in DGX probe p4 (gn100, aarch64, 2026-09-28).
+- SQLite 3.53.1 is what spec D15 records for uv 0.12.19's PBS interpreters (p4). p2's scaling figures were measured on 3.50.4 and were not re-measured on 3.53.1.
+- p4 read both on aarch64 only; this build is for the dev box's architecture. If the image reports another Python or SQLite version, record it in the PR 2 description. Task 10's `image.json` records both too.
 
 - [ ] **Step 6: Check that a volume written by the old image works with the new one (not executed in the sandbox)**
 
@@ -3559,11 +4299,17 @@ Push `packaging-foundation` and open PR 2 against `main`. Its description starts
 
 ### Task 10: DGX new reference baseline on PR 2 (not executed in the sandbox)
 
-Spec §2, order 2: "The DGX step records a **new reference baseline** for the PBS interpreter, SQLite 3.50.4 and single-threaded BLAS (D15, D16). The IVF build time and the flat vector rows must not regress beyond the band. Hybrid rows and IVF concurrent/filtered rows are expected to move and are reported."
+Spec §2, order 2: "The DGX step records a **new reference baseline** for the PBS interpreter, SQLite 3.53.1 and single-threaded BLAS (D15, D16). The IVF build time and the flat vector rows must not regress beyond the band. Hybrid rows and IVF concurrent/filtered rows are expected to move and are reported."
 
 This task measures two images in back-to-back sessions with the same runbook: `main` (with PR 1 and Plan B merged) as session `a-main`, then PR 2's head as session `a-ref`. It then compares them. `a-ref` becomes the reference that Plans C–G compare against.
 
 Both sessions start from a flat index, so each one measures the IVF build at 4 GiB (raggio-ivf run0). A session that starts on IVF measures no build: session.sh's IVF-first order only detaches. A small helper, `~/raggio-bench/detach.sh`, therefore drops the IVF index before each session. It uses the same 8 GiB transient container and the same `DELETE /collections/bench/index` that session.sh's `detach_index` uses.
+
+Spec §3.1 A1 decides the build gate: "The IVF build-time gate builds **twice per arm** and compares medians, against the band. There is no single-build tolerance and no rerun rule."
+- Both sessions therefore run with `IVF_BUILDS=2` (Task 4). After its measured runs, session.sh detaches the index once more in the 8 GiB container, then runs `build2 raggio-ivf`, which builds it again from flat at 4 GiB.
+- The measured runs keep the session's one IVF ↔ flat transition: the extra detach and build come after all of them. compare.py counts only build2's build time.
+- Each side's build row then has two values (run0's and build2's), a median and a band. Gate 1 (Step 12) is that row's verdict.
+- The two extra steps add about 13 minutes per session: about 5 for the detach (285 s in the research baseline) and about 8 for build2 (a 213 s build, then the bench's query phases, which compare.py ignores).
 
 This is a DGX task. Nothing in it was run in the sandbox, and no command here has contacted gn100 yet. It makes no repo change and has no test cycle. Every command runs from the workstation repo root in Git Bash, with the ssh form written out in full.
 
@@ -3573,7 +4319,7 @@ This is a DGX task. Nothing in it was run in the sandbox, and no command here ha
   - Create `~/raggio-bench/detach.sh`, `~/raggio-bench/detach-a-main.log` and `~/raggio-bench/detach-a-ref.log`.
   - Create `~/raggio-bench/a-main/` and `~/raggio-bench/a-ref/` (session outputs), with their `.log` files.
   - Replace `~/raggio` twice, by the two deploys. unpack.sh keeps the previous checkout's results, logs and fingerprints in `~/raggio-bench/pre-deploy-<UTC time>/`.
-  - Possibly update `~/.local/bin/uv` to 0.12.19, only with the user's yes (Step 3).
+  - No uv change: gn100's `~/.local/bin/uv` is 0.12.5, which meets PR 2's `>=0.12` floor (Step 3).
 - On the workstation: create `D:/DEV/_scratch/dgx/a-main/` and `D:/DEV/_scratch/dgx/a-ref/` (copies, Step 13).
 
 **Interfaces:**
@@ -3582,7 +4328,7 @@ This is a DGX task. Nothing in it was run in the sandbox, and no command here ha
   - the `bench-tv` volume in whatever index state Task 6 left;
   - `main` after PR 1 and Plan B merged, and PR 2's head (Tasks 7–9 on `packaging-foundation`, rebased on that `main`).
 - Produces:
-  - `~/raggio-bench/a-ref/`, the reference session for later plans: PBS CPython 3.12, SQLite 3.50.4, `OPENBLAS_NUM_THREADS=1`, `FLAT_RUNS=3`, host-warm, 4 GiB, podman's default swap;
+  - `~/raggio-bench/a-ref/`, the reference session for later plans: PBS CPython 3.12, SQLite 3.53.1, `OPENBLAS_NUM_THREADS=1`, `FLAT_RUNS=3`, `IVF_BUILDS=2`, host-warm, 4 GiB, podman's default swap;
   - `~/raggio-bench/a-ref/compare-a-main.txt`, which goes in PR 2's description;
   - a `bench-tv` volume left with an IVF index (a flat-first session ends IVF).
 
@@ -3590,17 +4336,19 @@ This is a DGX task. Nothing in it was run in the sandbox, and no command here ha
 
 Ask, and wait for an explicit yes:
 
-> Task 10 needs gn100 for about 2 hours:
-> - deploy `main` (~5 min), drop the IVF index if present (~10 min), and run one session of `main`'s image (capped at 50 min);
-> - deploy PR 2 (~10 min: the first trixie build downloads CPython), drop the IVF index again (~10 min), and run one session of PR 2's image (capped at 50 min).
+> Task 10 needs gn100 for about 2.5 hours:
+> - deploy `main` (~5 min), drop the IVF index if present (~10 min), and run one session of `main`'s image (about 53 min, capped at 65 min);
+> - deploy PR 2 (~10 min: the first trixie build downloads CPython), drop the IVF index again (~10 min), and run one session of PR 2's image (about 53 min, capped at 65 min).
+>
+> Each session builds the IVF index twice, as spec §3.1 A1 requires: once in its IVF warm-up run, and once more after its measured runs, after a second detach in the 8 GiB container. That adds about 13 minutes per session.
 >
 > Each deploy replaces `~/raggio`. Its `bench/results-*`, `*.log` and `fingerprint-*.json` files are copied to `~/raggio-bench/pre-deploy-<UTC time>/` first. `bench-wv`, its volume and `~/turborag` are not touched: turborag is only read.
 >
-> PR 2's setup needs uv 0.12 or later on gn100. If `~/.local/bin/uv` is older, I will ask before updating it.
+> PR 2's setup needs uv 0.12 or later. gn100 has uv 0.12.5 (checked 2026-09-28), so no uv update is planned.
 >
-> May I use gn100 for up to 150 minutes from now?
+> May I use gn100 for up to 180 minutes from now?
 
-If the answer names a shorter cap, below 120 minutes, say that both sessions will not fit. Offer to run `a-main` in this window and the rest (from Step 8) in a second one.
+If the answer names a shorter cap, below 150 minutes, say that both sessions will not fit. Offer to run `a-main` in this window and the rest (from Step 8) in a second one.
 
 - [ ] **Step 2: Read-only pre-checks**
 
@@ -3617,7 +4365,8 @@ cat ~/raggio/.deployed-sha
 Expected:
 - `no bench running`;
 - `a-equiv` (Task 6) in `~/raggio-bench`, and no `a-main`, `a-ref` or `detach.sh`;
-- `fingerprint-raggio-2549619.json` in the state directory.
+- `fingerprint-raggio-2549619.json` in the state directory;
+- a last line starting `uv 0.12.5`, the version measured on gn100 on 2026-09-28 at 20:55.
 
 Stop and ask the user if any of these holds:
 - a bench process is running;
@@ -3627,9 +4376,11 @@ Stop and ask the user if any of these holds:
 
 - [ ] **Step 3: uv on gn100 meets PR 2's floor**
 
-PR 2's `pyproject.toml` has `[tool.uv] required-version = ">=0.12"`, and its setup.sh runs `uv sync --frozen --group bench`. If Step 2 printed a version of 0.12 or later, skip this step.
+PR 2's `pyproject.toml` has `[tool.uv] required-version = ">=0.12"`, and its setup.sh runs `uv sync --frozen --group bench`.
 
-Otherwise ask:
+On 2026-09-28 at 20:55, gn100's `~/.local/bin/uv` was 0.12.5, installed by the standalone installer (`~/.config/uv/uv-receipt.json` is present). 0.12.5 meets the floor, so no update is planned. If Step 2 printed `uv 0.12.5`, or any version of 0.12 or later, skip this step.
+
+Only if Step 2 printed a version below 0.12 (someone changed uv since that check), ask:
 
 > `~/.local/bin/uv` on gn100 is `<version>`; PR 2 requires uv 0.12 or later. May I run `~/.local/bin/uv self update 0.12.19` there? It replaces only that binary.
 
@@ -3639,7 +4390,7 @@ After a yes:
 ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '~/.local/bin/uv self update 0.12.19 && ~/.local/bin/uv --version'
 ```
 
-Expected: the last line starts `uv 0.12.19`. If `self update` refuses (uv was not installed by the standalone installer), stop and ask the user how uv on gn100 should be updated.
+Expected: the last line starts `uv 0.12.19`. The standalone installer's receipt is what lets `self update` replace the binary. If it refuses anyway, stop and report its output to the user.
 
 - [ ] **Step 4: Deploy `main`**
 
@@ -3732,20 +4483,22 @@ On failure, stop, and report the log to the user. To stop the script early: `kil
 ```bash
 ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
 adopt=1; [ -e ~/raggio-bench/state/fingerprint-raggio-2549619.json ] && adopt=0
-setsid -f timeout --kill-after=60 50m env FLAT_RUNS=3 ADOPT=$adopt \
+setsid -f timeout --kill-after=60 65m env FLAT_RUNS=3 IVF_BUILDS=2 ADOPT=$adopt \
   bash ~/raggio/bench/dgx/session.sh a-main > ~/raggio-bench/a-main.log 2>&1 < /dev/null
 sleep 5; head -n 3 ~/raggio-bench/a-main.log'
 ```
 
 Expected first line: `<UTC time> session a-main: image localhost/raggio:<main sha>, bench checkout <main sha>`.
 
-Poll every 5 minutes with `ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'tail -n 4 ~/raggio-bench/a-main.log'`. The session is done when the last line is `<UTC time> session a-main done`, about 40 minutes in. The log shows:
+Poll every 5 minutes with `ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'tail -n 4 ~/raggio-bench/a-main.log'`. The session is done when the last line is `<UTC time> session a-main done`, about 53 minutes in. The log shows:
 - `index at start: flat`;
 - raggio run0–run3;
 - raggio-ivf run0, whose build is measured at 4 GiB, about 213 s in the research baseline;
-- raggio-ivf run1–run3.
+- raggio-ivf run1–run3;
+- `IVF detach at 8g took <s> s`, the second detach (`IVF_BUILDS=2`), about 285 s in the research baseline;
+- `build2 raggio-ivf`, whose build is measured at 4 GiB again.
 
-A line starting `bench aborted:` or `pending_jobs=… giving up` ends the session early. Read the log, and ask the user before relaunching; a relaunch needs a new label and another Step 6. To stop it early: `kill -TERM -- -"$(cat ~/raggio-bench/a-main/session.pgid)"`, run in the same ssh form. Never use a `pkill -f` pattern.
+A line starting `bench aborted:` or `pending_jobs=… giving up` ends the session early, and so does `IVF_BUILDS=2 needs a flat start`, which means Step 6 did not leave the volume flat. Read the log, and ask the user before relaunching; a relaunch needs a new label and another Step 6. To stop it early: `kill -TERM -- -"$(cat ~/raggio-bench/a-main/session.pgid)"`, run in the same ssh form. Never use a `pkill -f` pattern.
 
 - [ ] **Step 8: Deploy PR 2's head**
 
@@ -3759,7 +4512,7 @@ bash bench/dgx/deploy.sh
 Expected:
 - `git status --short` prints nothing, and the next line prints `on top of main`. If it doesn't, rebase PR 2 on `main` first and re-run Tasks 7–9's suite step.
 - deploy.sh prints `deploying <PR 2 sha> to gn100` and the `kept …` line.
-- setup.sh's trace shows `uv --version` printing uv 0.12 or later (`uv 0.12.19` if Step 3 updated it), then `uv sync --frozen --group bench`.
+- setup.sh's trace shows `uv --version` printing `uv 0.12.5` (or `uv 0.12.19` in the unplanned case that Step 3 updated it), then `uv sync --frozen --group bench`.
 - The `podman build` pulls `ghcr.io/astral-sh/uv:0.12.19` and `debian:trixie-slim` for arm64, and runs `uv python install 3.12`.
 - The last line is `<UTC time> deployed <PR 2 sha> as localhost/raggio:<PR 2 sha>`.
 
@@ -3782,28 +4535,33 @@ Expected final line: `<UTC time> index after: flat, detach took <s> s`, after `i
 
 ```bash
 ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
-setsid -f timeout --kill-after=60 50m env FLAT_RUNS=3 \
+setsid -f timeout --kill-after=60 65m env FLAT_RUNS=3 IVF_BUILDS=2 \
   bash ~/raggio/bench/dgx/session.sh a-ref > ~/raggio-bench/a-ref.log 2>&1 < /dev/null
 sleep 5; head -n 3 ~/raggio-bench/a-ref.log'
 ```
 
-Expected first line: `<UTC time> session a-ref: image localhost/raggio:<PR 2 sha>, bench checkout <PR 2 sha>`. Poll as in Step 7, with `a-ref`. The expected log shape is the same: `index at start: flat`, raggio run0–run3, raggio-ivf run0 with the build, run1–run3, then `session a-ref done`. `a-main` already recorded the fingerprint, so there is no `ADOPT`.
+Expected first line: `<UTC time> session a-ref: image localhost/raggio:<PR 2 sha>, bench checkout <PR 2 sha>`. Poll as in Step 7, with `a-ref`. The expected log shape is the same: `index at start: flat`, raggio run0–run3, raggio-ivf run0 with the build, run1–run3, the second `IVF detach at 8g took <s> s`, `build2 raggio-ivf` with the second build, then `session a-ref done`, about 53 minutes in. `a-main` already recorded the fingerprint, so there is no `ADOPT`.
 
 - [ ] **Step 11: Check both images' labels**
 
 ```bash
 ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
 cd ~/raggio-bench
-for s in a-main a-ref; do echo "$s"; cat "$s/image.json" "$s/regime.json"; grep -o "\"index_build_s\": [0-9.]*" "$s/run0-raggio-ivf.json" || echo "no IVF build measured"; done'
+for s in a-main a-ref; do echo "$s"; cat "$s/image.json" "$s/regime.json"
+  for r in run0 build2; do grep -o "\"index_build_s\": [0-9.]*" "$s/$r-raggio-ivf.json" || echo "no IVF build measured in $r"; done
+done
+podman image ls --format "{{.Tag}} {{.Size}}" localhost/raggio'
 ```
 
 Expected:
 - `a-main`: `{"python": "3.12.<n>", "sqlite_version": "3.40.1", "turbovec": "1.0.0", "openblas_num_threads": "unset"}`.
-- `a-ref`: `{"python": "3.12.<m>", "sqlite_version": "3.50.4", "turbovec": "1.0.0", "openblas_num_threads": "1"}`.
-- Both `regime.json` files: `{"page_cache": "host-warm", "first_start": "host-warm", "memory": "4g", "memory_swap": "host-default", "detach_memory": "8g"}`.
-- Each session then prints `"index_build_s": <seconds>`, the build that raggio-ivf run0 measured at 4 GiB (about 213 s in the research baseline). bench.py writes it to the run's JSON, not to `facts.txt`. `no IVF build measured` means the session did not start flat: stop and report.
+- `a-ref`: `{"python": "3.12.14", "sqlite_version": "3.53.1", "turbovec": "1.0.0", "openblas_num_threads": "1"}`, the versions p4 read from uv 0.12.19's PBS 3.12 on gn100.
+- Both `regime.json` files: `{"page_cache": "host-warm", "first_start": "host-warm", "memory": "4g", "memory_swap": "host-default", "detach_memory": "8g", "concurrency": "8"}`.
+- Each session then prints `"index_build_s": <seconds>` twice: the build that raggio-ivf run0 measured at 4 GiB, then build2's (each about 213 s in the research baseline). bench.py writes them to the runs' JSON, not to `facts.txt`.
+- `no IVF build measured in run0` means the session did not start flat. `no IVF build measured in build2` means the second build did not run or did not build. Either way, stop and report: Gate 1 needs both builds of both sessions (spec §3.1 A1).
+- The last lines are one `<tag> <size>` pair per `localhost/raggio` image. The `<main sha>` and `<PR 2 sha>` lines are the two images' sizes, which Step 13 reports.
 
-If `a-ref` has no `image.json`, or its `openblas_num_threads` is not `"1"`, the image under test is not Task 9's. Stop and report. If `sqlite_version` is not `3.50.4`, continue, and record the version in PR 2's description; spec D15 assumed 3.50.4.
+If `a-ref` has no `image.json`, or its `openblas_num_threads` is not `"1"`, the image under test is not Task 9's. Stop and report. If `sqlite_version` is not `3.53.1` or `python` is not `3.12.14`, continue, and record the versions in PR 2's description; spec D15 records 3.53.1 for uv 0.12.19's PBS interpreters (p4).
 
 - [ ] **Step 12: Compare, and apply the gates**
 
@@ -3817,23 +4575,36 @@ Expected shape:
 - `A/B: baseline … vs candidate …`, then the two identical-regime `Regime (…)` lines, apart from the image labels.
 - `The arms differ in sqlite_version, openblas_num_threads: a re-baseline across them, not a same-regime A/B (spec §6).`, with `python, ` first when the two 3.12 patch versions differ. This line is expected: it marks the D15 re-baseline that the spec calls for.
 - The 7-cell table.
-  - `raggio-ivf` `IVF index build (s)` has one value per side, no band and the verdict `no band`.
+  - `raggio-ivf` `IVF index build (s)` has two values per side (run0's and build2's builds): each side's median and max − min band, and the verdict `better`, `within band` or `worse`.
   - `Cold start to first query (s)` is `not claimable`.
 - No `Reported, not claimed` note: with `FLAT_RUNS=3` both sides have 3 counted runs per engine.
 - Then the `better beyond the noise band: …` and `worse beyond the noise band: …` lines, which list `(engine, key)` pairs.
 
-**Gate 1 (IVF build, D16):** a-ref's `IVF index build (s)` must be at most 1.10 × a-main's.
-- One build per side has no noise band.
-- The 10% threshold is this plan's rule, not the spec's; it is in the open questions.
+**Gate 1 (IVF build, D16 and spec §3.1 A1):** Gate 1 fails if and only if `('raggio-ivf', 'index_build_s')` is in the `worse beyond the noise band` list.
+- Each side's value is the median of its two builds. The band is the wider of the two sides' max − min, and never below 1 s, as for every row.
+- There is no single-build tolerance and no rerun rule (spec §3.1 A1). `better` and `within band` pass.
+- A build row whose verdict is `no band` or `-` lacks a build on some side; Step 11 should have caught it. That is a missing measurement, not a gate result: do not merge PR 2, and report Step 11's output to the user.
 
 **Gate 2 (vector rows, spec §2 order 2 and D16):** none of these pairs may be in the `worse` list:
 - `('raggio', k)` for k in `lat_p50`, `lat_p95`, `lat_p99`, `qps_serial`, `qps_concurrent`, `lat_c_p95`, `lat_filtered_p50`, `lat_filtered_p95`, `recall_at_10`;
 - `('raggio-ivf', k)` for k in `lat_p50`, `lat_p95`, `lat_p99`, `qps_serial`, `recall_at_10`: D16's "ingest-free rows" beyond the ones order 2 says are expected to move.
 
 These rows are reported, not gated:
-- every `hybrid_*` row, including `hybrid_first10_max_ms` and `hybrid_p99_after10`;
+- every `hybrid_*` row, including `hybrid_first10_max_ms`, `hybrid_p99_after10`, `hybrid_c_p99` and `hybrid_cpu_ms_per_q_c`;
+- `cpu_ms_per_q_c` of both engines (spec §3.1 G5: CPU per query is reported, not gated);
 - the `raggio-ivf` rows `qps_concurrent`, `lat_c_p95`, `lat_filtered_p50` and `lat_filtered_p95`, which the spec expects to move (D16's p3 probe saw them improve);
 - the memory and disk rows. A `worse` verdict on one of them is named to the user in the PR 2 description. It does not block by itself.
+
+**The p4 expectation for the hybrid rows (D15, D2).** DGX probe p4 (`docs/superpowers/research/2026-09-28-dgx-probe-p4-freethreaded.md`, gn100, 2026-09-28, code at 19a8a2e) measured the base migration alone. One arm was the Debian image of 19a8a2e (CPython 3.12.12, SQLite 3.40.1). The other was a probe image of D2's shape (PBS CPython 3.12.14, SQLite 3.53.1). Both ran with `OPENBLAS_NUM_THREADS=1` at `--memory 4g` without `--memory-swap`, on the IVF data, 3 runs per arm. The medians:
+- c=8: 12.7 → 17.9 hybrid QPS, p99 6,731 → 3,981 ms, server CPU per query 556.5 → 343.0 ms;
+- c=16: 12.1 → 14.8 hybrid QPS, p99 8.9 → 1.9 s, server CPU per query 872.3 → 365.1 ms.
+
+This is an expectation, not a target and not a gate:
+- It was measured on the probe image with p4's own driver on p2's 500-query set, not on Task 9's image with bench.py.
+- `hybrid_qps_concurrent`, `hybrid_c_p99` and `hybrid_cpu_ms_per_q_c` run at `CONCURRENCY=8`, the default, so p4's c=8 medians above are their counterparts. `a-ref`'s raggio-ivf QPS is expected above `a-main`'s, and its p99 and CPU per query below. p4's c=8 hybrid phase was 300 requests; bench.py's is 500.
+- p4's c=16 figures above have no counterpart here: this task runs no `CONCURRENCY=16` session. bench.py's `hybrid_p99` is a serial row.
+- `a-main` runs with BLAS unset, so this A/B also carries D16, which p4's two arms did not.
+- p4 measured hybrid on the IVF data only. It sets no expectation for the `raggio` (flat) hybrid rows.
 
 If both gates pass, `a-ref` is the new reference baseline, and PR 2 may merge after review.
 
@@ -3841,7 +4612,7 @@ If Gate 2 fails, do not merge PR 2:
 1. Read both `facts.txt` files for host differences: load average, cached pages, other containers.
 2. Report the table to the user. A repeat needs another detach and session under new labels (`a-ref2`), in a window the user grants.
 
-If Gate 1 fails, do not merge PR 2. Report both build times, and each session's `facts.txt` lines around raggio-ivf run0, to the user. D16's fallback applies: keep BLAS multi-threaded for the build and limit it on the search path only, with threadpoolctl, still owned by A. That is a follow-up change the user approves before it is planned; it is not part of this plan.
+If Gate 1 fails, do not merge PR 2. Report all four build times (run0 and build2 of each session), both medians and bands, and each session's `facts.txt` lines around raggio-ivf run0 and build2, to the user. D16's fallback applies, and only now that the gate has failed (spec §3.1 A1): keep BLAS multi-threaded for the build and limit it on the search path only, with threadpoolctl, still owned by A. That is a follow-up change the user approves before it is planned; it is not part of this plan.
 
 - [ ] **Step 13: Stop the container, keep the results, and record them**
 
@@ -3856,10 +4627,13 @@ Stopping `bench-tv` frees its 4 GiB. `bench-wv` is left as it was.
 
 Put `compare-a-main.txt` in PR 2's description under a `DGX reference baseline (D15, D16)` heading, with:
 - both sessions' `image.json` and regime lines, and both image ids;
-- both build times, with Gate 1's ratio;
-- both detach times (Steps 6 and 9);
+- all four build times (run0 and build2 of `a-main` and of `a-ref`), both medians and bands, and Gate 1's verdict;
+- the detach times: Steps 6 and 9, and each session's second `IVF detach at 8g took <s> s` before build2;
 - the first-hybrid-pass values;
 - the raggio-ivf concurrent and filtered rows, next to the p3 probe's figures quoted in D16 (serial 4 vs 8 ms, filtered 32 vs 70 ms, and F's server concurrency of about 325 vs 203 QPS, with the setting vs without). p3 used its own setup, so these are context, not targets.
+- the raggio-ivf hybrid rows, next to p4's figures from Step 12 (c=8: 12.7 → 17.9 QPS, p99 6,731 → 3,981 ms, CPU per query 556.5 → 343.0 ms). They were measured on the probe image, so they are context, not targets.
+- both sessions' `CPU per query under concurrency` per flat run, with the p4 state each one matches (c=8 fast 50.8–56.8 ms, slow 115.9–117.6 ms).
+- both images' sizes: the `<main sha>` and `<PR 2 sha>` lines of Step 11's `podman image ls`. p4 reported 408 MB for the Debian image of 19a8a2e and 317.4 MB for its PBS 3.12 probe image, which, like Task 9's image, has no `raggio_native` and no orjson. This is a reported expectation, not a gate.
 
 State that later plans compare against `~/raggio-bench/a-ref` (PBS CPython 3.12, SQLite `<version>`, `OPENBLAS_NUM_THREADS=1`), not against baseline3 or the research baseline.
 
@@ -3875,13 +4649,15 @@ Every item of the DGX benchmark protocol, and where this plan meets it:
 | Deploy: `git archive`, corpus link, ground truth, `uv sync --frozen --group bench`, `podman build -t localhost/raggio:<sha>` | Task 3 (`deploy.sh`, `unpack.sh`, `setup.sh`), Task 7 (`--group bench`) | unpack.sh keeps the old checkout's results before the wipe. `~/turborag` is only read. |
 | Container: `bench-tv`, 4 GiB, port 18000, `ROOT_API_KEY=bench`; `podman rm -f` names only `bench-tv`; a fresh container per run | Task 3 (`fresh_container`, `test_guard_rails`), Task 10 (`detach.sh`) | `CONTAINER=bench-tv` is the only name any script stops or removes. |
 | Bench invocation: `--limit 2549619`, no `--reingest` | Task 2 (preflight aborts on a wrong limit), Task 3 (`bench_run`, and a guard rail against `2549119` and `--reingest`) | |
-| Order in a session: facts, first start, pending wait, warm-up run0, grouped runs with one IVF ↔ flat transition, the 8 GiB detach, the build measured at 4 GiB | Task 3 (`session.sh`) | Task 10 adds a detach before each session, so both sessions start flat and measure the build. |
-| Noise band: flat run1 vs run2, IVF ≥ 3 runs with median and max − min, concurrent QPS ≥ 3 runs, a fresh container per arm, a win only beyond the band | Task 3 (`compare.py`), Task 4 (`FLAT_RUNS`, the not-claimed note) | Tasks 6 and 10 run `FLAT_RUNS=3`. |
+| Order in a session: facts, first start, pending wait, warm-up run0, grouped runs with one IVF ↔ flat transition, the 8 GiB detach, the build measured at 4 GiB | Task 3 (`session.sh`), Task 4 (`IVF_BUILDS=2`) | Task 10 adds a detach before each session, so both sessions start flat and measure the build. With `IVF_BUILDS=2`, each then detaches at 8 GiB and builds once more at 4 GiB after its measured runs, which keep the one transition (spec §3.1 A1). |
+| Noise band: flat run1 vs run2, IVF ≥ 3 runs with median and max − min, concurrent QPS ≥ 3 runs, a fresh container per arm, a win only beyond the band | Task 3 (`compare.py`), Task 4 (`FLAT_RUNS`, the not-claimed note, `BUILD_FILE`) | Tasks 6 and 10 run `FLAT_RUNS=3`. Task 10 also runs `IVF_BUILDS=2`, so its build row has two values per side and Gate 1 compares medians against the band (spec §3.1 A1). |
 | The concurrent phase repeats the same 500 queries (warm caches) | Task 5 (the report note) | |
 | `OPENBLAS_NUM_THREADS`: both arms the same, every row records it | Task 4 (`image.json`, the arms-differ line), Task 9 (the D16 `ENV`) | Task 10's A/B crosses it on purpose, and compare.py says so. |
 | Pinning with `os.sched_setaffinity` when a single-thread latency needs attributing | Not in this plan | A's steps attribute no single-thread latency. See the spec gaps. |
 | Regime labelling: page cache, memory cap, `sqlite_version`, the same regime on both arms | Task 4 (`regime.json`, `image.json`, `SAME_REGIME`) | Task 6 hand-labels baseline3's first start as `mostly-cold`. |
 | The first hybrid pass after a load, reported on its own | Task 5 (`hybrid_first10_max_ms`, `hybrid_p99_after10`) | |
+| Spec §3.1 G5 and §4.2: the concurrent hybrid p99 and CPU per query rows, with the CPU rows absent, never 0, where `cpu.stat` is not readable | Task 5 (`hybrid_c_p99`, `cpu_ms_per_q_c`, `hybrid_cpu_ms_per_q_c`, `--cpu-container`, the absent-row log line, compare.py's `-` cells), Task 6 Step 8 (the rows are present on gn100), Task 10 Step 12 | A reports them and gates none: baseline3 has no counterpart, and G owns the p99 guard. |
+| Spec §3.1 G7 and §4.2: the `CONCURRENCY` session knob, default 8 | Task 5 (`lib.sh`, `bench_run`, the regime's `concurrency` label and `REGIME_KEYS`) | Tasks 6 and 10 run at the default. G's c=16 sessions set `CONCURRENCY=16`, and compare.py flags arms that ran at different concurrency. |
 | Memory gate: `--memory 4g --memory-swap 4g` | Task 4 (`MEMORY_SWAP=4g`) | A makes no memory claim, so neither DGX task uses it. |
 | Cold start claimed only true-cold | Task 3 (`cold_start_s` is `not claimable`), Task 4 (`FIRST_START=true-cold` label) | The fadvise eviction (D12) belongs to Plan C. |
 | Tunables chosen on seed 7, published on seed 42 | Not applicable | A tunes nothing. |
@@ -3893,5 +4669,8 @@ These are places where another plan describes Plan A differently from what this 
 
 - **Plan E (`2026-09-28-native-bm25.md`):** no mismatch found. Its DGX task (Interfaces, line 3289) consumes only `deploy.sh`, `~/raggio/.deployed-sha` and Task 10's `~/raggio-bench/detach.sh <image>` with the last log line `index after: flat, detach took <s> s`; all three match. It runs its own arms, not `session.sh` or `compare.py`. `detach.sh` exists only on gn100 (Task 10 Step 5), so E's pre-check (line 3399, `detach.sh ok`) is what catches its absence.
 - **Plan G (`2026-09-28-free-threaded-python.md`):** reconciled in the cross-plan review. G used to assume that A's `session.sh` holds `~/raggio-bench/active-session`; A has no such lock. G's `g-ensure-ivf.sh`, pre-flights, poll and stop recipe now find a running `session.sh` with `pgrep -f` on its command line (`bash <path>/bench/dgx/session.sh <label>`), and treat only G's own `g-active` as a lock file. A keeps its behaviour: `session.sh` writes no lock file, so any change to that command line must be reflected in G.
-- **Plan C (`2026-09-28-cold-start-and-loop-hygiene.md`):** reconciled. Lines 102 and 174 now expect 175 tests after Plans A and B (46 + 113 + 16), and C's relative-count rule (`N0`) is unchanged.
-- **Plan F:** no mismatch found.
+  - Spec §3.1 G5, G7, G8 and G9: Plan G reads what Task 5 builds. Its Task 10 Interfaces, its "Cross-plan assumptions" list and its synthetic `regime.json` carry the keys `hybrid_c_p99`, `cpu_ms_per_q_c` and `hybrid_cpu_ms_per_q_c` with the labels "Hybrid p99 under concurrency (ms)", "CPU per query under concurrency (ms)" and "Hybrid CPU per query under concurrency (ms)". The `Regime (baseline): …` line format there includes `concurrency=…` between `memory_swap` and `python`, and the synthetic `regime.json` sets `concurrency` to 16 for `-c16` sessions and 8 otherwise. G's `g-abab.sh` sets `CONCURRENCY=16` for its c=16 sessions and 8 for the others, and `g-session.sh` hands it to `session.sh`. G gates on "Hybrid p99 under concurrency (ms)" (G5): a hybrid QPS win needs it not `worse` in either cross table. A real c=8 session compared with a c=16 one prints `The arms differ in concurrency: …`; G's pair tables pair c=8 with c=8 and c=16 with c=16, so they print none.
+- **Plan C (`2026-09-28-cold-start-and-loop-hygiene.md`):** reconciled with spec §3.1 G5 and G7. Task 5 adds 11 tests, so A ends at 171 and every A count from Task 5 on is 9 higher. C's lines 102 and 174 expect 188 tests after Plans A and B (46 + 125 + 17), and line 102's "after Task 9" total is 252, citing "A's 162+9 = 171". C's relative-count rule (`N0`) is unchanged. C also carries B1's 404 wording: a search that races B's `delete_collection` gets `collection '<name>' not found` (`CollectionDeletedError`), not a 500.
+- **Plan D (`2026-09-28-ingest-path.md`):** reconciled. D's "Suite counts" bullets, its Phase D1 pre-step and its Self-Review state N0 = 253 (252 without C's Task 12 test), from A's 171, B's 17 and C's 65. The example totals after each `N0 + k` are 261, 270, 275, 277, 280 and 281 "when N0 is 253". D's relative rule is unchanged. D's use of `compare.load`, `values`, `summary`, `verdict`, `RESOLUTION` and `RUN_FILE` is unchanged: `load` and `values` differ only for a session with a `build<N>` file, and only in `raggio-ivf`'s one-shot rows. D reads none of Task 5's new keys.
+- **`IVF_BUILDS` (spec §3.1 A1), all plans:** an optional `session.sh` knob with default 1. No other plan's `session.sh` launch line, `compare.py` call or cross-plan name changes. Without it, `session.sh` runs exactly the commands it ran before the knob existed.
+- **Plan F:** no mismatch found. Its `planF-cpu.py` records `cpu_ms_per_query` from the same cgroup `cpu.stat`, in its own files; bench.py's `cpu_ms_per_q_c` and `hybrid_cpu_ms_per_q_c` are different keys, and neither side reads the other's.

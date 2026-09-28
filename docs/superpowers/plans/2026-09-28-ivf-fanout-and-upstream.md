@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Run the probed IVF shard searches in parallel instead of one after another. Make filtered IVF search cheap. Close the two orphaned-search cache races (R2, R2b). Sync only the IVF shards a job wrote. Draft the turbovec upstream asks locally. Prove all of it on the DGX against the preceding main.
+**Goal:** Run the probed IVF shard searches in parallel instead of one after another. That serial pipeline is the pre-F limit. At 19a8a2e, p4 measured only 1.1–1.25 cores busy for IVF at c=16, bound by the single `_drain_scans` pipeline, and a split client did not raise QPS beyond trial-to-trial spread. Make filtered IVF search cheap. Close the two orphaned-search cache races (R2, R2b). Sync only the IVF shards a job wrote. Draft the turbovec upstream asks locally. Prove all of it on the DGX against the preceding main.
 
 **Architecture:** `_IvfIndex.search` builds one task per (query, shard) search, in the old serial loop's order. It runs them on a per-`Collection` `_ShardPool` whose threads are owned by the collection and joined by `stop()`, then merges the results in that same order, so any pool size returns the serial result bit-for-bit. The default pool size is `min(12, os.cpu_count())` (spec §4.2, p3). A filtered search cuts each shard's allowlist slice inside its own pool task, not up front on the caller (p3: 3.7 ms against 6.4–7.0 ms). The slice is intersected shard-side, binary-searching the smaller side into the larger, against allowlists sorted once at cache fill (p3: 29.8 → 2.0 ms). D3 is settled by p3: plain per-(query, shard) nq=1 fan-out, and no audience batching. The probe keeps a grouped arm only as a regression guard. Generation counters keep a scan that predates a write from caching its snapshot. Per-shard dirty flags make `sync()` write only what changed. The 32,768-row pooled-path cliff of turbovec is documented in `_ShardPool`, in ADR 0005 and in the DGX run, which reports the largest IVF list size.
 
@@ -13,7 +13,8 @@
 - §3 D1 (ADR 0005), D3 (fan-out grouping, settled by p3: plain q1, no audience batching), D6 and D7 (upstream stance, drafts outside the repo), D15 (SQLite build, `sqlite_version` on every row), D16 (BLAS threads: the image `ENV` is owned by A);
 - §4.1 (F owns `_IvfIndex`, `_vector_ids`, `_allow_cache`; D2 consumes the dirty-shard API);
 - §4.2 (`IVF_SEARCH_THREADS`, default 12; never `RAYON_NUM_THREADS=1`; `OPENBLAS_NUM_THREADS=1` is A's image `ENV`);
-- §6 (DGX protocol) and §7 F (acceptance items 1–7).
+- §6 (DGX protocol) and §7 F (acceptance items 1–7);
+- §3.1 row F1 (maintainer decision): §7 F item 5 is one-sided. Only a memory peak more than 50 MB above base's fails; a lower peak is reported.
 
 Research:
 - `docs/superpowers/research/2026-09-28-item3a-turbovec-internals.md` (inline nq=1 path, fan-out model);
@@ -23,7 +24,8 @@ Research:
 - `…-critic.md`;
 - `…-dgx-baseline.md` (the numbers ADR 0005 cites);
 - `…-dgx-probe-p3-ivf-fanout.md` (pool size 12, in-task intersection, q1 over grouped, the 32,768-row cliff, the OpenBLAS spinners, the server A/B brackets in §7 F);
-- `…-dgx-probe-p2-hybrid-native.md` (the SQLite memstatus mutex, a confounder for concurrent numbers).
+- `…-dgx-probe-p2-hybrid-native.md` (the SQLite memstatus mutex, a confounder for concurrent numbers);
+- `…-dgx-probe-p4-freethreaded.md` (Plan impacts item 12, the pre-F expectation: at 19a8a2e, concurrent IVF is bound by the single `_drain_scans` pipeline, with 1.1–1.25 cores busy at c=16, and a split client did not raise aggregate QPS beyond trial-to-trial spread; p4 read server CPU per query from the container cgroup's `cpu.stat`). Task 10 records cores busy at c=16 in both arms. It is not a gate.
 
 ## Global Constraints
 
@@ -47,6 +49,7 @@ Research:
 - Tunables are chosen on seed 7 (the probe's default) and published on seed 42 (the bench's). p3 chose the pool size, 12, on seed 7 and held it on seed 42. The probe's `fanout` mode re-measures it, and Task 10 reports the result. If the probe's chosen size differs from 12 beyond the band, that is a finding for the user, and this plan does not change the default on its own.
 - Spec §6, verbatim: "Vector concurrent QPS is bimodal (120–225) across identical configs, so it always needs at least 3 runs." / "The band must include **between-server** variance: every A/B arm runs on a fresh container." / "Both arms of an A/B run with the same `OPENBLAS_NUM_THREADS`, and every row records it." / "Every row also states its memory cap and `sqlite3.sqlite_version` (D15)."
 - Spec §7 F, verbatim, is the acceptance of Task 10. It is quoted in full there. The after-F note is quoted too: "After F, the server limit is the HTTP/event-loop pipeline, about 3.1 ms per request, against an in-process ceiling of 610–662 QPS. Follow-ups outside A–G: two `_drain_scans` batches in flight, and `_hydrate` off the loop." p3 adds a third follow-up: a cheaper parse of the vector body. All three are out of scope here.
+- Spec §3.1 row F1 (maintainer decision) makes §7 F item 5 one-sided: F fails it only when its median cgroup memory peak is more than 50 MB above base's (`round(pf - pb, 1) <= 50` passes; the peaks have one decimal, and the rounding keeps a float difference such as 50.00000000000023 from failing an exact +50.0). A lower peak passes, and the summary's `F5` line reports it with its signed delta in MB.
 - Commit trailer, on every commit: `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
 ## Review Focus
@@ -91,7 +94,7 @@ These are five failure modes the spec implies but that no task's main tests exer
 | `docs/adr/0005-ivf-fanout-and-upstream-stance.md` | Create. Task 10 replaces its "Pending:" Verification | 7, 10 |
 | `README.md`, `docs/getting-started.md`, `docs/concepts.md`, `docs/indexing.md`, `docs/adr/0001-performance-optimization-decisions.md`, `docs/adr/0002-optional-ivf-index.md` | Modify: the knob row, the corrected fixed-cost claim, ADR 0005 cross-references | 7 |
 | `D:/DEV/_scratch/upstream-drafts/` (outside the repo) | Six `turbovec-*.md` drafts, `neon_small_nq_repro.py`, `check_drafts.py`. Task 10 appends the DGX data | 8, 10 |
-| `D:/DEV/_scratch/dgx/` (outside the repo) | `dgx-planF-ab.sh`, `planF-build.sh`, `planF-summary.py`, `planF-verify.py`, `planF-check.py` | 9 |
+| `D:/DEV/_scratch/dgx/` (outside the repo) | `dgx-planF-ab.sh`, `planF-build.sh`, `planF-summary.py`, `planF-verify.py`, `planF-cpu.py` (the record-only c=16 CPU capture), `planF-check.py` | 9 |
 | `D:/DEV/_scratch/dgx/planF/`, `D:/DEV/_scratch/dgx/planF-shas.env` (outside the repo) | Fetched `ab.log`, `results/`, `summary.md`; the pinned base and F SHAs | 10 |
 
 ### Task 1: Per-collection shard pool and parallel IVF fan-out
@@ -2321,6 +2324,17 @@ threads reached 610.4 QPS (661.7 with `OPENBLAS_NUM_THREADS=1`). At the HTTP ser
 [162.8..207.3] to 324.7 [308.6..381.4], filtered p50 fell from 36.6 to 6.41 ms, and serial
 p50 fell from 8.44 to 6.50 ms. The memory peak was 1.82 GB in both arms.
 
+DGX probe p4 (`docs/superpowers/research/2026-09-28-dgx-probe-p4-freethreaded.md`)
+measured the server before this change: 19a8a2e, IVF vector at c=16, 4 GiB cap,
+`OPENBLAS_NUM_THREADS=1`. Only 1.1–1.25 cores were busy (per-thread CPU from `top -H`:
+about 1.1 on Debian CPython 3.12, 1.25 on free-threaded 3.14t), and no thread was
+saturated. Splitting the client in two did not raise aggregate QPS beyond trial-to-trial
+spread. So concurrent IVF was bound by the single `_drain_scans` batch pipeline, whose
+shard calls ran one after another, not by the client and not by the GIL: 3.14t's
++14–31 % QPS at c=8 and c=16 sits on top of that pipeline. This is the pre-fan-out
+expectation. The DGX A/B records cores busy at c=16 in both arms, as a record and not as
+a gate.
+
 ## Decisions
 
 | Decision | Rationale |
@@ -3015,21 +3029,25 @@ This task writes the scripts that Task 10 runs, and checks them end to end on sy
 - Create: `D:/DEV/_scratch/dgx/planF-check.py`
 - Create: `D:/DEV/_scratch/dgx/dgx-planF-ab.sh`, `D:/DEV/_scratch/dgx/planF-build.sh`
 - Create: `D:/DEV/_scratch/dgx/planF-summary.py`, `D:/DEV/_scratch/dgx/planF-verify.py`
+- Create: `D:/DEV/_scratch/dgx/planF-cpu.py`
 
 **Interfaces:**
 - Consumes:
   - spec §6: the deploy layout (`~/raggio`), container `bench-tv` with volume `bench-tv`, collection `bench`, `--limit 2549619`, the run order, the noise bands (at least 3 IVF runs, between-server variance from a fresh container per run, the same `OPENBLAS_NUM_THREADS` in both arms) and the row labels (regime, cap, `sqlite3.sqlite_version`);
-  - spec §7 F (acceptance items 1–7, quoted in Task 10);
+  - spec §7 F (acceptance items 1–7, quoted in Task 10), with item 5 one-sided per spec §3.1 F1: only F's median memory peak more than 50 MB above base's fails, and a lower peak passes and is reported;
   - `bench/bench.py`'s `results-partial.json` keys (`qps_concurrent`, `lat_filtered_p50`, `lat_p50`, `qps_serial`, `lat_c_p95`, `lat_filtered_p95`, `recall_at_10`, `hybrid_p50`, `mem_under_load_mb`, plus `index_build_s` / `ingest_s`, which appear only when a run rebuilt or re-ingested). `mem_under_load_mb` is one `podman stats` sample, not a peak, so item 5 reads the container's cgroup v2 `memory.peak` instead;
   - the `--fingerprint-dir` / `--adopt` flags, if Plan A's hardened bench is present;
   - Task 6's probe CLI and its `LISTS`, `GUARD` and `EXACT` lines;
   - Task 7's ADR 0005 `Pending:` Verification;
-  - Task 8's drafts and `neon_small_nq_repro.py`.
+  - Task 8's drafts and `neon_small_nq_repro.py`;
+  - p4's pre-F reading, for the record-only CPU capture: at 19a8a2e, IVF vector at c=16 kept 1.1–1.25 cores busy, bound by the single `_drain_scans` pipeline, and a split client did not raise aggregate QPS beyond trial-to-trial spread. p4 read server CPU per query from the container cgroup's `cpu.stat`.
 - Produces:
   - `dgx-planF-ab.sh <base tag> <F tag> <0|1>`, which writes `~/planF/ab.log` and `~/planF/results/` on gn100 and ends its log with `== PLANF AB DONE <ts> ==` or `== PLANF AB FAILED: <reason> (<ts>) ==`. Every container gets `-e OPENBLAS_NUM_THREADS=1`. After every bench run it writes `meta-planF-<label>.json` with the keys `label`, `regime` (`host-warm`), `cap`, `sqlite_version`, `openblas_num_threads` and `memory_peak_mb`;
   - `planF-build.sh <source dir> <tag>`;
-  - `planF-summary.py <results dir>`, which prints the Verification markdown: the A/B table, the row-label table, the guard line, and one `- PASS:` or `- FAIL:` line per spec §7 F item (`F1` to `F7`) plus one `labels` line. It reads `probe-exact.txt` and `probe-fanout.txt` from the results dir, and exits 1 if any line is `- FAIL:`;
-  - `planF-verify.py <fetched dir> <base sha> <F sha> <drafts dir>`, run from the repo root. It never writes `min(32` into ADR 0005, because Task 7's test forbids it.
+  - `planF-summary.py <results dir>`, which prints the Verification markdown: the A/B table, the row-label table, the guard line, and one `- PASS:` or `- FAIL:` line per spec §7 F item (`F1` to `F7`) plus one `labels` line. It reads `probe-exact.txt` and `probe-fanout.txt` from the results dir, and exits 1 if any line is `- FAIL:`. Its `F5` line states the signed memory-peak delta (F minus base, in MB, rounded to the peaks' one decimal) and fails only when that delta is above +50 (spec §3.1 F1); a lower peak passes and the line says `reported`;
+  - `planF-verify.py <fetched dir> <base sha> <F sha> <drafts dir>`, run from the repo root. It never writes `min(32` into ADR 0005, because Task 7's test forbids it;
+  - `planF-cpu.py <label> <out dir>`, record-only and never a gate. `dgx-planF-ab.sh` runs it after every measured base and F IVF run, once `meta()` has read `memory.peak`. It drives a discarded 200 and then 1,500 vector searches at c=16 on the running `bench-tv`. Over the measured window it reads the container cgroup's `cpu.stat` (`usage_usec`, as p4 did) and `/proc/<server pid>/task/*/stat` deltas. It writes `cpu16-planF-<label>.json` with the keys `label`, `concurrency`, `requests`, `qps`, `p50_ms`, `p99_ms`, `cpu_ms_per_query`, `cores_busy_cgroup`, `cores_busy_threads`, `main_thread_cores`, `threads_busy`, `threads_total`, `top_threads` and `driver_cores`, and logs one `CPU16 <label>: ...` line. A failed capture is logged, and the A/B goes on;
+  - in `planF-summary.py`, a `### Cores busy at c=16 (record-only, not a gate)` section after the guard line: median [min..max] per arm over the `cpu16` files, with p4's 1.1–1.25 cores as the pre-F expectation, or `No cpu16 files: ...` when there are none. No `- PASS:` or `- FAIL:` line reads it, and `planF-verify.py` carries it into ADR 0005 with the rest of the summary.
 
 - [ ] **Step 1: Write the failing check**
 
@@ -3037,14 +3055,20 @@ Create `D:/DEV/_scratch/dgx/planF-check.py` with exactly this content:
 
 ```python
 """Plan F Task 9: check the DGX session scripts on the laptop before any DGX time is spent.
-Syntax-checks both shell scripts, then runs planF-summary.py and planF-verify.py end to
+Syntax-checks both shell scripts, checks planF-cpu.py's /proc and cpu.stat parsers and its
+per-thread sums on synthetic lines, then runs planF-summary.py and planF-verify.py end to
 end on synthetic results (one passing A/B, one that fails spec §7 F item 2, one whose
-base arm lacks OPENBLAS_NUM_THREADS=1) against a temporary copy of ADR 0005 and of the
-upstream drafts. Nothing in the repo or the drafts dir is modified.
+base arm lacks OPENBLAS_NUM_THREADS=1, and three for the one-sided item 5 of spec §3.1 F1:
+F's memory peak 80 MB below base's passes and is reported, 60 MB above base's fails, and
+exactly 50 MB above base's passes)
+against a temporary copy of ADR 0005 and of the upstream drafts. Only the passing A/B
+carries record-only c=16 CPU captures (p4); their absence must fail nothing. Nothing in
+the repo or the drafts dir is modified.
 
 Usage: python D:/DEV/_scratch/dgx/planF-check.py [<repo> [<drafts dir>]]
        (defaults: D:/DEV/raggio and D:/DEV/_scratch/upstream-drafts)
 """
+import importlib.util
 import json
 import shutil
 import subprocess
@@ -3070,9 +3094,11 @@ def run(*cmd, cwd=None):
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8")
 
 
-def write_results(d: Path, f_qps: float, base_blas: str = "1") -> None:
+def write_results(d: Path, f_qps: float, base_blas: str = "1", f_peak_delta: float = 0.0,
+                  base_peak: float = META["memory_peak_mb"]) -> None:
     """run0 plus 3 measured runs per arm, each with its row labels (meta-*.json);
-    every arm's QPS band is 2.0 (runs 1..3)."""
+    every arm's QPS band is 2.0 (runs 1..3). Every base and f1 run peaks at base_peak MB,
+    every F run at base_peak + f_peak_delta (spec §3.1 F1 cases)."""
     d.mkdir(parents=True)
     arms = {"base": BASE, "f": dict(F, qps_concurrent=f_qps), "f1": BASE}
     for arm, m in arms.items():
@@ -3080,15 +3106,46 @@ def write_results(d: Path, f_qps: float, base_blas: str = "1") -> None:
             vals = dict(m, qps_concurrent=m["qps_concurrent"] + max(r - 1, 0))
             (d / f"results-planF-ivf-{arm}-run{r}.json").write_text(json.dumps({"raggio-ivf": vals}))
             meta = dict(META, label=f"ivf-{arm}-run{r}",
-                        openblas_num_threads=base_blas if arm == "base" else "1")
+                        openblas_num_threads=base_blas if arm == "base" else "1",
+                        memory_peak_mb=base_peak + (f_peak_delta if arm == "f" else 0.0))
             (d / f"meta-planF-ivf-{arm}-run{r}.json").write_text(json.dumps(meta))
+
+
+def write_probes(d: Path) -> None:
+    """The two probe outputs planF-summary.py reads (F1, F7 and the guard line)."""
+    (d / "probe-fanout.txt").write_text(LISTS + "\n" + GUARD + "\n", encoding="utf-8")
+    (d / "probe-exact.txt").write_text(LISTS + "\n" + EXACT + "\n", encoding="utf-8")
+
+
+def write_cpu(d: Path) -> None:
+    """planF-cpu.py's record-only c=16 captures, runs 1..3 of base and F: base near p4's
+    pre-F 1.1 cores busy, F above it. The cgroup cores are 1.11..1.13 and 2.41..2.43."""
+    for arm, cores in (("base", 1.10), ("f", 2.40)):
+        for r in (1, 2, 3):
+            rec = {"label": f"ivf-{arm}-run{r}", "concurrency": 16, "requests": 1500,
+                   "qps": 200.0 + 100.0 * (arm == "f") + r, "p50_ms": 70.0, "p99_ms": 110.0,
+                   "cpu_ms_per_query": 5.5, "cores_busy_cgroup": cores + r / 100,
+                   "cores_busy_threads": cores, "main_thread_cores": 0.23, "threads_busy": 6,
+                   "threads_total": 30, "top_threads": [], "driver_cores": 0.35}
+            (d / f"cpu16-planF-ivf-{arm}-run{r}.json").write_text(json.dumps(rec))
 
 
 for sh in ("dgx-planF-ab.sh", "planF-build.sh"):
     r = run("bash", "-n", str(HERE / sh))
     assert r.returncode == 0, (sh, r.stderr)
-for py in ("planF-summary.py", "planF-verify.py"):
+for py in ("planF-summary.py", "planF-verify.py", "planF-cpu.py"):
     compile((HERE / py).read_text(encoding="utf-8"), py, "exec")
+spec = importlib.util.spec_from_file_location("planF_cpu", HERE / "planF-cpu.py")
+cpu = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cpu)
+# utime and stime are fields 14 and 15, counted after the last ')': a thread name may hold ') ('
+assert cpu.task_ticks("4242 (a) (b c) S 1 4242 4242 0 -1 4194560 10 0 0 0 250 50 0 0 20 0 9 0") == 300
+assert cpu.usage_usec("usage_usec 1500000\nuser_usec 1200000\nsystem_usec 300000\n") == 1_500_000
+# 5 s window at 100 ticks/s: main thread 0.1 cores, one worker 0.2, a thread born inside it 0.004
+s = cpu.summarize(100, {100: 0, 101: 0}, {100: 50, 101: 100, 102: 2}, 5.0, 100, 1_500_000, 1500)
+assert s["cpu_ms_per_query"] == 1.0 and s["cores_busy_cgroup"] == 0.3, s
+assert s["cores_busy_threads"] == 0.3 and s["main_thread_cores"] == 0.1, s
+assert s["threads_busy"] == 2 and s["threads_total"] == 3 and s["top_threads"][0] == [101, 0.2], s
 assert (DRAFTS / "neon_small_nq_repro.py").exists(), "Task 8's repro is missing: the DGX session copies it"
 
 with tempfile.TemporaryDirectory() as t:
@@ -3096,8 +3153,8 @@ with tempfile.TemporaryDirectory() as t:
     got = tmp / "fetched"
     res = got / "results"
     write_results(res, 422.0)
-    (res / "probe-fanout.txt").write_text(LISTS + "\n" + GUARD + "\n", encoding="utf-8")
-    (res / "probe-exact.txt").write_text(LISTS + "\n" + EXACT + "\n", encoding="utf-8")
+    write_probes(res)
+    write_cpu(res)
     (res / "probe-stages.txt").write_text(LISTS + "\nstages fixture\n", encoding="utf-8")
     (res / "neon-repro.txt").write_text("neon fixture\n", encoding="utf-8")
     (got / "ab.log").write_text("== PLANF AB START 2026-10-01 09:00:00 base=aaa f=bbb flat_check=0 ==\n")
@@ -3105,6 +3162,9 @@ with tempfile.TemporaryDirectory() as t:
     assert r.returncode == 0 and "- FAIL:" not in r.stdout, r.stdout + r.stderr
     assert r.stdout.count("- PASS: F") == 7 and "- PASS: labels" in r.stdout, r.stdout
     assert "GUARD grouped vs plain at 12: OK" in r.stdout and "30,443 rows" in r.stdout, r.stdout
+    # the record-only c=16 CPU table (p4): medians [min..max] per arm, and no PASS/FAIL line of its own
+    assert "### Cores busy at c=16 (record-only, not a gate)" in r.stdout, r.stdout
+    assert "| Cores busy, cgroup | 1.12 [1.11..1.13], 3 | 2.42 [2.41..2.43], 3 |" in r.stdout, r.stdout
     (got / "summary.md").write_text(r.stdout, encoding="utf-8")
 
     write_results(tmp / "lose", 182.0)  # 183 median: below 1.5x base, and inside base's range
@@ -3114,6 +3174,35 @@ with tempfile.TemporaryDirectory() as t:
     write_results(tmp / "blas", 422.0, base_blas="unset")  # spec §7 F: OPENBLAS_NUM_THREADS=1 in both arms
     r = run(sys.executable, str(HERE / "planF-summary.py"), str(tmp / "blas"))
     assert r.returncode == 1 and "- FAIL: labels" in r.stdout, r.stdout + r.stderr
+
+    # spec §3.1 F1: item 5 is one-sided. F's peak 80 MB below base's passes and is reported
+    write_results(tmp / "low", 422.0, f_peak_delta=-80.0)
+    write_probes(tmp / "low")
+    r = run(sys.executable, str(HERE / "planF-summary.py"), str(tmp / "low"))
+    assert r.returncode == 0 and "- FAIL:" not in r.stdout, r.stdout + r.stderr
+    f5 = [ln for ln in r.stdout.splitlines() if ": F5 " in ln]
+    assert len(f5) == 1 and f5[0].startswith("- PASS: F5"), r.stdout
+    assert "delta -80.0 MB" in f5[0] and "80.0 MB lower, reported" in f5[0], f5[0]
+    # ... and no cpu16 files: the record-only section says so, and nothing fails on it
+    assert "No cpu16 files: no capture ran or every capture failed." in r.stdout, r.stdout
+
+    # ... and F's peak 60 MB above base's fails item 5, and only item 5
+    write_results(tmp / "high", 422.0, f_peak_delta=60.0)
+    write_probes(tmp / "high")
+    r = run(sys.executable, str(HERE / "planF-summary.py"), str(tmp / "high"))
+    assert r.returncode == 1 and r.stdout.count("- FAIL:") == 1, r.stdout + r.stderr
+    f5 = [ln for ln in r.stdout.splitlines() if ": F5 " in ln]
+    assert len(f5) == 1 and f5[0].startswith("- FAIL: F5"), r.stdout
+    assert "delta +60.0 MB" in f5[0] and "reported" not in f5[0], f5[0]
+
+    # ... and exactly +50 MB passes: in floats, 2050.3 - 2000.3 is 50.00000000000023
+    write_results(tmp / "edge", 422.0, f_peak_delta=50.0, base_peak=2000.3)
+    write_probes(tmp / "edge")
+    r = run(sys.executable, str(HERE / "planF-summary.py"), str(tmp / "edge"))
+    assert r.returncode == 0 and "- FAIL:" not in r.stdout, r.stdout + r.stderr
+    f5 = [ln for ln in r.stdout.splitlines() if ": F5 " in ln]
+    assert len(f5) == 1 and f5[0].startswith("- PASS: F5"), r.stdout
+    assert "delta +50.0 MB" in f5[0] and "reported" not in f5[0], f5[0]
 
     work = tmp / "repo"
     (work / "docs" / "adr").mkdir(parents=True)
@@ -3126,7 +3215,7 @@ with tempfile.TemporaryDirectory() as t:
     for needle in ("IVF_SEARCH_THREADS=1", "QPS concurrent", "Filtered p50", "Recall@10",
                    "Memory peak", "sqlite_version", "OPENBLAS_NUM_THREADS=1", "### §7 F acceptance",
                    "GUARD grouped vs plain", "Batching guard: **OK** at T=12", "EXACT seed 42",
-                   "LISTS largest 30443", "3.1 ms per request", "memstatus"):
+                   "LISTS largest 30443", "3.1 ms per request", "memstatus", "Cores busy at c=16"):
         assert needle in ver, needle
     assert "Pending:" not in ver and "- FAIL:" not in ver
     assert "min(32" not in adr, "Task 7's test forbids min(32 anywhere in ADR 0005"
@@ -3143,7 +3232,7 @@ Expected: exit 1 with `AssertionError: ('dgx-planF-ab.sh', 'bash: ...dgx-planF-a
 
 - [ ] **Step 3: Write the scripts**
 
-Create each file below with exactly the content shown, with LF line endings: the two shell scripts run under bash on gn100.
+Create each file below with exactly the content shown, with LF line endings: the two shell scripts run under bash on gn100, and `planF-cpu.py` runs there too.
 
 `D:/DEV/_scratch/dgx/dgx-planF-ab.sh`:
 
@@ -3157,6 +3246,8 @@ Create each file below with exactly the content shown, with LF line endings: the
 # the image ENV is Plan A's, D16, so it is passed explicitly in case the base predates it).
 # After every run, meta-planF-<label>.json records the row labels: regime host-warm, the
 # cap, sqlite3.sqlite_version (D15), OPENBLAS_NUM_THREADS, and the cgroup memory.peak.
+# After each measured base and F IVF run, planF-cpu.py records (never gates) server CPU at
+# c=16: cgroup cpu.stat per query and per-thread cores busy (p4: 1.1-1.25 cores before F).
 # Then the seed-7 probes and the seed-42 exactness check (container removed), the NEON
 # repro, and with FLAT_CHECK=1 one IVF<->flat transition plus a base/f flat
 # no-regression pair (run0 + 2 rounds). Nothing here sets RAYON_NUM_THREADS (spec §4.2).
@@ -3234,6 +3325,12 @@ run_one() {  # $1 = label, $2 = engine; measures the running container
   esac
   podman stats --no-stream --format '{{.Name}} {{.MemUsage}}' bench-tv
   meta "$1"
+}
+cpu16() {  # $1 = label. Record-only, never a gate: 1,500 searches at c=16 on the running
+  # container, after meta() has read memory.peak; writes $OUT/cpu16-planF-$1.json
+  echo "== cpu16 $1 ($(ts)) =="
+  .venv/bin/python -u ~/planF/planF-cpu.py "$1" "$OUT" \
+    || echo "  cpu16 $1: capture failed (record-only; the A/B goes on)"
 }
 arm_ctr() {  # $1 = arm: a fresh 4 GiB container of that arm's image and env
   case $1 in
@@ -3328,6 +3425,7 @@ for r in 1 2 3; do
   for arm in base f f1; do
     arm_ctr "$arm"
     run_one "ivf-$arm-run$r" raggio-ivf
+    case $arm in base | f) cpu16 "ivf-$arm-run$r" ;; esac  # p4: cores busy before/after F
   done
 done
 
@@ -3395,7 +3493,9 @@ Reads from a results directory:
 - results-planF-<phase>-<arm>-run<N>.json: bench.py's results-partial.json, one engine per file;
 - meta-planF-<phase>-<arm>-run<N>.json: dgx-planF-ab.sh's row labels for that run
   (regime, cap, sqlite_version, openblas_num_threads, memory_peak_mb);
-- probe-exact.txt (its EXACT and LISTS lines) and probe-fanout.txt (its GUARD line).
+- probe-exact.txt (its EXACT and LISTS lines) and probe-fanout.txt (its GUARD line);
+- cpu16-planF-ivf-<arm>-run<N>.json: planF-cpu.py's record-only c=16 CPU captures of base
+  and F, shown in a table that no PASS/FAIL line reads (p4's pre-F cores busy, never a gate).
 It ignores run0 and prints the markdown that goes under ADR 0005's "## Verification",
 ending with one PASS/FAIL line per spec §7 F item (F1..F7) and one for the row labels.
 
@@ -3425,6 +3525,17 @@ WANT = {"regime": ["host-warm"], "cap": ["4g"], "openblas_num_threads": ["1"]}
 ARMS = {"base": "base (preceding main)", "f": "F, default threads", "f1": "F, IVF_SEARCH_THREADS=1"}
 NAME = re.compile(r"results-planF-(ivf|flat)-(base|f|f1)-run(\d+)\.json$")
 CLIFF = 32_768  # turbovec 1.0.0's pooled-path threshold for nq=1 (spec §7 F item 7)
+CPU16 = re.compile(r"cpu16-planF-ivf-(base|f)-run(\d+)\.json$")
+# (key, label, decimals) of planF-cpu.py's record-only c=16 captures
+CPU_ROWS = [
+    ("qps", "QPS at c=16", 1),
+    ("cpu_ms_per_query", "CPU per query, cgroup cpu.stat (ms)", 2),
+    ("cores_busy_cgroup", "Cores busy, cgroup", 2),
+    ("cores_busy_threads", "Cores busy, sum of server threads", 2),
+    ("main_thread_cores", "Main thread, event loop (cores)", 2),
+    ("threads_busy", "Server threads above 0.05 cores", 0),
+    ("driver_cores", "Driver (cores)", 2),
+]
 
 
 def load(results: Path) -> dict:
@@ -3464,6 +3575,32 @@ def probe_line(path: Path, marker: str) -> str:
         return ""
     hits = [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines() if marker in ln]
     return hits[-1] if hits else ""
+
+
+def cpu_section(results: Path) -> list:
+    """Record-only, never a gate: planF-cpu.py's c=16 captures, median [min..max] per arm."""
+    runs: dict = {}
+    for p in sorted(results.glob("cpu16-planF-*.json")):
+        m = CPU16.search(p.name)
+        if m:
+            runs.setdefault(m.group(1), []).append(json.loads(p.read_text()))
+    lines = ["### Cores busy at c=16 (record-only, not a gate)", "",
+             "`planF-cpu.py` after each measured base and F run: 1,500 vector searches at c=16 "
+             "after a discarded 200, with CPU from the container cgroup's `cpu.stat` and from "
+             "per-thread `/proc/<pid>/task/*/stat` deltas. The pre-F expectation is p4's: "
+             "1.1–1.25 cores busy at 19a8a2e, bound by the single `_drain_scans` pipeline.", ""]
+    if not runs:
+        return lines + ["No cpu16 files: no capture ran or every capture failed."]
+    arms = [a for a in ("base", "f") if a in runs]
+    lines += ["| Metric | " + " | ".join(f"{ARMS[a]}: median [min..max], n" for a in arms) + " |",
+              "|---|" + "---|" * len(arms)]
+    for key, label, dec in CPU_ROWS:
+        cells = []
+        for a in arms:
+            v = [r[key] for r in runs[a]]
+            cells.append(f"{statistics.median(v):.{dec}f} [{min(v):.{dec}f}..{max(v):.{dec}f}], {len(v)}")
+        lines.append(f"| {label} | " + " | ".join(cells) + " |")
+    return lines
 
 
 def stats(vals: list) -> tuple:
@@ -3554,11 +3691,18 @@ def main(argv: list) -> int:
     # F4: serial p50 better beyond the band
     ok, why = beats(ivf, "f", "base", "lat_p50", False)
     verdicts.append((ok, f"F4 serial p50 better beyond the band: {why} ms [p3: 6.50 vs 8.44]"))
-    # F5: container memory peak within 50 MB of base
+    # F5, one-sided (spec §3.1 F1): only a median peak more than 50 MB above base's fails;
+    # a lower peak passes and is reported with its signed delta
     if ("f", "memory_peak_mb") in ivf and ("base", "memory_peak_mb") in ivf:
         pf, pb = ivf[("f", "memory_peak_mb")][0], ivf[("base", "memory_peak_mb")][0]
-        verdicts.append((abs(pf - pb) <= 50, f"F5 container memory peak (cgroup memory.peak, median) "
-                                             f"{pf:.0f} vs base {pb:.0f} MB, needs within 50 [p3: 1.82 GB in both]"))
+        # memory_peak_mb has one decimal, so the delta is rounded to it before the comparison:
+        # in floats 2050.3 - 2000.3 is 50.00000000000023, which would fail a delta of +50.0
+        delta = round(pf - pb, 1)
+        text = (f"F5 container memory peak (cgroup memory.peak, median) {pf:.0f} vs base {pb:.0f} MB, "
+                f"delta {delta:+.1f} MB; fails only above +50 MB (one-sided, spec §3.1 F1)")
+        if delta < 0:
+            text += f"; F's peak is {-delta:.1f} MB lower, reported"
+        verdicts.append((delta <= 50, text + " [p3: 1.82 GB in both]"))
     else:
         verdicts.append((False, "F5 no memory_peak_mb in the meta files"))
     # F6: IVF_SEARCH_THREADS=1 reproduces the serial path (base is the serial path)
@@ -3590,6 +3734,7 @@ def main(argv: list) -> int:
             verdicts.append((ok, f"flat {key} no regression: {why}"))
     print("\n### Seed-7 pool-size sweep and grouped regression guard\n")
     print("`bench/ivf_fanout_probe.py fanout` (seed 7): " + (guard or "no GUARD line"))
+    print("\n" + "\n".join(cpu_section(results)))  # after the guard: the drafts' IVF table stops above it
     print("\n### §7 F acceptance\n")
     for ok, text in verdicts:
         print(f"- {'PASS' if ok else 'FAIL'}: {text}")
@@ -3729,19 +3874,165 @@ if __name__ == "__main__":
     sys.exit(main(sys.argv))
 ````
 
+`D:/DEV/_scratch/dgx/planF-cpu.py`:
+
+```python
+"""Plan F Task 10, record-only (never a gate): server CPU at c=16 on the running bench-tv.
+
+p4 (docs/superpowers/research/2026-09-28-dgx-probe-p4-freethreaded.md) is the pre-F
+expectation: at 19a8a2e, IVF vector at c=16 kept only 1.1-1.25 cores busy, bound by the
+single _drain_scans pipeline, and a split client did not raise aggregate QPS beyond
+trial-to-trial spread. This runs that load on one arm: a discarded 200 vector searches
+at c=16, then 1,500 at c=16 (the bench's 500 seed-42 queries, cycled). Over the measured
+window it reads:
+- usage_usec from the container cgroup's cpu.stat (podman exec), as p4 did, for CPU per
+  query and cores busy;
+- utime + stime of every server thread from /proc/<host pid>/task/*/stat, for per-thread
+  cores busy (the main thread, which runs the event loop, is tid == pid);
+- the driver's own CPU, to show whether the client is the limit.
+It prints one CPU16 line and writes <out dir>/cpu16-planF-<label>.json.
+
+Usage (on gn100, from ~/raggio, with bench-tv up):
+  .venv/bin/python -u ~/planF/planF-cpu.py <label> <out dir>
+"""
+import asyncio
+import json
+import os
+import statistics
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+URL = "http://localhost:18000/collections/bench/search"
+HDRS = {"x-api-key": "bench", "content-type": "application/json"}
+C, WARM, N = 16, 200, 1500
+BUSY = 0.05  # a thread counts as busy above 5 % of one core
+
+
+def task_ticks(stat: str) -> int:
+    """utime + stime, in clock ticks, from one /proc/<pid>/task/<tid>/stat line. A thread
+    name may hold spaces and ')', so the fields are counted after the last ')'."""
+    rest = stat[stat.rindex(")") + 2:].split()
+    return int(rest[11]) + int(rest[12])  # fields 14 and 15 in proc(5)
+
+
+def usage_usec(cpu_stat: str) -> int:
+    """usage_usec from a cgroup v2 cpu.stat."""
+    for line in cpu_stat.splitlines():
+        key, _, val = line.partition(" ")
+        if key == "usage_usec":
+            return int(val)
+    raise ValueError("no usage_usec in cpu.stat")
+
+
+def summarize(pid: int, before: dict, after: dict, wall: float, hz: int, cg_usec: int, n: int) -> dict:
+    """Cores busy per thread over the window, busiest first (a thread born inside the
+    window counts from 0), plus the cgroup totals."""
+    per = sorted(((tid, (t - before.get(tid, 0)) / hz / wall) for tid, t in after.items()),
+                 key=lambda p: -p[1])
+    return {
+        "cpu_ms_per_query": round(cg_usec / 1000 / n, 2),
+        "cores_busy_cgroup": round(cg_usec / 1e6 / wall, 2),
+        "cores_busy_threads": round(sum(c for _, c in per), 2),
+        "main_thread_cores": round(dict(per).get(pid, 0.0), 2),
+        "threads_busy": sum(c > BUSY for _, c in per),
+        "threads_total": len(per),
+        "top_threads": [[tid, round(c, 3)] for tid, c in per[:12]],
+    }
+
+
+def thread_ticks(pid: int) -> dict:
+    out = {}
+    for t in Path(f"/proc/{pid}/task").iterdir():
+        try:
+            out[int(t.name)] = task_ticks((t / "stat").read_text())
+        except (FileNotFoundError, ProcessLookupError):
+            pass  # the thread exited between the listing and the read
+    return out
+
+
+def cgroup_usec() -> int:
+    r = subprocess.run(["podman", "exec", "bench-tv", "cat", "/sys/fs/cgroup/cpu.stat"],
+                       capture_output=True, text=True, check=True)
+    return usage_usec(r.stdout)
+
+
+def bodies() -> list:
+    """bench.py's 500 seed-42 queries (its load_corpus), rounded to 5 decimals, as JSON."""
+    import numpy as np
+
+    vecs = np.load("bench/corpus/embed-vecs.npy", mmap_mode="r")
+    limit = min(2549619, vecs.shape[0])
+    rows = np.sort(np.random.default_rng(42).choice(limit, size=500, replace=False))
+    qs = np.round(np.asarray(vecs[rows], dtype=np.float64), 5).tolist()
+    return [json.dumps({"query": {"vector": q}, "k": 10}).encode() for q in qs]
+
+
+async def drive(reqs: list, n: int) -> list:
+    """n searches at concurrency C, cycling reqs; returns the latencies in ms."""
+    import httpx
+
+    lat, sem = [], asyncio.Semaphore(C)
+    async with httpx.AsyncClient(headers=HDRS, timeout=120) as client:
+
+        async def one(i):
+            async with sem:
+                t = time.perf_counter()
+                r = await client.post(URL, content=reqs[i % len(reqs)])
+                r.raise_for_status()
+                lat.append((time.perf_counter() - t) * 1000)
+
+        await asyncio.gather(*[one(i) for i in range(n)])
+    return lat
+
+
+def main(argv: list) -> int:
+    label, out = argv[1], Path(argv[2])
+    pid = int(subprocess.run(["podman", "inspect", "bench-tv", "--format", "{{.State.Pid}}"],
+                             capture_output=True, text=True, check=True).stdout)
+    hz = os.sysconf("SC_CLK_TCK")
+    reqs = bodies()
+    asyncio.run(drive(reqs, WARM))  # discarded: loads the collection if needed, warms the pool
+    cg0, th0 = cgroup_usec(), thread_ticks(pid)
+    cpu0, t0 = time.process_time(), time.perf_counter()
+    lat = asyncio.run(drive(reqs, N))
+    wall, drv = time.perf_counter() - t0, time.process_time() - cpu0
+    th1, cg1 = thread_ticks(pid), cgroup_usec()
+    q = statistics.quantiles(lat, n=100)
+    rec = {"label": label, "concurrency": C, "requests": N, "qps": round(N / wall, 1),
+           "p50_ms": round(q[49], 1), "p99_ms": round(q[98], 1),
+           **summarize(pid, th0, th1, wall, hz, cg1 - cg0, N), "driver_cores": round(drv / wall, 2)}
+    (out / f"cpu16-planF-{label}.json").write_text(json.dumps(rec) + "\n")
+    print(f"CPU16 {label}: {N} req at c={C}, {rec['qps']} QPS, p50 {rec['p50_ms']} ms, "
+          f"p99 {rec['p99_ms']} ms; cgroup {rec['cpu_ms_per_query']} ms CPU/query, "
+          f"{rec['cores_busy_cgroup']} cores busy; threads {rec['cores_busy_threads']} cores "
+          f"(main {rec['main_thread_cores']}), {rec['threads_busy']} of {rec['threads_total']} "
+          f"above {BUSY}; driver {rec['driver_cores']} cores")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+```
+
 - [ ] **Step 4: Run the check to verify it passes**
 
 Run from the repo root: `uv run python D:/DEV/_scratch/dgx/planF-check.py`
 
-Expected: `Plan F DGX scripts OK in D:\DEV\_scratch\dgx (ADR from D:\DEV\raggio, drafts from D:\DEV\_scratch\upstream-drafts)`. The check syntax-checks both shell scripts, then runs:
-- a passing synthetic A/B: seven `- PASS: F1` to `- PASS: F7` lines, a `- PASS: labels` line, the guard line and the `30,443 rows` list size;
+Expected: `Plan F DGX scripts OK in D:\DEV\_scratch\dgx (ADR from D:\DEV\raggio, drafts from D:\DEV\_scratch\upstream-drafts)`. The check syntax-checks both shell scripts. It checks `planF-cpu.py`'s parsers on synthetic lines: `task_ticks` counts utime and stime after a thread name that holds `) (`, `usage_usec` reads `cpu.stat`, and `summarize` gives 0.3 cores busy, 1.0 ms CPU per query and 2 busy threads out of 3. Then it runs:
+- a passing synthetic A/B: seven `- PASS: F1` to `- PASS: F7` lines, a `- PASS: labels` line, the guard line and the `30,443 rows` list size. Its six synthetic `cpu16` files give the record-only `### Cores busy at c=16 (record-only, not a gate)` table, with the row `| Cores busy, cgroup | 1.12 [1.11..1.13], 3 | 2.42 [2.41..2.43], 3 |`;
 - one that fails item 2: exit 1 with `- FAIL: F2 concurrent QPS` (its missing probe files also fail F1 and F7);
 - one whose base arm has `OPENBLAS_NUM_THREADS` unset: exit 1 with `- FAIL: labels`;
+- the three spec §3.1 F1 cases, all with probe files:
+  - F's peak 80 MB below base's: exit 0, with `- PASS: F5 container memory peak (cgroup memory.peak, median) 1740 vs base 1820 MB, delta -80.0 MB; fails only above +50 MB (one-sided, spec §3.1 F1); F's peak is 80.0 MB lower, reported [p3: 1.82 GB in both]`. This case has no `cpu16` files, so its summary prints `No cpu16 files: no capture ran or every capture failed.` and still exits 0: the capture is record-only;
+  - F's peak 60 MB above base's: exit 1, and the only `- FAIL:` line is `- FAIL: F5 container memory peak (cgroup memory.peak, median) 1880 vs base 1820 MB, delta +60.0 MB; fails only above +50 MB (one-sided, spec §3.1 F1) [p3: 1.82 GB in both]`;
+  - F's peak exactly 50 MB above base's (2050.3 vs 2000.3, whose float difference is 50.00000000000023): exit 0, with `- PASS: F5 container memory peak (cgroup memory.peak, median) 2050 vs base 2000 MB, delta +50.0 MB; fails only above +50 MB (one-sided, spec §3.1 F1) [p3: 1.82 GB in both]`;
 - `planF-verify.py`, on temporary copies of ADR 0005 and the drafts. It asserts every Verification needle, that the ADR holds no `min(32`, and the `## DGX data (2026-10-01, gn100)` sections.
 
 Neither the repo nor the drafts directory is modified.
 
-Run: `grep -l $'\r' D:/DEV/_scratch/dgx/dgx-planF-ab.sh D:/DEV/_scratch/dgx/planF-build.sh D:/DEV/_scratch/dgx/planF-summary.py D:/DEV/_scratch/dgx/planF-verify.py D:/DEV/_scratch/upstream-drafts/neon_small_nq_repro.py`. Expected: no output (exit 1), which means no CRLF line endings.
+Run: `grep -l $'\r' D:/DEV/_scratch/dgx/dgx-planF-ab.sh D:/DEV/_scratch/dgx/planF-build.sh D:/DEV/_scratch/dgx/planF-summary.py D:/DEV/_scratch/dgx/planF-verify.py D:/DEV/_scratch/dgx/planF-cpu.py D:/DEV/_scratch/upstream-drafts/neon_small_nq_repro.py`. Expected: no output (exit 1), which means no CRLF line endings.
 
 - [ ] **Step 5: No commit**
 
@@ -3763,13 +4054,21 @@ The acceptance is spec §7 F, verbatim:
 >   7. The run reports the largest IVF list size, against the 32,768-row pooled-path cliff [30,443].
 >   - After F, the server limit is the HTTP/event-loop pipeline, about 3.1 ms per request, against an in-process ceiling of 610–662 QPS. Follow-ups outside A–G: two `_drain_scans` batches in flight, and `_hydrate` off the loop.
 
+Item 5 is applied one-sided, by the maintainer's decision in spec §3.1 row F1: only F's median memory peak more than 50 MB above base's fails. A lower peak passes, and the summary's `F5` line reports it with its signed delta.
+
 How each item is measured:
 - Item 1: `recall_at_10` from every bench run, plus the probe's `exact` mode on seed 42 (the bench's own 500 queries from `bench/corpus/embed-vecs.npy`). It compares T=12 with `_ShardPool(1)`, which is what `IVF_SEARCH_THREADS=1` builds, on ids and float32 score bits position by position: unfiltered, filtered on `year` (>128 ids), and on a ≤128-id slice of that filter.
 - Item 2: `qps_concurrent`, 3 measured runs per arm after a discarded run0, each in a fresh container, so the range includes between-server variance (spec §6).
 - Items 3, 4 and 6: `lat_filtered_p50` and `lat_p50` from the same runs. Item 6 compares the `IVF_SEARCH_THREADS=1` arm with base, which is the serial path, within the band.
-- Item 5: the container's cgroup v2 `memory.peak`, read after every run (`meta-planF-<label>.json`). bench.py's `mem_under_load_mb` is one `podman stats` sample, not a peak.
+- Item 5: the container's cgroup v2 `memory.peak`, read after every run (`meta-planF-<label>.json`). bench.py's `mem_under_load_mb` is one `podman stats` sample, not a peak. The summary compares the medians one-sided (spec §3.1 F1): it passes when F's peak minus base's is at most +50 MB, and states that signed delta.
 - Item 7: the probe's `LISTS` line.
 - Every row: host-warm, `--memory 4g`, `sqlite3.sqlite_version` and `OPENBLAS_NUM_THREADS=1`, all recorded per run by the A/B script, and checked by the summary's `labels` line. Probe rows are host-warm, uncapped host processes; each probe file opens with its label line.
+- Record-only, never a gate: cores busy at c=16, before and after F. p4 is the pre-F expectation. At 19a8a2e, IVF vector at c=16 kept only 1.1–1.25 cores busy, bound by the single `_drain_scans` pipeline, and a split client did not raise aggregate QPS beyond trial-to-trial spread. The capture works like this:
+  - After every measured base and F run, once `meta()` has read `memory.peak`, the A/B script runs `planF-cpu.py` against the same container: a discarded 200 vector searches at c=16, then 1,500 at c=16 on the bench's 500 seed-42 queries.
+  - Over those 1,500 it reads the container cgroup's `cpu.stat` `usage_usec` (as p4 did), which gives CPU per query and cores busy. It also reads `/proc/<server pid>/task/*/stat` deltas, which give each thread's cores busy, and its own driver CPU.
+  - The six `cpu16-planF-ivf-{base,f}-run{1,2,3}.json` files land in `~/planF/results/` and are fetched with the rest. The summary tabulates them under `### Cores busy at c=16 (record-only, not a gate)`.
+  - No `- PASS:` or `- FAIL:` line reads them. A failed capture logs `capture failed` in `ab.log`, and the A/B goes on.
+  - base is the preceding main, not 19a8a2e, so p4's figure is an expectation, not a baseline.
 
 Two things are out of scope, and the report says so rather than chasing them:
 - After F the limit is the HTTP/event-loop pipeline (about 3.1 ms per request, of which the loop burns 1.2–1.5 ms of CPU). Its follow-ups are two `_drain_scans` batches in flight, `_hydrate` off the event loop, and a cheaper parse of the vector body (p3). None is in Plans A–G.
@@ -3796,19 +4095,20 @@ Every `ssh` and `scp` below is written out in full with `-F "C:/Users/emanu/AppD
   - Task 9's scripts;
   - on gn100: `~/turborag/bench/corpus`, `~/turborag/bench/gt-2549619-42-d1024.npz`, `~/turborag/bench/fingerprint-turborag-ivf.json` (used by the pre-A bench only), and the `bench-tv` volume holding collection `bench` (2,549,119 rows).
 - Produces:
-  - ADR 0005's `## Verification`, with the A/B table, the row-label table, the §7 F PASS lines (items 1–7), the seed-42 exactness check and the largest IVF list, the stage attribution, the seed-7 pool-size sweep with the grouped regression guard, the after-F note, and the NEON repro output;
+  - ADR 0005's `## Verification`, with the A/B table, the row-label table, the §7 F PASS lines (items 1–7), the seed-42 exactness check and the largest IVF list, the stage attribution, the seed-7 pool-size sweep with the grouped regression guard, the record-only cores-busy table at c=16 (p4), the after-F note, and the NEON repro output;
   - the Task 10 test.
 
 - [ ] **Step 1: Ask the user for a run window (time cap)**
 
 Ask, and wait for an explicit answer. Do not run anything on gn100 before it:
 
-> Plan F's DGX A/B needs a run window on gn100. The estimate is about 95 minutes:
+> Plan F's DGX A/B needs a run window on gn100. The estimate is about 97 minutes:
 > - up to 20 min to build two images, if they are absent;
 > - about 50 min for 10 IVF bench runs of ~4.5 min each (one discarded run0, then 3 rounds of base / F / F with `IVF_SEARCH_THREADS=1`), each in a fresh 4 GiB `bench-tv` container with `OPENBLAS_NUM_THREADS=1`;
+> - about 2 min for six record-only CPU captures at c=16 (1,700 searches each, one after each measured base and F run);
 > - about 20 min for three in-process probes (stage attribution, pool-size sweep, seed-42 exactness check) and a 30 s turbovec repro.
 >
-> Add about 20 min (115 min in all) for the optional flat no-regression check: one IVF-to-flat detach in a transient 8 GiB container, then 5 flat runs. Add about 6 min if the volume is flat at the start, because run0 then builds the index.
+> Add about 20 min (117 min in all) for the optional flat no-regression check: one IVF-to-flat detach in a transient 8 GiB container, then 5 flat runs. Add about 6 min if the volume is flat at the start, because run0 then builds the index.
 >
 > It uses only `bench-tv`, `~/raggio` and `~/planF/`. It replaces `~/raggio` with Plan F's tree (spec §6 deploy), and never touches `bench-wv`.
 >
@@ -3865,13 +4165,13 @@ An existing `~/planF` holds an earlier session's results. It is moved aside, nev
 ```bash
 ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'if [ -e ~/planF ]; then mv ~/planF ~/planF.prev-$(date +%Y%m%d-%H%M%S); fi; mkdir -p ~/planF/results'
 cd D:/DEV/_scratch/dgx
-scp -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes dgx-planF-ab.sh planF-build.sh gn100:planF/
+scp -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes dgx-planF-ab.sh planF-build.sh planF-cpu.py gn100:planF/
 cd D:/DEV/_scratch/upstream-drafts
 scp -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes neon_small_nq_repro.py gn100:planF/
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'ls -l ~/planF; bash -n ~/planF/dgx-planF-ab.sh && bash -n ~/planF/planF-build.sh && echo SYNTAX_OK'
+ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'ls -l ~/planF; bash -n ~/planF/dgx-planF-ab.sh && bash -n ~/planF/planF-build.sh && python3 -m py_compile ~/planF/planF-cpu.py && echo SYNTAX_OK'
 ```
 
-Expected: the three files are listed, then `SYNTAX_OK`.
+Expected: the four files are listed, then `SYNTAX_OK`.
 
 - [ ] **Step 5: Deploy both trees (spec §6)**
 
@@ -3937,12 +4237,13 @@ If it instead ends with `== PLANF AB FAILED: no readable /sys/fs/cgroup/memory.p
 - [ ] **Step 8: Poll until done (every 5 minutes)**
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'grep -E "^== (ivf-|flat-|probe|NEON|PLANF AB)" ~/planF/ab.log | tail -n 4; date'
+ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'grep -E "^== (ivf-|flat-|cpu16|probe|NEON|PLANF AB)" ~/planF/ab.log | tail -n 4; date'
 ```
 
 Progress runs as follows:
 - `== ivf-base-run0 raggio-ivf`;
 - then `ivf-base-run1`, `ivf-f-run1`, `ivf-f1-run1` and so on through `ivf-f1-run3`, each followed by a `labels <label>: host-warm, cap 4g, sqlite_version ..., OPENBLAS_NUM_THREADS=1, memory.peak ...` line;
+- after each measured base and F run (not run0, not f1), `== cpu16 ivf-<arm>-run<N>` and its `CPU16 ivf-<arm>-run<N>: 1500 req at c=16, ...` line, or `cpu16 ...: capture failed (record-only; the A/B goes on)`;
 - `== probe stages`, `== probe fanout`, `== probe exact`, `== NEON small-nq repro`;
 - with the flat check, the `flat-*` runs;
 - finally `== PLANF AB DONE <ts> ==`.
@@ -3955,7 +4256,7 @@ If the time cap is reached first, stop only this session's processes. The bracke
 ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
 for p in $(pgrep -f "planF/dgx-planF-a[b][.]sh"); do kill "$p"; done
 sleep 2
-for p in $(pgrep -f "bench/bench[.]py|ivf_fanout_probe[.]py|neon_small_nq_rep[r]o[.]py"); do kill "$p"; done
+for p in $(pgrep -f "bench/bench[.]py|ivf_fanout_probe[.]py|neon_small_nq_rep[r]o[.]py|planF-cp[u][.]py"); do kill "$p"; done
 podman stop -t 60 bench-tv
 podman ps -a --filter name=bench-tv'
 ```
@@ -3973,7 +4274,8 @@ ls results
 Expected in `results/`:
 - `results-planF-ivf-base-run0.json`, plus `results-planF-ivf-{base,f,f1}-run{1,2,3}.json`, each with its `.md` and its `meta-planF-ivf-<arm>-run<N>.json`;
 - with the flat check, `results-planF-flat-base-run0` and `results-planF-flat-{base,f}-run{1,2}`, with their meta files;
-- `probe-stages.txt`, `probe-fanout.txt`, `probe-exact.txt` and `neon-repro.txt`.
+- `probe-stages.txt`, `probe-fanout.txt`, `probe-exact.txt` and `neon-repro.txt`;
+- the six record-only `cpu16-planF-ivf-{base,f}-run{1,2,3}.json` (p4's c=16 CPU capture). A missing one is a failed capture: its `ab.log` line says why, the summary tabulates the rest, and nothing fails on it.
 
 - [ ] **Step 10: Summarize against spec §7 F**
 
@@ -3988,13 +4290,13 @@ Expected: `exit 0` and no `- FAIL:` line. There are 8 `- PASS:` lines, or 11 wit
 - `F2`: F's median concurrent QPS at least 1.5× base's, F's minimum above base's maximum, and one `sqlite_version` for both arms;
 - `F3`: F's filtered p50 at most 10 ms;
 - `F4`: F's serial p50 better than base's beyond the band;
-- `F5`: F's median cgroup memory peak within 50 MB of base's;
+- `F5`: F's median cgroup memory peak at most 50 MB above base's (one-sided, spec §3.1 F1), with the signed `delta ... MB`; a peak below base's passes, and its line adds `F's peak is N MB lower, reported`;
 - `F6`: the `IVF_SEARCH_THREADS=1` arm within the band of base, on serial p50 and on concurrent QPS;
 - `F7`: `largest IVF list N rows, P% of the 32,768-row pooled-path cliff`;
 - `labels`: every measured IVF run host-warm, cap 4g, `OPENBLAS_NUM_THREADS=1`, one `sqlite_version` per arm;
 - with the flat check, three flat no-regression lines.
 
-The file also holds the row-label table and the guard line `... chosen pool size T (default here 12); GUARD grouped vs plain at T: OK|REVISIT`.
+The file also holds the row-label table and the guard line `... chosen pool size T (default here 12); GUARD grouped vs plain at T: OK|REVISIT`. After the guard comes the record-only `### Cores busy at c=16 (record-only, not a gate)` table, base against F as `median [min..max], n`, under p4's pre-F 1.1–1.25 cores. It is not a gate: no reading of it stops this task.
 
 If the exit code is 1, or any line reads `- FAIL:`, stop. Report `summary.md` to the user, and do not record, commit or re-run to chase a pass. A failed §7 F item is a finding for the user. Three findings go to the user even when every line passes:
 - F7 ends with `AT OR ABOVE THE CLIFF`;
@@ -4013,11 +4315,13 @@ def test_adr0005_records_the_dgx_verification():
     adr = Path("docs/adr/0005-ivf-fanout-and-upstream-stance.md").read_text(encoding="utf-8")
     ver = adr.split("## Verification", 1)[1]
     assert "Pending:" not in ver
-    # spec §7 F items 1-7, the §6 row labels, the guard, and the after-F note
+    # spec §7 F items 1-7, the §6 row labels, the guard, the after-F note, and the
+    # record-only c=16 cores-busy table (p4)
     for needle in ("IVF_SEARCH_THREADS=1", "QPS concurrent", "Filtered p50", "Recall@10",
                    "Memory peak", "sqlite_version", "OPENBLAS_NUM_THREADS=1", "### §7 F acceptance",
                    "- PASS: F1", "- PASS: F7", "EXACT seed 42", "LISTS largest",
-                   "GUARD grouped vs plain", "Batching guard:", "3.1 ms per request"):
+                   "GUARD grouped vs plain", "Batching guard:", "3.1 ms per request",
+                   "Cores busy at c=16"):
         assert needle in ver, needle
     assert "- FAIL:" not in ver
 ```
@@ -4060,11 +4364,13 @@ git commit -m "Record Plan F's DGX A/B in ADR 0005
 
 gn100, arXiv 2,549,119 x 1024, seed 42: base vs Plan F at the default
 IVF_SEARCH_THREADS and at 1, 3 interleaved rounds per arm in fresh 4 GiB
-containers, host-warm, OPENBLAS_NUM_THREADS=1 in every arm, sqlite_version
-recorded per run. Spec 7 F items 1-7 all pass. Adds the seed-42 exactness
-check, the largest IVF list against the 32,768-row cliff, the stage
-attribution, the seed-7 pool-size sweep with the grouped regression guard,
-and the NEON repro. Raw results: D:/DEV/_scratch/dgx/planF/.
+containers, host-warm, OPENBLAS_NUM_THREADS=1 in every arm,
+sqlite_version recorded per run. Spec 7 F items 1-7 all pass. Adds the
+seed-42 exactness check, the largest IVF list against the 32,768-row
+cliff, the stage attribution, the seed-7 pool-size sweep with the
+grouped regression guard, the NEON repro, and a record-only c=16
+cores-busy table, base vs F, next to p4's pre-fan-out 1.1-1.25 cores (a
+record, not a gate). Raw results: D:/DEV/_scratch/dgx/planF/.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -4073,9 +4379,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 Report the following:
 - the `summary.md` tables (A/B and row labels) and its PASS lines for items 1–7;
+- the `F5` signed memory-peak delta; a peak below base's passes item 5 and is reported as such (one-sided, spec §3.1 F1);
 - the largest IVF list against the 32,768-row cliff (item 7);
 - the guard (OK or REVISIT at T), and the seed-7 pool size against the default of 12;
 - that after F the server limit is the HTTP/event-loop pipeline (about 3.1 ms per request), and that its follow-ups (two `_drain_scans` batches in flight, `_hydrate` off the loop, a cheaper vector-body parse) are out of scope here;
+- the record-only cores busy at c=16, base against F: cgroup CPU per query and cores busy, the sum over server threads, the main thread, and the driver. Set them beside p4's pre-F 1.1–1.25 cores at 19a8a2e. It is a record, not a gate, and base is the preceding main, not 19a8a2e. Name any failed capture;
 - that concurrent numbers carry the SQLite memstatus mutex (p2, D15), with each arm's `sqlite_version`;
 - how long the session ran against the cap;
 - the state left on gn100: `bench-tv` stopped, both images kept, and `~/planF` kept;
@@ -4116,10 +4424,11 @@ Say plainly that the drafts are not posted. Posting them, if at all, is the main
 | §7 F item 2: concurrent QPS ≥1.5× base (median of ≥3), F's min above base's max | Task 10 | Summary line `F2` (planF-check's `lose` case fails it) |
 | §7 F item 3: filtered p50 ≤10 ms | Task 10 | Summary line `F3` |
 | §7 F item 4: serial p50 better beyond the band | Task 10 | Summary line `F4` |
-| §7 F item 5: container memory peak within 50 MB of base | Tasks 9, 10 | cgroup `memory.peak` per run in the meta files, checked readable before run0; summary line `F5` |
+| §7 F item 5, one-sided per §3.1 F1: F's container memory peak at most 50 MB above base's; a lower peak passes and is reported | Tasks 9, 10 | cgroup `memory.peak` per run in the meta files, checked readable before run0; summary line `F5` (`round(pf - pb, 1) <= 50`) with the signed delta in MB; planF-check's `low` case (80 MB below base) passes and is reported, its `high` case (60 MB above) fails, and its `edge` case (exactly 50 MB above) passes |
 | §7 F item 6: `IVF_SEARCH_THREADS=1` reproduces the serial path | Tasks 1, 10 | `test_threads_one_is_the_serial_path` (no thread, same result); summary line `F6` |
 | §7 F item 7: the largest IVF list against the 32,768-row cliff [30,443] | Tasks 6, 10 | The probe's `LISTS` line and `exact`'s `max_list`/`cliff` keys; summary line `F7` |
 | §7 F: the after-F note (HTTP/event-loop limit, follow-ups outside A–G) | Tasks 7, 10 | Global Constraints and Task 10 state it; `planF-verify.py` writes it into the Verification; Task 10's test checks `3.1 ms per request` |
+| p4 Plan impacts item 12 (research input, not a §7 item): cores busy at c=16 before and after F, as a record and not a gate | Tasks 7, 9, 10 | ADR 0005's Context cites p4's pre-F 1.1–1.25 cores (Task 7); `planF-cpu.py` runs after each measured base and F run (Task 10 Step 8 shows its `CPU16` lines); planF-check asserts its parsers and sums, the passing case's `Cores busy, cgroup` row, and the `low` case's `No cpu16 files` line at exit 0; no `- PASS:` or `- FAIL:` line reads it; Task 10's test checks `Cores busy at c=16` |
 
 ### Placeholder scan
 
@@ -4153,6 +4462,8 @@ Every step that needs one of these values computes it (Task 10 Step 2 writes `pl
 | `results-planF-<phase>-<arm>-run<N>.json` | Task 9, `dgx-planF-ab.sh` | `planF-summary.py` |
 | `meta-planF-<phase>-<arm>-run<N>.json` (`label`, `regime`, `cap`, `sqlite_version`, `openblas_num_threads`, `memory_peak_mb`) | Task 9, `dgx-planF-ab.sh`'s `meta()` | `planF-summary.py` (`F5`, `labels`), `planF-check.py` |
 | `probe-stages.txt`, `probe-fanout.txt`, `probe-exact.txt`, `neon-repro.txt` | Task 9, `dgx-planF-ab.sh` | `planF-summary.py`, `planF-verify.py` |
+| `planF-cpu.py <label> <out dir>`; `task_ticks(stat) -> int`, `usage_usec(cpu_stat) -> int`, `summarize(pid, before, after, wall, hz, cg_usec, n) -> dict` | Task 9 | `dgx-planF-ab.sh`'s `cpu16()`, `planF-check.py` |
+| `cpu16-planF-ivf-<arm>-run<N>.json` (`label`, `concurrency`, `requests`, `qps`, `p50_ms`, `p99_ms`, `cpu_ms_per_query`, `cores_busy_cgroup`, `cores_busy_threads`, `main_thread_cores`, `threads_busy`, `threads_total`, `top_threads`, `driver_cores`), arms `base` and `f` only | Task 9, `planF-cpu.py` | `planF-summary.py`'s `cpu_section`, `planF-check.py`'s `write_cpu` |
 
 Commit subjects are unique. Task 10 Step 2 finds Task 1's commit by its exact subject, `Fan out IVF shard searches on a per-collection thread pool`.
 
@@ -4169,7 +4480,9 @@ The pre-p3 version of this plan was validated on a Plan F series applied to 19a8
 - Task 7's new assertions and ADR text;
 - Task 8's NEON draft and repro text;
 - Task 9's scripts (OPENBLAS in every arm, the meta labels and `memory.peak`, the `exact` probe, items F1–F7, the `labels` line) and `planF-check.py`;
-- Task 10's test needles and counts.
+- the spec §3.1 F1 edit, made by hand after the p3 revision: the one-sided `F5` check with its signed delta in `planF-summary.py`, and `planF-check.py`'s `f_peak_delta` and `base_peak`, `write_probes` and its `low`, `high` and `edge` cases. Only a partial run exists: `planF-summary.py` and `planF-check.py` were copied out of this plan's text into a temp directory, and all six synthetic summary cases passed (the passing A/B, `lose`, `blas`, `low`, `high`, `edge`), with the three F5 lines exactly as Task 9 Step 4 quotes them. `edge` failed on the unrounded `pf - pb <= 50`, and `low` failed on the old `abs(pf - pb) <= 50`. Both shell scripts, copied out the same way, pass `bash -n`. The check's `planF-verify.py` part was not run, because it needs Task 7's ADR 0005 and Task 8's drafts;
+- Task 10's test needles and counts;
+- the p4 item 12 additions, also written by hand: `planF-cpu.py`, `cpu16()` in `dgx-planF-ab.sh`, `cpu_section` in `planF-summary.py`, `write_cpu` and the parser asserts in `planF-check.py`, ADR 0005's p4 paragraph, and Task 10's needle. The Task 9 scripts were then copied out of this plan's text into a temp directory, with ADR 0005 taken from Task 7 Step 3a and stub drafts (each with a `## Disclosure` heading) plus a stub repro. There, `planF-check.py` ran end to end and printed `Plan F DGX scripts OK in ...`; a second run, with Task 8's six drafts and repro taken from this plan instead of stubs, printed the same. That run covered the `planF-cpu.py` parser asserts, all six summary cases and the `planF-verify.py` part, whose Verification holds `Cores busy at c=16`. Both shell scripts passed `bash -n`. The cores table prints after the guard line, and the drafts' IVF table, cut at `### Seed-7`, does not hold it. `planF-cpu.py`'s `main`, `drive` and `bodies` were not run: they need `bench-tv` and the corpus.
 
 The counts in Global Constraints and in each task's steps are derived from the pre-p3 counts plus the two added tests, not observed.
 
@@ -4192,7 +4505,11 @@ The counts in Global Constraints and in each task's steps are derived from the p
   - legacy mode starting from a flat volume;
   - a measured run that rebuilt the index, which aborts with `PLANF AB FAILED: ... rebuilt or re-ingested`.
 
-  The p3 additions to it (`-e OPENBLAS_NUM_THREADS=1`, `meta()`, the `memory.peak` pre-check, the `exact` probe, `podman unshare env ...`) were not dry-run. Two host facts are assumed and checked at run time: that `podman exec bench-tv` can read the container's cgroup v2 `/sys/fs/cgroup/memory.peak` under rootless podman (the script fails before run0 if not), and that `podman unshare env OPENBLAS_NUM_THREADS=1 ...` reaches the probe (the probe label line records it). The real `ssh`/`scp` commands, the podman builds and the fingerprint copy were not run.
+  The p3 additions to it (`-e OPENBLAS_NUM_THREADS=1`, `meta()`, the `memory.peak` pre-check, the `exact` probe, `podman unshare env ...`) were not dry-run. Two host facts are assumed and checked at run time: that `podman exec bench-tv` can read the container's cgroup v2 `/sys/fs/cgroup/memory.peak` under rootless podman (the script fails before run0 if not), and that `podman unshare env OPENBLAS_NUM_THREADS=1 ...` reaches the probe (the probe label line records it). The real `ssh`/`scp` commands, the podman builds and the fingerprint copy were not run. The record-only `planF-cpu.py` capture assumes two more host facts:
+  - that `podman exec bench-tv cat /sys/fs/cgroup/cpu.stat` gives the container's `usage_usec`;
+  - that the rootless container's server threads are readable at `/proc/<podman inspect pid>/task/*/stat` on the host.
+
+  On gn100, p4 read the container cgroup's `cpu.stat`, and its `top -H` per-thread samples came from the same `/proc` task files. If either fails, only that capture is lost: its `ab.log` line says `capture failed`, and no §7 F line depends on it.
 - **aarch64/NEON behaviour.** The laptop is x86 (AVX2). p3 measured the NEON small-batch cost on gn100 (nq=2 2.05×/2.61×, nq=3 4.89×/1.95×, nq=8 0.87×/0.82× per query against nq=1), and grouping lost to plain there. Task 10 re-measures both on Plan F's code.
 - **Interplay with Plans B, C, D1 and E.** Those plans are not merged anywhere yet. The sandbox base is 19a8a2e. Only Task 1 was also replayed on Plan B's sandbox branch. That is why the tasks above anchor every edit on quoted text; the next section lists what this plan expects those plans to leave in place.
 - **The real 2.55M-row corpus.** The laptop numbers used synthetic 262,144 × 1024 vectors, and synthetic 2.55M-id allowlists for the intersection timings.
