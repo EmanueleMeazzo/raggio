@@ -133,6 +133,55 @@ def podman_disk(volume: str) -> float:
     return int(out.split()[0]) / 1e6  # MB
 
 
+CGROUP_ROOT = "/sys/fs/cgroup"
+CPU_KEYS = {"cpu_ms_per_q_c", "hybrid_cpu_ms_per_q_c"}  # absent, never 0, without a cgroup read
+
+
+def cpu_stat_path(container):
+    """The container's cgroup v2 cpu.stat, found as DGX probe p4 did: /sys/fs/cgroup plus
+    `podman inspect --format {{.State.CgroupPath}}`. OSError when podman or the inspect fails."""
+    r = subprocess.run(["podman", "inspect", container, "--format", "{{.State.CgroupPath}}"],
+                       capture_output=True, text=True)
+    cgroup = r.stdout.strip()
+    if r.returncode != 0 or not cgroup.startswith("/"):
+        raise OSError(f"podman inspect {container} gave no cgroup path (exit {r.returncode})")
+    return f"{CGROUP_ROOT}{cgroup}/cpu.stat"
+
+
+def read_usage_usec(path):
+    """usage_usec (the cgroup's total CPU time, microseconds) from a cgroup v2 cpu.stat."""
+    for line in Path(path).read_text().splitlines():
+        field, _, value = line.partition(" ")
+        if field == "usage_usec":
+            return int(value)
+    raise OSError(f"{path} has no usage_usec line")
+
+
+async def cpu_phase(name, key, container, phase):
+    """Run one concurrent phase and read the server container's cgroup CPU around it (spec §3.1
+    G5). Returns (the phase's result, {key: CPU ms per request}); the dict is empty, with one
+    line saying why, when --cpu-container is unset or another engine's, or a read fails."""
+    before = why = None
+    if not container:
+        why = "no --cpu-container"
+    elif container != ENGINES[name]["container"]:
+        why = f"--cpu-container {container} is not {name}'s container"
+    else:
+        try:
+            path = cpu_stat_path(container)
+            before = read_usage_usec(path)
+        except (OSError, ValueError) as e:
+            why = str(e)
+    out = await phase()
+    if why is None:
+        try:
+            return out, {key: (read_usage_usec(path) - before) / 1000 / len(out[0])}
+        except (OSError, ValueError) as e:
+            why = str(e)
+    print(f"[{name}] {key} absent: {why}")
+    return out, {}
+
+
 # ---------- ingest ----------
 
 def batches_by_doc(paths, years, ingest_rows, batch_size):
@@ -326,6 +375,15 @@ def pct(lat, p):
     return statistics.quantiles(lat, n=100)[p - 1]
 
 
+def hybrid_first_pass(lat_h, n=10):
+    """The first n serial hybrid queries apart from the rest (spec §6: after a load the first
+    ~10 take 470-980 ms). With concurrency 1 the queries run in list order, so lat_h[:n] are
+    the first n sent."""
+    if len(lat_h) < n + 2:
+        return {}
+    return {"hybrid_first10_max_ms": max(lat_h[:n]), "hybrid_p99_after10": pct(lat_h[n:], 99)}
+
+
 def cold_start(container, engine, probe_vec, headers):
     subprocess.run(["podman", "restart", "-t", "2", container], capture_output=True)
     t0 = time.time()
@@ -411,9 +469,11 @@ async def bench_engine(name, vecs, paths, years, ingest_rows, queries, gt_rows, 
 
     print(f"[{name}] concurrent search (x{args.concurrency})...")
     mem_probe = asyncio.create_task(asyncio.to_thread(podman_mem, e["container"]))
-    lat_c, wall_c, _ = await run_queries(name, queries, args.concurrency, e["hdrs"])
+    (lat_c, wall_c, _), cpu = await cpu_phase(
+        name, "cpu_ms_per_q_c", args.cpu_container,
+        lambda: run_queries(name, queries, args.concurrency, e["hdrs"]))
     res.update(qps_concurrent=len(lat_c) / wall_c, lat_c_p95=pct(lat_c, 95),
-               mem_under_load_mb=await mem_probe)
+               mem_under_load_mb=await mem_probe, **cpu)
 
     year = statistics.mode(years[r] for r in ingest_rows)
     print(f"[{name}] filtered search (year={year})...")
@@ -425,14 +485,17 @@ async def bench_engine(name, vecs, paths, years, ingest_rows, queries, gt_rows, 
     lat_h, wall_h, hits_h = await run_queries(name, queries, 1, e["hdrs"], texts=hybrid_texts)
     res.update(hybrid_p50=pct(lat_h, 50), hybrid_p95=pct(lat_h, 95), hybrid_p99=pct(lat_h, 99),
                hybrid_qps_serial=len(lat_h) / wall_h)
+    res.update(hybrid_first_pass(lat_h))  # the text index's warm-up, reported on its own
     # did the doc whose path tokens we queried surface through fusion?
     res["hybrid_text_hit_rate"] = statistics.mean(
         any(paths[int(h[1:])] == p for h in hits) for hits, p in zip(hits_h, hybrid_paths))
     assert all(hits_h), f"{name}: hybrid queries returned empty hits"
 
     print(f"[{name}] hybrid concurrent search (x{args.concurrency})...")
-    lat_hc, wall_hc, _ = await run_queries(name, queries, args.concurrency, e["hdrs"], texts=hybrid_texts)
-    res["hybrid_qps_concurrent"] = len(lat_hc) / wall_hc
+    (lat_hc, wall_hc, _), cpu = await cpu_phase(
+        name, "hybrid_cpu_ms_per_q_c", args.cpu_container,
+        lambda: run_queries(name, queries, args.concurrency, e["hdrs"], texts=hybrid_texts))
+    res.update(hybrid_qps_concurrent=len(lat_hc) / wall_hc, hybrid_c_p99=pct(lat_hc, 99), **cpu)
 
     print(f"[{name}] cold start...")
     res["cold_start_s"] = cold_start(e["container"], name, queries[0], e["hdrs"])
@@ -447,11 +510,17 @@ ROWS = [("Ingest wall time (s)", "ingest_s", "{:.0f}"), ("Ingest throughput (vec
         ("Search p50 (ms)", "lat_p50", "{:.1f}"), ("Search p95 (ms)", "lat_p95", "{:.1f}"),
         ("Search p99 (ms)", "lat_p99", "{:.1f}"), ("QPS serial", "qps_serial", "{:.0f}"),
         ("QPS concurrent", "qps_concurrent", "{:.0f}"), ("p95 under concurrency (ms)", "lat_c_p95", "{:.1f}"),
+        ("CPU per query under concurrency (ms)", "cpu_ms_per_q_c", "{:.1f}"),
         ("Filtered p50 (ms)", "lat_filtered_p50", "{:.1f}"), ("Filtered p95 (ms)", "lat_filtered_p95", "{:.1f}"),
         ("Recall@10 vs exact", "recall_at_10", "{:.3f}"),
         ("Hybrid p50 (ms)", "hybrid_p50", "{:.1f}"), ("Hybrid p95 (ms)", "hybrid_p95", "{:.1f}"),
-        ("Hybrid p99 (ms)", "hybrid_p99", "{:.1f}"), ("Hybrid QPS serial", "hybrid_qps_serial", "{:.1f}"),
+        ("Hybrid p99 (ms)", "hybrid_p99", "{:.1f}"),
+        ("Hybrid first 10 queries, slowest (ms)", "hybrid_first10_max_ms", "{:.1f}"),
+        ("Hybrid p99 without the first 10 (ms)", "hybrid_p99_after10", "{:.1f}"),
+        ("Hybrid QPS serial", "hybrid_qps_serial", "{:.1f}"),
         ("Hybrid QPS concurrent", "hybrid_qps_concurrent", "{:.1f}"),
+        ("Hybrid p99 under concurrency (ms)", "hybrid_c_p99", "{:.1f}"),
+        ("Hybrid CPU per query under concurrency (ms)", "hybrid_cpu_ms_per_q_c", "{:.1f}"),
         ("Hybrid text-hit@10", "hybrid_text_hit_rate", "{:.3f}"),
         ("Cold start to first query (s)", "cold_start_s", "{:.1f}")]
 
@@ -466,6 +535,8 @@ def report(results, args, n_ingested):
              f"property; query = held-out vector + {hybrid_src} of a sampled ingested doc.", "",
              "| Metric | " + " | ".join(names) + " |", "|---|" + "---|" * len(names)]
     for label, key, fmt in ROWS:
+        if key in CPU_KEYS and not any(key in results[n] for n in names):
+            continue  # no cgroup read on this host: the row is absent, never 0
         vals = [fmt.format(results[n][key]) if key in results[n] else "—" for n in names]
         lines.append(f"| {label} | " + " | ".join(vals) + " |")
     lines += ["", "Notes: raggio = single Python asyncio process, brute-force scan over 4-bit quantized "
@@ -473,7 +544,11 @@ def report(results, args, n_ingested):
               "generation + full-query rescore), per-collection lock. raggio-ivf = the same store and "
               "data with the optional IVF index built (approximate, default nprobe, same rescore). "
               "Weaviate = Go, HNSW approximate index, uncompressed vectors. All queried via REST with "
-              "client-supplied vectors; identical stored payloads."]
+              "client-supplied vectors; identical stored payloads. The concurrent phases repeat the "
+              "serial phases' queries (warm caches). The first 10 serial hybrid queries are also "
+              "reported on their own: after a container start they include the text index's warm-up. "
+              "CPU per query is the server container's cgroup CPU time over a concurrent phase, "
+              "divided by its requests; its rows are absent where the cgroup is not readable."]
     return "\n".join(lines)
 
 
@@ -484,6 +559,10 @@ def build_parser():
     ap.add_argument("--queries", type=int, default=500)
     ap.add_argument("--filtered-queries", type=int, default=200)
     ap.add_argument("--concurrency", type=int, default=8)
+    ap.add_argument("--cpu-container", metavar="NAME",
+                    help="container whose cgroup cpu.stat gives the server CPU per query of the "
+                         "concurrent phases (the DGX runbook passes bench-tv); without it, or when "
+                         "the cgroup is not readable, the CPU rows are absent")
     ap.add_argument("--ingest-concurrency", type=int, default=2)
     ap.add_argument("--batch-size", type=int, default=250)
     ap.add_argument("--seed", type=int, default=42)

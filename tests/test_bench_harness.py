@@ -119,3 +119,168 @@ def test_adopt_passes_preflight_and_records_nothing_yet(monkeypatch, corpus, tmp
     with pytest.raises(ReachedGroundTruth):
         run("--engine", "raggio-ivf", "--limit", str(LIMIT), "--fingerprint-dir", str(tmp_path), "--adopt")
     assert list(tmp_path.iterdir()) == []  # written by the engine's own step, not the preflight
+
+
+# ---- first hybrid pass (Task 5): spec §6 reports it separately ----------------------------
+
+def test_first_hybrid_pass_is_reported_separately():
+    lat = [900.0, 700.0, 600.0, 500.0, 480.0, 300.0, 200.0, 100.0, 50.0, 20.0] + [10.0] * 90
+    assert bench.hybrid_first_pass(lat) == {"hybrid_first10_max_ms": 900.0, "hybrid_p99_after10": 10.0}
+    assert bench.hybrid_first_pass(lat[:11]) == {}  # too short for a p99 of the rest
+    keys = [key for _, key, _ in bench.ROWS]
+    at = keys.index("hybrid_p99")
+    assert keys[at + 1: at + 3] == ["hybrid_first10_max_ms", "hybrid_p99_after10"]
+
+
+def test_report_says_the_concurrent_phase_repeats_the_queries():
+    text = bench.report({"raggio": {"hybrid_first10_max_ms": 612.3}}, bench.build_parser().parse_args([]), 1000)
+    assert "| Hybrid first 10 queries, slowest (ms) | 612.3 |" in text
+    assert "| Hybrid p99 without the first 10 (ms) | — |" in text
+    assert "The concurrent phases repeat the serial phases' queries (warm caches)." in text
+
+
+# ---- spec §3.1 G5 rows (Task 5): the concurrent hybrid p99 and the server CPU per query ----
+
+import subprocess
+
+N = 100  # requests per phase in these tests
+
+
+def cpu_stat(path, usage_usec):
+    """A cgroup v2 cpu.stat as the kernel writes it."""
+    path.write_text(f"usage_usec {usage_usec}\nuser_usec {usage_usec // 2}\n"
+                    f"system_usec {usage_usec // 2}\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\n")
+
+
+def test_cpu_stat_path_is_the_containers_cgroup(monkeypatch):
+    seen = []
+
+    def inspect(stdout, code=0):
+        def run(cmd, **kw):
+            seen.append(cmd)
+            return subprocess.CompletedProcess(cmd, code, stdout=stdout, stderr="")
+        monkeypatch.setattr(bench.subprocess, "run", run)
+
+    inspect("/user.slice/libpod-abc123.scope\n")
+    assert bench.cpu_stat_path("bench-tv") == "/sys/fs/cgroup/user.slice/libpod-abc123.scope/cpu.stat"
+    assert seen == [["podman", "inspect", "bench-tv", "--format", "{{.State.CgroupPath}}"]]
+    inspect("", 125)  # no such container
+    with pytest.raises(OSError, match="gave no cgroup path"):
+        bench.cpu_stat_path("bench-tv")
+
+    def no_podman(cmd, **kw):
+        raise FileNotFoundError("podman")
+
+    monkeypatch.setattr(bench.subprocess, "run", no_podman)
+    with pytest.raises(OSError):
+        bench.cpu_stat_path("bench-tv")
+
+
+def test_read_usage_usec_reads_cpu_stat(tmp_path):
+    stat = tmp_path / "cpu.stat"
+    cpu_stat(stat, 123_456_789)
+    assert bench.read_usage_usec(stat) == 123_456_789
+    stat.write_text("user_usec 1\nsystem_usec 2\n")
+    with pytest.raises(OSError, match="no usage_usec line"):
+        bench.read_usage_usec(stat)
+    with pytest.raises(OSError):  # a laptop: no such cgroup file
+        bench.read_usage_usec(tmp_path / "missing" / "cpu.stat")
+
+
+def test_cpu_rows_are_absent_never_zero(monkeypatch, tmp_path, capsys):
+    stat = tmp_path / "cpu.stat"
+    monkeypatch.setattr(bench, "cpu_stat_path", lambda container: str(stat))
+
+    def phase(usec=0, delete=False):
+        async def run():
+            if delete:
+                stat.unlink()
+            elif usec:
+                cpu_stat(stat, bench.read_usage_usec(stat) + usec)
+            return [5.0] * N, 1.0, [["r0"]] * N
+        return run
+
+    def measure(container, run):
+        out, cpu = asyncio.run(bench.cpu_phase("raggio", "cpu_ms_per_q_c", container, run))
+        assert out[0] == [5.0] * N  # the phase's own result, untouched
+        return cpu
+
+    cpu_stat(stat, 1_000_000)
+    assert measure("bench-tv", phase(usec=50_800 * N)) == {"cpu_ms_per_q_c": pytest.approx(50.8)}
+    assert capsys.readouterr().out == ""
+    assert measure(None, phase()) == {}  # no --cpu-container
+    assert measure("bench-wv", phase()) == {}  # not the engine's container
+    assert measure("bench-tv", phase(delete=True)) == {}  # cpu.stat went away mid-phase
+    assert measure("bench-tv", phase()) == {}  # no cpu.stat at all
+    stat.write_text("user_usec 1\n")
+    assert measure("bench-tv", phase()) == {}  # no usage_usec line
+
+    def no_cgroup(container):
+        raise OSError(f"podman inspect {container} gave no cgroup path (exit 125)")
+
+    monkeypatch.setattr(bench, "cpu_stat_path", no_cgroup)
+    assert measure("bench-tv", phase()) == {}
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 6 and all(ln.startswith("[raggio] cpu_ms_per_q_c absent: ") for ln in lines)
+    assert lines[0] == "[raggio] cpu_ms_per_q_c absent: no --cpu-container"
+    assert lines[1] == "[raggio] cpu_ms_per_q_c absent: --cpu-container bench-wv is not raggio's container"
+    assert lines[5] == "[raggio] cpu_ms_per_q_c absent: podman inspect bench-tv gave no cgroup path (exit 125)"
+
+
+def test_bench_engine_measures_both_concurrent_phases(monkeypatch, tmp_path, capsys):
+    stat, usage = tmp_path / "cpu.stat", [1_000_000]
+    cpu_stat(stat, usage[0])
+
+    async def run_queries(engine, queries, concurrency, headers, filt=None, k=10, texts=None):
+        n = len(queries)
+        if concurrency > 1:  # server CPU per request, p4's c=8 figures: 50.8 ms flat, 343.0 hybrid
+            usage[0] += (343_000 if texts else 50_800) * n
+            cpu_stat(stat, usage[0])
+        lat = [10.0] * (n - 1) + [500.0] if texts and concurrency > 1 else [5.0] * n
+        return lat, 1.0, [[f"r{i}"] for i in range(n)]
+
+    async def nothing(*a, **kw):
+        return {}
+
+    for attr, fake in [("cpu_stat_path", lambda container: str(stat)), ("run_queries", run_queries),
+                       ("prepare_engine", nothing), ("ensure_no_index", nothing), ("engine_state", nothing),
+                       ("podman_mem", lambda container: 512.0), ("podman_disk", lambda volume: 100.0),
+                       ("cold_start", lambda *a: 4.2)]:
+        monkeypatch.setattr(bench, attr, fake)
+    rows, paths = list(range(N)), [f"p{i}" for i in range(N)]
+
+    def measure(*argv):
+        args = bench.build_parser().parse_args(list(argv))
+        return asyncio.run(bench.bench_engine("raggio", None, paths, [2000] * N, rows, [None] * N,
+                                              [[i] for i in rows], ["text"] * N, paths, args))
+
+    res = measure("--cpu-container", "bench-tv")
+    assert res["cpu_ms_per_q_c"] == pytest.approx(50.8)
+    assert res["hybrid_cpu_ms_per_q_c"] == pytest.approx(343.0)
+    assert res["hybrid_c_p99"] == pytest.approx(495.1)  # the hybrid concurrent phase's own p99
+    assert res["hybrid_p99"] == 5.0  # the serial row is unchanged
+    assert "absent" not in capsys.readouterr().out
+    res = measure()  # no --cpu-container: the CPU keys are absent, the p99 is not
+    assert "cpu_ms_per_q_c" not in res and "hybrid_cpu_ms_per_q_c" not in res
+    assert res["hybrid_c_p99"] == pytest.approx(495.1)
+    out = capsys.readouterr().out
+    assert "[raggio] cpu_ms_per_q_c absent: no --cpu-container" in out
+    assert "[raggio] hybrid_cpu_ms_per_q_c absent: no --cpu-container" in out
+
+
+def test_concurrent_rows_sit_next_to_their_siblings():
+    keys = [key for _, key, _ in bench.ROWS]
+    at = keys.index("lat_c_p95")
+    assert keys[at + 1] == "cpu_ms_per_q_c"
+    at = keys.index("hybrid_qps_concurrent")
+    assert keys[at + 1: at + 3] == ["hybrid_c_p99", "hybrid_cpu_ms_per_q_c"]
+    args = bench.build_parser().parse_args([])
+    assert args.cpu_container is None and args.concurrency == 8
+    text = bench.report({"raggio": {"hybrid_c_p99": 612.3}}, args, 1000)
+    assert "| Hybrid p99 under concurrency (ms) | 612.3 |" in text
+    # no engine has a CPU read: the rows are absent, never 0.0
+    assert "| CPU per query under concurrency (ms) |" not in text
+    assert "| Hybrid CPU per query under concurrency (ms) |" not in text
+    text = bench.report({"raggio": {"cpu_ms_per_q_c": 50.8}, "weaviate": {}}, args, 1000)
+    assert "| CPU per query under concurrency (ms) | 50.8 | — |" in text
+    assert "| Hybrid CPU per query under concurrency (ms) |" not in text

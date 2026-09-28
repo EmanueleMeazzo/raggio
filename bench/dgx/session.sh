@@ -25,8 +25,10 @@
 # fadvise-evicted, before the session); default host-warm.
 # IVF_BUILDS=2 (flat start only): after every measured run, detach at 8 GiB and build the IVF
 # index once more at 4 GiB (build2-raggio-ivf); compare.py counts only its build time (spec §3.1 A1).
-# regime.json (page cache, first start, memory, swap) and image.json (python, sqlite,
-# turbovec, OPENBLAS_NUM_THREADS inside the image) label every row; compare.py prints them.
+# CONCURRENCY=16: bench.py --concurrency of every run (default 8; spec §3.1 G7). Every run also
+# passes --cpu-container bench-tv, for the server CPU per query of the concurrent phases.
+# regime.json (page cache, first start, memory, swap, concurrency) and image.json (python,
+# sqlite, turbovec, OPENBLAS_NUM_THREADS inside the image) label every row; compare.py prints them.
 # DRY_RUN=1: print the commands without running them; DRY_INDEX=ivf|flat is the index
 # state a dry run assumes (default ivf).
 source "$(dirname "$0")/lib.sh"
@@ -137,7 +139,8 @@ bench_run() {  # bench_run <run0|run1|...> <engine>
   log "$tag $engine"
   run rm -f bench/results-partial.json
   run .venv/bin/python -u bench/bench.py --limit "$LIMIT" --caps-note "$CAPS" --host "$HOST_NOTE" \
-    --engine "$engine" --fingerprint-dir "$STATE" --out "$OUT/$tag-$engine.md" "${EXTRA[@]}"
+    --engine "$engine" --concurrency "$CONCURRENCY" --cpu-container "$CONTAINER" \
+    --fingerprint-dir "$STATE" --out "$OUT/$tag-$engine.md" "${EXTRA[@]}"
   EXTRA=()
   run mv bench/results-partial.json "$OUT/$tag-$engine.json"
 }
@@ -172,8 +175,8 @@ log "session $LABEL: image $IMAGE, bench checkout $SHA" | tee "$OUT/facts.txt"
 } >> "$OUT/facts.txt" 2>&1 || true  # facts are informational: a missing one never stops the session
 image_facts > "$OUT/image.json" || { rm -f "$OUT/image.json"; log "no image facts: compare.py reads them as unknown" >&2; }
 # every measured run follows the first start, so it reads a host-warm page cache
-printf '{"page_cache": "host-warm", "first_start": "%s", "memory": "%s", "memory_swap": "%s", "detach_memory": "%s"}\n' \
-  "$FIRST_START" "$MEMORY" "${MEMORY_SWAP:-host-default}" "$DETACH_MEMORY" > "$OUT/regime.json"
+printf '{"page_cache": "host-warm", "first_start": "%s", "memory": "%s", "memory_swap": "%s", "detach_memory": "%s", "concurrency": "%s"}\n' \
+  "$FIRST_START" "$MEMORY" "${MEMORY_SWAP:-host-default}" "$DETACH_MEMORY" "$CONCURRENCY" > "$OUT/regime.json"
 
 fresh_container "first start ($FIRST_START)" "$MEMORY"
 START_INDEX=$(index_type)

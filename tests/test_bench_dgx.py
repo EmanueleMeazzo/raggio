@@ -306,7 +306,7 @@ def test_compare_covers_every_bench_metric():
 # ---- regime labels (Task 4): spec §6, every row states its regime ------------------------
 
 REGIME = {"page_cache": "host-warm", "first_start": "host-warm", "memory": "4g",
-          "memory_swap": "host-default", "detach_memory": "8g"}
+          "memory_swap": "host-default", "detach_memory": "8g", "concurrency": "8"}
 BOOKWORM = {"python": "3.12.11", "sqlite_version": "3.40.1", "turbovec": "1.0.0",
             "openblas_num_threads": "unset"}
 TRIXIE = {"python": "3.12.14", "sqlite_version": "3.53.1", "turbovec": "1.0.0",
@@ -387,7 +387,8 @@ def test_compare_prints_each_sides_regime(tmp_path):
     write_labels(cand, REGIME, BOOKWORM)
     assert compare.render(base).splitlines()[1] == (
         "Regime (session): page_cache=host-warm, first_start=host-warm, memory=4g, "
-        "memory_swap=host-default, python=3.12.11, sqlite_version=3.40.1, openblas_num_threads=unset")
+        "memory_swap=host-default, concurrency=8, python=3.12.11, sqlite_version=3.40.1, "
+        "openblas_num_threads=unset")
     ab = compare.render(base, cand).splitlines()
     assert ab[1].startswith("Regime (baseline): page_cache=host-warm, ")
     assert ab[2].startswith("Regime (candidate): page_cache=host-warm, ")
@@ -490,3 +491,67 @@ def test_the_second_ivf_build_counts_for_the_build_row_only(tmp_path):
     # 220 - 217 = 3 is inside the candidate's band of 10: no single-build tolerance decides it
     assert "| raggio-ivf | IVF index build (s) | 217 | 8 | 220 | 10 | within band |" in compare.render(base, cand2)
     assert compare.beyond_band(base, cand2) == {"better": [], "worse": []}
+
+
+# ---- spec §3.1 G7 knob and G5 rows (Task 5): CONCURRENCY in every run and in the regime ----
+
+def test_lib_reads_the_concurrency_from_the_environment():
+    lib = (DGX / "lib.sh").read_text(encoding="utf-8")
+    session = (DGX / "session.sh").read_text(encoding="utf-8")
+    assert 'CONCURRENCY="${CONCURRENCY:-8}"' in lib
+    assert '--concurrency "$CONCURRENCY" --cpu-container "$CONTAINER"' in session
+    assert '"concurrency": "%s"' in session
+
+
+@needs_bash
+def test_session_passes_the_concurrency_and_the_cpu_container(tmp_path):
+    home, cmds = dry_session(tmp_path)
+    runs = [c for c in cmds if c.startswith(BENCH_CMD)]
+    assert len(runs) == 7 and all(" --concurrency 8 --cpu-container bench-tv " in r for r in runs)
+    assert json.loads((home / "s1" / "regime.json").read_text())["concurrency"] == "8"
+    c16 = tmp_path / "c16"  # a spec §3.1 G7 c=16 session
+    c16.mkdir()
+    home, cmds = dry_session(c16, ("CONCURRENCY", "16"))
+    runs = [c for c in cmds if c.startswith(BENCH_CMD)]
+    assert len(runs) == 7 and all(" --concurrency 16 --cpu-container bench-tv " in r for r in runs)
+    assert json.loads((home / "s1" / "regime.json").read_text())["concurrency"] == "16"
+
+
+def test_compare_flags_arms_that_ran_at_different_concurrency(tmp_path):
+    base, cand = tmp_path / "main", tmp_path / "cand"
+    flat_session(base, (23.0, 24.0))
+    flat_session(cand, (23.5, 23.5))
+    write_labels(base, REGIME, BOOKWORM)
+    write_labels(cand, {**REGIME, "concurrency": "16"}, BOOKWORM)
+    ab = compare.render(base, cand)
+    assert ("The arms differ in concurrency: a re-baseline across them, not a same-regime A/B "
+            "(spec §6).") in ab
+    assert "memory_swap=host-default, concurrency=16, python=3.12.11" in ab.splitlines()[2]
+    # a session recorded before the label existed reads "unknown", which differs too
+    write_labels(cand, {k: v for k, v in REGIME.items() if k != "concurrency"}, BOOKWORM)
+    assert "The arms differ in concurrency: " in compare.render(base, cand)
+
+
+def test_compare_leaves_absent_cpu_rows_out_of_the_verdicts(tmp_path):
+    base, cand, none = tmp_path / "main", tmp_path / "cand", tmp_path / "none"
+    write_session(base, {"run1-raggio": {"lat_p50": 23.0, "hybrid_c_p99": 900.0},
+                         "run2-raggio": {"lat_p50": 24.0, "hybrid_c_p99": 950.0}})
+    write_session(cand, {
+        "run1-raggio": {"lat_p50": 23.5, "hybrid_c_p99": 700.0, "cpu_ms_per_q_c": 50.8,
+                        "hybrid_cpu_ms_per_q_c": 365.1},
+        "run2-raggio": {"lat_p50": 23.5, "hybrid_c_p99": 720.0, "cpu_ms_per_q_c": 116.0,
+                        "hybrid_cpu_ms_per_q_c": 361.9}})
+    write_session(none, {"run1-raggio": {"lat_p50": 23.0}, "run2-raggio": {"lat_p50": 24.0}})
+    ab = compare.render(base, cand)
+    # one side lacks the CPU rows (a laptop, or a session before Task 5): "-", never 0, no verdict
+    assert "| raggio | CPU per query under concurrency (ms) | - | - | 83.4 | 65.2 | - |" in ab
+    assert "| raggio | Hybrid CPU per query under concurrency (ms) | - | - | 363.5 | 3.2 | - |" in ab
+    assert "| raggio | Hybrid p99 under concurrency (ms) | 925.0 | 50.0 | 710.0 | 20.0 | better |" in ab
+    assert compare.beyond_band(base, cand) == {"better": [("raggio", "hybrid_c_p99")], "worse": []}
+    # neither side has them: no row at all
+    assert "CPU per query" not in compare.render(base, none)
+    assert "CPU per query" not in compare.render(none)
+    # all three are lower-is-better: p4's fast state (50.8-56.8 ms) beats its slow one (115.9-117.6)
+    assert [compare.HIGHER_IS_BETTER[k] for k in
+            ("cpu_ms_per_q_c", "hybrid_c_p99", "hybrid_cpu_ms_per_q_c")] == [False] * 3
+    assert compare.verdict("cpu_ms_per_q_c", [115.9, 117.6], [50.8, 56.8]) == "better"

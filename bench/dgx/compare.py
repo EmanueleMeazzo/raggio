@@ -44,14 +44,19 @@ METRICS = [
     ("qps_serial", "QPS serial", "{:.0f}", True),
     ("qps_concurrent", "QPS concurrent", "{:.0f}", True),
     ("lat_c_p95", "p95 under concurrency (ms)", "{:.1f}", False),
+    ("cpu_ms_per_q_c", "CPU per query under concurrency (ms)", "{:.1f}", False),
     ("lat_filtered_p50", "Filtered p50 (ms)", "{:.1f}", False),
     ("lat_filtered_p95", "Filtered p95 (ms)", "{:.1f}", False),
     ("recall_at_10", "Recall@10 vs exact", "{:.3f}", True),
     ("hybrid_p50", "Hybrid p50 (ms)", "{:.1f}", False),
     ("hybrid_p95", "Hybrid p95 (ms)", "{:.1f}", False),
     ("hybrid_p99", "Hybrid p99 (ms)", "{:.1f}", False),
+    ("hybrid_first10_max_ms", "Hybrid first 10 queries, slowest (ms)", "{:.1f}", False),
+    ("hybrid_p99_after10", "Hybrid p99 without the first 10 (ms)", "{:.1f}", False),
     ("hybrid_qps_serial", "Hybrid QPS serial", "{:.1f}", True),
     ("hybrid_qps_concurrent", "Hybrid QPS concurrent", "{:.1f}", True),
+    ("hybrid_c_p99", "Hybrid p99 under concurrency (ms)", "{:.1f}", False),
+    ("hybrid_cpu_ms_per_q_c", "Hybrid CPU per query under concurrency (ms)", "{:.1f}", False),
     ("hybrid_text_hit_rate", "Hybrid text-hit@10", "{:.3f}", True),
     ("cold_start_s", "Cold start to first query (s)", "{:.1f}", False),
 ]
@@ -64,8 +69,8 @@ RUN_FILE = re.compile(r"run(\d+)-(raggio-ivf|raggio|weaviate)\.json")
 BUILD_FILE = re.compile(r"build([1-9]\d*)-(raggio-ivf)\.json")  # IVF_BUILDS=2: a build after the runs
 # spec §6: every row states its page-cache regime, memory cap, sqlite3.sqlite_version and
 # OPENBLAS_NUM_THREADS; the arms of one A/B share them (the first start is not a measured row)
-REGIME_KEYS = ["page_cache", "first_start", "memory", "memory_swap", "python", "sqlite_version",
-               "openblas_num_threads"]
+REGIME_KEYS = ["page_cache", "first_start", "memory", "memory_swap", "concurrency", "python",
+               "sqlite_version", "openblas_num_threads"]
 SAME_REGIME = [k for k in REGIME_KEYS if k != "first_start"]
 CLAIM_RUNS = {"qps_concurrent": 3}  # vector concurrent QPS is bimodal: >= 3 runs per side
 
