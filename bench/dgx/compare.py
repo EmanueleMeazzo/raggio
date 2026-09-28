@@ -12,6 +12,15 @@ medians and bands and a verdict, "better" or "worse" only when the medians diffe
 than the wider band; "no band" when a side has a single value; "not claimable" for the
 bench's cold-start metric, a warm restart (spec §6: cold start is claimed only true-cold).
 
+Each side's regime (regime.json and image.json from session.sh, "unknown" when absent) is
+printed above the table. Arms that differ in a label of the measured rows get a line saying
+the A/B is a re-baseline, not a same-regime comparison, and a vector concurrent-QPS row with
+fewer than 3 counted runs on a side is listed as reported, not claimed (spec §6).
+
+A build<N>-raggio-ivf.json (session.sh IVF_BUILDS=2) is an extra IVF build after the measured
+runs: only its one-shot metrics count, after run0's, so the build row gets two values per
+side, a median and a band (spec §3.1 A1).
+
 Usage: python bench/dgx/compare.py <baseline-dir> [<candidate-dir>]
 """
 
@@ -52,24 +61,44 @@ ONE_SHOT = {"ingest_s", "ingest_vps", "index_build_s"}  # measured once, possibl
 NOT_CLAIMABLE = {"cold_start_s"}
 ENGINE_ORDER = ["raggio", "raggio-ivf", "weaviate"]
 RUN_FILE = re.compile(r"run(\d+)-(raggio-ivf|raggio|weaviate)\.json")
+BUILD_FILE = re.compile(r"build([1-9]\d*)-(raggio-ivf)\.json")  # IVF_BUILDS=2: a build after the runs
+# spec §6: every row states its page-cache regime, memory cap, sqlite3.sqlite_version and
+# OPENBLAS_NUM_THREADS; the arms of one A/B share them (the first start is not a measured row)
+REGIME_KEYS = ["page_cache", "first_start", "memory", "memory_swap", "python", "sqlite_version",
+               "openblas_num_threads"]
+SAME_REGIME = [k for k in REGIME_KEYS if k != "first_start"]
+CLAIM_RUNS = {"qps_concurrent": 3}  # vector concurrent QPS is bimodal: >= 3 runs per side
 
 
 def load(session_dir):
-    """{engine: {run number: {metric: value}}} from a session directory."""
+    """{engine: {run number: {metric: value}}} from a session directory. A build<N> file
+    (IVF_BUILDS=2) is stored as run -N: only its one-shot metrics count (values)."""
     runs = {}
     for p in sorted(Path(session_dir).iterdir()):
-        m = RUN_FILE.fullmatch(p.name)
+        m, sign = RUN_FILE.fullmatch(p.name), 1
+        if m is None:
+            m, sign = BUILD_FILE.fullmatch(p.name), -1
         if m:
             data = json.loads(p.read_text(encoding="utf-8"))
-            runs.setdefault(m.group(2), {})[int(m.group(1))] = data.get(m.group(2), {})
+            runs.setdefault(m.group(2), {})[sign * int(m.group(1))] = data.get(m.group(2), {})
     if not runs:
         raise SystemExit(f"{session_dir}: no run<N>-<engine>.json files")
     return runs
 
 
+def regime(session_dir):
+    """{label: value} from regime.json and image.json; a missing label reads "unknown"."""
+    labels = {}
+    for name in ("regime.json", "image.json"):
+        p = Path(session_dir) / name
+        if p.exists():
+            labels.update(json.loads(p.read_text(encoding="utf-8")))
+    return {k: str(labels.get(k, "unknown")) for k in REGIME_KEYS}
+
+
 def values(engine_runs, key):
-    """The values that count for one engine's metric, in run order."""
-    return [engine_runs[n][key] for n in sorted(engine_runs)
+    """The values that count for one engine's metric: the runs in order, then the extra builds."""
+    return [engine_runs[n][key] for n in sorted(engine_runs, key=lambda n: (n < 0, abs(n)))
             if key in engine_runs[n] and (n >= 1 or key in ONE_SHOT)]
 
 
@@ -113,16 +142,32 @@ def _mid_band(fmt, vals):
     return [fmt.format(mid), fmt.format(band) if len(vals) > 1 else "-"]
 
 
+def _regime_line(side, labels):
+    return f"Regime ({side}): " + ", ".join(f"{k}={labels[k]}" for k in REGIME_KEYS)
+
+
+def _thin(key, *sides):
+    """A claimed metric with fewer counted runs than spec §6 needs on some side."""
+    return key in CLAIM_RUNS and any(0 < len(v) < CLAIM_RUNS[key] for v in sides)
+
+
 def render(base_dir, cand_dir=None):
     base = load(base_dir)
     cand = load(cand_dir) if cand_dir else None
     if cand is None:
-        lines = [f"Noise band: {base_dir}", "",
+        lines = [f"Noise band: {base_dir}", _regime_line("session", regime(base_dir)), "",
                  "| Engine | Metric | runs | median | band |", "|---|---|---|---|---|"]
     else:
-        lines = [f"A/B: baseline {base_dir} vs candidate {cand_dir}", "",
-                 "| Engine | Metric | base median | base band | cand median | cand band | verdict |",
-                 "|---|---|---|---|---|---|---|"]
+        base_regime, cand_regime = regime(base_dir), regime(cand_dir)
+        lines = [f"A/B: baseline {base_dir} vs candidate {cand_dir}",
+                 _regime_line("baseline", base_regime), _regime_line("candidate", cand_regime)]
+        differ = [k for k in SAME_REGIME if base_regime[k] != cand_regime[k]]
+        if differ:
+            lines.append(f"The arms differ in {', '.join(differ)}: a re-baseline across them, "
+                         "not a same-regime A/B (spec §6).")
+        lines += ["", "| Engine | Metric | base median | base band | cand median | cand band | verdict |",
+                  "|---|---|---|---|---|---|---|"]
+    thin = []
     for engine, key, label, fmt, b, c in _rows(base, cand):
         if cand is None:
             cells = [engine, label, " / ".join(fmt.format(v) for v in b), *_mid_band(fmt, b)]
@@ -130,6 +175,11 @@ def render(base_dir, cand_dir=None):
             cells = [engine, label, *_mid_band(fmt, b), *_mid_band(fmt, c),
                      verdict(key, b, c) if b and c else "-"]
         lines.append("| " + " | ".join(cells) + " |")
+        if _thin(key, b, c):
+            thin.append(f"{engine} {label}")
+    if thin:
+        lines += ["", "Reported, not claimed (spec §6 needs >= 3 runs per side; FLAT_RUNS=3): "
+                  + ", ".join(thin)]
     return "\n".join(lines)
 
 

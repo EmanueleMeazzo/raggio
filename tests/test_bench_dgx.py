@@ -301,3 +301,192 @@ def test_compare_covers_every_bench_metric():
     import bench
     assert [(key, label, fmt) for label, key, fmt in bench.ROWS] == \
         [(key, label, fmt) for key, label, fmt, _ in compare.METRICS]
+
+
+# ---- regime labels (Task 4): spec §6, every row states its regime ------------------------
+
+REGIME = {"page_cache": "host-warm", "first_start": "host-warm", "memory": "4g",
+          "memory_swap": "host-default", "detach_memory": "8g"}
+BOOKWORM = {"python": "3.12.11", "sqlite_version": "3.40.1", "turbovec": "1.0.0",
+            "openblas_num_threads": "unset"}
+TRIXIE = {"python": "3.12.14", "sqlite_version": "3.53.1", "turbovec": "1.0.0",
+          "openblas_num_threads": "1"}
+
+
+def write_labels(d, regime=None, image=None):
+    """regime.json and image.json as session.sh writes them."""
+    if regime is not None:
+        (d / "regime.json").write_text(json.dumps(regime))
+    if image is not None:
+        (d / "image.json").write_text(json.dumps(image))
+
+
+def flat_session(d, lat):
+    write_session(d, {"run1-raggio": {"lat_p50": lat[0]}, "run2-raggio": {"lat_p50": lat[1]}})
+
+
+@needs_bash
+def test_session_records_the_regime_labels(tmp_path):
+    home, _ = dry_session(tmp_path)
+    out = home / "s1"
+    assert json.loads((out / "regime.json").read_text()) == REGIME
+    assert json.loads((out / "image.json").read_text()) == {
+        "python": "dry-run", "sqlite_version": "dry-run", "turbovec": "dry-run",
+        "openblas_num_threads": "dry-run"}
+
+
+@needs_bash
+def test_swapless_gate_caps_swap_on_the_measured_runs_only(tmp_path):
+    home, cmds = dry_session(tmp_path, ("MEMORY_SWAP", "4g"))
+    starts = [c for c in cmds if c.startswith("podman run -d ")]
+    # the first start and 4 IVF runs, the 8 GiB detach (podman's default swap), 3 flat runs
+    assert [" --memory 4g --memory-swap 4g " in c for c in starts] == [True] * 5 + [False] + [True] * 3
+    assert starts[5] == podman_run("8g")
+    assert json.loads((home / "s1" / "regime.json").read_text())["memory_swap"] == "4g"
+    runs = [c for c in cmds if c.startswith(BENCH_CMD)]
+    assert len(runs) == 7 and all("Swap capped too: --memory-swap 4g." in r for r in runs)
+
+
+@needs_bash
+def test_first_start_regime_is_validated(tmp_path):
+    home, raggio = tmp_path / "bench-home", tmp_path / "raggio"
+    raggio.mkdir()
+    (raggio / ".deployed-sha").write_text("abc1234\n")
+    env = {**os.environ, "DRY_RUN": "1", "BENCH_HOME": home.as_posix(), "RAGGIO_DIR": raggio.as_posix()}
+    session = [BASH, (DGX / "session.sh").resolve().as_posix()]
+    r = subprocess.run([*session, "s1"], env={**env, "FIRST_START": "cold"}, capture_output=True, text=True)
+    assert r.returncode != 0 and "use host-warm or true-cold" in r.stderr
+    assert not (home / "s1").exists()
+    subprocess.run([*session, "s2"], env={**env, "FIRST_START": "true-cold"}, capture_output=True, check=True)
+    assert json.loads((home / "s2" / "regime.json").read_text())["first_start"] == "true-cold"
+
+
+@needs_bash
+def test_flat_runs_can_be_raised_for_a_concurrent_qps_claim(tmp_path):
+    _, cmds = dry_session(tmp_path, ("FLAT_RUNS", "3"))
+    assert [tag for _, tag, engine in bench_runs(cmds) if engine == "raggio"] == ["run0", "run1", "run2", "run3"]
+
+
+def test_image_facts_snippet_reports_sqlite_and_blas_threads():
+    import sqlite3
+    text = (DGX / "session.sh").read_text(encoding="utf-8")
+    (snippet,) = re.findall(r"^IMAGE_FACTS='(.*?)'$", text, re.S | re.M)
+    out = subprocess.run([sys.executable, "-c", snippet], env={**os.environ, "OPENBLAS_NUM_THREADS": "1"},
+                         capture_output=True, text=True, check=True).stdout
+    facts = json.loads(out)
+    assert sorted(facts) == ["openblas_num_threads", "python", "sqlite_version", "turbovec"]
+    assert facts["sqlite_version"] == sqlite3.sqlite_version
+    assert facts["openblas_num_threads"] == "1"
+
+
+def test_compare_prints_each_sides_regime(tmp_path):
+    base, cand = tmp_path / "main", tmp_path / "cand"
+    flat_session(base, (23.0, 24.0))
+    flat_session(cand, (23.5, 23.5))
+    write_labels(base, REGIME, BOOKWORM)
+    write_labels(cand, REGIME, BOOKWORM)
+    assert compare.render(base).splitlines()[1] == (
+        "Regime (session): page_cache=host-warm, first_start=host-warm, memory=4g, "
+        "memory_swap=host-default, python=3.12.11, sqlite_version=3.40.1, openblas_num_threads=unset")
+    ab = compare.render(base, cand).splitlines()
+    assert ab[1].startswith("Regime (baseline): page_cache=host-warm, ")
+    assert ab[2].startswith("Regime (candidate): page_cache=host-warm, ")
+    assert not [ln for ln in ab if ln.startswith("The arms differ")]
+    # a hand-assembled session without labels reads "unknown", never a guess
+    (base / "regime.json").unlink()
+    (base / "image.json").unlink()
+    assert compare.regime(base) == {key: "unknown" for key in compare.REGIME_KEYS}
+
+
+def test_compare_flags_arms_that_differ_in_regime(tmp_path):
+    base, cand = tmp_path / "main", tmp_path / "cand"
+    flat_session(base, (23.0, 24.0))
+    flat_session(cand, (23.5, 23.5))
+    write_labels(base, REGIME, BOOKWORM)
+    write_labels(cand, REGIME, TRIXIE)
+    assert ("The arms differ in python, sqlite_version, openblas_num_threads: a re-baseline across "
+            "them, not a same-regime A/B (spec §6).") in compare.render(base, cand)
+    write_labels(cand, {**REGIME, "memory_swap": "4g"}, BOOKWORM)  # swapless vs default swap
+    assert "The arms differ in memory_swap: " in compare.render(base, cand)
+    write_labels(cand, {**REGIME, "first_start": "true-cold"}, BOOKWORM)  # labels the first start only
+    assert "The arms differ" not in compare.render(base, cand)
+    assert compare.beyond_band(base, cand) == {"better": [], "worse": []}  # verdicts unchanged
+
+
+def test_compare_reports_thin_concurrent_qps_as_not_claimed(tmp_path):
+    two = {"run1-raggio": {"qps_concurrent": 129.0}, "run2-raggio": {"qps_concurrent": 131.0}}
+    three = {**two, "run3-raggio": {"qps_concurrent": 200.0}}
+    thin, full, cand = tmp_path / "thin", tmp_path / "full", tmp_path / "cand"
+    write_session(thin, two)
+    write_session(full, three)
+    write_session(cand, three)
+    note = "Reported, not claimed (spec §6 needs >= 3 runs per side; FLAT_RUNS=3): raggio QPS concurrent"
+    assert compare.render(thin).splitlines()[-1] == note
+    assert compare.render(thin, cand).splitlines()[-1] == note
+    assert "Reported, not claimed" not in compare.render(full, cand)
+
+
+# ---- the second IVF build (Task 4): spec §3.1 A1, the build gate builds twice per arm ----
+
+@needs_bash
+def test_a_second_ivf_build_runs_after_every_measured_run(tmp_path):
+    home, cmds = dry_session(tmp_path, ("DRY_INDEX", "flat"), ("IVF_BUILDS", "2"))
+    out = (home / "s1").as_posix()
+    runs = [(i, *re.search(r"--out \S+/(\w+)-(raggio-ivf|raggio)\.md", c).groups())
+            for i, c in enumerate(cmds) if c.startswith(BENCH_CMD)]
+    assert [(tag, engine) for _, tag, engine in runs] == [
+        ("run0", "raggio"), ("run1", "raggio"), ("run2", "raggio"),
+        ("run0", "raggio-ivf"), ("run1", "raggio-ivf"), ("run2", "raggio-ivf"), ("run3", "raggio-ivf"),
+        ("build2", "raggio-ivf")]
+    # the measured runs keep the one transition (run0's build); the extra detach comes after them
+    (d,) = [i for i, c in enumerate(cmds) if "-X DELETE" in c]
+    assert runs[6][0] < d < runs[7][0]
+    assert cmds[d - 5:d + 1] == [STOP, RM, podman_run("8g"), STARTED, IDLE, DETACH]
+    assert [c for c in cmds if "--memory 8g" in c] == [podman_run("8g")]
+    # build2 builds from flat in a fresh 4 GiB container, like any bench run
+    b = runs[7][0]
+    assert cmds[b - 6:b] == [STOP, RM, podman_run("4g"), STARTED, IDLE, "rm -f bench/results-partial.json"]
+    assert "--engine raggio-ivf " in cmds[b] and cmds[b].endswith(f"--out {out}/build2-raggio-ivf.md")
+    assert cmds[b + 1] == f"mv bench/results-partial.json {out}/build2-raggio-ivf.json"
+
+
+@needs_bash
+def test_ivf_builds_is_validated_and_needs_a_flat_start(tmp_path):
+    home, raggio = tmp_path / "bench-home", tmp_path / "raggio"
+    raggio.mkdir()
+    (raggio / ".deployed-sha").write_text("abc1234\n")
+    env = {**os.environ, "DRY_RUN": "1", "BENCH_HOME": home.as_posix(), "RAGGIO_DIR": raggio.as_posix()}
+    session = [BASH, (DGX / "session.sh").resolve().as_posix()]
+    r = subprocess.run([*session, "s1"], env={**env, "IVF_BUILDS": "3"}, capture_output=True, text=True)
+    assert r.returncode != 0 and "IVF_BUILDS=3: use 1 or 2" in r.stderr
+    assert not (home / "s1").exists()
+    # an IVF start would need a second IVF <-> flat transition before the extra build
+    r = subprocess.run([*session, "s2"], env={**env, "IVF_BUILDS": "2", "DRY_INDEX": "ivf"},
+                       capture_output=True, text=True)
+    assert r.returncode != 0 and "IVF_BUILDS=2 needs a flat start" in r.stderr
+    assert BENCH_CMD not in r.stdout
+
+
+def ivf_builds(d, first, second):
+    """An IVF_BUILDS=2 session: run0 builds the index, build2 builds it again after the runs."""
+    write_session(d, {
+        "run0-raggio-ivf": {"index_build_s": first, "lat_p50": 15.5},
+        "run1-raggio-ivf": {"lat_p50": 11.0}, "run2-raggio-ivf": {"lat_p50": 12.0},
+        "build2-raggio-ivf": {"index_build_s": second, "lat_p50": 30.0}})
+
+
+def test_the_second_ivf_build_counts_for_the_build_row_only(tmp_path):
+    base, cand, cand2 = tmp_path / "main", tmp_path / "cand", tmp_path / "cand2"
+    ivf_builds(base, 213.0, 221.0)
+    ivf_builds(cand, 227.0, 233.0)
+    ivf_builds(cand2, 215.0, 225.0)
+    runs = compare.load(base)["raggio-ivf"]
+    assert compare.values(runs, "index_build_s") == [213.0, 221.0]  # run0's build, then build2's
+    assert compare.values(runs, "lat_p50") == [11.0, 12.0]  # build2's queries never count
+    assert "| raggio-ivf | IVF index build (s) | 213 / 221 | 217 | 8 |" in compare.render(base)
+    # medians against the band (spec §3.1 A1): 230 - 217 = 13 is beyond the wider band of 8
+    assert "| raggio-ivf | IVF index build (s) | 217 | 8 | 230 | 6 | worse |" in compare.render(base, cand)
+    assert compare.beyond_band(base, cand) == {"better": [], "worse": [("raggio-ivf", "index_build_s")]}
+    # 220 - 217 = 3 is inside the candidate's band of 10: no single-build tolerance decides it
+    assert "| raggio-ivf | IVF index build (s) | 217 | 8 | 220 | 10 | within band |" in compare.render(base, cand2)
+    assert compare.beyond_band(base, cand2) == {"better": [], "worse": []}

@@ -19,10 +19,27 @@
 #   kill -TERM -- -"$(cat ~/raggio-bench/<label>/session.pgid)"
 # IMAGE=<ref>: measure another image (default localhost/raggio:<deployed sha>).
 # ADOPT=1: pass --adopt to the first run (first session on a volume with no fingerprint yet).
+# FLAT_RUNS=3: a third measured flat run, needed before a vector concurrent-QPS row is claimed.
+# MEMORY_SWAP=4g: the swapless memory gate (--memory-swap on every 4 GiB start, not the detach).
+# FIRST_START=true-cold: label the first start true-cold (host rebooted, or the volume's files
+# fadvise-evicted, before the session); default host-warm.
+# IVF_BUILDS=2 (flat start only): after every measured run, detach at 8 GiB and build the IVF
+# index once more at 4 GiB (build2-raggio-ivf); compare.py counts only its build time (spec §3.1 A1).
+# regime.json (page cache, first start, memory, swap) and image.json (python, sqlite,
+# turbovec, OPENBLAS_NUM_THREADS inside the image) label every row; compare.py prints them.
 # DRY_RUN=1: print the commands without running them; DRY_INDEX=ivf|flat is the index
 # state a dry run assumes (default ivf).
 source "$(dirname "$0")/lib.sh"
 LABEL="${1:?usage: session.sh <label>}"
+case "$FIRST_START" in
+  host-warm|true-cold) ;;
+  *) echo "FIRST_START=$FIRST_START: use host-warm or true-cold" >&2; exit 1 ;;
+esac
+case "$IVF_BUILDS" in
+  1|2) ;;
+  *) echo "IVF_BUILDS=$IVF_BUILDS: use 1 or 2" >&2; exit 1 ;;
+esac
+if [ -n "$MEMORY_SWAP" ]; then CAPS="$CAPS Swap capped too: --memory-swap $MEMORY_SWAP."; fi
 
 cd "$RAGGIO_DIR"
 SHA=$(cat .deployed-sha)
@@ -46,6 +63,8 @@ print("python", sys.version.split()[0], "sqlite", sqlite3.sqlite_version, "turbo
 FIELD='import json, sys
 info = json.load(sys.stdin)
 print(info["pending_jobs"] if sys.argv[1] == "pending" else (info.get("index") or {}).get("type"))'
+IMAGE_FACTS='import json, os, sys, sqlite3, importlib.metadata as m
+print(json.dumps({"python": sys.version.split()[0], "sqlite_version": sqlite3.sqlite_version, "turbovec": m.version("turbovec"), "openblas_num_threads": os.environ.get("OPENBLAS_NUM_THREADS", "unset")}))'
 EXTRA=()
 if [ "${ADOPT:-0}" = 1 ]; then EXTRA=(--adopt); fi
 
@@ -58,6 +77,14 @@ field() { info | .venv/bin/python -c "$FIELD" "$1"; }
 index_type() {  # prints ivf or flat
   if [ "${DRY_RUN:-0}" = 1 ]; then echo "${DRY_INDEX:-ivf}"; return; fi
   field index
+}
+
+image_facts() {  # the image's python, sqlite, turbovec and BLAS threads as JSON (spec §6, D15, D16)
+  if [ "${DRY_RUN:-0}" = 1 ]; then
+    echo '{"python": "dry-run", "sqlite_version": "dry-run", "turbovec": "dry-run", "openblas_num_threads": "dry-run"}'
+    return
+  fi
+  podman run --rm "$IMAGE" python -c "$IMAGE_FACTS"
 }
 
 wait_started() {  # $1 = label, $2 = container start time in ns
@@ -92,11 +119,13 @@ wait_pending() {
 }
 
 fresh_container() {  # $1 = label for facts.txt, $2 = memory cap
-  local t0
+  local t0 swap=()
+  # the swapless gate caps the measured 4 GiB starts; the transient 8 GiB detach keeps the default
+  if [ -n "$MEMORY_SWAP" ] && [ "$2" = "$MEMORY" ]; then swap=(--memory-swap "$MEMORY_SWAP"); fi
   run podman stop -t 60 --ignore "$CONTAINER"  # clean shutdown of the previous run's server
   run podman rm -f --ignore "$CONTAINER"
   t0=$(date +%s%N)
-  run podman run -d --name "$CONTAINER" --memory "$2" -p "$PORT:8000" -v "$VOLUME:/data" \
+  run podman run -d --name "$CONTAINER" --memory "$2" "${swap[@]}" -p "$PORT:8000" -v "$VOLUME:/data" \
     -e "ROOT_API_KEY=$API_KEY" "$IMAGE"
   wait_started "$1" "$t0"
   wait_pending
@@ -118,7 +147,7 @@ engine_group() {  # engine_group <engine> <measured runs>: warm-up run0, then ru
   for i in $(seq 0 "$2"); do bench_run "run$i" "$1"; done
 }
 
-detach_index() {  # the session's one IVF -> flat transition
+detach_index() {  # IVF -> flat: the session's one transition, or the detach before build2 (IVF_BUILDS=2)
   local start
   fresh_container "detach at $DETACH_MEMORY" "$DETACH_MEMORY"
   start=$SECONDS
@@ -141,12 +170,20 @@ log "session $LABEL: image $IMAGE, bench checkout $SHA" | tee "$OUT/facts.txt"
   run podman image inspect --format '{{.Id}} {{.Digest}}' "$IMAGE"
   run podman run --rm "$IMAGE" python -c "$VERSIONS"
 } >> "$OUT/facts.txt" 2>&1 || true  # facts are informational: a missing one never stops the session
+image_facts > "$OUT/image.json" || { rm -f "$OUT/image.json"; log "no image facts: compare.py reads them as unknown" >&2; }
+# every measured run follows the first start, so it reads a host-warm page cache
+printf '{"page_cache": "host-warm", "first_start": "%s", "memory": "%s", "memory_swap": "%s", "detach_memory": "%s"}\n' \
+  "$FIRST_START" "$MEMORY" "${MEMORY_SWAP:-host-default}" "$DETACH_MEMORY" > "$OUT/regime.json"
 
-fresh_container "first start" "$MEMORY"
+fresh_container "first start ($FIRST_START)" "$MEMORY"
 START_INDEX=$(index_type)
 log "index at start: $START_INDEX" | tee -a "$OUT/facts.txt"
 case "$START_INDEX" in
   ivf)
+    if [ "$IVF_BUILDS" = 2 ]; then
+      log "IVF_BUILDS=2 needs a flat start (run0 builds, then build2 once more): leave the volume flat first" >&2
+      exit 1
+    fi
     engine_group raggio-ivf "$IVF_RUNS"
     detach_index
     engine_group raggio "$FLAT_RUNS"
@@ -154,6 +191,11 @@ case "$START_INDEX" in
   flat)
     engine_group raggio "$FLAT_RUNS"
     engine_group raggio-ivf "$IVF_RUNS"  # run0 builds the index: index_build_s at 4 GiB
+    if [ "$IVF_BUILDS" = 2 ]; then
+      # after every measured run, so they keep the one transition; only build2's build time counts
+      detach_index
+      bench_run build2 raggio-ivf  # finds a flat index and builds it again at 4 GiB
+    fi
     ;;
   *)
     log "unexpected index state '$START_INDEX': stopping" >&2
