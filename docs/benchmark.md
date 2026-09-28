@@ -104,7 +104,7 @@ The harness (`bench/bench.py`) ingests, then measures serial / concurrent /
 filtered / hybrid search, recall against cached exact ground truth, memory,
 disk, and cold start, and writes `bench/results.md`. Ingested data stays in
 the volumes and is fingerprinted per corpus size
-(`bench/fingerprint-<engine>-<limit>.json`, untracked), so repeat runs start
+(`bench/fingerprint-<raggio|weaviate>-<limit>.json`, untracked; raggio-ivf shares raggio's), so repeat runs start
 straight at the search phases; ingest wall time is measured on `--reingest`
 runs. Before the ground-truth pass the harness checks every engine: if one
 doesn't answer, holds a different chunk count (a wrong `--limit`, or the

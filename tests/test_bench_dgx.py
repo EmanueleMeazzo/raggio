@@ -65,7 +65,10 @@ def test_guard_rails():
     assert "--reingest" not in joined
     assert "2549119" not in joined  # the ingested count, never a --limit
     assert "LIMIT=2549619" in text["lib.sh"]
-    assert "CONTAINER=bench-tv" in text["lib.sh"]
+    assert re.search(r"^CONTAINER=bench-tv\s", text["lib.sh"], re.M)
+    for verb in ("podman kill", "podman container rm", "podman container kill", "podman container stop",
+                 "prune", "podman rmi", "podman volume"):
+        assert verb not in joined
     rm_lines = stop_lines = 0
     for line in joined.splitlines():
         code = line.split("#")[0]
@@ -365,6 +368,13 @@ def test_first_start_regime_is_validated(tmp_path):
 def test_flat_runs_can_be_raised_for_a_concurrent_qps_claim(tmp_path):
     _, cmds = dry_session(tmp_path, ("FLAT_RUNS", "3"))
     assert [tag for _, tag, engine in bench_runs(cmds) if engine == "raggio"] == ["run0", "run1", "run2", "run3"]
+    # a bad value refuses before the label directory exists, so it does not burn the label
+    for var, bad in (("FLAT_RUNS", "abc"), ("FLAT_RUNS", "0"), ("FLAT_RUNS", "3 "), ("CONCURRENCY", "0")):
+        sub = tmp_path / f"{var}-{len(bad)}{bad.strip()}"
+        sub.mkdir()
+        with pytest.raises(subprocess.CalledProcessError):
+            dry_session(sub, (var, bad))
+        assert not (sub / "bench-home" / "s1").exists()
 
 
 def test_image_facts_snippet_reports_sqlite_and_blas_threads():

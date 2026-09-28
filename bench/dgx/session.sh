@@ -32,6 +32,9 @@
 # DRY_RUN=1: print the commands without running them; DRY_INDEX=ivf|flat is the index
 # state a dry run assumes (default ivf).
 source "$(dirname "$0")/lib.sh"
+# a detached session's exit code is lost: say which command stopped it (set -e exits are otherwise silent)
+set -E
+trap 'log "session stopped: exit $? at line $LINENO: $BASH_COMMAND" >&2' ERR
 LABEL="${1:?usage: session.sh <label>}"
 case "$FIRST_START" in
   host-warm|true-cold) ;;
@@ -40,6 +43,14 @@ esac
 case "$IVF_BUILDS" in
   1|2) ;;
   *) echo "IVF_BUILDS=$IVF_BUILDS: use 1 or 2" >&2; exit 1 ;;
+esac
+case "$FLAT_RUNS" in
+  [1-9]|[1-9][0-9]) ;;
+  *) echo "FLAT_RUNS=$FLAT_RUNS: use a whole number of measured runs, 1 or more" >&2; exit 1 ;;
+esac
+case "$CONCURRENCY" in
+  [1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;;
+  *) echo "CONCURRENCY=$CONCURRENCY: use a whole number, 1 or more" >&2; exit 1 ;;
 esac
 if [ -n "$MEMORY_SWAP" ]; then CAPS="$CAPS Swap capped too: --memory-swap $MEMORY_SWAP."; fi
 
@@ -102,11 +113,17 @@ wait_started() {  # $1 = label, $2 = container start time in ns
   log "$1: first GET /collections/bench answered after $(ms_since "$2") ms" | tee -a "$OUT/facts.txt"
 }
 
+container_gone() {  # read-only: true, and logs why, when the bench container is no longer running
+  [ "$(podman container inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = true ] && return 1
+  log "$CONTAINER is not running (exit code $(podman container inspect --format '{{.State.ExitCode}}' "$CONTAINER" 2>/dev/null || echo unknown))" >&2
+}
+
 wait_pending() {
   if [ "${DRY_RUN:-0}" = 1 ]; then echo "+ wait for pending_jobs == 0"; return; fi
   local start=$SECONDS n
   while :; do
     n=$(field pending) || n=unknown
+    if [ "$n" = unknown ] && container_gone; then exit 1; fi
     if [ "$n" = 0 ]; then
       log "pending_jobs == 0 after $((SECONDS - start)) s" | tee -a "$OUT/facts.txt"
       return
