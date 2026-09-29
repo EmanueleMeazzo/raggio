@@ -640,8 +640,10 @@ async def _storm(col: Collection, seed: int, stop_after: float | None = None):
         await col.stop()
         ops["stopped"] += 1
 
-    await asyncio.gather(*(client() for _ in range(STRESS_CLIENTS)),
-                         *([stopper()] if stop_after is not None else []))
+    await asyncio.wait_for(  # a lock deadlock fails the test instead of hanging the run
+        asyncio.gather(*(client() for _ in range(STRESS_CLIENTS)),
+                       *([stopper()] if stop_after is not None else [])),
+        STRESS_SECONDS + 60)
     return errors, ops
 
 

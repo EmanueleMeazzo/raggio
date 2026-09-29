@@ -679,16 +679,20 @@ class Collection:
                     pass
             await asyncio.to_thread(self._sync_index)
             self._closed = True
-            # still write-locked, so no search is mid-query on a read connection
+            # write-locked: no search holding the read lock is mid-query. Orphaned
+            # to_thread bodies of cancelled searches, orphaned index builds and the
+            # unlocked reads (list_records, get_document, job status) can still be
+            # (ADR 0001, concurrency addendum, Deferred row)
             await asyncio.to_thread(self._close_conns)
         if self._embedder is not None:
             await self._embedder.aclose()
 
     def _close_conns(self) -> None:
-        # under db_lock: a write transaction still in flight on self.db (a request's
-        # enqueue, or the worker's claim/finish orphaned by its cancellation) commits
-        # before the close, and _rdb re-checks _closed here, so no read connection
-        # registers after this sweep
+        # under db_lock: a write transaction that already holds db_lock on self.db (a
+        # request's enqueue, or the worker's claim/finish orphaned by its cancellation)
+        # commits before the close; one still waiting for db_lock finds the connection
+        # closed and fails, and its job keeps its old status and replays on boot.
+        # _rdb re-checks _closed here, so no read connection registers after this sweep
         with self.db_lock:
             conns, self._read_conns = self._read_conns, []
             for c in conns:
