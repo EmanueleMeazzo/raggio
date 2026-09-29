@@ -39,7 +39,7 @@ def test_lock_matches_the_dependency_groups():
 
 def _shell_lines(text):
     """Lines with backslash continuations joined, so a wrapped command reads as one."""
-    return re.sub(r"\\n\s*", " ", text).splitlines()
+    return re.sub(r"\\\n\s*", " ", text).splitlines()
 
 
 def test_orjson_scripts_are_documented_with_the_bench_group():
