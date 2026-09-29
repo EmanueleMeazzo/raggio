@@ -9,6 +9,11 @@ on:
 permissions:
   contents: read
 
+# uv takes a runner's system Python over its managed builds unless told otherwise; the image
+# runs uv's managed CPython and its bundled SQLite (D2, D15), so every job does too
+env:
+  UV_PYTHON_PREFERENCE: only-managed
+
 jobs:
   # the Python suite on the production interpreter (spec D11); the native-extension job
   # and the non-blocking 3.14t job are added next to this one by their own plans

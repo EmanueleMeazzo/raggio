@@ -183,6 +183,8 @@ Setup and full table: [docs/benchmark.md](docs/benchmark.md).
 
 ## Develop
 
+Needs uv 0.12 or newer (`required-version` in `pyproject.toml`).
+
 ```bash
 uv sync --group bench
 uv run pytest

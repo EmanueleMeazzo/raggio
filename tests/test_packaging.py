@@ -59,6 +59,11 @@ def test_develop_instructions_and_the_dgx_setup_sync_the_bench_group():
     # without the group, the bench-harness tests skip and the DGX venv can't run bench.py
     for doc in ("README.md", "docs/getting-started.md"):
         assert "uv sync --group bench" in (ROOT / doc).read_text(encoding="utf-8").splitlines()
+    # an exact `uv sync` without the group removes orjson again, and the harness tests then skip
+    unsynced = [f"{doc}: {line}" for doc in ("README.md", "docs/getting-started.md")
+                for line in (ROOT / doc).read_text(encoding="utf-8").splitlines()
+                if line.startswith("uv sync") and "--group bench" not in line]
+    assert unsynced == []
     setup = (ROOT / "bench/dgx/setup.sh").read_text(encoding="utf-8")
     assert 'run "$HOME/.local/bin/uv" sync --frozen --group bench' in setup.splitlines()
 
@@ -88,6 +93,9 @@ def test_ci_pins_uv_above_the_floor_and_python_312():
     uv = re.search(r'^\s+version: "(\d+\.\d+\.\d+)"', job, re.M).group(1)
     assert tuple(int(x) for x in uv.split(".")) >= _floor()
     assert re.search(r'^\s+python-version: "3\.12"$', job, re.M)
+    # setup-uv's python-version only sets UV_PYTHON; uv would still take the runner's system 3.12
+    # (Ubuntu's SQLite) over its managed build, the interpreter the image ships (D2, D15)
+    assert re.search(r"^env:\n  UV_PYTHON_PREFERENCE: only-managed$", _ci(), re.M)
 
 
 def test_ci_checks_the_lock_and_runs_the_suite_with_the_bench_group():
@@ -97,6 +105,13 @@ def test_ci_checks_the_lock_and_runs_the_suite_with_the_bench_group():
     assert steps == ["uv lock --check", "uv sync --frozen --group bench", "uv run --no-sync pytest -q"]
     ci = _ci()
     assert re.search(r"^  pull_request:", ci, re.M) and re.search(r"^  push:\n    branches: \[main\]", ci, re.M)
+
+
+def test_every_ci_action_is_pinned_by_commit():
+    # every job, including the ones later plans add: a tag can move, a commit can't
+    uses = re.findall(r"^\s+(?:- )?uses: (.+)$", _ci(), re.M)
+    assert uses and [u for u in uses
+                     if not re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40} # v\d+\.\d+\.\d+", u)] == []
 
 
 CMD = ('CMD ["uvicorn", "raggio.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", '
@@ -110,7 +125,10 @@ def _dockerfile():
 def test_dockerfile_pins_the_ci_uv_and_defaults_to_312_on_trixie():
     d = _dockerfile()
     uv = re.search(r"^ARG UV_VERSION=(\S+)$", d, re.M)
-    assert uv and uv.group(1) == re.search(r'^\s+version: "(\S+)"', _ci_job("test"), re.M).group(1)
+    # every job's setup-uv runs the image's uv, not only the test job's
+    ci = _ci()
+    setups = re.findall(r"^\s+(?:- )?uses: astral-sh/setup-uv@", ci, re.M)
+    assert uv and re.findall(r'^\s+version: "(\S+)"', ci, re.M) == [uv.group(1)] * len(setups)
     assert re.search(r"^ARG PYTHON=3\.12$", d, re.M)
     froms = re.findall(r"^FROM (\S+)", d, re.M)
     assert froms[0] == "ghcr.io/astral-sh/uv:${UV_VERSION}"
@@ -126,8 +144,8 @@ def test_image_keeps_the_runtime_contract():
     assert "RUN useradd -m --uid 1000 app && mkdir /data && chown app /data" in runtime
     # python:3.12-slim set LANG=C.UTF-8; debian:trixie-slim sets no locale
     assert re.search(r"^ENV LANG=C\.UTF-8 DATA_DIR=/data PATH=\"/app/\.venv/bin:\$PATH\"$", runtime, re.M)
-    for line in ("COPY --from=builder /python /python", "WORKDIR /app", "USER app", "VOLUME /data",
-                 "EXPOSE 8000"):
+    for line in ("COPY --from=builder /python /python", "COPY --from=builder /app /app", "WORKDIR /app",
+                 "USER app", "VOLUME /data", "EXPOSE 8000"):
         assert re.search(f"^{re.escape(line)}$", runtime, re.M), line
     assert runtime.rstrip().endswith(CMD)
     # the image installs no dependency group: no pytest, no orjson

@@ -121,6 +121,6 @@ tests) imports; the server itself never needs it.
 Build these docs locally:
 
 ```bash
-uv sync --group docs
+uv sync --group bench --group docs
 uv run mkdocs serve
 ```
