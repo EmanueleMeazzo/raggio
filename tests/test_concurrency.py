@@ -202,3 +202,69 @@ def test_no_threading_lock_is_held_across_an_await():
                        if isinstance(n, (ast.Await, ast.AsyncWith, ast.AsyncFor))]
     assert sites["_catalog_lock"] and sites["db_lock"]  # the scan still sees the locks
     assert awaits == []
+
+
+# ---- delete_collection vs a racing touch() ----
+
+
+def test_delete_collection_is_not_resurrected_by_a_racing_touch(tmp_path, monkeypatch):
+    m = make_manager(tmp_path, monkeypatch)
+
+    async def run():
+        await m.create_collection("x", DIM, 4, None, None, None)
+        c = await m.touch("x")
+        in_stop, release = asyncio.Event(), asyncio.Event()
+        real_stop = c.stop
+
+        async def slow_stop():  # eviction yields to the loop (sync, worker cancel)
+            in_stop.set()
+            await release.wait()
+            await real_stop()
+
+        c.stop = slow_stop
+        deleter = asyncio.create_task(m.delete_collection("x"))
+        await in_stop.wait()
+        toucher = asyncio.create_task(m.touch("x"))  # a request arriving mid-delete
+        await asyncio.sleep(0.05)
+        release.set()
+        await deleter
+        with pytest.raises(KeyError):
+            await toucher  # the collection is gone: 404, never a reload of its files
+        assert "x" not in m.resident
+        await m.shutdown()
+
+    asyncio.run(run())
+
+
+def test_delete_waits_for_an_in_flight_load_of_the_same_collection(tmp_path, monkeypatch):
+    # touch() yields mid-load while it LRU-evicts another collection (and, once
+    # plan C builds Collection off the loop, while it constructs): a delete landing
+    # there must wait, or the load registers a collection whose row and files are gone
+    monkeypatch.setenv("MAX_RESIDENT_COLLECTIONS", "1")
+    m = make_manager(tmp_path, monkeypatch)
+
+    async def run():
+        for n in ("x", "y"):
+            await m.create_collection(n, DIM, 4, None, None, None)
+        x = await m.touch("x")
+        in_stop, release = asyncio.Event(), asyncio.Event()
+        real_stop = x.stop
+
+        async def slow_stop():
+            in_stop.set()
+            await release.wait()
+            await real_stop()
+
+        x.stop = slow_stop
+        loader = asyncio.create_task(m.touch("y"))  # budget 1: evicts x first
+        await in_stop.wait()
+        deleter = asyncio.create_task(m.delete_collection("y"))
+        await asyncio.sleep(0.05)
+        release.set()
+        await asyncio.gather(loader, deleter, return_exceptions=True)
+        state = ("y" in m.resident, m._dir("y").exists(), m.get_config("y"),
+                 loader.exception(), deleter.exception())
+        await m.shutdown()
+        return state
+
+    assert asyncio.run(run()) == (False, False, None, None, None)

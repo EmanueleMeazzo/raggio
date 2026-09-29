@@ -1728,10 +1728,17 @@ class CollectionManager:
             await c.stop()
 
     async def delete_collection(self, name: str) -> None:
-        await self._evict(name)
-        with self._catalog_lock:
-            self.catalog.execute("DELETE FROM collections WHERE name=?", (name,))
-            self.catalog.commit()
+        # evict + catalog delete under _load_lock, like touch() and housekeeping's
+        # evictions: stop() yields, and a touch() landing there would reload the
+        # collection from the still-present row and files (a resident zombie on
+        # deleted files that would also shadow a re-created collection of the same
+        # name). Once the row is gone a racing touch() raises KeyError (404), so the
+        # rmtree can run unlocked.
+        async with self._load_lock:
+            await self._evict(name)
+            with self._catalog_lock:
+                self.catalog.execute("DELETE FROM collections WHERE name=?", (name,))
+                self.catalog.commit()
         await asyncio.to_thread(shutil.rmtree, self._dir(name), True)
 
     async def resume_pending(self) -> None:
