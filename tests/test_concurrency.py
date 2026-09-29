@@ -6,6 +6,7 @@ structurally (lock spies, identity checks) instead of by timing."""
 import ast
 import asyncio
 import collections
+import re
 import sqlite3
 import sys
 import threading
@@ -454,3 +455,60 @@ def test_deleted_collection_leaves_no_files_and_its_name_can_be_reused(tmp_path,
         return gone, docs
 
     assert asyncio.run(run()) == (True, 0)
+
+
+# ---- R4: copy-on-write indexed_counts ----
+
+
+def test_indexed_counts_writers_rebind_never_mutate_the_published_dict(tmp_path):
+    # readers (search gating, BM25's N, request_index) iterate the dict from other
+    # threads; on free-threaded builds an in-place insert races that iteration
+    # ("dictionary changed size during iteration"), so writers must publish a new dict
+    col = make_collection(tmp_path)
+
+    def chunk(i):
+        return {"id": f"c{i}", "text": f"t {i}", "vector": vec(i)}
+
+    asyncio.run(col._process_job({"documents": [
+        {"doc_id": "d1", "chunks": [chunk(1)]}, {"doc_id": "d2", "chunks": [chunk(2)]}]}))
+    writes = {
+        # first summary: a key the dict never had, plus a re-upsert (-1 then +1)
+        "upsert": lambda: asyncio.run(col._process_job({"documents": [
+            {"doc_id": "d1", "summary": {"text": "s", "vector": vec(9)}, "chunks": [chunk(1)]}]})),
+        "delete": lambda: asyncio.run(col.delete_document("d2")),
+    }
+    for name, write in writes.items():
+        published = col.indexed_counts
+        before = dict(published)
+        write()
+        assert published == before, f"{name} mutated the published dict in place"
+        assert col.indexed_counts is not published, f"{name} did not publish a new dict"
+    assert col.indexed_counts == {"chunk": 1, "summary": 1}
+
+
+def test_indexed_counts_is_published_only_under_db_lock(tmp_path):
+    # plan D moves the publication after the commit: it must stay inside db_lock, or
+    # the worker's upsert and a delete_document copy the same base and one rebind
+    # drops the other's update (counts drift; search gating skips a needed allowlist)
+    col = make_collection(tmp_path)
+    seen = []
+
+    class Spy(Collection):
+        def __setattr__(self, name, value):
+            if name == "indexed_counts":
+                seen.append(self.db_lock.locked())
+            super().__setattr__(name, value)
+
+    col.__class__ = Spy
+    asyncio.run(col._process_job({"documents": [
+        {"doc_id": "d1", "chunks": [{"id": "c1", "text": "t", "vector": vec(1)}]}]}))
+    asyncio.run(col.delete_document("d1"))
+    assert seen == [True, True]  # one publication per write, each under db_lock
+
+
+def test_no_in_place_indexed_counts_mutation_in_store_source():
+    # tripwire for future writers (the ingest path is rewritten by later plans)
+    src = Path(store.__file__).read_text(encoding="utf-8")
+    assert not re.search(r"indexed_counts\[[^\n]*?\]\s*(=(?!=)|\+=|-=)", src)
+    assert not re.search(r"del\s+[\w.]*indexed_counts\[", src)
+    assert not re.search(r"indexed_counts\.(update|pop|popitem|setdefault|clear)\(", src)

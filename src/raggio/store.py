@@ -571,7 +571,10 @@ class Collection:
         self.index.prepare()  # warm search caches at load, not on the first query
         # per-type indexed-row counts, kept in step by _upsert_rows/_delete_doc_rows:
         # lets search skip the allowlist (and its full-table id fetch) when nothing
-        # would be excluded — the allowlist path costs ~15x a plain scan at 500k rows
+        # would be excluded — the allowlist path costs ~15x a plain scan at 500k rows.
+        # Copy-on-write: writers (under db_lock) build a new dict and rebind it, never
+        # mutate the published one, so a reader thread iterating it (sum(.values()))
+        # can't hit "dictionary changed size during iteration" on free-threaded builds
         self.indexed_counts: dict[str, int] = dict(
             self.db.execute("SELECT type, COUNT(*) FROM records WHERE indexed=1 GROUP BY type")
         )
@@ -839,6 +842,7 @@ class Collection:
         vecs16 = mat.astype(np.float16)
         ids, fresh = [], []
         with self.db_lock:
+            counts = dict(self.indexed_counts)  # copy-on-write, published below
             # explicit ids, not lastrowid: records are only inserted here, in the single worker
             next_id = self.db.execute("SELECT COALESCE(MAX(id),0) FROM records").fetchone()[0] + 1
             for n, (ext_id, doc_id, rtype, pos, text, meta, _) in enumerate(rows):
@@ -849,7 +853,7 @@ class Collection:
                 if old:  # upsert: replace record; makes crash-replay of a job idempotent
                     if old[1]:
                         self.index.remove(old[0])
-                        self.indexed_counts[old[2]] -= 1
+                        counts[old[2]] -= 1
                     self.db.execute("DELETE FROM records WHERE id=?", (old[0],))
                     self.db.execute("DELETE FROM vecs WHERE id=?", (old[0],))
                 self.db.execute(
@@ -860,9 +864,10 @@ class Collection:
                 self.db.execute(
                     "INSERT INTO vecs(id, vec) VALUES (?,?)", (next_id, vecs16[n].tobytes())
                 )
-                self.indexed_counts[rtype] = self.indexed_counts.get(rtype, 0) + 1
+                counts[rtype] = counts.get(rtype, 0) + 1
                 ids.append(next_id)
                 next_id += 1
+            self.indexed_counts = counts  # one reference store: readers see old or new
             self.db.commit()
         self._allow_cache.clear()
         self._df_cache_churn += len(rows)
@@ -1525,14 +1530,16 @@ class Collection:
             rows = self.db.execute(
                 "SELECT id, indexed, type FROM records WHERE doc_id=?", (doc_id,)
             ).fetchall()
+            counts = dict(self.indexed_counts)  # copy-on-write, as in _upsert_rows
             for rid, indexed, rtype in rows:
                 if indexed:
                     self.index.remove(rid)
-                    self.indexed_counts[rtype] -= 1
+                    counts[rtype] -= 1
             self.db.execute(
                 "DELETE FROM vecs WHERE id IN (SELECT id FROM records WHERE doc_id=?)", (doc_id,)
             )
             self.db.execute("DELETE FROM records WHERE doc_id=?", (doc_id,))
+            self.indexed_counts = counts
             self.db.commit()
         self._allow_cache.clear()
         self._df_cache_churn += len(rows)
