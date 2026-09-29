@@ -97,3 +97,45 @@ def test_ci_checks_the_lock_and_runs_the_suite_with_the_bench_group():
     assert steps == ["uv lock --check", "uv sync --frozen --group bench", "uv run --no-sync pytest -q"]
     ci = _ci()
     assert re.search(r"^  pull_request:", ci, re.M) and re.search(r"^  push:\n    branches: \[main\]", ci, re.M)
+
+
+CMD = ('CMD ["uvicorn", "raggio.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", '
+       '"--no-access-log"]')
+
+
+def _dockerfile():
+    return (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+
+def test_dockerfile_pins_the_ci_uv_and_defaults_to_312_on_trixie():
+    d = _dockerfile()
+    uv = re.search(r"^ARG UV_VERSION=(\S+)$", d, re.M)
+    assert uv and uv.group(1) == re.search(r'^\s+version: "(\S+)"', _ci_job("test"), re.M).group(1)
+    assert re.search(r"^ARG PYTHON=3\.12$", d, re.M)
+    froms = re.findall(r"^FROM (\S+)", d, re.M)
+    assert froms[0] == "ghcr.io/astral-sh/uv:${UV_VERSION}"
+    assert froms[-1] == "docker.io/library/debian:trixie-slim"
+    assert "bookworm" not in d  # the bookworm uv tags stopped at 0.9.30
+    assert re.search(r"^RUN uv python install \$\{PYTHON\}$", d, re.M)
+
+
+def test_image_keeps_the_runtime_contract():
+    d = _dockerfile()
+    runtime = re.split(r"^FROM ", d, flags=re.M)[-1]  # the last stage is the image
+    # the old base's `useradd -m app` got uid 1000; existing /data volumes are owned by it
+    assert "RUN useradd -m --uid 1000 app && mkdir /data && chown app /data" in runtime
+    # python:3.12-slim set LANG=C.UTF-8; debian:trixie-slim sets no locale
+    assert re.search(r"^ENV LANG=C\.UTF-8 DATA_DIR=/data PATH=\"/app/\.venv/bin:\$PATH\"$", runtime, re.M)
+    for line in ("COPY --from=builder /python /python", "WORKDIR /app", "USER app", "VOLUME /data",
+                 "EXPOSE 8000"):
+        assert re.search(f"^{re.escape(line)}$", runtime, re.M), line
+    assert runtime.rstrip().endswith(CMD)
+    # the image installs no dependency group: no pytest, no orjson
+    syncs = re.findall(r"^RUN uv sync (.*)$", d, re.M)
+    assert syncs and all("--frozen" in s and "--no-dev" in s and "--group" not in s for s in syncs)
+
+
+def test_image_runs_blas_single_threaded():
+    # spec D16: numpy's OpenBLAS otherwise spins one thread per core under search load
+    runtime = re.split(r"^FROM ", _dockerfile(), flags=re.M)[-1]
+    assert re.search(r"^ENV OPENBLAS_NUM_THREADS=1$", runtime, re.M)
