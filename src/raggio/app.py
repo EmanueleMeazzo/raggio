@@ -9,7 +9,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from .config import Settings
-from .store import CollectionManager, _normalize, hash_key
+from .store import CollectionDeletedError, CollectionManager, _normalize, hash_key
 
 
 # ---- request models ----
@@ -271,12 +271,21 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
             qvec = None
             if body.mode != "text":
                 # in hybrid mode a supplied vector skips the embedding call
-                vec = q.vector if q.vector is not None else (await c.embedder.embed([q.text]))[0]
+                vec = q.vector
+                if vec is None:
+                    try:
+                        vec = (await c.embedder.embed([q.text]))[0]
+                    except Exception:
+                        if c.deleted:  # DELETE's stop() closed the embedder under this call
+                            raise CollectionDeletedError(c.cfg.name) from None
+                        raise
                 qvec = _normalize(np.array([vec], dtype=np.float32))
             hits = await c.search(body.mode, qvec, q.text, body.k, body.scope, body.filter,
                                   body.expand, body.nprobe)
         except ValueError as e:
             raise HTTPException(400, str(e))
+        except CollectionDeletedError:  # DELETE /collections/{name} landed first
+            raise HTTPException(404, f"collection '{c.cfg.name}' not found")
         return {"hits": hits}
 
     @app.get("/healthz")

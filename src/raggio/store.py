@@ -535,6 +535,11 @@ class _IvfIndex:
         return np.concatenate(parts) if parts else np.empty(0, np.uint64)
 
 
+class CollectionDeletedError(Exception):
+    """A request reached a collection that DELETE /collections/{name} removed while
+    it waited; the app answers 404, as for a name that never existed (spec 3.1 B1)."""
+
+
 class Collection:
     """A resident collection: turbovec index + sqlite metadata + ingest worker."""
 
@@ -571,7 +576,10 @@ class Collection:
         self.index.prepare()  # warm search caches at load, not on the first query
         # per-type indexed-row counts, kept in step by _upsert_rows/_delete_doc_rows:
         # lets search skip the allowlist (and its full-table id fetch) when nothing
-        # would be excluded — the allowlist path costs ~15x a plain scan at 500k rows
+        # would be excluded — the allowlist path costs ~15x a plain scan at 500k rows.
+        # Copy-on-write: writers (under db_lock) build a new dict and rebind it, never
+        # mutate the published one, so a reader thread iterating it (sum(.values()))
+        # can't hit "dictionary changed size during iteration" on free-threaded builds
         self.indexed_counts: dict[str, int] = dict(
             self.db.execute("SELECT type, COUNT(*) FROM records WHERE indexed=1 GROUP BY type")
         )
@@ -595,6 +603,8 @@ class Collection:
         self._closed = False  # set by stop(); makes stale searches fail closed instead
         # of resurrecting connections on a dead collection (leaks the handle and, on
         # Windows, keeps the deleted collection dir undeletable)
+        self.deleted = False  # set by delete_collection before stop(); a search that
+        # then finds the collection closed raises CollectionDeletedError (404)
         self._reconcile_ghosts()
         # one-shot TQ+ calibration arming: any uncalibrated collection still below the
         # threshold participates. After an eviction/restart the reservoir only witnesses
@@ -622,6 +632,10 @@ class Collection:
     def embedder(self) -> Embedder:
         # lazy so vector-only collections work without any embedding endpoint configured
         if self._embedder is None:
+            if self._closed:  # stop() has run: a client built now would never be closed
+                if self.deleted:
+                    raise CollectionDeletedError(self.cfg.name)
+                raise RuntimeError(f"collection '{self.cfg.name}' is closed")
             self._embedder = self._embedder_factory()
         return self._embedder
 
@@ -653,20 +667,37 @@ class Collection:
         self._worker = asyncio.create_task(self._run_worker())
 
     async def stop(self) -> None:
-        if self._worker:
-            self._worker.cancel()
-            try:
-                await self._worker
-            except asyncio.CancelledError:
-                pass
         async with self.lock.write():
+            # cancel the worker only once write-locked: it is then outside its write
+            # section (upsert -> index add -> sync), so no orphaned to_thread body is
+            # left committing rows the index never receives behind a released lock
+            if self._worker:
+                self._worker.cancel()
+                try:
+                    await self._worker
+                except asyncio.CancelledError:
+                    pass
             await asyncio.to_thread(self._sync_index)
             self._closed = True
-        for c in self._read_conns:
-            c.close()
-        self.db.close()
+            # write-locked: no search holding the read lock is mid-query. Orphaned
+            # to_thread bodies of cancelled searches, orphaned index builds and the
+            # unlocked reads (list_records, get_document, job status) can still be
+            # (ADR 0001, concurrency addendum, Deferred row)
+            await asyncio.to_thread(self._close_conns)
         if self._embedder is not None:
             await self._embedder.aclose()
+
+    def _close_conns(self) -> None:
+        # under db_lock: a write transaction that already holds db_lock on self.db (a
+        # request's enqueue, or the worker's claim/finish orphaned by its cancellation)
+        # commits before the close; one still waiting for db_lock finds the connection
+        # closed and fails, and its job keeps its old status and replays on boot.
+        # _rdb re-checks _closed here, so no read connection registers after this sweep
+        with self.db_lock:
+            conns, self._read_conns = self._read_conns, []
+            for c in conns:
+                c.close()
+            self.db.close()
 
     async def enqueue(self, payload: dict) -> int:
         # journaling a bulky payload is real I/O: run the transaction in a thread and
@@ -826,6 +857,7 @@ class Collection:
         vecs16 = mat.astype(np.float16)
         ids, fresh = [], []
         with self.db_lock:
+            counts = dict(self.indexed_counts)  # copy-on-write, published below
             # explicit ids, not lastrowid: records are only inserted here, in the single worker
             next_id = self.db.execute("SELECT COALESCE(MAX(id),0) FROM records").fetchone()[0] + 1
             for n, (ext_id, doc_id, rtype, pos, text, meta, _) in enumerate(rows):
@@ -836,7 +868,7 @@ class Collection:
                 if old:  # upsert: replace record; makes crash-replay of a job idempotent
                     if old[1]:
                         self.index.remove(old[0])
-                        self.indexed_counts[old[2]] -= 1
+                        counts[old[2]] -= 1
                     self.db.execute("DELETE FROM records WHERE id=?", (old[0],))
                     self.db.execute("DELETE FROM vecs WHERE id=?", (old[0],))
                 self.db.execute(
@@ -847,9 +879,10 @@ class Collection:
                 self.db.execute(
                     "INSERT INTO vecs(id, vec) VALUES (?,?)", (next_id, vecs16[n].tobytes())
                 )
-                self.indexed_counts[rtype] = self.indexed_counts.get(rtype, 0) + 1
+                counts[rtype] = counts.get(rtype, 0) + 1
                 ids.append(next_id)
                 next_id += 1
+            self.indexed_counts = counts  # one reference store: readers see old or new
             self.db.commit()
         self._allow_cache.clear()
         self._df_cache_churn += len(rows)
@@ -1069,9 +1102,12 @@ class Collection:
         if db is None:
             db = sqlite3.connect(self.dir / "meta.db", check_same_thread=False)
             db.execute("PRAGMA query_only=1")
-            self._read_local.db = db
             with self.db_lock:
+                if self._closed:  # stop() swept the registry while this one opened
+                    db.close()
+                    raise RuntimeError(f"collection '{self.cfg.name}' is closed")
                 self._read_conns.append(db)
+            self._read_local.db = db
         return db
 
     def _hydrate(self, ids: list[int], scores: list[float] | None = None) -> list[dict]:
@@ -1409,6 +1445,10 @@ class Collection:
     ) -> list[dict]:
         n = max(HYBRID_DEPTH, k) if mode == "hybrid" else k  # per-leg depth so RRF sees the tail
         async with self.lock.read():
+            if self._closed:  # queued for the read lock behind stop()'s write section
+                if self.deleted:
+                    raise CollectionDeletedError(self.cfg.name)
+                raise RuntimeError(f"collection '{self.cfg.name}' is closed")
             if mode == "vector":
                 ids, scores = await self._vector_ids(qvec, n, scope, filt, nprobe)
             elif mode == "text":
@@ -1509,14 +1549,16 @@ class Collection:
             rows = self.db.execute(
                 "SELECT id, indexed, type FROM records WHERE doc_id=?", (doc_id,)
             ).fetchall()
+            counts = dict(self.indexed_counts)  # copy-on-write, as in _upsert_rows
             for rid, indexed, rtype in rows:
                 if indexed:
                     self.index.remove(rid)
-                    self.indexed_counts[rtype] -= 1
+                    counts[rtype] -= 1
             self.db.execute(
                 "DELETE FROM vecs WHERE id IN (SELECT id FROM records WHERE doc_id=?)", (doc_id,)
             )
             self.db.execute("DELETE FROM records WHERE doc_id=?", (doc_id,))
+            self.indexed_counts = counts
             self.db.commit()
         self._allow_cache.clear()
         self._df_cache_churn += len(rows)
@@ -1610,8 +1652,11 @@ class CollectionManager:
             if col not in have:
                 self.catalog.execute(f"ALTER TABLE collections ADD COLUMN {ddl}")
                 self.catalog.commit()
-        # attach/detach jobs update index_config from worker threads while the loop
-        # creates/deletes rows: serialize write transactions so they never interleave
+        # EVERY catalog statement (reads too) runs under this lock: require_collection
+        # is a sync FastAPI dependency, so get_config runs on threadpool threads while
+        # the loop creates/deletes rows and attach/detach jobs update index_config.
+        # One pysqlite connection used concurrently returns another query's row or
+        # raises InterfaceError (ADR 0001, addendum 2026-09)
         self._catalog_lock = threading.Lock()
         self.resident: dict[str, Collection] = {}
         self._load_lock = asyncio.Lock()
@@ -1628,11 +1673,12 @@ class CollectionManager:
         return self.data_dir / "collections" / name
 
     def get_config(self, name: str) -> CollectionConfig | None:
-        row = self.catalog.execute(
-            "SELECT name, dim, bit_width, model, base_url, key_hash, tokenizer, index_config"
-            " FROM collections WHERE name=?",
-            (name,),
-        ).fetchone()
+        with self._catalog_lock:
+            row = self.catalog.execute(
+                "SELECT name, dim, bit_width, model, base_url, key_hash, tokenizer, index_config"
+                " FROM collections WHERE name=?",
+                (name,),
+            ).fetchone()
         if row is None:
             return None
         return CollectionConfig(
@@ -1648,7 +1694,9 @@ class CollectionManager:
             self.catalog.commit()
 
     def list_collections(self) -> list[str]:
-        return [r[0] for r in self.catalog.execute("SELECT name FROM collections ORDER BY name")]
+        with self._catalog_lock:  # fetchall inside: the cursor is the shared state
+            rows = self.catalog.execute("SELECT name FROM collections ORDER BY name").fetchall()
+        return [r[0] for r in rows]
 
     async def create_collection(
         self,
@@ -1722,10 +1770,20 @@ class CollectionManager:
             await c.stop()
 
     async def delete_collection(self, name: str) -> None:
-        await self._evict(name)
-        with self._catalog_lock:
-            self.catalog.execute("DELETE FROM collections WHERE name=?", (name,))
-            self.catalog.commit()
+        # evict + catalog delete under _load_lock, like touch() and housekeeping's
+        # evictions: stop() yields, and a touch() landing there would reload the
+        # collection from the still-present row and files (a resident zombie on
+        # deleted files that would also shadow a re-created collection of the same
+        # name). Once the row is gone a racing touch() raises KeyError (404), so the
+        # rmtree can run unlocked.
+        async with self._load_lock:
+            c = self.resident.get(name)
+            if c is not None:  # its queued searches answer 404 once stop() closes it
+                c.deleted = True
+            await self._evict(name)
+            with self._catalog_lock:
+                self.catalog.execute("DELETE FROM collections WHERE name=?", (name,))
+                self.catalog.commit()
         await asyncio.to_thread(shutil.rmtree, self._dir(name), True)
 
     async def resume_pending(self) -> None:
@@ -1751,4 +1809,5 @@ class CollectionManager:
     async def shutdown(self) -> None:
         for name in list(self.resident):
             await self._evict(name)
-        self.catalog.close()
+        with self._catalog_lock:  # a threadpool get_config may still be mid-query
+            self.catalog.close()
