@@ -6,6 +6,7 @@ structurally (lock spies, identity checks) instead of by timing."""
 import ast
 import asyncio
 import collections
+import sqlite3
 import sys
 import threading
 import time
@@ -19,7 +20,7 @@ import pytest
 import raggio.store as store
 from raggio.app import create_app
 from raggio.config import Settings
-from raggio.store import CollectionManager
+from raggio.store import Collection, CollectionConfig, CollectionManager
 
 DIM = 8
 ROOT = {"x-api-key": "root-key"}
@@ -37,6 +38,14 @@ class FakeEmbedder:
 
     async def aclose(self):
         pass
+
+
+def vec(seed):
+    return np.random.default_rng(seed).standard_normal(DIM).tolist()
+
+
+def make_collection(tmp_path) -> Collection:
+    return Collection(CollectionConfig("t", DIM, 4, None, None, None), Path(tmp_path), FakeEmbedder)
 
 
 def make_manager(tmp_path, monkeypatch) -> CollectionManager:
@@ -268,3 +277,180 @@ def test_delete_waits_for_an_in_flight_load_of_the_same_collection(tmp_path, mon
         return state
 
     assert asyncio.run(run()) == (False, False, None, None, None)
+
+
+# ---- R3: Collection.stop() vs in-flight threads ----
+
+
+def test_stop_does_not_cancel_the_worker_inside_its_write_section(tmp_path):
+    # cancelling first released the write lock mid-upsert while the orphaned to_thread
+    # body went on to commit indexed=1 rows the index never received: a filtered search
+    # in that window built an allowlist with ids the index lacks (turbovec KeyError)
+    col = make_collection(tmp_path)
+    inside, release = threading.Event(), threading.Event()
+    real_upsert = col._upsert_rows
+
+    def slow_upsert(rows, mat):
+        inside.set()
+        release.wait(5)
+        return real_upsert(rows, mat)
+
+    col._upsert_rows = slow_upsert
+
+    async def run():
+        col.start_worker()
+        await col.enqueue({"documents": [
+            {"doc_id": "d", "chunks": [{"id": "c", "text": "t", "vector": vec(1)}]}]})
+        assert await asyncio.to_thread(inside.wait, 5)
+        stopper = asyncio.create_task(col.stop())
+        await asyncio.sleep(0.1)
+        cancelled_mid_write = col._worker.done()
+        release.set()
+        await asyncio.wait_for(stopper, 5)
+        return cancelled_mid_write
+
+    assert asyncio.run(run()) is False  # stop() waited for upsert -> add -> sync
+    reopened = make_collection(tmp_path)  # the row reached the index before the close
+    try:
+        n = reopened._rdb().execute("SELECT COUNT(*) FROM records WHERE indexed=1").fetchone()[0]
+        assert (n, len(reopened.index)) == (1, 1)
+    finally:
+        asyncio.run(reopened.stop())
+
+
+def test_stop_waits_for_a_write_transaction_its_cancelled_worker_left_running(tmp_path):
+    col = make_collection(tmp_path)
+    inside, release = threading.Event(), threading.Event()
+    outcome = {}
+
+    def slow_finish(job_id, status, error):  # the worker's to_thread body, still running
+        with col.db_lock:  # once stop() cancels the task that awaited it
+            inside.set()
+            release.wait(5)
+            try:
+                col.db.execute("UPDATE jobs SET status=? WHERE id=?", (status, job_id))
+                col.db.commit()
+                outcome["committed"] = status
+            except sqlite3.ProgrammingError as e:  # "Cannot operate on a closed database"
+                outcome["error"] = e
+
+    col._finish_job = slow_finish
+
+    async def run():
+        col.start_worker()
+        await col.enqueue({"documents": [
+            {"doc_id": "d", "chunks": [{"id": "c", "text": "t", "vector": vec(1)}]}]})
+        assert await asyncio.to_thread(inside.wait, 5)
+        stopper = asyncio.create_task(col.stop())
+        for _ in range(500):  # until stop() has marked the collection closed
+            if col._closed:
+                break
+            await asyncio.sleep(0.01)
+        assert col._closed, "stop() never marked the collection closed"
+        await asyncio.sleep(0.1)
+        closed_under_the_writer = stopper.done()
+        release.set()
+        await asyncio.wait_for(stopper, 5)
+        return closed_under_the_writer
+
+    assert asyncio.run(run()) is False  # stop() waited for db_lock before closing
+    assert outcome == {"committed": "done"}
+
+
+def test_read_connection_opened_during_stop_is_closed_not_leaked(tmp_path, monkeypatch):
+    col = make_collection(tmp_path)
+    opened = []
+    connecting, release = threading.Event(), threading.Event()
+    real_connect = sqlite3.connect
+
+    def spy_connect(*args, **kw):
+        conn = real_connect(*args, **kw)
+        opened.append(conn)
+        if threading.current_thread().name == "late-reader":
+            connecting.set()  # past _rdb's _closed check, not yet registered
+            release.wait(5)
+        return conn
+
+    monkeypatch.setattr(store.sqlite3, "connect", spy_connect)
+    outcome = {}
+
+    def late_reader():
+        try:
+            outcome["conn"] = col._rdb()
+        except RuntimeError as e:
+            outcome["error"] = e
+
+    async def run():
+        reader = threading.Thread(target=late_reader, name="late-reader")
+        reader.start()
+        assert await asyncio.to_thread(connecting.wait, 5)
+        await col.stop()
+        release.set()
+        await asyncio.to_thread(reader.join, 5)
+
+    asyncio.run(run())
+    assert "error" in outcome  # a closed collection hands out no connection
+    for conn in opened:  # and every connection it opened is closed (Windows: the
+        with pytest.raises(sqlite3.ProgrammingError):  # dir stays deletable)
+            conn.execute("SELECT 1")
+
+
+class _CloseSpy:
+    """Stands in for a sqlite3 connection; records the collection's lock state at close()."""
+
+    def __init__(self, inner, col, seen):
+        self._inner, self._col, self._seen = inner, col, seen
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def close(self):
+        self._seen.append((self._col.lock._writing, self._col.db_lock.locked()))
+        self._inner.close()
+
+
+def test_stop_closes_connections_inside_the_write_lock_and_under_db_lock(tmp_path):
+    # the stop() contract plan D2 builds on (its flush goes in the same section, before
+    # the close): no search mid-query on a read connection (write lock), no write
+    # transaction mid-flight on self.db (db_lock) when the connections close
+    col = make_collection(tmp_path)
+    seen = []
+
+    async def run():
+        col.start_worker()
+        await asyncio.to_thread(col.stats)  # a pool thread registers a read connection
+        col.db = _CloseSpy(col.db, col, seen)
+        col._read_conns[:] = [_CloseSpy(c, col, seen) for c in col._read_conns]
+        await col.stop()
+
+    asyncio.run(run())
+    assert len(seen) >= 2
+    assert set(seen) == {(True, True)}
+
+
+def test_deleted_collection_leaves_no_files_and_its_name_can_be_reused(tmp_path, monkeypatch):
+    # stop() must close every connection the collection opened (the write connection
+    # and one read connection per thread that served it): on Windows one leaked handle
+    # makes delete's rmtree(ignore_errors=True) leave the directory behind
+    m = make_manager(tmp_path, monkeypatch)
+
+    async def run():
+        await m.create_collection("x", DIM, 4, None, None, None)
+        c = await m.touch("x")
+        await c.enqueue({"documents": [
+            {"doc_id": "d", "chunks": [{"id": "c", "text": "t", "vector": vec(1)}]}]})
+        deadline = time.monotonic() + 10
+        while c.pending_jobs():
+            assert time.monotonic() < deadline, "ingest job never finished"
+            await asyncio.sleep(0.01)
+        await asyncio.gather(*(asyncio.to_thread(c.list_records, "both", None, None, 10, 0)
+                               for _ in range(8)))
+        assert c.get_document("d") is not None
+        await m.delete_collection("x")
+        gone = not m._dir("x").exists()
+        await m.create_collection("x", DIM, 4, None, None, None)
+        docs = (await m.touch("x")).stats()["documents"]
+        await m.shutdown()
+        return gone, docs
+
+    assert asyncio.run(run()) == (True, 0)

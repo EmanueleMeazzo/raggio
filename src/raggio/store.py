@@ -653,20 +653,33 @@ class Collection:
         self._worker = asyncio.create_task(self._run_worker())
 
     async def stop(self) -> None:
-        if self._worker:
-            self._worker.cancel()
-            try:
-                await self._worker
-            except asyncio.CancelledError:
-                pass
         async with self.lock.write():
+            # cancel the worker only once write-locked: it is then outside its write
+            # section (upsert -> index add -> sync), so no orphaned to_thread body is
+            # left committing rows the index never receives behind a released lock
+            if self._worker:
+                self._worker.cancel()
+                try:
+                    await self._worker
+                except asyncio.CancelledError:
+                    pass
             await asyncio.to_thread(self._sync_index)
             self._closed = True
-        for c in self._read_conns:
-            c.close()
-        self.db.close()
+            # still write-locked, so no search is mid-query on a read connection
+            await asyncio.to_thread(self._close_conns)
         if self._embedder is not None:
             await self._embedder.aclose()
+
+    def _close_conns(self) -> None:
+        # under db_lock: a write transaction still in flight on self.db (a request's
+        # enqueue, or the worker's claim/finish orphaned by its cancellation) commits
+        # before the close, and _rdb re-checks _closed here, so no read connection
+        # registers after this sweep
+        with self.db_lock:
+            conns, self._read_conns = self._read_conns, []
+            for c in conns:
+                c.close()
+            self.db.close()
 
     async def enqueue(self, payload: dict) -> int:
         # journaling a bulky payload is real I/O: run the transaction in a thread and
@@ -1069,9 +1082,12 @@ class Collection:
         if db is None:
             db = sqlite3.connect(self.dir / "meta.db", check_same_thread=False)
             db.execute("PRAGMA query_only=1")
-            self._read_local.db = db
             with self.db_lock:
+                if self._closed:  # stop() swept the registry while this one opened
+                    db.close()
+                    raise RuntimeError(f"collection '{self.cfg.name}' is closed")
                 self._read_conns.append(db)
+            self._read_local.db = db
         return db
 
     def _hydrate(self, ids: list[int], scores: list[float] | None = None) -> list[dict]:
