@@ -61,3 +61,39 @@ def test_develop_instructions_and_the_dgx_setup_sync_the_bench_group():
         assert "uv sync --group bench" in (ROOT / doc).read_text(encoding="utf-8").splitlines()
     setup = (ROOT / "bench/dgx/setup.sh").read_text(encoding="utf-8")
     assert 'run "$HOME/.local/bin/uv" sync --frozen --group bench' in setup.splitlines()
+
+
+def _ci():
+    return (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
+
+
+def _ci_job(name):
+    """One job's lines of tests.yml: the jobs later plans add (native, 3.14t) carry their
+    own steps and pins."""
+    lines = _ci().splitlines()
+    start = lines.index(f"  {name}:")
+    end = next((i for i in range(start + 1, len(lines)) if re.match(r"^ {0,2}\S", lines[i])), len(lines))
+    return "\n".join(lines[start:end])
+
+
+def _floor():
+    return tuple(int(x) for x in PYPROJECT["tool"]["uv"]["required-version"].removeprefix(">=").split("."))
+
+
+def test_ci_pins_uv_above_the_floor_and_python_312():
+    job = _ci_job("test")
+    assert re.search(r"^    runs-on: ubuntu-latest$", job, re.M)
+    # third-party action pinned by commit, tag in the comment
+    assert re.search(r"^\s+- uses: astral-sh/setup-uv@[0-9a-f]{40} # v\d+\.\d+\.\d+$", job, re.M)
+    uv = re.search(r'^\s+version: "(\d+\.\d+\.\d+)"', job, re.M).group(1)
+    assert tuple(int(x) for x in uv.split(".")) >= _floor()
+    assert re.search(r'^\s+python-version: "3\.12"$', job, re.M)
+
+
+def test_ci_checks_the_lock_and_runs_the_suite_with_the_bench_group():
+    job = _ci_job("test")
+    steps = [ln.strip().removeprefix("- run: ") for ln in job.splitlines() if ln.strip().startswith("- run: ")]
+    # without --group bench the bench-harness tests would skip instead of run
+    assert steps == ["uv lock --check", "uv sync --frozen --group bench", "uv run --no-sync pytest -q"]
+    ci = _ci()
+    assert re.search(r"^  pull_request:", ci, re.M) and re.search(r"^  push:\n    branches: \[main\]", ci, re.M)
