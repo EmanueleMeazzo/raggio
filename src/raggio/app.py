@@ -9,7 +9,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from .config import Settings
-from .store import CollectionManager, _normalize, hash_key
+from .store import CollectionDeletedError, CollectionManager, _normalize, hash_key
 
 
 # ---- request models ----
@@ -277,6 +277,8 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
                                   body.expand, body.nprobe)
         except ValueError as e:
             raise HTTPException(400, str(e))
+        except CollectionDeletedError:  # DELETE /collections/{name} landed first
+            raise HTTPException(404, f"collection '{c.cfg.name}' not found")
         return {"hits": hits}
 
     @app.get("/healthz")

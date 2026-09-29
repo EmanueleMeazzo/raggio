@@ -690,3 +690,92 @@ def test_stop_under_load_fails_closed_and_closes_every_connection(tmp_path, monk
     for conn in opened:  # the write connection and every per-thread read connection
         with pytest.raises(sqlite3.ProgrammingError):
             conn.execute("SELECT 1")
+
+
+# ---- B1/B2: searches over HTTP at c=16, and racing DELETE /collections/{name} ----
+
+
+def test_http_searches_at_c16_and_racing_a_collection_delete(tmp_path, monkeypatch):
+    # spec 3.1 B2, in process: (1) 16 clients search, half with the collection
+    # key: every one 200 (R1: no 401 on a valid key, no 500); (2) 16 clients search
+    # while DELETE /collections/x lands behind a writer: 200 before it, 404 after
+    # it, never 500 (B1)
+    monkeypatch.setenv("ROOT_API_KEY", "root-key")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
+    app = create_app(embedder_factory=lambda cfg: FakeEmbedder())
+    key = {"x-api-key": "key-x"}
+    inside, release, gate = threading.Event(), threading.Event(), {}
+    real_patch = Collection._patch_rows
+
+    def gated_patch(self, *args):  # holds a PATCH inside its write section
+        gate["col"] = self
+        inside.set()
+        release.wait(5)
+        return real_patch(self, *args)
+
+    def body(i):
+        mode = ("vector", "text", "hybrid")[i % 3]
+        q = {} if mode == "vector" else {"text": f"w{i % 7} w{i % 5}"}
+        if mode != "text":
+            q["vector"] = vec(i)
+        return {"query": q, "mode": mode, "k": 5}
+
+    async def run():
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+                r = await c.post("/collections", headers=ROOT,
+                                 json={"name": "x", "collection_key": "key-x"})
+                assert r.status_code == 201, r.text
+                docs = [{"doc_id": f"d{i}", "chunks": [
+                    {"id": f"d{i}c{j}", "text": f"w{i % 7} w{j}", "vector": vec(10 * i + j)}
+                    for j in range(3)]} for i in range(40)]
+                r = await c.post("/collections/x/documents", headers=ROOT, json={"documents": docs})
+                job = r.json()["job_id"]
+                for _ in range(500):
+                    r = await c.get(f"/collections/x/jobs/{job}", headers=ROOT)
+                    if r.json()["status"] == "done":
+                        break
+                    await asyncio.sleep(0.01)
+                assert r.json()["status"] == "done", r.text
+                phase1, phase2 = collections.Counter(), collections.Counter()
+
+                async def client(t):  # phase 1: 20 searches each, alternating keys
+                    for n in range(20):
+                        hdr, who = (key, "key") if n % 2 else (ROOT, "root")
+                        r = await c.post("/collections/x/search", headers=hdr, json=body(t + n))
+                        phase1[f"{who}:{r.status_code}"] += 1
+
+                await asyncio.gather(*(client(t) for t in range(16)))
+
+                async def looper(t):  # phase 2: search until the delete reaches us
+                    for n in range(10_000):
+                        r = await c.post("/collections/x/search", headers=ROOT, json=body(t + n))
+                        phase2[r.status_code] += 1
+                        if r.status_code != 200:
+                            return
+
+                monkeypatch.setattr(Collection, "_patch_rows", gated_patch)
+                loopers = [asyncio.create_task(looper(t)) for t in range(16)]
+                await asyncio.sleep(0.05)
+                patch = asyncio.create_task(c.patch("/collections/x/documents/d0", headers=ROOT,
+                                                    json={"metadata": {"g": 1}}))
+                assert await asyncio.to_thread(inside.wait, 5)
+                await asyncio.sleep(0.1)  # the loopers' next searches queue behind it
+                delete = asyncio.create_task(c.delete("/collections/x", headers=ROOT))
+                for _ in range(500):  # until stop() waits for the write lock too
+                    if gate["col"].lock._writers_waiting:
+                        break
+                    await asyncio.sleep(0.01)
+                queued = bool(gate["col"].lock._writers_waiting)
+                release.set()
+                assert queued, "stop() never queued for the write lock"
+                statuses = [(await patch).status_code, (await delete).status_code]
+                await asyncio.gather(*loopers)
+                r = await c.post("/collections/x/search", headers=ROOT, json=body(0))
+                statuses.append(r.status_code)
+        return dict(phase1), sorted(phase2), phase2[404], statuses
+
+    assert asyncio.run(run()) == (
+        {"key:200": 160, "root:200": 160}, [200, 404], 16, [200, 200, 404])

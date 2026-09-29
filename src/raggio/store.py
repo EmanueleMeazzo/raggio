@@ -535,6 +535,11 @@ class _IvfIndex:
         return np.concatenate(parts) if parts else np.empty(0, np.uint64)
 
 
+class CollectionDeletedError(Exception):
+    """A request reached a collection that DELETE /collections/{name} removed while
+    it waited; the app answers 404, as for a name that never existed (spec 3.1 B1)."""
+
+
 class Collection:
     """A resident collection: turbovec index + sqlite metadata + ingest worker."""
 
@@ -598,6 +603,8 @@ class Collection:
         self._closed = False  # set by stop(); makes stale searches fail closed instead
         # of resurrecting connections on a dead collection (leaks the handle and, on
         # Windows, keeps the deleted collection dir undeletable)
+        self.deleted = False  # set by delete_collection before stop(); a search that
+        # then finds the collection closed raises CollectionDeletedError (404)
         self._reconcile_ghosts()
         # one-shot TQ+ calibration arming: any uncalibrated collection still below the
         # threshold participates. After an eviction/restart the reservoir only witnesses
@@ -1430,6 +1437,10 @@ class Collection:
     ) -> list[dict]:
         n = max(HYBRID_DEPTH, k) if mode == "hybrid" else k  # per-leg depth so RRF sees the tail
         async with self.lock.read():
+            if self._closed:  # queued for the read lock behind stop()'s write section
+                if self.deleted:
+                    raise CollectionDeletedError(self.cfg.name)
+                raise RuntimeError(f"collection '{self.cfg.name}' is closed")
             if mode == "vector":
                 ids, scores = await self._vector_ids(qvec, n, scope, filt, nprobe)
             elif mode == "text":
@@ -1758,6 +1769,9 @@ class CollectionManager:
         # name). Once the row is gone a racing touch() raises KeyError (404), so the
         # rmtree can run unlocked.
         async with self._load_lock:
+            c = self.resident.get(name)
+            if c is not None:  # its queued searches answer 404 once stop() closes it
+                c.deleted = True
             await self._evict(name)
             with self._catalog_lock:
                 self.catalog.execute("DELETE FROM collections WHERE name=?", (name,))
