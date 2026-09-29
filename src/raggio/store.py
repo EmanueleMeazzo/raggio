@@ -632,6 +632,10 @@ class Collection:
     def embedder(self) -> Embedder:
         # lazy so vector-only collections work without any embedding endpoint configured
         if self._embedder is None:
+            if self._closed:  # stop() has run: a client built now would never be closed
+                if self.deleted:
+                    raise CollectionDeletedError(self.cfg.name)
+                raise RuntimeError(f"collection '{self.cfg.name}' is closed")
             self._embedder = self._embedder_factory()
         return self._embedder
 

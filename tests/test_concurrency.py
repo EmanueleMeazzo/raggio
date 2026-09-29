@@ -24,7 +24,7 @@ import pytest
 import raggio.store as store
 from raggio.app import create_app
 from raggio.config import Settings
-from raggio.store import Collection, CollectionConfig, CollectionManager
+from raggio.store import Collection, CollectionConfig, CollectionDeletedError, CollectionManager
 
 DIM = 8
 ROOT = {"x-api-key": "root-key"}
@@ -779,3 +779,78 @@ def test_http_searches_at_c16_and_racing_a_collection_delete(tmp_path, monkeypat
 
     assert asyncio.run(run()) == (
         {"key:200": 160, "root:200": 160}, [200, 404], 16, [200, 200, 404])
+
+
+# ---- B1: a search that the server embeds, with DELETE landing during the embedding call ----
+
+
+class GatedEmbedder:
+    """embed() parks until released; aclose() releases it. With fail_after_close,
+    a parked call then fails the way a closed httpx client does."""
+
+    def __init__(self, fail_after_close: bool):
+        self.fail_after_close = fail_after_close
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.closed = False
+
+    async def embed(self, texts):
+        self.entered.set()
+        await self.release.wait()
+        if self.closed and self.fail_after_close:
+            raise RuntimeError("Cannot send a request, as the client has been closed.")
+        return [vec(0) for _ in texts]
+
+    async def aclose(self):
+        self.closed = True
+        self.release.set()
+
+
+@pytest.mark.parametrize("fail_after_close", [True, False])
+def test_http_search_embedding_while_delete_lands_answers_404(tmp_path, monkeypatch, fail_after_close):
+    monkeypatch.setenv("ROOT_API_KEY", "root-key")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
+    emb = GatedEmbedder(fail_after_close)
+    app = create_app(embedder_factory=lambda cfg: emb)
+    search_body = {"query": {"text": "w1"}, "mode": "hybrid", "k": 5}
+
+    async def run():
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+                r = await c.post("/collections", headers=ROOT, json={"name": "x"})
+                assert r.status_code == 201, r.text
+                docs = [{"doc_id": f"d{i}", "chunks": [
+                    {"id": f"d{i}c{j}", "text": f"w{i % 7} w{j}", "vector": vec(10 * i + j)}
+                    for j in range(3)]} for i in range(5)]
+                r = await c.post("/collections/x/documents", headers=ROOT, json={"documents": docs})
+                job = r.json()["job_id"]
+                for _ in range(500):
+                    r = await c.get(f"/collections/x/jobs/{job}", headers=ROOT)
+                    if r.json()["status"] == "done":
+                        break
+                    await asyncio.sleep(0.01)
+                assert r.json()["status"] == "done", r.text
+                search = asyncio.create_task(
+                    c.post("/collections/x/search", headers=ROOT, json=search_body))
+                await asyncio.wait_for(emb.entered.wait(), 5)
+                d = await c.delete("/collections/x", headers=ROOT)
+                s = await asyncio.wait_for(search, 10)
+                after = await c.post("/collections/x/search", headers=ROOT, json=search_body)
+        return d.status_code, s.status_code, after.status_code
+
+    assert asyncio.run(run()) == (200, 404, 404)
+
+
+def test_closed_collection_never_builds_an_embedder(tmp_path):
+    calls = []
+    col = Collection(CollectionConfig("t", DIM, 4, None, None, None), Path(tmp_path),
+                     lambda: calls.append(1) or FakeEmbedder())
+    asyncio.run(col.stop())
+    with pytest.raises(RuntimeError, match="is closed"):
+        col.embedder
+    col.deleted = True
+    with pytest.raises(CollectionDeletedError):
+        col.embedder
+    assert calls == []

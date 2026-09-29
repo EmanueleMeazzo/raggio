@@ -271,7 +271,14 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
             qvec = None
             if body.mode != "text":
                 # in hybrid mode a supplied vector skips the embedding call
-                vec = q.vector if q.vector is not None else (await c.embedder.embed([q.text]))[0]
+                vec = q.vector
+                if vec is None:
+                    try:
+                        vec = (await c.embedder.embed([q.text]))[0]
+                    except Exception:
+                        if c.deleted:  # DELETE's stop() closed the embedder under this call
+                            raise CollectionDeletedError(c.cfg.name) from None
+                        raise
                 qvec = _normalize(np.array([vec], dtype=np.float32))
             hits = await c.search(body.mode, qvec, q.text, body.k, body.scope, body.filter,
                                   body.expand, body.nprobe)
