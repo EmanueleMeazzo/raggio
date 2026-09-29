@@ -464,6 +464,8 @@ All five code tasks passed review on the first pass, with no fix rounds.
   - The concurrent hybrid p99 is 2.5 to 5.1 s across the eight runs.
   - The slowest of the first ten hybrid queries takes 560 to 598 ms per run, inside spec §6's 470 to 980 ms estimate.
 
+### 2026-09-29
+
 **00:01Z. a-equiv2, the replication the brief prescribes when the gate fails.** PR 1's final head (caa93b1) was deployed first. Its delta over d312711 is validation and diagnostics only, but this way the scripts that measure are the ones the PR ships. The launch line is otherwise the same. The volume now starts flat, so this session also runs in the other order: flat first, then the IVF build as run0. Either way, the maintainer decides once both tables are in.
 
 **00:19Z. a-equiv2 finished** in 18 minutes on PR 1's final head. It ran flat first, then built a fresh IVF index in run0. The G5 rows were all present. **The gate failed again**, on six rows:
@@ -604,6 +606,87 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
 - **Issues:** the maintainer chose to file all five drafts (section 9.5), labelled `needs-triage`. They are not filed yet, because the GitHub CLI on the workstation is not logged in. They are filed once the maintainer logs in.
 - **Docs:** the maintainer chose to commit this journal and plan A's `git archive` line-ending fix locally on `docs/perf-plans-2026-09` now. Task 8's entries go on `docs/planB-race-rerun`, branched from it.
 
+**11:12Z. Plan B's race re-run on gn100 (DGX Spark) starts.** This is plan B's Task 8. B merged as d096fde onto ff48930. Both images are built from the repository `Dockerfile`, which uses Python 3.12 on Debian bookworm:
+- `localhost/raggio:planB-pre-ff48930` (4a7fd9c5f84b);
+- `localhost/raggio:planB-post-d096fde` (8d0ea119dc04).
+- **Go-ahead:** the maintainer's standing "you can continue the DGX tasks too with no limits" (09-28 01:11:33Z, section 7.7, W-2). The task caps itself at 30 minutes, and `timeout` caps the race script at 20.
+- **Conditions:**
+  - p4's scripts are unchanged except for the working directory and `podman rm --ignore` in place of `podman rm -f`;
+  - `--memory 4g` and `OPENBLAS_NUM_THREADS=1`;
+  - a fresh data directory per run;
+  - a 45 s mixed phase;
+  - 2 reps, alternating `pre` and `post`.
+  - `bench-tv` was up but idle, left running by control1. It serves another port and was not touched.
+- **Builds:** both took about 2 s. `pre` came entirely from the build cache, because an image with the same sources had been built before. `post` reused the dependency layers and rebuilt from `COPY src` on. The two arms therefore share the same interpreter and the same SQLite.
+- **Deviations from the plan:**
+  - p4's driver venv was gone. It was most likely removed in p4's clean-up: p4's directory last changed on 09-28 at 20:06Z, the minute p4 recorded its end state. A fresh venv was built in the task's own directory from the host's Python 3.12.3, with httpx 0.28.1 and numpy 2.5.2, raggio's locked versions. The driver only sends requests and draws random vectors, so it cannot change the status codes the server returns. The plan said to stop and report here. The ruling was to go on, because the new venv touches nothing of p4's.
+  - The sources were exported with `git -c core.autocrlf=false archive`, so gn100 got LF files.
+  - The laptop check counted 3 uses of `CollectionDeletedError` in `app.py` and 4 in `store.py` at d096fde, and none at ff48930. The plan expected 2 and 3; it was written before B's fix wave, which added one use in each file.
+- **Reference at 19a8a2e (p4):**
+  - collection-key requests failed at 5.4–6.8 % on the GIL builds and 0.46 % on 3.14t;
+  - base312's mixed-phase searches got 61 and 66 401s, and 33 and 47 500s;
+  - searches racing `DELETE` got 464–704 500s on base312, and 171–704 across all builds;
+  - R2 and R4 were not observed.
+
+  Source: [the p4 note](../research/2026-09-28-dgx-probe-p4-freethreaded.md), "Race stress, R1–R4".
+- **Alternatives:** none. Spec §3.1 B2 prescribes this re-run.
+- **Expectation (spec §7 B):** 0 failures on `post` in the classes B owns: R1 in the mixed phase, 500s and dropped connections on searches racing `DELETE`, and R4. An R2 stale read would be a finding for plan F and does not fail B.
+- **Status:** running. (Dated note, 11:16Z: done; see 11:16Z.)
+
+**11:16Z. Plan B's race re-run on gn100 (DGX Spark) done: 0 failures on `post`.**
+
+**Timing and setup:**
+- The four runs took 11:12:09–11:16:27Z. There was no `!! driver rc=` line and no `RUN_FAILED`.
+- The task used about 9 minutes of gn100 time against its 30-minute cap.
+- All four servers printed `python=3.12.12 sqlite=3.40.1`, so the arms are comparable (D15).
+
+**`post` (d096fde), both reps:**
+
+| Phase | r1 | r2 | Allowed |
+|---|---|---|---|
+| `mixed:` searches | 3,818 × 200 | 4,008 × 200 | only 200 |
+| `mixed-writes:` | ingest 410 × 202; delete 431 × 200, 10 × 404; PATCH 402 × 200, 9 × 404 | ingest 400 × 202; delete 409 × 200, 15 × 404; PATCH 403 × 200, 16 × 404 | yes: a 404 is a document whose ingest had not landed yet |
+| `mixed-list:` | 721 × 200 | 717 × 200 | only 200 |
+| `stale-check:` | 1,719 × 200, plus 54 expected late ingests | 1,803 × 200 | only 200 |
+| `delete-under-load:` | 328 × 200, 2,608 × 404, 2,586 × 401 | 370 × 200, 2,673 × 404, 2,538 × 401 | 200, 404 or 401 |
+
+- **401s under a delete:** a reader using the collection's own key gets 401 once the collection is gone, because the key can no longer be checked. R1 is judged in the mixed phase.
+- **After the delete:** `delete_collection=200` and `healthz_after=200`, with no 500 body.
+- **Server state:** `exit=0 oomkilled=false`, no server exception, and no traceback. Each server log is 14 lines: start, four thread samples, shutdown.
+
+**`pre` (ff48930): p4's failures reproduced at base312's level.**
+
+| Phase | r1 | r2 | p4 base312 at 19a8a2e (r1, r2) |
+|---|---|---|---|
+| `mixed:` 200 / 401 / 500 | 3,830 / 43 / 25 | 4,318 / 49 / 40 | 3,987 / 61 / 33 and 4,105 / 66 / 47 |
+| `mixed:` `RemoteProtocolError` | 1 | 1 | 2 and 2 |
+| `stale-check:` 401 / 500 | 16 / 11 | 15 / 8 | not reported |
+| `delete-under-load:` 500s | 438 | 484 | 464 and 704 |
+| `delete-under-load:` `RemoteProtocolError` | 98 | 156 | 96 and 165 |
+| `delete-under-load:` `ReadError` | 1 | 3 | not reported |
+
+- **Server exceptions per run:**
+  - `sqlite3.OperationalError: unable to open database file`: 410 and 458;
+  - `sqlite3.InterfaceError`: 58 and 65;
+  - `IndexError`: 6 and 9;
+  - one `FileNotFoundError` on the IVF directory in each run.
+- **Tracebacks:** 475 and 533.
+
+**R2 and R4:**
+- R2 (a deleted document returned stale): not observed; `stale_ids=0` in all four runs.
+- R4 (a "changed size" `RuntimeError`, a crash or a deadlock): no such line in any run.
+- p4 saw neither of them either.
+
+**Verdict:** spec §7 B passes on gn100. `post` has 0 failures in the classes B owns: R1 in the mixed phase, 500s and dropped connections on searches racing `DELETE`, and R4.
+
+**Kept:**
+- the images `localhost/raggio:planB-pre-ff48930` (4a7fd9c5f84b) and `localhost/raggio:planB-post-d096fde` (8d0ea119dc04);
+- the working directory `~/probe/planB-race`, including its driver venv.
+
+**Source:** the logs in `~/probe/planB-race/logs/` on gn100 (`racestress.log`, `srv/race/*.log`) and the per-run JSON in `out/race/`.
+
+**Status:** done.
+
 ## 3. Decision register
 
 ID prefixes:
@@ -649,7 +732,7 @@ ID prefixes:
 | R-G3 | 2026-09-28 19:38Z | Follow-up to R-G2: G stops and the maintainer is asked in two cases: after 3 failed builder-stage attempts, and when no allowed Dockerfile line can express a fix although turbovec's source needs no change. ADR 0006 stays Pending. Parking without asking applies only to the source-change case. | "Park G automatically", i.e. draft an upstream issue and park without asking. | Raised by the verifier of the R-G2 edit. R-G2 did not say what happens in these two cases. | Maintainer (chose the recommended "Stop and ask me") | spec §3.1 G3 | Planned (plan G; applied and verified by `raggio-apply-followup-decisions`, ~20:08Z) |
 | R-G4 | 2026-09-28 19:38Z | Follow-up to R-G1: the 90-minute cap applies to measurement (ABAB) sessions only. G Task 11's build-and-fix window has no cap. | "Cap everything at 90 min": Task 11 would be split into windows of at most 90 minutes each. | Task 11 can take about 60 min plus about 25 min per fix attempt, up to 3 attempts: about 135 min. Heat and drift matter for measurements, not for builds. W-2 already gives unlimited gn100 time. | Maintainer (chose the recommended "Only measurement sessions") | spec §3.1 G4 | Planned (plan G; applied and verified by `raggio-apply-followup-decisions`, ~20:08Z) |
 | R-B1 | 2026-09-28 20:28Z | A search in flight on a collection that `DELETE /collections/{name}` is removing returns 404, the answer for a collection that does not exist, never 500. B may change `app.py` for the error-to-404 mapping only. | "503 Service Unavailable": transient, and a retry then gets 404, although the collection is not coming back. "Leave 500 for now": out of scope for B, logged as an open item. | p4: 171–704 HTTP 500s per delete-race run on every build (`OperationalError`: unable to open database file, no such table, disk I/O error; `FileNotFoundError` on the IVF directory; dropped connections). `/healthz` stayed 200. | Maintainer (chose the recommended "404 Not Found") | spec §3.1 B1 | Planned (plan B Task 6, applied and verified ~21:41Z) |
-| R-B2 | 2026-09-28 20:28Z | B gets an HTTP-level acceptance: an in-process concurrent HTTP test (R1 at c=16: 0×401 on valid keys and 0×500; searches racing `DELETE`: only 200 or 404), plus a gn100 re-run of p4's race phase after B lands, journaled before and after. | "CI test only"; "DGX re-run only"; "Unit tests are enough". | p4: R1 over HTTP fails 5.4–6.8 % of collection-key requests at c=16 on the GIL builds, 0.46 % on 3.14t. The bench phases use the root key, so they never see R1. | Maintainer (chose the recommended "CI test + DGX re-run") | spec §3.1 B2 | Planned (plan B Tasks 1 and 6 for the HTTP test, Task 8 for the gn100 re-run; applied and verified ~21:41Z) |
+| R-B2 | 2026-09-28 20:28Z | B gets an HTTP-level acceptance: an in-process concurrent HTTP test (R1 at c=16: 0×401 on valid keys and 0×500; searches racing `DELETE`: only 200 or 404), plus a gn100 re-run of p4's race phase after B lands, journaled before and after. | "CI test only"; "DGX re-run only"; "Unit tests are enough". | p4: R1 over HTTP fails 5.4–6.8 % of collection-key requests at c=16 on the GIL builds, 0.46 % on 3.14t. The bench phases use the root key, so they never see R1. | Maintainer (chose the recommended "CI test + DGX re-run") | spec §3.1 B2 | Planned (plan B Tasks 1 and 6 for the HTTP test, Task 8 for the gn100 re-run; applied and verified ~21:41Z). Dated note, 2026-09-29 11:16Z: done. The HTTP test is in `main` with B (d096fde), and the gn100 re-run found 0 failures on `post` (section 2, 11:16Z). |
 | R-G5 | 2026-09-28 20:28Z | G's decision rule: a `Hybrid QPS concurrent` win counts only when the hybrid p99 under concurrency is not `worse` in both tables. CPU per query is recorded for every run and classifies each flat run's fast or slow state. It is reported, not gated. | "Also gate on CPU per query": a win would also need CPU per query not worse beyond the band; stricter, since free threading usually costs some CPU. "Keep the current rule": costs listed, never gating. | p4 at c=16: 3.14t hybrid +51 % QPS at +77–79 % CPU per query and 3.8–4.0× the p99. Flat c=8 is bimodal on every interpreter (132.7–135.8 against 234.3–257.8 QPS), and CPU per query separates the states (115.9–117.6 against 50.8–56.8 ms). | Maintainer (chose the recommended "p99 guard + CPU/query") | spec §3.1 G5 | Planned (plan G, 22:36Z; amended by R-G9) |
 | R-G6 | 2026-09-28 20:28Z | The optional C1 arm stays, reworded: 3.14 with the GIL, turbovec built locally from the same sdist and maturin, as an abi3 wheel. It is not "the same turbovec build" as 3.14t's. | "Drop C1": one image fewer and about 50 min less DGX time, but A (3.12) against B (3.14t) then mixes the interpreter upgrade with free threading. | p4: `UV_NO_BINARY_PACKAGE=turbovec` on 3.14 builds `cp39-abi3-linux_aarch64`, because the sdist enables `abi3-py39`; 3.14t builds `cp314-cp314t`. | Maintainer (chose the recommended "Reword it") | spec §3.1 G6 | Planned (plan G's facts stage, ~21:42Z) |
 | R-G7 | 2026-09-28 21:20Z | Each ABAB arm session (A1, B1, A2, B2) is followed, on the same boot and image, by a c=16 session (`bench.py --concurrency 16`, same runs, fresh container per run, its own 90-minute cap under G1). Its pair tables get the usual verdicts and go into ADR 0006, reported and not gated. C1 and D1 stay at c=8. | "Keep c=8, note it" (recommended): no extra DGX time, stays comparable with the other plans, and at c=16 the G5 guard would reject the hybrid gain anyway. "Gate at c=16 instead": same time, but G's tables would stop matching the other plans' c=8 baselines. | p4: 3.14t hybrid 22.4 against 14.8 QPS at c=16, no gain at c=8. IVF vector +14–31 % at both. | Maintainer (chose "Add a c=16 pass, recorded") | spec §3.1 G7 | Planned (plan G, 22:36Z; amended by R-G8) |
@@ -1064,7 +1147,7 @@ Plan G described its optional C1 arm (3.14 with the GIL, `UV_NO_BINARY_PACKAGE=t
 
 ### 5.15 Plan B's bugs over HTTP, on every build, and rarer on 3.14t
 
-R1 reproduced over HTTP on all four builds. At c=16 with a collection key, 5.4–6.8 % of requests failed on the GIL builds and 0.46 % on 3.14t. The failures were 500s (`sqlite3.InterfaceError` in `get_config`, 155 tracebacks; one `IndexError` on `row[7]`, meaning another statement's row came back) and silent 401s on a valid key. Why 3.14t fails 12–15× less often was not investigated; it does not fix the bug. The bench phases use the root key, so they never see R1. Searches racing `DELETE /collections/{name}` returned 171–704 500s per run on every build, with `OperationalError`s, a `FileNotFoundError` on the IVF directory, and dropped connections, but no crash or deadlock. R2 and R4 were not observed. These results led to R-B1 (404, not 500) and R-B2 (an HTTP-level acceptance and a DGX re-run after B).
+R1 reproduced over HTTP on all four builds. At c=16 with a collection key, 5.4–6.8 % of requests failed on the GIL builds and 0.46 % on 3.14t. The failures were 500s (`sqlite3.InterfaceError` in `get_config`, 155 tracebacks; one `IndexError` on `row[7]`, meaning another statement's row came back) and silent 401s on a valid key. Why 3.14t fails 12–15× less often was not investigated; it does not fix the bug. The bench phases use the root key, so they never see R1. Searches racing `DELETE /collections/{name}` returned 171–704 500s per run on every build, with `OperationalError`s, a `FileNotFoundError` on the IVF directory, and dropped connections, but no crash or deadlock. R2 and R4 were not observed. These results led to R-B1 (404, not 500) and R-B2 (an HTTP-level acceptance and a DGX re-run after B). (Dated note, 2026-09-29 11:16Z: after B, the gn100 re-run found none of these failures on `post` (d096fde). In both reps the mixed phase answered only 200s, and searches racing `DELETE` got only 200, 404 or 401, with no 500, no dropped connection and no server exception. `pre` (ff48930) reproduced p4's base312 figures. See section 2, 11:16Z.)
 
 ### 5.16 The host moved the numbers more than the bench did
 
@@ -1227,6 +1310,7 @@ State as of 2026-09-28, about 19:30Z.
 - Dated note, 23:00Z: committed as fb57288. Plan A's PR 1 is being executed in `.worktrees/bench-hardening` (W-9); the pre-flight scan runs first.
 - **Next: execution, subagent-driven** (the maintainer's choice), starting with plan A's bench tasks (Tasks 1–6), then the merge order in section 8.
 - Dated note, 2026-09-29 11:01Z: plan A's PR 1 is merged into `main` locally (ff48930). Plan B is complete on its branch (b876b68, 9 commits, final review passed after one fix wave) and waits for the maintainer's merge choice. B's Task 8, the gn100 race re-run, follows the merge. Plan A's PR 2 (Tasks 7–10) comes after B in the merge order.
+- Dated note, 2026-09-29 11:16Z: B is merged into `main` locally (d096fde), and its Task 8 gn100 re-run passed: 0 failures on `post` (section 2, 11:16Z). Next in the merge order is plan A's PR 2.
 
 ### 9.2 Open questions in the plans
 
