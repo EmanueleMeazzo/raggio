@@ -1610,8 +1610,11 @@ class CollectionManager:
             if col not in have:
                 self.catalog.execute(f"ALTER TABLE collections ADD COLUMN {ddl}")
                 self.catalog.commit()
-        # attach/detach jobs update index_config from worker threads while the loop
-        # creates/deletes rows: serialize write transactions so they never interleave
+        # EVERY catalog statement (reads too) runs under this lock: require_collection
+        # is a sync FastAPI dependency, so get_config runs on threadpool threads while
+        # the loop creates/deletes rows and attach/detach jobs update index_config.
+        # One pysqlite connection used concurrently returns another query's row or
+        # raises InterfaceError (ADR 0001, addendum 2026-09)
         self._catalog_lock = threading.Lock()
         self.resident: dict[str, Collection] = {}
         self._load_lock = asyncio.Lock()
@@ -1628,11 +1631,12 @@ class CollectionManager:
         return self.data_dir / "collections" / name
 
     def get_config(self, name: str) -> CollectionConfig | None:
-        row = self.catalog.execute(
-            "SELECT name, dim, bit_width, model, base_url, key_hash, tokenizer, index_config"
-            " FROM collections WHERE name=?",
-            (name,),
-        ).fetchone()
+        with self._catalog_lock:
+            row = self.catalog.execute(
+                "SELECT name, dim, bit_width, model, base_url, key_hash, tokenizer, index_config"
+                " FROM collections WHERE name=?",
+                (name,),
+            ).fetchone()
         if row is None:
             return None
         return CollectionConfig(
@@ -1648,7 +1652,9 @@ class CollectionManager:
             self.catalog.commit()
 
     def list_collections(self) -> list[str]:
-        return [r[0] for r in self.catalog.execute("SELECT name FROM collections ORDER BY name")]
+        with self._catalog_lock:  # fetchall inside: the cursor is the shared state
+            rows = self.catalog.execute("SELECT name FROM collections ORDER BY name").fetchall()
+        return [r[0] for r in rows]
 
     async def create_collection(
         self,
@@ -1751,4 +1757,5 @@ class CollectionManager:
     async def shutdown(self) -> None:
         for name in list(self.resident):
             await self._evict(name)
-        self.catalog.close()
+        with self._catalog_lock:  # a threadpool get_config may still be mid-query
+            self.catalog.close()
