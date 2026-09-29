@@ -81,7 +81,7 @@ Plan rules:
 - Commit trailer: every commit message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 - DGX (Tasks 6 and 10):
   - step 1 asks the user for a run window and a time cap; if the user declines, the ADR results stay `Pending:`;
-  - every ssh/scp is written out in full with `-F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes`;
+  - every ssh/scp is written out in full with `-F "$SSH_CONFIG" -o BatchMode=yes` (`SSH_CONFIG` is the maintainer's local ssh config for gn100: set in the environment, never committed);
   - `podman rm -f` names only `bench-tv`, never `bench-wv`; never `pkill -f`; long runs launch with `setsid -f` into a log file, which is then polled;
   - every arm runs on a fresh container, and arms are interleaved;
   - `--reingest` appears only in the ingest runs, last in the session. It leaves the `bench-tv` volume flat with a drained queue.
@@ -3258,7 +3258,7 @@ Expected: four lines, and the two SHAs are 12 hex digits each.
 This step runs only after the user has granted the window in Step 1.
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 uptime
 free -m | head -2
 pgrep -af "[b]ench\.py|[i]ngest_probe" || echo "no bench.py or probe running"
@@ -3282,10 +3282,10 @@ If a bench.py or probe is running, `bench-tv` is up, or the load is high, that i
 An existing `~/planD` holds an earlier session's results, so move it aside and never delete it. `scp` reads `D:/...` as a host name, so `cd` first and pass relative names.
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'if [ -e ~/planD ]; then mv ~/planD ~/planD.prev-$(date +%Y%m%d-%H%M%S); fi; mkdir -p ~/planD/base-src ~/planD/tmp'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'if [ -e ~/planD ]; then mv ~/planD ~/planD.prev-$(date +%Y%m%d-%H%M%S); fi; mkdir -p ~/planD/base-src ~/planD/tmp'
 cd D:/DEV/_scratch/dgx/planD
-scp -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes planD-ab.sh planD-build.sh gn100:planD/
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'ls -l ~/planD; bash -n ~/planD/planD-ab.sh && bash -n ~/planD/planD-build.sh && echo SYNTAX_OK'
+scp -F "$SSH_CONFIG" -o BatchMode=yes planD-ab.sh planD-build.sh gn100:planD/
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'ls -l ~/planD; bash -n ~/planD/planD-ab.sh && bash -n ~/planD/planD-build.sh && echo SYNTAX_OK'
 ```
 
 Expected: `planD-ab.sh`, `planD-build.sh`, `base-src` and `tmp` are listed, then `SYNTAX_OK`.
@@ -3295,9 +3295,9 @@ Deploy D1's tree to `~/raggio` (spec §6), with the corpus link, the ground trut
 ```bash
 cd D:/DEV/raggio
 source D:/DEV/_scratch/dgx/planD/d1-shas.env
-git archive "$CAND_SHA" | ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'rm -rf ~/raggio && mkdir ~/raggio && tar -x -C ~/raggio'
-git archive "$BASE_SHA" | ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'tar -x -C ~/planD/base-src'
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+git archive "$CAND_SHA" | ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'rm -rf ~/raggio && mkdir ~/raggio && tar -x -C ~/raggio'
+git archive "$BASE_SHA" | ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'tar -x -C ~/planD/base-src'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 cd ~/raggio || exit 1
 ln -sfn ~/turborag/bench/corpus bench/corpus
 cp ~/turborag/bench/gt-2549619-42-d1024.npz bench/
@@ -3317,13 +3317,13 @@ Expected: `cand tree OK True`, `base probe present`, then `0` (the base store ha
 ```bash
 cd D:/DEV/raggio
 source D:/DEV/_scratch/dgx/planD/d1-shas.env
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 "setsid -f bash -c 'bash ~/planD/planD-build.sh ~/planD/base-src planD-$BASE_SHA && bash ~/planD/planD-build.sh ~/raggio planD-$CAND_SHA' >>~/planD/build.log 2>&1 </dev/null"
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 "setsid -f bash -c 'bash ~/planD/planD-build.sh ~/planD/base-src planD-$BASE_SHA && bash ~/planD/planD-build.sh ~/raggio planD-$CAND_SHA' >>~/planD/build.log 2>&1 </dev/null"
 ```
 
 Poll every 2 minutes:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'grep -E "^== BUILD" ~/planD/build.log; tail -n 2 ~/planD/build.log'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'grep -E "^== BUILD" ~/planD/build.log; tail -n 2 ~/planD/build.log'
 ```
 
 It is done when there are two `== BUILD_DONE` lines, for `planD-$BASE_SHA` and `planD-$CAND_SHA`. If a `== BUILD_FAILED` line appears, stop and report the tail of `~/planD/build.log` to the user.
@@ -3335,9 +3335,9 @@ It is done when there are two `== BUILD_DONE` lines, for `planD-$BASE_SHA` and `
 ```bash
 cd D:/DEV/raggio
 source D:/DEV/_scratch/dgx/planD/d1-shas.env
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 "setsid -f timeout --kill-after=60 ${CAP_MIN}m bash ~/planD/planD-ab.sh d1 $BASE_SHA $CAND_SHA $REINGEST $CAP_MIN >/dev/null 2>&1 </dev/null"
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 "setsid -f timeout --kill-after=60 ${CAP_MIN}m bash ~/planD/planD-ab.sh d1 $BASE_SHA $CAND_SHA $REINGEST $CAP_MIN >/dev/null 2>&1 </dev/null"
 sleep 90
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'cat ~/planD/d1/ab.pgid; head -n 40 ~/planD/d1/ab.log'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'cat ~/planD/d1/ab.pgid; head -n 40 ~/planD/d1/ab.log'
 ```
 
 Expected:
@@ -3354,7 +3354,7 @@ If the log ends with `== PLAND AB FAILED: <reason>`, go to Step 11 to fetch it. 
 - [ ] **Step 10: Poll until done (every 5 minutes)**
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'grep -E "^== (probe|reingest|PLAND AB)" ~/planD/d1/ab.log | tail -n 3; grep -E "^  (vps|jobs run|labels:)" ~/planD/d1/ab.log | tail -n 2; date'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'grep -E "^== (probe|reingest|PLAND AB)" ~/planD/d1/ab.log | tail -n 3; grep -E "^  (vps|jobs run|labels:)" ~/planD/d1/ab.log | tail -n 2; date'
 ```
 
 Progress runs as follows:
@@ -3368,7 +3368,7 @@ If `== PLAND AB FAILED: <reason>` appears, go to Step 11 to fetch the log. Repor
 `timeout` ends the driver at the cap by itself. If the user asks to stop early, or the cap passed and a process is still listed, stop only this session's process group and `bench-tv`. Never use `pkill`, and never touch another container:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 PG=$(cat ~/planD/d1/ab.pgid)
 kill -TERM -- "-$PG" 2>/dev/null
 sleep 5
@@ -3384,7 +3384,7 @@ Expected: `no Plan D process left`, then `bench-tv Exited (...)`. If a process i
 ```bash
 cd D:/DEV/_scratch/dgx/planD
 if [ -e d1 ]; then mv d1 d1.prev-$(date +%Y%m%d-%H%M%S); fi
-scp -r -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100:planD/d1 .
+scp -r -F "$SSH_CONFIG" -o BatchMode=yes gn100:planD/d1 .
 ls d1 d1/probe d1/bench-base d1/bench-cand
 ```
 
@@ -3540,7 +3540,7 @@ Then report to the user:
 - `~/planD/d1` kept on gn100, and the local copy in `D:/DEV/_scratch/dgx/planD/d1/`.
 
 **Review Focus for Task 6:** the header assigns none of RF1-RF5 to this task. Its own pins are `test_adr_ingest_path_d1_results_pass_the_gates` and Plan C's `test_adr_records_the_acceptance_run` (which must stay green once the new `## ` heading follows C's section). When reviewing, check that:
-- nothing ran on gn100 before the user's explicit window answer (Step 1), and the launch ran under `timeout` with the granted cap. Every `ssh` and `scp` uses the full `-F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes` form;
+- nothing ran on gn100 before the user's explicit window answer (Step 1), and the launch ran under `timeout` with the granted cap. Every `ssh` and `scp` uses the full `-F "$SSH_CONFIG" -o BatchMode=yes` form;
 - `planD-ab.sh` and `planD-build.sh` never name `bench-wv` or `~/turborag`, and use no `pkill`, `sudo` or `rm -rf`. `podman rm -f` appears only as `podman rm -f bench-tv`, and `--reingest` only inside `reingest()`. `planD-check.py` asserts all of this; the deploy step only reads `~/turborag`;
 - the reingest phase comes after every probe run (spec §6), and it runs only with `REINGEST=1` and 180 min left. Each reingest runs in a fresh 4 GiB `bench-tv` of that arm's image, interleaved base, cand, base, cand;
 - each probe arm runs its own tree's `bench/ingest_probe.py`, and both the driver and the summary check `store_file`. A base row measured with D1 code would fake the gain;
@@ -6849,7 +6849,7 @@ Expected: five lines, and the two SHAs are 12 hex digits each.
 This step runs only after the user has granted the window in Step 1. Run it again at the start of each window.
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 uptime
 free -m | head -2
 pgrep -af "[b]ench\.py|[i]ngest_probe|[p]lanD-ab\.sh" || echo "no bench.py, probe or driver running"
@@ -6873,10 +6873,10 @@ If something is running, `bench-tv` is up, or the load is high, that is someone 
 An existing `~/planD` holds an earlier session's results (D1's, for one), so move it aside and never delete it. `scp` reads `D:/...` as a host name, so `cd` first and pass relative names.
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'if [ -e ~/planD ]; then mv ~/planD ~/planD.prev-$(date +%Y%m%d-%H%M%S); fi; mkdir -p ~/planD/base-src ~/planD/tmp'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'if [ -e ~/planD ]; then mv ~/planD ~/planD.prev-$(date +%Y%m%d-%H%M%S); fi; mkdir -p ~/planD/base-src ~/planD/tmp'
 cd D:/DEV/_scratch/dgx/planD
-scp -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes planD-ab.sh planD-build.sh gn100:planD/
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'ls -l ~/planD; bash -n ~/planD/planD-ab.sh && bash -n ~/planD/planD-build.sh && echo SYNTAX_OK'
+scp -F "$SSH_CONFIG" -o BatchMode=yes planD-ab.sh planD-build.sh gn100:planD/
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'ls -l ~/planD; bash -n ~/planD/planD-ab.sh && bash -n ~/planD/planD-build.sh && echo SYNTAX_OK'
 ```
 
 Expected: `planD-ab.sh`, `planD-build.sh`, `base-src` and `tmp` are listed, then `SYNTAX_OK`.
@@ -6886,8 +6886,8 @@ Deploy D2's tree to `~/raggio` (spec §6), with the corpus link, the ground trut
 ```bash
 cd D:/DEV/raggio
 source D:/DEV/_scratch/dgx/planD/d2-shas.env
-git archive "$CAND_SHA" | ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'rm -rf ~/raggio && mkdir ~/raggio && tar -x -C ~/raggio'
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+git archive "$CAND_SHA" | ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'rm -rf ~/raggio && mkdir ~/raggio && tar -x -C ~/raggio'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 cd ~/raggio || exit 1
 ln -sfn ~/turborag/bench/corpus bench/corpus
 cp ~/turborag/bench/gt-2549619-42-d1024.npz bench/
@@ -6905,9 +6905,9 @@ No image is needed. `timeout` enforces the cap on the whole process group, and t
 ```bash
 cd D:/DEV/raggio
 source D:/DEV/_scratch/dgx/planD/d2-shas.env
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 "setsid -f timeout --kill-after=60 ${TUNE_CAP}m bash ~/planD/planD-ab.sh d2tune $CAND_SHA $CAND_SHA 0 $TUNE_CAP >/dev/null 2>&1 </dev/null"
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 "setsid -f timeout --kill-after=60 ${TUNE_CAP}m bash ~/planD/planD-ab.sh d2tune $CAND_SHA $CAND_SHA 0 $TUNE_CAP >/dev/null 2>&1 </dev/null"
 sleep 90
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'cat ~/planD/d2tune/ab.pgid; head -n 30 ~/planD/d2tune/ab.log'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'cat ~/planD/d2tune/ab.pgid; head -n 30 ~/planD/d2tune/ab.log'
 ```
 
 Expected:
@@ -6921,7 +6921,7 @@ Expected:
 Poll every 5 minutes:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'grep -E "^== (tune|PLAND AB)" ~/planD/d2tune/ab.log | tail -n 3; grep -E "^  vps" ~/planD/d2tune/ab.log | tail -n 2; date'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'grep -E "^== (tune|PLAND AB)" ~/planD/d2tune/ab.log | tail -n 3; grep -E "^  vps" ~/planD/d2tune/ab.log | tail -n 2; date'
 ```
 
 Progress: per mode (flat, then ivf256), `n8 t1000 run0`, then 3 rounds of `n1 t0`, `n8 t1000`, `n32 t1000`, `n32 t4000`: 13 runs, about 65 minutes. Each run is followed by `  vps <n> drain <s> s stall <s> s jobs {'done': 200} knobs <N>/<T> payload_rows 0`, with `<T>` printed as a float (`1000.0`). The end is `== tune done (<ts>) ==` and `== PLAND AB DONE <ts> ==`.
@@ -6931,7 +6931,7 @@ If `== PLAND AB FAILED: <reason>` appears, or the cap passes before `== tune don
 If the user asks to stop early, stop only this session's process group. Never use `pkill`:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 PG=$(cat ~/planD/d2tune/ab.pgid)
 kill -TERM -- "-$PG" 2>/dev/null
 sleep 5
@@ -6945,7 +6945,7 @@ Expected: `no Plan D process left`. If a process is still listed, report it to t
 ```bash
 cd D:/DEV/_scratch/dgx/planD
 if [ -e d2tune ]; then mv d2tune d2tune.prev-$(date +%Y%m%d-%H%M%S); fi
-scp -r -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100:planD/d2tune .
+scp -r -F "$SSH_CONFIG" -o BatchMode=yes gn100:planD/d2tune .
 ls d2tune/probe | wc -l
 cd D:/DEV/raggio
 uv run python D:/DEV/_scratch/dgx/planD/planD-d2-summary.py tune D:/DEV/_scratch/dgx/planD/d2tune
@@ -7021,10 +7021,10 @@ If the publish has its own window, ask Step 1's publish question again, now nami
 `~/planD` now holds the tuning, so it stays. Only an earlier `d2`, `base-src` or `build.log` inside it is moved aside, and the scripts are copied again (the same files as in Step 7):
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'mkdir -p ~/planD/tmp; for d in d2 base-src build.log; do if [ -e ~/planD/$d ]; then mv ~/planD/$d ~/planD/$d.prev-$(date +%Y%m%d-%H%M%S); fi; done; mkdir ~/planD/base-src'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'mkdir -p ~/planD/tmp; for d in d2 base-src build.log; do if [ -e ~/planD/$d ]; then mv ~/planD/$d ~/planD/$d.prev-$(date +%Y%m%d-%H%M%S); fi; done; mkdir ~/planD/base-src'
 cd D:/DEV/_scratch/dgx/planD
-scp -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes planD-ab.sh planD-build.sh gn100:planD/
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'ls ~/planD; bash -n ~/planD/planD-ab.sh && bash -n ~/planD/planD-build.sh && echo SYNTAX_OK'
+scp -F "$SSH_CONFIG" -o BatchMode=yes planD-ab.sh planD-build.sh gn100:planD/
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'ls ~/planD; bash -n ~/planD/planD-ab.sh && bash -n ~/planD/planD-build.sh && echo SYNTAX_OK'
 ```
 
 Expected: `base-src`, `d2tune`, `planD-ab.sh`, `planD-build.sh` and `tmp` (and any `*.prev-*` names), then `SYNTAX_OK`.
@@ -7034,9 +7034,9 @@ Deploy the D2 tree again, because Step 10 may have moved `CAND_SHA` and a separa
 ```bash
 cd D:/DEV/raggio
 source D:/DEV/_scratch/dgx/planD/d2-shas.env
-git archive "$CAND_SHA" | ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'rm -rf ~/raggio && mkdir ~/raggio && tar -x -C ~/raggio'
-git archive "$BASE_SHA" | ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'tar -x -C ~/planD/base-src'
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+git archive "$CAND_SHA" | ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'rm -rf ~/raggio && mkdir ~/raggio && tar -x -C ~/raggio'
+git archive "$BASE_SHA" | ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'tar -x -C ~/planD/base-src'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 cd ~/raggio || exit 1
 ln -sfn ~/turborag/bench/corpus bench/corpus
 cp ~/turborag/bench/gt-2549619-42-d1024.npz bench/
@@ -7060,13 +7060,13 @@ Build both images. `planD-build.sh` skips a tag that already exists:
 ```bash
 cd D:/DEV/raggio
 source D:/DEV/_scratch/dgx/planD/d2-shas.env
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 "setsid -f bash -c 'bash ~/planD/planD-build.sh ~/planD/base-src planD-$BASE_SHA && bash ~/planD/planD-build.sh ~/raggio planD-$CAND_SHA' >>~/planD/build.log 2>&1 </dev/null"
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 "setsid -f bash -c 'bash ~/planD/planD-build.sh ~/planD/base-src planD-$BASE_SHA && bash ~/planD/planD-build.sh ~/raggio planD-$CAND_SHA' >>~/planD/build.log 2>&1 </dev/null"
 ```
 
 Poll every 2 minutes:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'grep -E "^== BUILD" ~/planD/build.log; tail -n 2 ~/planD/build.log'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'grep -E "^== BUILD" ~/planD/build.log; tail -n 2 ~/planD/build.log'
 ```
 
 The build is done when there are two `== BUILD_DONE` lines, for `planD-$BASE_SHA` and `planD-$CAND_SHA`. If a `== BUILD_FAILED` line appears, stop and report the tail of `~/planD/build.log` to the user.
@@ -7078,9 +7078,9 @@ Task 6's A/B, unchanged, in mode `d2`. The reingests run last, and only with `RE
 ```bash
 cd D:/DEV/raggio
 source D:/DEV/_scratch/dgx/planD/d2-shas.env
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 "setsid -f timeout --kill-after=60 ${PUB_CAP}m bash ~/planD/planD-ab.sh d2 $BASE_SHA $CAND_SHA $REINGEST $PUB_CAP >/dev/null 2>&1 </dev/null"
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 "setsid -f timeout --kill-after=60 ${PUB_CAP}m bash ~/planD/planD-ab.sh d2 $BASE_SHA $CAND_SHA $REINGEST $PUB_CAP >/dev/null 2>&1 </dev/null"
 sleep 90
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'cat ~/planD/d2/ab.pgid; head -n 40 ~/planD/d2/ab.log'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'cat ~/planD/d2/ab.pgid; head -n 40 ~/planD/d2/ab.log'
 ```
 
 Expected:
@@ -7097,7 +7097,7 @@ If the log ends with `== PLAND AB FAILED: <reason>`, go to Step 13 to fetch it. 
 Poll every 5 minutes:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'grep -E "^== (probe|reingest|PLAND AB)" ~/planD/d2/ab.log | tail -n 3; grep -E "^  (vps|jobs run|labels:)" ~/planD/d2/ab.log | tail -n 2; date'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'grep -E "^== (probe|reingest|PLAND AB)" ~/planD/d2/ab.log | tail -n 3; grep -E "^  (vps|jobs run|labels:)" ~/planD/d2/ab.log | tail -n 2; date'
 ```
 
 Progress:
@@ -7111,7 +7111,7 @@ If `== PLAND AB FAILED: <reason>` appears, go to Step 13 to fetch the log. Repor
 `timeout` ends the driver at the cap by itself. If the user asks to stop early, or the cap has passed and a process is still listed, stop only this session's process group and `bench-tv`. Never use `pkill`, and never touch another container:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 PG=$(cat ~/planD/d2/ab.pgid)
 kill -TERM -- "-$PG" 2>/dev/null
 sleep 5
@@ -7127,7 +7127,7 @@ Expected: `no Plan D process left`, then `bench-tv Exited (...)`. If a process i
 ```bash
 cd D:/DEV/_scratch/dgx/planD
 if [ -e d2 ]; then mv d2 d2.prev-$(date +%Y%m%d-%H%M%S); fi
-scp -r -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100:planD/d2 .
+scp -r -F "$SSH_CONFIG" -o BatchMode=yes gn100:planD/d2 .
 ls d2 d2/probe d2/bench-base d2/bench-cand
 ```
 
@@ -7330,7 +7330,7 @@ Then report to the user:
 - `~/planD/d2tune` and `~/planD/d2` kept on gn100 (plus any `*.prev-*` moved aside), and the local copies in `D:/DEV/_scratch/dgx/planD/`.
 
 **Review Focus for Task 10:** the header assigns none of RF1-RF5 to this task. Its own pins are `test_adr_ingest_path_d2_results_pass_the_gates` (appended only after a completed publish) and Task 7's `test_settings_sync_batch_knobs` and `test_ingest_probe_accepts_batch_flags` (the default pins that Step 10 moves). Task 6's `test_adr_ingest_path_d1_results_pass_the_gates` and Plan C's `test_adr_records_the_acceptance_run` must stay green with the D2 subsections after them. When reviewing, check that:
-- nothing ran on gn100 before the user's explicit window answer (Step 1), and the preflight ran at the start of each window. Both launches ran under `timeout` with the granted `TUNE_CAP` / `PUB_CAP`, and every `ssh` and `scp` uses the full `-F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes` form;
+- nothing ran on gn100 before the user's explicit window answer (Step 1), and the preflight ran at the start of each window. Both launches ran under `timeout` with the granted `TUNE_CAP` / `PUB_CAP`, and every `ssh` and `scp` uses the full `-F "$SSH_CONFIG" -o BatchMode=yes` form;
 - the edited `planD-ab.sh` still passes Task 6's `check_text`: no `bench-wv`, `turborag`, `pkill`, `sudo` or `rm -rf`; `podman rm -f` only as `podman rm -f bench-tv`; `--reingest` only inside `reingest()`. `d2tune` runs only `~/raggio` at `--seed 7`, passes the batch flags only inside `tune_probe`, and exits before the A/B loop and the reingest phase. The seed-42 A/B passes no batch flag. `planD-d2-check.py` asserts all of this;
 - seed 7 only chooses and seed 42 only publishes (spec §6). The publish cand runs at its defaults: Step 11 checks them with `inspect.signature` before the build, and `knobs_ok` checks every publish probe file (base `None`, cand the choice). A publish at (8, 1000) after seed 7 chose another pair fails `D2-tuning`;
 - the choice rule (Step 3b) needs ivf256 `better` and flat `better` or `within band` against (1, 0), and keeps (8, 1000) unless the winner beats it on ivf256 beyond the band. `NO CHOICE`, or a tuning that is incomplete, mislabelled or has unequal fingerprints, stops the task before any default moves;

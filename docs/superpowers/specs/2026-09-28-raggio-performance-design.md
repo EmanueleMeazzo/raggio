@@ -182,7 +182,7 @@ The host is `gn100`, an NVIDIA DGX Spark: GB10, 20 aarch64 cores, about 120 GB R
 podman 4.9.3, uv on the host, and **no Rust toolchain** (native code builds only inside a
 container build stage).
 
-Access: `ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100`.
+Access: `ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100`. `SSH_CONFIG` is the maintainer's local ssh config for gn100: set in the environment, never committed.
 
 **Any DGX run over about 5 minutes needs the user's explicit go-ahead in the session, with a time cap.** The one exception is build-and-fix windows: their go-ahead has no cap (§3.1 G4).
 A plan's DGX task is written as runnable steps, but its first step is "ask the user for a

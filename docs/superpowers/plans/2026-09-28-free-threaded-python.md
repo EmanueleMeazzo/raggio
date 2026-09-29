@@ -86,7 +86,7 @@ Research:
   - On the laptop they are in `D:/DEV/_scratch/dgx/planG/`. On gn100 they are in `~/raggio-bench/`, all prefixed `g-`.
   - Fetched results go to `D:/DEV/_scratch/dgx/planG/results/`.
 - **DGX rules** (spec §6).
-  - Every ssh is `ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100`.
+  - Every ssh is `ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100`. `SSH_CONFIG` is the maintainer's local ssh config for gn100: set in the environment, never committed.
   - Local paths given to `scp` are relative, after a `cd`, because `scp` would read `D:` as a host name.
   - Only the `bench-tv` container is ever stopped or removed (`podman rm -f bench-tv`). Never touch `bench-wv` or its volume.
   - Never `pkill -f`. Long runs are `setsid -f` into a log, then polled. A stop recipe finds the PIDs first, leaves out the shell that runs it, and kills by PID.
@@ -3284,7 +3284,7 @@ Nothing in the repo changed. `git status --short --untracked-files=no` prints no
 
 This task prepares Task 12's ABAB on gn100, under spec §6. It follows Tasks 1–10, and needs the user's explicit go-ahead, with no time cap: it is a build and fix window, which spec §6 exempts from the cap (§3.1 G4). A deploy or build whose log stops growing for 30 minutes is hung, which is not a cap: Task 11 stops it and asks the user (Steps 4 and 6). It is Plan G's first DGX task, and it opens with spec §8's probe p4 on G's own tree (Step 6). p4 ran on gn100 on 2026-09-28 (`docs/superpowers/research/2026-09-28-dgx-probe-p4-freethreaded.md`) at the 19a8a2e tree, which has no `raggio_native`, with a stand-in `check_image.py`: turbovec 1.0.0's sdist built for cp314t on aarch64 with 0 builder-stage fixes and no build arg, in a 28.7 s cold image build, and the GIL stayed off. Two things stay open, and Step 6 settles them: whether `raggio_native` builds for cp314t on aarch64, and whether G's real `check_image.py` passes on G's real Dockerfile. If turbovec's sdist does not build, which p4 makes unlikely, Step 6 classifies the cause from the build log (spec §3.1 G2). A missing system build dependency, a Rust or maturin toolchain version, or a missing interpreter-specific build flag or env is fixed in the Dockerfile's builder stage only, in at most 3 rebuild attempts, each recorded in the task log `D:/DEV/_scratch/dgx/planG/p4-attempts.md`. If 3 attempts do not fix it, or no builder-stage line can express the fix although turbovec's source needs no change, Task 11 stops and asks the user, and ADR 0006 stays `Pending:` (spec §3.1 G3). A cause that only a change to turbovec's own source would fix gets an upstream issue draft in `D:/DEV/_scratch/upstream-drafts/turbovec-cp314t-build.md`, which the maintainer posts, and G is parked in ADR 0006, the only case that parks without asking (spec §3.1 G3). Nobody patches, forks or vendors turbovec (D6). After p4, it records what each image runs: interpreter, GIL, turbovec wheel tag, `raggio_native`'s compiled file, the bundled SQLite (D15), `OPENBLAS_NUM_THREADS` (D16) and the Unicode versions. It also records the Unicode drift between the arms, and runs Plan F's fan-out probe in both images on one IVF index. It changes nothing in the repo, except on p4's failure path: a builder-stage fix and its regression test, committed on G's branch, or the Park recorded in ADR 0006.
 
-Every `ssh` and `scp` is written out in full, with `-F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes`. Rules for gn100:
+Every `ssh` and `scp` is written out in full, with `-F "$SSH_CONFIG" -o BatchMode=yes`. Rules for gn100:
 - Local paths given to `scp` are relative, after a `cd`, because `scp` would read `D:` as a host name.
 - Only the `bench-tv` container is ever stopped or removed.
 - Never touch `bench-wv` or its volume.
@@ -3359,7 +3359,7 @@ Note the start time, for the report; there is no cap to track (spec §6, §3.1 G
 ```bash
 lt() { local d p; for d in /proc/[0-9]*; do { read -r p < "$d/ppid"; } 2>/dev/null && [ "$p" = "$1" ] && lt "${d#/proc/}"; done; echo "$1"; }
 for d in /proc/[0-9]*; do [ "${d#/proc/}" = "$$" ] || case "$(tr '\0' ' ' 2>/dev/null < "$d/cmdline")" in *bench/dgx/deploy[.]sh*) lt "${d#/proc/}";; esac; done | sort -un | while read -r p; do echo "laptop: stopping $p"; kill "$p" 2>/dev/null; done
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 tree() { local c; for c in $(pgrep -P "$1"); do tree "$c"; done; echo "$1"; }
 for p in $(pgrep -f "raggio-bench/g-(build|facts|ensure-ivf|fanout)[.]sh"); do kill -TERM -- "-$p"; done
 pids=$(for r in $(pgrep -f "raggio/bench/dgx/setup[.]sh"); do tree "$r"; done | sort -un | grep -vx "$$")
@@ -3417,7 +3417,7 @@ If any of these differ, stop and fix that first. The images are built from the c
 - [ ] **Step 3: Pre-flight on gn100 (read-only, under a minute)**
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 uptime; free -m | head -2; df -h ~ | tail -1
 pgrep -af "bench/bench[.]py" || echo "no bench.py running"
 pgrep -af "raggio-bench/g-[a-z-]*[.]sh" || echo "no g- script running"
@@ -3477,10 +3477,10 @@ Expected when the command exits: the last line is `<ts> deployed <SHA> as localh
 Earlier Plan G files in `~/raggio-bench` are moved aside, never deleted:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'cd ~/raggio-bench && shopt -s nullglob && old=(g-*) && if [ ${#old[@]} -gt 0 ]; then d=planG-prev-$(date +%Y%m%d-%H%M%S) && mkdir "$d" && mv "${old[@]}" "$d"/ && echo "moved ${#old[@]} to $d"; else echo "nothing to move"; fi'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'cd ~/raggio-bench && shopt -s nullglob && old=(g-*) && if [ ${#old[@]} -gt 0 ]; then d=planG-prev-$(date +%Y%m%d-%H%M%S) && mkdir "$d" && mv "${old[@]}" "$d"/ && echo "moved ${#old[@]} to $d"; else echo "nothing to move"; fi'
 cd D:/DEV/_scratch/dgx/planG
-scp -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes g-session.sh g-ensure-ivf.sh g-abab.sh g-build.sh g-facts.sh g-fanout.sh g-image-facts.py g-render.py gn100:raggio-bench/
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'cd ~/raggio-bench && for f in g-session.sh g-ensure-ivf.sh g-abab.sh g-build.sh g-facts.sh g-fanout.sh; do bash -n "$f" || exit 1; done && ls -l g-* && echo SYNTAX_OK'
+scp -F "$SSH_CONFIG" -o BatchMode=yes g-session.sh g-ensure-ivf.sh g-abab.sh g-build.sh g-facts.sh g-fanout.sh g-image-facts.py g-render.py gn100:raggio-bench/
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'cd ~/raggio-bench && for f in g-session.sh g-ensure-ivf.sh g-abab.sh g-build.sh g-facts.sh g-fanout.sh; do bash -n "$f" || exit 1; done && ls -l g-* && echo SYNTAX_OK'
 ```
 
 Expected: the eight files are listed, then `SYNTAX_OK`.
@@ -3491,7 +3491,7 @@ This is spec §8's probe p4 on G's own tree, and nothing later in this task runs
 
 ```bash
 source D:/DEV/_scratch/dgx/planG/g.env
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 "setsid -f bash ~/raggio-bench/g-build.sh $SHA $WITH_C1 $WITH_D1 > ~/raggio-bench/g-build.log 2>&1 < /dev/null"
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 "setsid -f bash ~/raggio-bench/g-build.sh $SHA $WITH_C1 $WITH_D1 > ~/raggio-bench/g-build.log 2>&1 < /dev/null"
 echo "0 $(date +%s)" > D:/DEV/_scratch/dgx/planG/g-build.stall
 ```
 
@@ -3499,8 +3499,8 @@ The last line starts the stall guard's clock, as in Step 4. Poll every 5 minutes
 
 ```bash
 cd D:/DEV/_scratch/dgx/planG
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'tail -n 3 ~/raggio-bench/g-build.log'
-if size=$(ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'stat -c %s ~/raggio-bench/g-build.log'); then
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'tail -n 3 ~/raggio-bench/g-build.log'
+if size=$(ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'stat -c %s ~/raggio-bench/g-build.log'); then
   now=$(date +%s); read -r last since < g-build.stall
   [ "$size" = "$last" ] || since=$now
   echo "$size $since" > g-build.stall
@@ -3520,7 +3520,7 @@ On `== BUILD_DONE`, list the images and p4's lines:
 
 ```bash
 source D:/DEV/_scratch/dgx/planG/g.env
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 "podman images --format '{{.Repository}}:{{.Tag}} {{.Size}}' | grep -F $SHA; grep -E 'check_image|Building (turbovec|raggio-native)|built localhost' ~/raggio-bench/g-build.log"
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 "podman images --format '{{.Repository}}:{{.Tag}} {{.Size}}' | grep -F $SHA; grep -E 'check_image|Building (turbovec|raggio-native)|built localhost' ~/raggio-bench/g-build.log"
 ```
 
 Expected:
@@ -3537,7 +3537,7 @@ Expected:
 
 ```bash
 cd D:/DEV/_scratch/dgx/planG
-scp -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100:raggio-bench/g-build.log .
+scp -F "$SSH_CONFIG" -o BatchMode=yes gn100:raggio-bench/g-build.log .
 grep -n -E "^(\[[0-9]+/[0-9]+\] )?STEP [0-9]+/[0-9]+:|Failed to build|check_image|BUILD_FAILED" g-build.log | tail -n 8
 grep -n -E "error(\[E[0-9]+\])?:" g-build.log | head -n 10
 ```
@@ -3560,7 +3560,7 @@ source D:/DEV/_scratch/dgx/planG/g.env
 cd D:/DEV/_scratch/dgx/planG
 STEP=6  # 4 if Step 4's deploy hung
 h=$(date -u +%Y%m%dT%H%MZ)
-if [ "$STEP" = 4 ]; then cp deploy.log "hung-$h.log"; else scp -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100:raggio-bench/g-build.log "hung-$h.log"; fi
+if [ "$STEP" = 4 ]; then cp deploy.log "hung-$h.log"; else scp -F "$SSH_CONFIG" -o BatchMode=yes gn100:raggio-bench/g-build.log "hung-$h.log"; fi
 printf '\n## p4 hung build, not counted\n\n- time (UTC): %s\n- SHA: %s\n- step: Step %s\n- log: hung-%s.log, last line: %s\n- next: stop: build hung (no log output for 30 min)\n' "$(date -u +%Y-%m-%dT%H:%MZ)" "$SHA" "$STEP" "$h" "$(tail -n 1 "hung-$h.log")" >> p4-attempts.md
 grep -c "^## p4 build " p4-attempts.md
 tail -n 7 p4-attempts.md
@@ -3814,13 +3814,13 @@ Expected: `1 passed, 28 deselected` (`1 passed, 29 deselected` if an attempt add
 
 ```bash
 source D:/DEV/_scratch/dgx/planG/g.env
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 "setsid -f bash ~/raggio-bench/g-facts.sh $SHA $WITH_C1 $WITH_D1 > ~/raggio-bench/g-facts.log 2>&1 < /dev/null"
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 "setsid -f bash ~/raggio-bench/g-facts.sh $SHA $WITH_C1 $WITH_D1 > ~/raggio-bench/g-facts.log 2>&1 < /dev/null"
 ```
 
 Poll every minute until the last line is `== FACTS_DONE` or `== FACTS_FAILED <what>`:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'tail -n 8 ~/raggio-bench/g-facts.log'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'tail -n 8 ~/raggio-bench/g-facts.log'
 ```
 
 Expected on `== FACTS_DONE`:
@@ -3846,19 +3846,19 @@ The fan-out probe reads the IVF index from the volume. On a flat volume, `g-ensu
 
 ```bash
 source D:/DEV/_scratch/dgx/planG/g.env
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 "setsid -f bash ~/raggio-bench/g-ensure-ivf.sh localhost/raggio:$SHA > ~/raggio-bench/g-ensure-ivf.log 2>&1 < /dev/null"
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 "setsid -f bash ~/raggio-bench/g-ensure-ivf.sh localhost/raggio:$SHA > ~/raggio-bench/g-ensure-ivf.log 2>&1 < /dev/null"
 ```
 
 Poll every 2 minutes until the log has `ready from the IVF index`, or a line that ends in `stopping`:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'tail -n 3 ~/raggio-bench/g-ensure-ivf.log'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'tail -n 3 ~/raggio-bench/g-ensure-ivf.log'
 ```
 
 The probe runs in a container named `bench-tv`, so stop and remove the server first:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'podman stop -t 60 bench-tv && podman rm -f bench-tv && echo REMOVED'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'podman stop -t 60 bench-tv && podman rm -f bench-tv && echo REMOVED'
 ```
 
 Expected: `REMOVED`. On `stopping`, fetch `g-ensure-ivf.log`, stop `bench-tv` the same way, and report.
@@ -3867,13 +3867,13 @@ Expected: `REMOVED`. On `stopping`, fetch `g-ensure-ivf.log`, stop `bench-tv` th
 
 ```bash
 source D:/DEV/_scratch/dgx/planG/g.env
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 "setsid -f bash ~/raggio-bench/g-fanout.sh $SHA > ~/raggio-bench/g-fanout.log 2>&1 < /dev/null"
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 "setsid -f bash ~/raggio-bench/g-fanout.sh $SHA > ~/raggio-bench/g-fanout.log 2>&1 < /dev/null"
 ```
 
 Poll every 5 minutes until the last line of `g-fanout.log` is `== FANOUT_DONE` or `== FANOUT_FAILED <what>`:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'tail -n 2 ~/raggio-bench/g-fanout.log; tail -n 3 ~/raggio-bench/g-fanout-A.txt ~/raggio-bench/g-fanout-B.txt 2>/dev/null'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'tail -n 2 ~/raggio-bench/g-fanout.log; tail -n 3 ~/raggio-bench/g-fanout-A.txt ~/raggio-bench/g-fanout-B.txt 2>/dev/null'
 ```
 
 Expected on `== FANOUT_DONE`: each of `g-fanout-A.txt` and `g-fanout-B.txt` ends with Plan F's gate line, `serial r1/r2 <a>/<b> ms; chosen pool size <T> (default here <D>); GATE grouped vs plain at <T>: WIN` or `LOSS`. On `FANOUT_FAILED`, fetch the two files and `g-fanout.log`, and report. The transient container was `--rm`, so nothing is left running.
@@ -3972,7 +3972,7 @@ Note the cap and the start time. If the cap is reached before Step 5 sees `g-aba
 source D:/DEV/_scratch/dgx/planG/g.env
 cd D:/DEV/raggio
 [ "$(git rev-parse --short=7 HEAD)" = "$SHA" ] && [ -z "$(git status --short --untracked-files=no)" ] && echo "HEAD is $SHA, clean"
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 "echo deployed \$(cat ~/raggio/.deployed-sha); podman images --format '{{.Repository}}:{{.Tag}}' | grep -F $SHA"
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 "echo deployed \$(cat ~/raggio/.deployed-sha); podman images --format '{{.Repository}}:{{.Tag}}' | grep -F $SHA"
 ```
 
 Expected:
@@ -3985,7 +3985,7 @@ If anything differs, stop and ask the user. The arms must come from the commit T
 - [ ] **Step 3: Pre-flight on gn100 (read-only, then a move-aside)**
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 uptime; free -m | head -2; df -h ~ | tail -1
 pgrep -af "bench/bench[.]py" || echo "no bench.py running"
 pgrep -af "raggio-bench/g-[a-z-]*[.]sh" || echo "no g- script running"
@@ -4013,7 +4013,7 @@ Set `ADOPT` from the last line: `ADOPT=0` if the fingerprint exists, `ADOPT=1` i
 Plan A's `session.sh` refuses a label whose directory exists, and a stale `<label>.end` would end a new session's sampler at once. So move the outputs of any earlier ABAB aside; nothing is deleted:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'cd ~/raggio-bench && shopt -s nullglob && old=(g-[abcd][12]-* g-boot-*.txt g-abab.log g-verification.md) && if [ ${#old[@]} -gt 0 ]; then d=planG-prev-$(date +%Y%m%d-%H%M%S) && mkdir "$d" && mv "${old[@]}" "$d"/ && echo "moved ${#old[@]} to $d"; else echo "nothing to move"; fi'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'cd ~/raggio-bench && shopt -s nullglob && old=(g-[abcd][12]-* g-boot-*.txt g-abab.log g-verification.md) && if [ ${#old[@]} -gt 0 ]; then d=planG-prev-$(date +%Y%m%d-%H%M%S) && mkdir "$d" && mv "${old[@]}" "$d"/ && echo "moved ${#old[@]} to $d"; else echo "nothing to move"; fi'
 ```
 
 Expected: `nothing to move` on the first ABAB. The pattern `g-[abcd][12]-*` covers the `-c16` sessions too, such as `g-a1-py312-c16.log`.
@@ -4023,9 +4023,9 @@ Expected: `nothing to move` on the first ABAB. The pattern `g-[abcd][12]-*` cove
 ```bash
 source D:/DEV/_scratch/dgx/planG/g.env
 ADOPT=0  # 1 only if Step 3 found no fingerprint
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 "ADOPT=$ADOPT setsid -f bash ~/raggio-bench/g-abab.sh $SHA 90m $WITH_C1 $WITH_D1 > ~/raggio-bench/g-abab.log 2>&1 < /dev/null"
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 "ADOPT=$ADOPT setsid -f bash ~/raggio-bench/g-abab.sh $SHA 90m $WITH_C1 $WITH_D1 > ~/raggio-bench/g-abab.log 2>&1 < /dev/null"
 sleep 60
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'cat ~/raggio-bench/g-abab.log; cat ~/raggio-bench/g-active'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'cat ~/raggio-bench/g-abab.log; cat ~/raggio-bench/g-active'
 ```
 
 Expected:
@@ -4038,7 +4038,7 @@ Expected:
 Poll every 10 minutes:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'tail -n 3 ~/raggio-bench/g-abab.log; cat ~/raggio-bench/g-active 2>/dev/null; pgrep -af "bench/dgx/session[.]sh"; podman ps --format "{{.Names}} {{.Status}} {{.Image}}"'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'tail -n 3 ~/raggio-bench/g-abab.log; cat ~/raggio-bench/g-active 2>/dev/null; pgrep -af "bench/dgx/session[.]sh"; podman ps --format "{{.Names}} {{.Status}} {{.Image}}"'
 ```
 
 The last line of `g-abab.log` ends the chain in one of two ways:
@@ -4048,7 +4048,7 @@ The last line of `g-abab.log` ends the chain in one of two ways:
 **Stop recipe**, for the user's time cap or on the user's request. It was validated in a container, with the real `g-abab.sh` and `g-session.sh` over stub sessions: the chain stops, the running session's `timeout` passes the TERM on, and no `g-session.sh` is left after 70 s. The 70 s wait covers `--kill-after=60`. Then `bench-tv` is stopped.
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'for p in $(pgrep -f "raggio-bench/g-abab[.]sh"); do kill "$p"; done; for p in $(pgrep -f "timeout --kill-after=60 [0-9]+m bash -c"); do kill "$p"; done; sleep 70; podman stop -t 60 bench-tv; pgrep -af "bench/dgx/session[.]sh" || echo "no session.sh running"; ls ~/raggio-bench/g-active 2>&1'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'for p in $(pgrep -f "raggio-bench/g-abab[.]sh"); do kill "$p"; done; for p in $(pgrep -f "timeout --kill-after=60 [0-9]+m bash -c"); do kill "$p"; done; sleep 70; podman stop -t 60 bench-tv; pgrep -af "bench/dgx/session[.]sh" || echo "no session.sh running"; ls ~/raggio-bench/g-active 2>&1'
 ```
 
 Expected: `no session.sh running`, and `g-active`: `No such file or directory`. If a `session.sh` is still running or `g-active` remains, report it and ask; do not kill or remove anything yourself. Then go to the failure path.
@@ -4056,7 +4056,7 @@ Expected: `no session.sh running`, and `g-active`: `No such file or directory`. 
 - [ ] **Step 6: Render the Verification on gn100**
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'podman stop -t 60 bench-tv; cd ~/raggio && .venv/bin/python ~/raggio-bench/g-render.py && cat ~/raggio-bench/g-boot-before.txt ~/raggio-bench/g-boot-after.txt'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'podman stop -t 60 bench-tv; cd ~/raggio && .venv/bin/python ~/raggio-bench/g-render.py && cat ~/raggio-bench/g-boot-before.txt ~/raggio-bench/g-boot-after.txt'
 ```
 
 Expected:
@@ -4071,8 +4071,8 @@ Two different boot ids mean gn100 rebooted during the chain. The Task 12 test wi
 ```bash
 mkdir -p D:/DEV/_scratch/dgx/planG/results
 cd D:/DEV/_scratch/dgx/planG/results
-scp -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100:raggio-bench/g-verification.md .
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'cd ~/raggio-bench && tar -czf - g-[abcd][12]-* g-boot-*.txt g-images.txt g-u-*.json g-drift* g-fanout-* g-abab.log g-build.log g-facts.log g-ensure-ivf.log g-fanout.log g-verification.md' > g-abab-outputs.tar.gz
+scp -F "$SSH_CONFIG" -o BatchMode=yes gn100:raggio-bench/g-verification.md .
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'cd ~/raggio-bench && tar -czf - g-[abcd][12]-* g-boot-*.txt g-images.txt g-u-*.json g-drift* g-fanout-* g-abab.log g-build.log g-facts.log g-ensure-ivf.log g-fanout.log g-verification.md' > g-abab-outputs.tar.gz
 tar -tzf g-abab-outputs.tar.gz | wc -l
 head -n 20 g-verification.md
 ```

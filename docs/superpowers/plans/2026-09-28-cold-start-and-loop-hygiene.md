@@ -96,7 +96,7 @@ These are copied from the spec, one requirement per line:
 The following are harness and repository rules:
 
 - Tests pass on Windows (dev) and Linux (CI). Code that needs glibc, ctypes or POSIX is guarded, and so are the tests that exercise it.
-- DGX access is only through `ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100`.
+- DGX access is only through `ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100`. `SSH_CONFIG` is the maintainer's local ssh config for gn100: set in the environment, never committed.
 - On the DGX: never touch `~/turborag` (read-only use of its corpus symlink target, as §6 prescribes, is allowed), and no `sudo`.
 - Line numbers are those of base 19a8a2e. After A and B they shift, so every Modify step names the function and quotes the exact text it replaces.
 - **Suite count.** Before Task 1, run `uv run pytest -q` on the branch base and record the pass count as `N0`. After Plans A and B it is 188 (`188 passed, 1 warning`: A's 162+9 = 171 plus B's 17, per Plan A's suite-count note), so after Task 9 it is 252. Each task states its expected total as `N0 + k`; the one Starlette deprecation warning stays throughout.
@@ -3994,7 +3994,7 @@ Expected: the same output as before Step 1, with no `src/`, `tests/`, `docs/adr/
 ### Task 12: Acceptance run on gn100 (spec §7 C), recorded in ADR 0001
 
 This is the last task. It deploys the branch's `HEAD` to gn100 and runs Task 11's session there. If every §7 C threshold passes, it records the verdict in the Plan C addendum. The DGX rules of spec §6 hold throughout:
-- ssh only as `ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100`;
+- ssh only as `ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100`;
 - no sudo;
 - `podman rm -f` names only `bench-tv`, and nothing touches `bench-wv` (container or volume) or writes `~/turborag`;
 - the session runs detached with `setsid -f` into a log that is polled;
@@ -4054,7 +4054,7 @@ Expected: exit status 0, ending in `Plan C DGX scripts OK`.
 Run:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 uptime; free -m
 podman ps -a --format "{{.Names}} | {{.Status}} | {{.Image}}"
 pgrep -af "[s]ession\.sh|[b]ench\.py" || echo "no sessions running"
@@ -4081,11 +4081,11 @@ If `bench-tv` is `Up`, or a session is listed, it is someone's work. Stop, repor
 Run, in Git Bash from the repo root:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 \
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 \
   'if [ -e ~/planC ]; then mv ~/planC ~/planC.prev-$(date -u +%Y%m%dT%H%M%SZ); fi; mkdir ~/planC && chmod 755 ~/planC'
-(cd /d/DEV/_scratch/dgx/planC && scp -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" \
+(cd /d/DEV/_scratch/dgx/planC && scp -F "$SSH_CONFIG" \
   -o BatchMode=yes c_evict.py c_probe.py c_session.sh gn100:planC/)
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 cd ~/planC && chmod 644 c_evict.py c_probe.py c_session.sh && bash -n c_session.sh && echo "syntax ok"
 MNT=$(podman volume inspect bench-tv --format "{{.Mountpoint}}")
 podman unshare python3 ~/planC/c_evict.py --check "$MNT"'
@@ -4107,7 +4107,7 @@ Run, from the repo root:
 
 ```bash
 SHA=$(git rev-parse --short=7 HEAD)
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 \
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 \
   "setsid -f timeout --kill-after=60 60m bash ~/planC/c_session.sh c1 localhost/raggio:$SHA > ~/planC/c1.log 2>&1 < /dev/null; sleep 5; head -n 3 ~/planC/c1.log"
 ```
 
@@ -4118,7 +4118,7 @@ Expected: `[hh:mm:ss] == PLANC START c1 localhost/raggio:<sha7> ==`, then a `ROW
 Every 3–5 minutes, run:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 \
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 \
   'grep -E "== PLANC|ROW" ~/planC/c1.log | tail -n 4 | cut -c1-200'
 ```
 
@@ -4127,7 +4127,7 @@ The session is over when the last line is `== PLANC DONE ==` or `== PLANC FAILED
 - To stop it early (the user asks, or the window closes), run:
 
   ```bash
-  ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 \
+  ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 \
     'kill -TERM -- -"$(cat ~/planC/c1/session.pgid)"; podman stop -t 60 --ignore bench-tv'
   ```
 
@@ -4142,7 +4142,7 @@ The session is over when the last line is `== PLANC DONE ==` or `== PLANC FAILED
 Run:
 
 ```bash
-(cd /d/DEV/_scratch/dgx/planC && scp -r -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" \
+(cd /d/DEV/_scratch/dgx/planC && scp -r -F "$SSH_CONFIG" \
   -o BatchMode=yes gn100:planC/c1 gn100:planC/c1.log .)
 ```
 

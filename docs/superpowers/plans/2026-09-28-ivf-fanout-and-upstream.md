@@ -4074,7 +4074,7 @@ Two things are out of scope, and the report says so rather than chasing them:
 - After F the limit is the HTTP/event-loop pipeline (about 3.1 ms per request, of which the loop burns 1.2–1.5 ms of CPU). Its follow-ups are two `_drain_scans` batches in flight, `_hydrate` off the event loop, and a cheaper parse of the vector body (p3). None is in Plans A–G.
 - SQLite's global memstatus malloc mutex (p2, D15) is a confounder for concurrent numbers. F's pool tasks do not touch SQLite, but the request path does. Both arms must show the same `sqlite_version`. If they differ, the summary fails item 2 rather than attribute the gap to F.
 
-Every `ssh` and `scp` below is written out in full with `-F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes`. Local paths given to `scp` are relative, after a `cd`, because `scp` would read `D:` as a host name. Never run `podman rm -f` on anything but `bench-tv`, never touch `bench-wv` or its volume, and never `pkill -f`.
+Every `ssh` and `scp` below is written out in full with `-F "$SSH_CONFIG" -o BatchMode=yes`. `SSH_CONFIG` is the maintainer's local ssh config for gn100: set in the environment, never committed. Local paths given to `scp` are relative, after a `cd`, because `scp` would read `D:` as a host name. Never run `podman rm -f` on anything but `bench-tv`, never touch `bench-wv` or its volume, and never `pkill -f`.
 
 **Files:**
 - Modify: `docs/adr/0005-ivf-fanout-and-upstream-stance.md`: `planF-verify.py` replaces the `Pending:` Verification.
@@ -4143,7 +4143,7 @@ If any of these differ, stop and fix that first: the image is built from the com
 - [ ] **Step 3: Pre-flight on gn100 (read-only, under a minute)**
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 uptime; free -m | head -2
 pgrep -af "bench/bench[.]py" || echo "no bench.py running"
 podman ps -a --format "{{.Names}} {{.Status}} {{.Image}}"
@@ -4163,12 +4163,12 @@ If the volume line errors (there is no `bench-tv` volume), stop and ask: the 2.5
 An existing `~/planF` holds an earlier session's results. It is moved aside, never deleted.
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'if [ -e ~/planF ]; then mv ~/planF ~/planF.prev-$(date +%Y%m%d-%H%M%S); fi; mkdir -p ~/planF/results'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'if [ -e ~/planF ]; then mv ~/planF ~/planF.prev-$(date +%Y%m%d-%H%M%S); fi; mkdir -p ~/planF/results'
 cd D:/DEV/_scratch/dgx
-scp -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes dgx-planF-ab.sh planF-build.sh planF-cpu.py gn100:planF/
+scp -F "$SSH_CONFIG" -o BatchMode=yes dgx-planF-ab.sh planF-build.sh planF-cpu.py gn100:planF/
 cd D:/DEV/_scratch/upstream-drafts
-scp -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes neon_small_nq_repro.py gn100:planF/
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'ls -l ~/planF; bash -n ~/planF/dgx-planF-ab.sh && bash -n ~/planF/planF-build.sh && python3 -m py_compile ~/planF/planF-cpu.py && echo SYNTAX_OK'
+scp -F "$SSH_CONFIG" -o BatchMode=yes neon_small_nq_repro.py gn100:planF/
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'ls -l ~/planF; bash -n ~/planF/dgx-planF-ab.sh && bash -n ~/planF/planF-build.sh && python3 -m py_compile ~/planF/planF-cpu.py && echo SYNTAX_OK'
 ```
 
 Expected: the four files are listed, then `SYNTAX_OK`.
@@ -4180,9 +4180,9 @@ Plan F's tree goes to `~/raggio`, with the corpus link, the ground truth, the fi
 ```bash
 cd D:/DEV/raggio
 source D:/DEV/_scratch/dgx/planF-shas.env
-git archive "$F_SHA" | ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'rm -rf ~/raggio && mkdir ~/raggio && tar -x -C ~/raggio'
-git archive "$BASE_SHA" | ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'mkdir ~/planF/base-src && tar -x -C ~/planF/base-src'
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+git archive "$F_SHA" | ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'rm -rf ~/raggio && mkdir ~/raggio && tar -x -C ~/raggio'
+git archive "$BASE_SHA" | ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'mkdir ~/planF/base-src && tar -x -C ~/planF/base-src'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 cd ~/raggio || exit 1
 ln -sfn ~/turborag/bench/corpus bench/corpus
 cp ~/turborag/bench/gt-2549619-42-d1024.npz bench/
@@ -4203,13 +4203,13 @@ The fingerprint copy only matters in the pre-A (legacy) bench mode. Plan A's har
 ```bash
 cd D:/DEV/raggio
 source D:/DEV/_scratch/dgx/planF-shas.env
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 "setsid -f bash -c 'bash ~/planF/planF-build.sh ~/planF/base-src $BASE_SHA && bash ~/planF/planF-build.sh ~/raggio $F_SHA' >>~/planF/build.log 2>&1 </dev/null"
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 "setsid -f bash -c 'bash ~/planF/planF-build.sh ~/planF/base-src $BASE_SHA && bash ~/planF/planF-build.sh ~/raggio $F_SHA' >>~/planF/build.log 2>&1 </dev/null"
 ```
 
 Poll every 2 minutes:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'grep -E "^== BUILD" ~/planF/build.log; tail -n 2 ~/planF/build.log'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'grep -E "^== BUILD" ~/planF/build.log; tail -n 2 ~/planF/build.log'
 ```
 
 Done when there are two `== BUILD_DONE <tag>` lines, one for `$BASE_SHA` and one for `$F_SHA`. If a `== BUILD_FAILED` line appears, stop and report the tail of `~/planF/build.log` to the user.
@@ -4219,9 +4219,9 @@ Done when there are two `== BUILD_DONE <tag>` lines, one for `$BASE_SHA` and one
 ```bash
 cd D:/DEV/raggio
 source D:/DEV/_scratch/dgx/planF-shas.env
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 "setsid -f bash ~/planF/dgx-planF-ab.sh $BASE_SHA $F_SHA $FLAT_CHECK >/dev/null 2>&1 </dev/null"
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 "setsid -f bash ~/planF/dgx-planF-ab.sh $BASE_SHA $F_SHA $FLAT_CHECK >/dev/null 2>&1 </dev/null"
 sleep 60
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'head -n 30 ~/planF/ab.log'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'head -n 30 ~/planF/ab.log'
 ```
 
 Expected: the log opens with:
@@ -4237,7 +4237,7 @@ If it instead ends with `== PLANF AB FAILED: no readable /sys/fs/cgroup/memory.p
 - [ ] **Step 8: Poll until done (every 5 minutes)**
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'grep -E "^== (ivf-|flat-|cpu16|probe|NEON|PLANF AB)" ~/planF/ab.log | tail -n 4; date'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'grep -E "^== (ivf-|flat-|cpu16|probe|NEON|PLANF AB)" ~/planF/ab.log | tail -n 4; date'
 ```
 
 Progress runs as follows:
@@ -4253,7 +4253,7 @@ If `== PLANF AB FAILED: <reason>` appears, go to Step 9 to fetch the log. Then r
 If the time cap is reached first, stop only this session's processes. The bracketed patterns keep `pgrep` from matching its own command line. Then report to the user, and stop:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 for p in $(pgrep -f "planF/dgx-planF-a[b][.]sh"); do kill "$p"; done
 sleep 2
 for p in $(pgrep -f "bench/bench[.]py|ivf_fanout_probe[.]py|neon_small_nq_rep[r]o[.]py|planF-cp[u][.]py"); do kill "$p"; done
@@ -4266,8 +4266,8 @@ podman ps -a --filter name=bench-tv'
 ```bash
 mkdir -p D:/DEV/_scratch/dgx/planF
 cd D:/DEV/_scratch/dgx/planF
-scp -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100:planF/ab.log .
-scp -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes -r gn100:planF/results .
+scp -F "$SSH_CONFIG" -o BatchMode=yes gn100:planF/ab.log .
+scp -F "$SSH_CONFIG" -o BatchMode=yes -r gn100:planF/results .
 ls results
 ```
 

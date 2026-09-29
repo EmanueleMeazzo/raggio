@@ -91,7 +91,7 @@ These are copied from the spec, one requirement per line:
 - "A reuse check that cannot reach the server must fail loudly. It must never re-ingest." (§5.3)
 - "Fingerprints must be keyed by corpus/limit, or be untracked." (§5.3)
 - "The bench must wait for `pending_jobs == 0` before measuring." (§5.3)
-- "Access: `ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100`." (§6)
+- "Access: `ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100`. `SSH_CONFIG` is the maintainer's local ssh config for gn100: set in the environment, never committed." (§6)
 - "**Any DGX run over about 5 minutes needs the user's explicit go-ahead in the session, with a time cap.** A plan's DGX task is written as runnable steps, but its first step is "ask the user for a run window"." (§6)
 - "`podman rm -f` may only name `bench-tv`, never `bench-wv` (the Weaviate container, whose `bench-wv` volume must be preserved)." (§6)
 - "Every run starts from a fresh container of the image under test." (§6)
@@ -1588,12 +1588,14 @@ run() {
 ```bash
 #!/usr/bin/env bash
 # Ship the committed HEAD to the DGX and build its image (spec §6 "Deploy").
-# Run on the workstation from the repo root:  bash bench/dgx/deploy.sh
+# Run on the workstation from the repo root:
+#   SSH_CONFIG=<ssh config that reaches the DGX> bash bench/dgx/deploy.sh
+# The ssh config path is the operator's, so the repo carries no default for it.
 # ~/raggio on the DGX is replaced (unpack.sh keeps a copy of its bench results and logs);
 # bench state and session outputs live in ~/raggio-bench (lib.sh).
 set -euo pipefail
 
-SSH_CONFIG="${SSH_CONFIG:-C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config}"
+SSH_CONFIG="${SSH_CONFIG:?set SSH_CONFIG to the ssh config file that reaches the DGX}"
 DGX_HOST="${DGX_HOST:-gn100}"
 ssh_dgx() { ssh -F "$SSH_CONFIG" -o BatchMode=yes "$DGX_HOST" "$@"; }
 
@@ -3318,7 +3320,7 @@ This is a DGX task. Nothing in it was run in the sandbox, and no command here ha
 
 Every command runs from the workstation repo root in Git Bash. `DGX_SSH` below stands for exactly this command, written out in full in every step:
 
-`ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100`
+`ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100`
 
 **Files:**
 - No repo file changes.
@@ -3357,7 +3359,7 @@ If the answer names a shorter cap, pass it to `timeout` in Step 5. It must be at
 - [ ] **Step 2: Read-only pre-checks**
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 uptime; free -m | head -2
 podman ps -a --format "{{.Names}} {{.Status}} {{.Image}}"
 podman image inspect --format "{{.Id}}" localhost/raggio:baseline || echo "NO BASELINE IMAGE"
@@ -3411,7 +3413,7 @@ baseline3's run1-ivf followed the 128 s cold load, so it becomes the discarded w
 This is the mapping of `D:/DEV/_scratch/plan-sandbox/plan-A-tools/b3convert.py`.
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 set -euo pipefail
 src=$(ls -d ~/raggio-bench/pre-deploy-* | tail -1)
 dst=~/raggio-bench/baseline3
@@ -3435,13 +3437,13 @@ baseline3 ran bench.py at its default `--concurrency 8`, so its label is `"concu
 If the pre-deploy copy lacks the files, build the directory locally, then copy it:
 1. Run `uv run python D:/DEV/_scratch/plan-sandbox/plan-A-tools/b3convert.py D:/DEV/_scratch/dgx/baseline3-session`.
 2. Write the same `regime.json` into that directory.
-3. Run `ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'mkdir -p ~/raggio-bench/baseline3'`. The `-p` matters: a Step 4 that stopped at a missing file has already created the directory and copied part of it. scp in the next step overwrites those files with the same content.
-4. Run `scp -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes /d/DEV/_scratch/dgx/baseline3-session/* gn100:raggio-bench/baseline3/`. The local path is in the `/d/…` form: Git Bash's scp reads `D:/…` as a host named `D`.
+3. Run `ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'mkdir -p ~/raggio-bench/baseline3'`. The `-p` matters: a Step 4 that stopped at a missing file has already created the directory and copied part of it. scp in the next step overwrites those files with the same content.
+4. Run `scp -F "$SSH_CONFIG" -o BatchMode=yes /d/DEV/_scratch/dgx/baseline3-session/* gn100:raggio-bench/baseline3/`. The local path is in the `/d/…` form: Git Bash's scp reads `D:/…` as a host named `D`.
 
 - [ ] **Step 5: Launch the session, detached**
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 adopt=1; [ -e ~/raggio-bench/state/fingerprint-raggio-2549619.json ] && adopt=0
 setsid -f timeout --kill-after=60 50m env IMAGE=localhost/raggio:baseline FLAT_RUNS=3 ADOPT=$adopt \
   bash ~/raggio/bench/dgx/session.sh a-equiv > ~/raggio-bench/a-equiv.log 2>&1 < /dev/null
@@ -3463,7 +3465,7 @@ Fallback when Step 2 printed `NO BASELINE IMAGE`: drop `IMAGE=…`. The session 
 Every 5 minutes:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'tail -n 4 ~/raggio-bench/a-equiv.log'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'tail -n 4 ~/raggio-bench/a-equiv.log'
 ```
 
 The session is done when the last line is `<UTC time> session a-equiv done`, about 35 minutes in.
@@ -3478,7 +3480,7 @@ The session is done when the last line is `<UTC time> session a-equiv done`, abo
 a-equiv read the facts inside `localhost/raggio:baseline`, the image baseline3 ran. Copy them only after checking that it is that image:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 set -euo pipefail
 id=$(podman image inspect --format "{{.Id}}" localhost/raggio:baseline)
 case "$id" in 66aadc92*) ;; *) echo "not the baseline3 image: $id" >&2; exit 1 ;; esac
@@ -3497,7 +3499,7 @@ If the python version is not 3.12.x or sqlite is not 3.40.1, the image is not th
 The command first checks that every raggio and raggio-ivf run file holds the three spec §3.1 G5 keys, and that no bench.py run logged an absent CPU row. Then it compares.
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 cd ~/raggio-bench/a-equiv
 for f in run*-raggio*.json; do
   for k in hybrid_c_p99 cpu_ms_per_q_c hybrid_cpu_ms_per_q_c; do grep -q "\"$k\"" "$f" || echo "$f: no $k"; done
@@ -3531,8 +3533,8 @@ If the gate fails, do not merge PR 1:
 - [ ] **Step 9: Stop the container, keep the results, and record them**
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'podman stop -t 60 --ignore bench-tv; podman ps -a --format "{{.Names}} {{.Status}}"'
-scp -r -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100:raggio-bench/a-equiv gn100:raggio-bench/baseline3 /d/DEV/_scratch/dgx/
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'podman stop -t 60 --ignore bench-tv; podman ps -a --format "{{.Names}} {{.Status}}"'
+scp -r -F "$SSH_CONFIG" -o BatchMode=yes gn100:raggio-bench/a-equiv gn100:raggio-bench/baseline3 /d/DEV/_scratch/dgx/
 ```
 
 The target is in the `/d/…` form because Git Bash's scp reads `D:/…` as a host named `D`.
@@ -3694,7 +3696,7 @@ Run: `uv --version`
 
 If it prints a version below 0.12, ask the user before changing their tools:
 
-> The uv floor needs uv >= 0.12 on this machine; `uv --version` shows `<version>`. May I run `uv self update 0.12.19`? It replaces the standalone uv in `C:/Users/emanu/.local/bin`.
+> The uv floor needs uv >= 0.12 on this machine; `uv --version` shows `<version>`. May I run `uv self update 0.12.19`? It replaces the standalone uv in `~/.local/bin`.
 
 After a yes, run `uv self update 0.12.19`. Then `uv --version` must print `uv 0.12.19 (…)`.
 
@@ -4353,7 +4355,7 @@ If the answer names a shorter cap, below 150 minutes, say that both sessions wil
 - [ ] **Step 2: Read-only pre-checks**
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 uptime; free -m | head -2; df -h ~ | tail -1
 podman ps -a --format "{{.Names}} {{.Status}} {{.Image}}"
 pgrep -af "[s]ession\.sh|[b]ench/bench\.py|[d]etach\.sh|[d]gx-baseline" || echo "no bench running"
@@ -4387,7 +4389,7 @@ Only if Step 2 printed a version below 0.12 (someone changed uv since that check
 After a yes:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '~/.local/bin/uv self update 0.12.19 && ~/.local/bin/uv --version'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '~/.local/bin/uv self update 0.12.19 && ~/.local/bin/uv --version'
 ```
 
 Expected: the last line starts `uv 0.12.19`. The standalone installer's receipt is what lets `self update` replace the binary. If it refuses anyway, stop and report its output to the user.
@@ -4412,7 +4414,7 @@ Expected:
 - [ ] **Step 5: Install the detach helper**
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'mkdir -p ~/raggio-bench && cat > ~/raggio-bench/detach.sh' <<'EOF'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'mkdir -p ~/raggio-bench && cat > ~/raggio-bench/detach.sh' <<'EOF'
 #!/usr/bin/env bash
 # Leave the bench-tv volume with a flat index, so the next session.sh session starts flat
 # and measures the IVF build (plan A, Task 10). Same 8 GiB transient container and
@@ -4450,7 +4452,7 @@ podman stop -t 60 bench-tv
 log "index after: $after, detach took $((SECONDS - start)) s"
 [ "$after" = flat ]
 EOF
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'bash -n ~/raggio-bench/detach.sh && echo syntax ok'
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'bash -n ~/raggio-bench/detach.sh && echo syntax ok'
 ```
 
 Expected: `syntax ok`.
@@ -4460,13 +4462,13 @@ The only container it stops or removes is `bench-tv`. Its waits have no bounds o
 - [ ] **Step 6: Leave the volume flat before `a-main`**
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 img=localhost/raggio:$(cat ~/raggio/.deployed-sha)
 setsid -f timeout --kill-after=60 20m bash ~/raggio-bench/detach.sh "$img" > ~/raggio-bench/detach-a-main.log 2>&1 < /dev/null
 sleep 5; cat ~/raggio-bench/detach-a-main.log'
 ```
 
-Poll every 2 minutes with `ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'tail -n 3 ~/raggio-bench/detach-a-main.log'`.
+Poll every 2 minutes with `ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'tail -n 3 ~/raggio-bench/detach-a-main.log'`.
 
 It is done when the last line is `<UTC time> index after: flat, detach took <s> s`:
 - If Task 6's session ended flat, the log has `index before: flat` and a detach time near 0.
@@ -4481,7 +4483,7 @@ On failure, stop, and report the log to the user. To stop the script early: `kil
 - [ ] **Step 7: Session `a-main`**
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 adopt=1; [ -e ~/raggio-bench/state/fingerprint-raggio-2549619.json ] && adopt=0
 setsid -f timeout --kill-after=60 65m env FLAT_RUNS=3 IVF_BUILDS=2 ADOPT=$adopt \
   bash ~/raggio/bench/dgx/session.sh a-main > ~/raggio-bench/a-main.log 2>&1 < /dev/null
@@ -4490,7 +4492,7 @@ sleep 5; head -n 3 ~/raggio-bench/a-main.log'
 
 Expected first line: `<UTC time> session a-main: image localhost/raggio:<main sha>, bench checkout <main sha>`.
 
-Poll every 5 minutes with `ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'tail -n 4 ~/raggio-bench/a-main.log'`. The session is done when the last line is `<UTC time> session a-main done`, about 53 minutes in. The log shows:
+Poll every 5 minutes with `ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'tail -n 4 ~/raggio-bench/a-main.log'`. The session is done when the last line is `<UTC time> session a-main done`, about 53 minutes in. The log shows:
 - `index at start: flat`;
 - raggio run0–run3;
 - raggio-ivf run0, whose build is measured at 4 GiB, about 213 s in the research baseline;
@@ -4523,7 +4525,7 @@ If `uv sync` fails with `Required uv version`, Step 3 was skipped wrongly. Go ba
 `a-main` ended on IVF. Run Step 6's launch and polling, with `detach-a-ref.log` in place of `detach-a-main.log`:
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 img=localhost/raggio:$(cat ~/raggio/.deployed-sha)
 setsid -f timeout --kill-after=60 20m bash ~/raggio-bench/detach.sh "$img" > ~/raggio-bench/detach-a-ref.log 2>&1 < /dev/null
 sleep 5; cat ~/raggio-bench/detach-a-ref.log'
@@ -4534,7 +4536,7 @@ Expected final line: `<UTC time> index after: flat, detach took <s> s`, after `i
 - [ ] **Step 10: Session `a-ref`**
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 setsid -f timeout --kill-after=60 65m env FLAT_RUNS=3 IVF_BUILDS=2 \
   bash ~/raggio/bench/dgx/session.sh a-ref > ~/raggio-bench/a-ref.log 2>&1 < /dev/null
 sleep 5; head -n 3 ~/raggio-bench/a-ref.log'
@@ -4545,7 +4547,7 @@ Expected first line: `<UTC time> session a-ref: image localhost/raggio:<PR 2 sha
 - [ ] **Step 11: Check both images' labels**
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 cd ~/raggio-bench
 for s in a-main a-ref; do echo "$s"; cat "$s/image.json" "$s/regime.json"
   for r in run0 build2; do grep -o "\"index_build_s\": [0-9.]*" "$s/$r-raggio-ivf.json" || echo "no IVF build measured in $r"; done
@@ -4566,7 +4568,7 @@ If `a-ref` has no `image.json`, or its `openblas_num_threads` is not `"1"`, the 
 - [ ] **Step 12: Compare, and apply the gates**
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 '
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 '
 cd ~/raggio && .venv/bin/python bench/dgx/compare.py ~/raggio-bench/a-main ~/raggio-bench/a-ref \
   | tee ~/raggio-bench/a-ref/compare-a-main.txt'
 ```
@@ -4617,8 +4619,8 @@ If Gate 1 fails, do not merge PR 2. Report all four build times (run0 and build2
 - [ ] **Step 13: Stop the container, keep the results, and record them**
 
 ```bash
-ssh -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100 'podman stop -t 60 --ignore bench-tv; podman ps -a --format "{{.Names}} {{.Status}}"'
-scp -r -F "C:/Users/emanu/AppData/Local/NVIDIA Corporation/Sync/config/ssh_config" -o BatchMode=yes gn100:raggio-bench/a-main gn100:raggio-bench/a-ref /d/DEV/_scratch/dgx/
+ssh -F "$SSH_CONFIG" -o BatchMode=yes gn100 'podman stop -t 60 --ignore bench-tv; podman ps -a --format "{{.Names}} {{.Status}}"'
+scp -r -F "$SSH_CONFIG" -o BatchMode=yes gn100:raggio-bench/a-main gn100:raggio-bench/a-ref /d/DEV/_scratch/dgx/
 ```
 
 As in Task 6, the scp target is written `/d/…`, not `D:/…`.
