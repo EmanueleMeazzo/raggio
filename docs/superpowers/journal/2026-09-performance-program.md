@@ -371,6 +371,239 @@ Completed agents replay from the cache when the same run is resumed. gn100 was i
 - **Slip.** The orchestrator's launch prompt said G8 and G9 were "added 2026-09-29" (the workstation's local date). No agent wrote that date into a file; a grep of `docs/superpowers/` finds none.
 - **Orchestrator review.** Read the new `uneven_states`, `worse_in_both`, `gate_rows` and `gil_ran` code; the Task 12 assertion sorts the arms, so the interleaved c=16 rows pass it. Every file under `docs/superpowers/` is LF-only, and the plans' code fences are balanced.
 
+**22:59Z. The planning docs are committed** as fb57288 on `docs/perf-plans-2026-09`: the spec, plans A–G, this journal and the p4 note. The branch is not pushed (W-8).
+
+**23:00Z. Execution starts with plan A's PR 1** (Tasks 1–6: the bench hardening, the DGX runbook, the new bench rows and the equivalence re-baseline), subagent-driven. The setup is recorded as W-9:
+- The code goes to a git worktree, `.worktrees/bench-hardening`, on a new branch `bench-hardening` from `main` at 19a8a2e, as plan A says. The main checkout stays on the docs branch, so the plans, the spec and this journal stay readable and editable while the code changes elsewhere. A `.gitignore` of `*` inside `.worktrees/` keeps it out of `git status` without a commit.
+- The base suite in the worktree: `46 passed, 1 warning`, the count plan A starts from. The dev box's uv is still 0.5.24; plan A moves it to 0.12.19 only in Task 7, after asking.
+- Plan A's progress ledger, task briefs, reports and review packages live in the main checkout under `.superpowers/sdd/` (ignored by git), so they outlive this worktree and carry over to PR 2's branch.
+- Every implementer and task reviewer runs on Sonnet 5.5; the final whole-branch review runs on Opus 5.5.
+- A Sonnet agent runs the pre-flight conflict scan over Tasks 1–6 before Task 1 is dispatched.
+
+**23:20Z. The pre-flight scan of plan A's PR 1 finished** (one Sonnet agent, 263,318 tokens, about 20 min). It replayed Tasks 1–5 in a scratch copy of 19a8a2e on Windows: every anchor the plan edits matched once, and every RED and GREEN count came out as the plan states (55 tests and a suite of 101 after Task 1, then 109, 139, 150 and 161). It listed 15 conflicts and 11 things a reviewer would call defects that the plan mandates. The orchestrator ruled on each before Task 1 (the ledger holds all rulings). The ones that change what runs:
+- **CRLF in the deploy archive.** The workstation has `core.autocrlf=true`, and `git archive` applies it, so `deploy.sh` would have shipped the Dockerfile, `uv.lock` and every `*.py` to gn100 with CRLF line endings. Only `bench/dgx/*.sh` were protected, by `.gitattributes`. Ruling: `deploy.sh` runs `git -c core.autocrlf=false archive HEAD`, so gn100 gets the committed bytes, the same ones CI and a Linux clone see.
+- **baseline3's patched bench.** The deploy keeps the old checkout's results, logs and fingerprints, but not the scratch-patched `bench.py` that produced baseline3. Ruling: before Task 6's deploy, the orchestrator copies it next to baseline3's results, on gn100 and locally.
+- **A test that could pass while checking nothing.** `test_guard_rails` asserts inside `if` branches, so a script with no matching line would pass it. Ruling: the test also asserts that each guarded pattern occurs.
+- **The equivalence wording.** `compare.py` judges a row by the wider of the two sides' bands, but spec §2 asks whether the hardened bench lands "inside the baseline's noise band". Ruling: Task 6's report also says, row by row, whether the candidate median lies inside baseline3's own band.
+- The rest are kept as the plan wrote them, each with a reason in the ledger. Examples: duplicated probe code that plans D and G quote; spec A1's two IVF builds per arm override §6's one flat ↔ IVF transition per session; the commit trailer stays the plan's.
+
+**23:21Z. Task 1 dispatched** (the reuse-or-ingest module, `bench/bench_reuse.py`, 55 tests) to a Sonnet implementer in the worktree.
+
+**23:24Z. Task 1 landed on `bench-hardening`** as 042b542: `bench/bench_reuse.py` and 55 tests, written as the plan gives them. The suite went from 46 to 101 passed (the 1 warning is the base suite's own). A Sonnet task reviewer approved it with no Critical or Important findings (47,612 tokens, 25 s). It traced each of the three review-focus failures to named tests: an engine that is slow or down read as "no data", a wrong `--limit`, and another corpus's fingerprint vouching for the volume. Three minor points were parked in the ledger:
+- `decide` treats 0 chunks as "ingest" without looking at queued jobs. That is safe only if the caller waits for the queue to drain first. Task 2's `engine_state` does, through `wait_idle`, and Task 2's reviewer is told to check it.
+- The Weaviate check reads any 404 as "class absent", while the raggio check cross-checks the collection list first. Task 6 never runs Weaviate, and its volume stays untouched; the final review decides.
+- One test asserts only a constant (the 900 s state timeout). Task 2's client is what uses it.
+
+**23:25Z. Task 2 dispatched** (wiring the reuse module into `bench.py`, plus the `--adopt`, `--fingerprint-dir` and `--state-timeout` flags) to a Sonnet implementer. The dispatch carries the rulings on anchors, CRLF, the smoke command and the trailer.
+
+**23:27Z. Task 2 landed** as 307a703: `bench.py` checks every engine before it computes ground truth (minutes of work at 2.5M rows), so a wrong `--limit`, a missing fingerprint or an unreachable engine now aborts in seconds. Fingerprints are keyed by the limit. The old 30 s `current_count`, which read a timeout as "no data", is gone. The implementer's run: RED 8 failed, GREEN 8 passed, suite 109 (Sonnet, 44,369 tokens, 81 s). A Sonnet reviewer approved it with no Critical or Important findings (45,669 tokens, 21 s). It traced Task 1's parked point through both call paths: raggio's state is read only after its job queue drains, before the reuse decision and again before measuring.
+- **Ruling: no extra test for that drain in PR 1.** The reviewer noted that no test pins the wiring; every fake reports an empty queue. One more test would shift every later suite count that plans A, C, D and G quote (139, 150, 161 and on). The wiring is two lines, and the review checked both paths. The final review may add the test at the end of the chain.
+
+**23:28Z. Task 3 dispatched** (the DGX runbook: `deploy.sh`, `unpack.sh`, `setup.sh`, `session.sh`, `lib.sh`, `compare.py` and 30 tests). The dispatch carries two changes to the plan's text, both from the pre-flight rulings. `deploy.sh` archives with `core.autocrlf=false`, and a test pins that line. `test_guard_rails` counts the `podman rm` and `podman stop` lines it checks, so an empty script can no longer pass it. Both add assertions to existing tests, so the plan's counts stand.
+
+**23:30Z. Task 3 landed** as 2e339a2: the DGX runbook is in the repo. It holds `deploy.sh` (workstation side), `unpack.sh`, `setup.sh`, `session.sh` and `lib.sh` (gn100 side), `compare.py` (medians and noise bands between sessions), a `.gitattributes` line that keeps shell scripts LF, and 30 tests. Fourteen of the tests need bash and ran under Git Bash. The implementer's run: RED `1 error` (no `compare` module yet), GREEN 30 passed, suite 139 (Sonnet, 59,372 tokens, 110 s). Both pre-flight changes are in, and `git ls-files --eol` shows the five scripts LF in the index and the working tree. Nothing ran against gn100. A Sonnet reviewer approved it with no Critical or Important findings (73,925 tokens, 51 s). It checked the scripts under `set -euo pipefail`: every failure stops the session loudly, and the one tolerated failure, a job-queue read, is capped at an hour. It also confirmed the guard rails: no `pkill`, no volume removal, no `--reingest`, and `podman rm`/`podman stop` only ever name the bench container. Parked as minor: the guard-rails test has no deny-list for other podman verbs; its container-name check is a substring match; and `unpack.sh` empties the checkout before `tar` can fail. In that last case the deploy fails loudly and the results survive.
+
+**23:31Z. Small incident.** The orchestrator ran the plan-brief script from inside the worktree, so the script put a second copy of the SDD workspace there. It was git-ignored and never committed. The orchestrator deleted it and regenerated the brief in the main checkout. The SDD scripts now run from the main checkout only.
+
+**23:32Z. Task 4 dispatched** (regime labels and image facts per session, two IVF builds per arm, the 8 GiB detach, and `compare.py` reading them). The dispatch tells the implementer to keep Task 3's two ruled changes and lists the plan-mandated duplications that stay because plans D and G quote the code.
+
+**23:32Z. Task 6's read-only pre-checks, run early** while Task 4 was being implemented, so that surprises surface before the deploy rather than during it. Everything the plan expects is there:
+- no bench running;
+- the baseline image, `66aadc92a7b1`;
+- all five baseline3 result files, including the last IVF build's, which an earlier check had not listed;
+- no runbook state yet.
+The plan says to stop and ask if the old checkout on gn100 holds files that are neither git-tracked nor kept by the deploy. It holds four: the scratch-patched `bench.py` that produced baseline3 and the three baseline scripts. The scripts' SHA-256 hashes match the workstation copies.
+- **Ruling:** no stop. Before the deploy, the four files and the old deploy marker are copied to a `baseline3-provenance` directory on gn100. After Step 4 creates baseline3's directory, the patched bench is copied there too. That step's `mkdir` needs the directory absent, which is why pre-flight ruling C5's copy waits until then. The deploy then loses only `__pycache__`.
+- **Ruling:** no run-window question in Step 1. The maintainer's standing go-ahead (unlimited gn100 time for this program) answers it. The session keeps the plan's 50-minute cap.
+
+**23:33Z. Task 4 landed** as 5e73a17. Every session now records a `regime.json` (page cache, first start, memory, swap, detach memory) and an `image.json` (python, SQLite, turbovec, BLAS threads). `compare.py` prints both and flags arms that differ in them. `IVF_BUILDS=2` builds the index twice per arm (spec A1), and the 8 GiB detach never gets a swap flag. The implementer's run: RED 11 failed / 30 passed, GREEN 41, suite 150 (Sonnet, 50,857 tokens, 70 s). A Sonnet reviewer approved it with no Critical or Important findings (55,601 tokens, 33 s). Parked as minor: `FLAT_RUNS` and `MEMORY_SWAP` are not validated, and `IVF_BUILDS=2` on an IVF start is refused only after the label directory exists. Task 6 uses none of those paths.
+
+**23:34Z. Task 5 dispatched** (the first hybrid pass, the concurrent hybrid p99, server CPU per query from the container's cgroup, `--cpu-container` and the `CONCURRENCY` knob). These are the rows plan G's decision rule reads.
+
+**23:35Z. baseline3's provenance copied** on gn100, before anything replaced the old checkout. The scratch-patched `bench.py` that produced baseline3, the three baseline scripts and the old deploy marker (19a8a2e) went into a `baseline3-provenance` directory, and the patched bench also went to the workstation. The bench's SHA-256 starts `adf87fa0`.
+
+**23:37Z. Task 5 landed** as d312711, the last code task of PR 1. The bench now reports the first hybrid pass separately (the warm-up that used to hide inside the mean), the p99 of hybrid queries at concurrency 8, and the server's CPU milliseconds per query. It reads the CPU figure from the container's cgroup `cpu.stat` before and after each phase. Plan G's decision rule classifies its runs by these rows (spec §3.1, G5). The implementer's run: RED 13 failed / 47 passed, GREEN 60, suite 161 (Sonnet, 52,691 tokens, 111 s). A Sonnet reviewer approved it with no Critical or Important findings (61,161 tokens, 24 s). Parked as minor:
+- the CPU division sits outside its `except`, so a phase with no latencies would raise (the percentile call fails first anyway);
+- the cgroup lookup runs a blocking `podman` call, before the phase and outside its timing;
+- some test imports sit mid-file;
+- `CONCURRENCY` is not validated before it is written into the regime label.
+All five code tasks passed review on the first pass, with no fix rounds.
+
+**23:38Z. Task 6 started: the equivalence re-baseline on gn100.** The orchestrator ran it itself, since it is measurement, not code. PR 1's head was deployed with the new runbook. The deploy script kept 23 result, log and fingerprint files from the old checkout in a dated `pre-deploy` directory, replaced the checkout with the committed bytes, and built `localhost/raggio:d312711`. It exited 0 in about a minute. baseline3's files were then put into the runbook's layout: run1-ivf, which followed the 128 s cold load, became the discarded warm-up run0; the IVF run built at 4 GiB became run2. The layout also got a `regime.json` (first start `mostly-cold`, concurrency 8) and the patched bench.
+
+**23:39Z. The a-equiv session launched**, detached, with a 50-minute cap. It runs baseline3's own image (`localhost/raggio:baseline`) with PR 1's bench: three flat runs plus a warm-up, and the IVF runs, on the same 2,549,119-chunk volume. The first run adopts the volume's fingerprint, since baseline3 already vouched for it. The question it answers (spec §2, order 0): does the hardened bench, on the same image and data, land inside baseline3's noise band?
+- **Ruling: the final whole-branch review runs while the session measures.** The review reads only git, and the session measures the tree already deployed, so neither can disturb the other. If the review's fixes touch what is measured (bench phases or metrics, the session's run order, the runbook knobs), Task 6 re-runs as `a-equiv2`. Validation, test and documentation fixes don't trigger a re-run. Cost if wrong: one more session of about 40 minutes.
+
+**23:41Z. Final whole-branch review dispatched** on Opus, the one seat in this program that doesn't run on Sonnet. It reviews 19a8a2e..d312711 (5 commits, a 124 KB diff) against the plan and the spec. It triages every parked minor for fix-before-merge and must list what it declined to judge. It may not touch gn100.
+
+**23:52Z. The final review: "with fixes".** No Critical findings and one Important one (Opus, 97,174 tokens, 11 min). It ran the suite (161 passed) and checked a shell behaviour the plan had missed: under `set -e`, a `for` loop over `$(seq 0 "$FLAT_RUNS")` does not stop when `seq` fails. A mistyped `FLAT_RUNS` (`abc`, or `3 ` with a trailing space) would skip the whole flat group, and the session would still log "done" and exit 0. compare.py would then show the flat rows as `-`, which its gate ignores. So a "nothing got worse" check would pass on an engine that was never measured. `CONCURRENCY=0` would hang the concurrent phase until the session cap. The gap is in the plan, and the implementation followed it. The reviewer also listed six minors and triaged the fifteen parked ones: four to fix now, eleven not, each with a reason.
+- **Ruling: one fix wave** covering the Important finding, the two guard-rail test gaps, and three minors:
+  - a detached session that stops now logs why;
+  - a dead container no longer gets polled for an hour;
+  - the docs' fingerprint file name is corrected.
+  All of these are validation, diagnostics, tests and docs, so the suite stays at 161.
+- **Ruling: the anchor rule.** Later plans edit these scripts by quoting their lines verbatim. The fixer could not change any line another plan quotes. For the silent-stop fix, the fixer added an `ERR` trap instead of editing the quoted `curl -sf` lines.
+- **Deferred:**
+  - an index-state assert in `bench.py`, which would re-open Task 6;
+  - a "missing engine" line in compare.py's output, which plans D and G quote;
+  - a Weaviate 404 cross-check, needed before any Weaviate session;
+  - a cosmetic timeout message.
+
+**23:57Z. The fix landed** as caa93b1 (Sonnet, 45,305 tokens, 105 s; suite 161). A scoped Sonnet re-review found all six items addressed (42,585 tokens, 63 s). It checked the trap in a standalone shell: the trap does not fire at any place where a failure is expected and handled, and it doesn't change the exit status of a real stop. Parked: one real stop can print several "stopped" lines.
+
+**23:57Z. a-equiv finished** in 18 minutes, with no aborted run and no missing CPU row. All eight run files hold the three G5 rows. The image check passed: `66aadc92`, Python 3.12.12, SQLite 3.40.1, turbovec 1.0.0. **The equivalence gate failed**: eight rows sit outside the noise band, and none of them is an exempt row.
+- **Flat raggio, six rows "better":** p50 21.0 → 17.8 ms, p95 23.4 → 20.1, p99 24.8 → 21.3, serial QPS 47 → 55, and memory 21 MB lower.
+- **raggio-ivf, two rows:**
+  - filtered p50 "better", 63 → 37 ms;
+  - serial QPS "worse", 88 → 87.
+- **What the per-run numbers say.** On latency, IVF matches baseline3: p50 11.1 vs 11.2 ms. IVF's "worse" comes from a zero band: baseline3's two runs were both 87.6 QPS, so the band fell back to its 1 QPS display resolution, and a-equiv read 86.4 to 87.2. IVF filtered p50 is bimodal (about 37 or 53 to 70 ms), and baseline3's two counted runs both landed in the slow mode.
+- **The flat side got faster during the session:** p50 19.7, 19.0, 17.7, 17.8 ms across run0 to run3. The first run of the G5 classifier on gn100 found both states it was built to tell apart. Runs 0 to 2 took 138 to 155 ms of server CPU per query at concurrency 8 (about 115 QPS). Run 3 took 69 ms (233 QPS). This is the same fast/slow split the p4 probe found.
+- **The hosts differed.** Both sessions ran in the same order: IVF first, the detach, then flat. baseline3 began 1 h 49 min after a reboot, with 6.1 GB of page cache. a-equiv began after a day of uptime, with 40.5 GB cached. The load average was near zero both times.
+- **New numbers for the article:**
+  - A hybrid query costs 0.83 to 1.03 s of server CPU at concurrency 8, against 39 to 46 ms for an IVF vector query.
+  - The concurrent hybrid p99 is 2.5 to 5.1 s across the eight runs.
+  - The slowest of the first ten hybrid queries takes 560 to 598 ms per run, inside spec §6's 470 to 980 ms estimate.
+
+**00:01Z. a-equiv2, the replication the brief prescribes when the gate fails.** PR 1's final head (caa93b1) was deployed first. Its delta over d312711 is validation and diagnostics only, but this way the scripts that measure are the ones the PR ships. The launch line is otherwise the same. The volume now starts flat, so this session also runs in the other order: flat first, then the IVF build as run0. Either way, the maintainer decides once both tables are in.
+
+**00:19Z. a-equiv2 finished** in 18 minutes on PR 1's final head. It ran flat first, then built a fresh IVF index in run0. The G5 rows were all present. **The gate failed again**, on six rows:
+- **Five "better":** flat p50, p95 and p99 (flat p50 21.0 → 19.0 ms), IVF p50, and IVF filtered p50.
+- **One "worse":** IVF hybrid p95, 156.9 → 158.1 ms. That is 0.8%, against a baseline band of 0.2 ms.
+What changed from a-equiv:
+- The flat memory rows are back inside the band (1550 and 1555 MB). a-equiv's lower memory came from running flat after the detach. (Dated note, 2026-09-29 08:30Z: withdrawn. control1 ran in a-equiv's order and read 1549 MB; see 08:20Z.)
+- The flat latency gain held in both orders, flat first and flat last.
+- **The strongest clue about the host:** the IVF build took **49 s**. baseline3's build, on the same image, the same data and the same 4 GiB cap, took **213 s**. baseline3 began 1 h 49 min after a reboot, with 6.1 GB of page cache against a 15.1 GB database. By the page-cache measure, its `host-warm` label was probably wrong.
+- A fresh IVF build is a different index: recall@10 is 0.995 now, against 0.9928 for the index a-equiv used. So a-equiv2's IVF rows differ from a-equiv's for a real reason, not noise.
+
+**The spec's own test is too strict with two baseline runs.** Ruling C9 asked, row by row, whether the candidate median lies inside baseline3's own band. The answer is no for 21 rows in a-equiv and 22 in a-equiv2. With two runs, the band is the gap between two numbers, often zero. The IVF disk footprint, for example, is 16757.87 MB in baseline3 and 16757.85 MB in a-equiv. Spec §6 already asks for at least three runs per side for a claim. The equivalence gate needs the same from the baseline.
+
+**A control is possible.** baseline3's patched bench differs from the pre-PR bench in only two lines: it refuses to delete or re-ingest, and its client timeout is 900 s. Run today on the same image, it would separate what the bench changed from what the host changed. It cannot touch the data.
+
+**By 07:57Z. The maintainer's call: a control run first.** I offered three options: run a control, accept today's sessions as the new baseline, or hold PR 1. The maintainer chose the control. It runs **baseline3's own bench**, the pre-PR script with its two safety patches, on today's host, with the same image and the same volume. It uses the hardened runbook's container lifecycle: a fresh 4 GiB container for every run, with a wait for `/healthz`, the first collection read and an empty job queue. It also uses the same layout:
+- IVF warm-up run0, then runs 1 to 3;
+- the detach in a transient 8 GiB container;
+- flat warm-up run0, then runs 1 to 3;
+- one IVF build at 4 GiB, which restores the index the volume started with.
+The old bench runs from its own scratch directory, so the deployed checkout is not touched. It carries its original fingerprints, the ground-truth cache and a link to the corpus. A checksum check refuses any other `bench.py`. With one session there are three comparisons:
+- **baseline3 vs control:** same bench, different day, so the difference is the host.
+- **control vs a-equiv and a-equiv2:** same host, different bench, so the difference is PR 1.
+- **The build time:** the old bench builds IVF too, so the 213 s against 49 s gap gets a same-bench reading.
+
+**07:59Z. control1 launched.** The host had been up 1 day 8.5 hours, with 40.6 GB of page cache and a load of 0.1. The index at start was IVF, the one a-equiv2 built (recall@10 0.995). The first read of the collection took 5.6 s. baseline3's took 128 s after the reboot.
+
+**The ssh config path (W-8), decided at the same time.** The committed `deploy.sh` defaulted to the maintainer's local ssh config path, and the spec and plans quoted it in about 140 places. The maintainer chose **an environment variable with no default**:
+- `deploy.sh` now stops with a message when `SSH_CONFIG` is unset, before git or ssh run.
+- A guard rail refuses operator paths in any runbook script, and a new test covers the refusal. The suite is 162.
+- The spec and plans now read `-F "$SSH_CONFIG"` everywhere.
+- The path is still in the earlier local commits of both branches. So publishing means a squash or a history rewrite, to be chosen when the branch is finished. Rewriting now would orphan the commit IDs this journal, the ledger and the DGX image tags use.
+
+**08:20Z. control1 finished** in 21 minutes, with no stop line and no traceback. The detach took 34 s. The session gives three comparisons.
+- **The host (baseline3 → control1, same old bench, same image):** 8 rows "better" and 1 "worse". Flat p50 21.0 → 18.7 ms, p95 23.4 → 20.4, p99 24.8 → 21.6, serial QPS 47 → 53. IVF p50 11.2 → 10.9 ms, serial QPS 88 → 89, filtered p50 63.0 → 37.0, filtered p95 77.1 → 73.7. The worse row is IVF hybrid p99, 556.8 → 590.3 ms. **Every row a-equiv and a-equiv2 called "better" moves the same way with the old bench, so those gains came from the host.**
+- **The IVF build:** the old bench built IVF in **50.3 s** at 4 GiB. a-equiv2 took 49.0 s and baseline3 213 s. The build-time gap also came from the host.
+- **The bench (control1 → a-equiv2, same day, same image, same IVF index):** one row sits outside the band. IVF hybrid p95 went from 157.1 to 158.1 ms, +0.6%, against bands of 0.2 and 0.8. Per run, 156.9–157.1 against 158.0–158.8, so the ranges don't overlap. The code that times the serial hybrid phase is identical in both bench versions; PR 1 only adds a calculation after the timing. The sessions ran in different orders: control1's IVF runs came right after a restart on an index already built, and a-equiv2's came after its own build. control1's uncounted build1 run, also right after a build, read 158.0 ms with the old bench.
+- **control1 → a-equiv:** 5 IVF rows "worse" (p50, p95, p99, serial QPS, recall), because a-equiv used a different index (recall 0.9928 against 0.995). 3 rows "better": both flat memory rows and IVF hybrid p99.
+- **A correction.** At 00:19Z I wrote that a-equiv's lower flat memory came from running flat after the detach. control1 ran in the same order and read 1548–1549 MB. a-equiv2, with a-equiv's bench, read 1547–1551 MB. So neither the order nor the bench explains a-equiv's 1528–1529 MB in runs 2 and 3. It is now listed as unexplained (section 9.4).
+- build1 left a new IVF index on the volume, with recall@10 0.9924. IVF builds differ from run to run, so each build is a different index.
+
+**By 08:27Z. The maintainer accepted equivalence (R-A4).** As written, the gate failed on one row, so the call went to the maintainer. I recommended accepting it, because the timed code is identical and the old bench reads the same value in the same state. The alternative was a paired replication: about 45 minutes on gn100, both benches in the same order. PR 1's reference is a-equiv2 plus control1. PR 1 moves to finishing.
+
+**08:28Z. The W-8 change reviewed.** A scoped Sonnet review of eccdc6c found the finding addressed and nothing broken (29,101 tokens, 17 s). It flagged one stale line in plan A. The deploy.sh listing still showed `git archive HEAD` without the `-c core.autocrlf=false` flag that ruling C7 shipped with Task 3. The listing now matches the branch.
+
+**08:58Z. PR 1 merged into `main` locally, as one squashed commit** (ff48930), the maintainer's choice. The squash keeps the ssh path out of `main`'s history: the path lived only in the branch's intermediate commits, and the squashed diff has none. The tree is identical to the branch head, the suite on `main` is 162 passed, and nothing is pushed. The branch stays local as provenance, because the ledger, this journal and gn100's image tags name its commits (d312711, caa93b1). It must never be pushed. Next: PR 2 of plan A (Tasks 7–10, packaging), then B. (Dated note, 2026-09-29 09:05Z: wrong order. X1 puts B before the rest of A; see 09:00Z.)
+
+**09:00Z. Plan B started** (concurrency correctness), the maintainer's choice ("Start plan B now", recommended). It runs subagent-driven like PR 1: Sonnet implementers and reviewers, one task at a time, and a final whole-branch review on Opus. The branch `concurrency-correctness` starts from `main` at ff48930, not the plan's 19a8a2e, because X1 puts PR 1 first. PR 1 touched nothing under `src/`, so B's code anchors still hold. The baseline suite is 162 passed. B's plan was written against 46 tests, so every count it gives is 116 higher on this base: 166, 168, 173, 176, 178, 179. Before Task 1, three Sonnet agents scan the plan: task pairs that share a file, each task against itself, and each quoted anchor against the code. B makes no performance claim. Its gn100 step, Task 8, re-runs p4's race phase after B merges.
+
+**09:14Z. B's pre-flight scan: 18 findings, no plan change.** Three Sonnet agents read the plan against the code at ff48930, in parallel (405,908 tokens, 9 min). One checked every pair of tasks that share a file, one checked each task against itself, and one checked each quoted anchor. Every anchor was found verbatim and exactly once. The RED claims for Tasks 1–4 reproduced on base. The test counts add up to 17. Two findings are about design, not wording:
+- **A DELETE can now stall the whole server briefly.** `delete_collection` holds the global `_load_lock` while `stop()` runs, and every request's `touch()` takes that lock. Task 3 makes `stop()` wait for an in-flight ingest job's write section before closing connections; that is the R3 fix. So a DELETE in the middle of an ingest makes every collection's requests wait for up to one write section. **Kept**: base's LRU and idle evictions already hold `_load_lock` across `stop()`, including its index sync. The IVF build itself runs outside the write lock, so the wait is one job's write section, seconds at most. The ADR will name the cost, and plan C, which moves collection construction off the event loop, is where it can move. (Dated note, 10:45Z: "seconds at most" was too low, as B's final review showed. Before a DELETE's `stop()` finishes, it waits out four things: the victim's in-flight readers, any writer queued ahead of it (an ingest write section has no size cap), the index sync, and a connection close that waits for orphaned reads. See 10:33Z.)
+- **Re-creating a name while its delete is still removing files.** A same-name create that lands between delete's catalog DELETE and its unlocked `rmtree` loses its directory, and its next request answers 500. **Not fixed in B**: base has the same window, B does not widen it, and the spec does not name it. It goes to the ADR's Deferred list and to section 9.5.
+The other 16 are rulings on wording and tests, not on design. The ADR states only measured facts, and the implementers add deadlines to three test waits that could hang or pass vacuously. All 13 rulings are in B's ledger.
+
+**09:18Z. B Task 1 dispatched** (the catalog lock, R1).
+
+**09:20–09:33Z. B Tasks 1–3 land; every review comes back clean.** Each implementer and each reviewer is Sonnet. Every task ran red, then green, then the full suite, and was reviewed against its brief and the diff.
+- **Task 1, the catalog lock (R1): commit 454ecc8.** Before the fix, 3 of the 4 new tests failed. The fourth is an AST guard checking that no lock is held across an `await`, and it is meant to pass on base. After the fix, 4/4 pass and the suite is at 166. The review deferred two minor notes about the test spy.
+- **Task 2, delete under `_load_lock`: commit 5805474.** Before the fix, 2 tests failed; after it, 6/6 pass and the suite is at 168. The review raised two minors. One is the rmtree race, already covered by the 09:14Z ruling. The other is a 50 ms sleep in the "delete must wait" half of a test; a regression there still fails the final-state asserts.
+- **Task 3, `stop()` (R3): commit ff6457f.** `stop()` now waits for the write section and closes connections under the database lock. Reads refuse once a collection is closed. Before the fix, 4 of the 5 new tests failed; after it, 11/11 pass and the suite is at 173. The implementer also added the test deadlines the pre-flight asked for. The review raised three minors:
+  - `stop()` is not exception-safe if the index sync raises; this is pre-existing.
+  - A comment about orphaned job claims claims more than the code guarantees.
+  - Evictions now wait for the victim's write section. This is the 09:14Z trade-off.
+- **Cost:** each implementer took 60–90 s and 33–43k tokens; each review took 15–47 s.
+
+**09:33Z. B Task 4 dispatched** (copy-on-write `indexed_counts`, R4).
+
+**09:35–09:52Z. B Tasks 4 and 5 land; both reviews come back clean.**
+- **Task 4, copy-on-write `indexed_counts` (R4): commit 7ef0e6a.** Each writer now copies the counts dict, updates the copy, and publishes it under `db_lock` before the commit. Every reader dereferences it only once. Before the fix, 3 tests failed; after it, the module is at 14/14 and the suite at 176. With the GIL, `sum(d.values())` cannot fail, so the tests cannot force the race. They pin the discipline instead: an identity check, a spy that records whether `db_lock` is held at each publication, and a source tripwire. The implementer wrote the code before the tests and stashed it to reproduce RED; the review accepted the evidence.
+- **Task 5, the mixed-workload stress test: commit 87bb1d5, tests only.** It runs 16 clients for 3 s of searches, with 15 % cancelled mid-flight, plus upserts, re-upserts, patches, deletes, unlocked reads, and a `stop()` in the middle of the storm. Once things are quiet it checks three invariants: index size equals the number of indexed rows; `indexed_counts` equals `GROUP BY type`; and after `stop()` only "closed" errors appear and every connection is closed.
+  - **Planted bugs:** removing the decrement in `_upsert_rows` made the counts drift (`{'chunk': 915, 'summary': 177}` vs `{'chunk': 856, 'summary': 169}`); removing the close loop in `_close_conns` left a read connection open (`DID NOT RAISE ProgrammingError`).
+  - **Acceptance:** 50 of 50 green runs of the module (two batches, 344 s and 340 s). The one 60 s soak passed: `2 passed in 127.28s`.
+  - **Review minors, deferred:** a `TimeoutError` raised inside `search` would be counted as a cancellation, the storm's final gather has no overall timeout, and nothing asserts that deletes and re-upserts actually happened.
+
+**09:52Z. B Task 6 dispatched** (a search racing a DELETE answers 404, B1).
+
+**10:07–10:14Z. B Tasks 6 and 7 land; both reviews come back clean.**
+- **Task 6: a search that races a DELETE now answers 404 (B1). Commit c0e380e.** `delete_collection` sets `Collection.deleted` before `stop()`. A search that reaches the read lock after `stop()` raises `CollectionDeletedError`, and the search endpoint maps that one error to 404. SQLite errors and the eviction `RuntimeError` keep their 500: a collection that was only evicted still exists, so 404 would be wrong for it.
+  - **RED:** the deterministic HTTP test failed exactly as the plan predicted: `[200, 500] != [200, 404]`. Sixteen searches queued behind a gated PATCH ran after `stop()`, because writer preference lets `stop()` go first.
+  - **After the fix:** 17/17 in the module, 179 in the suite, and the 50-run loop passed again, 50/50 (369 s and 357 s).
+  - **Test changes from the pre-flight:** two bounded waits now assert their outcome. The wait for `stop()` to queue releases its gate before it asserts, so a failure cannot hang the test.
+- **Task 7, the ADR 0001 addendum: commit 300294e, 14 lines.** Its evidence column states only what was measured. It says "Every Accepted row is pinned", reports the 50/50 loop measured twice and the one 60 s soak (both stress tests passed, 127 s), and dates the addendum 2026-09-29. The Deferred row now names the two costs the pre-flight found: a same-name create racing the delete's file removal, and the brief wait every collection takes when a DELETE lands mid-ingest. The reviewer rebuilt the block from the brief plus the amendments and found it byte-identical. They also checked every Accepted claim against the code at HEAD and matched each to a test that pins it.
+- **Tally for B's seven tasks:** 14 Sonnet dispatches, one implementer and one reviewer per task, at 31–43k tokens each. None needed a fix round, and 13 minors were deferred to the final review.
+
+**10:14Z. B's final whole-branch review dispatched** on Opus (ff48930..300294e: 7 commits, 4 files, +876/−28). It is asked to triage every deferred minor and to challenge the controller's rulings.
+
+**10:33Z. B's final review: "With fixes".** The review ran on Opus: 18 min 38 s, 45,493 tokens, 45 tool uses. It re-ran the suite (179 passed) and ran throwaway SQLite probes. It found no Critical issue, one Important and four Minor. It agreed that all 13 deferred minors can wait, and it challenged one controller ruling.
+- **Important: a search that the server embeds still answers 500 when it races a DELETE, which breaks spec B1.** This is a text query in vector or hybrid mode with no supplied vector. It awaits the embedding call before it takes any lock. DELETE's `stop()` closes the embedder under that call. The embedder retries every error three times (1 + 2 + 4 s), then raises, so the client gets a 500 after about 7 s. Separately, the lazy `embedder` property builds a fresh client on a collection that `stop()` has already closed, and nothing ever closes that client. Task 6's test used supplied vectors, so it never went through this path.
+- **Minor 1: a comment and the ADR claimed more than the write lock guarantees.** `stop()`'s comment said no search is mid-query when it closes connections. Three kinds of read can be: orphaned `to_thread` bodies of cancelled searches, orphaned index builds, and the unlocked reads. The reviewer probed SQLite 3.47.1 under CPython 3.12.8 on Windows:
+  - `close()` blocked until the running statement finished: 5.0 s for a 5 s query.
+  - Closing mid-query segfaulted in every run on a connection that had run no earlier statement.
+  - In raggio's connection shape (a `PRAGMA` runs first) it crashed in 0 of 8 runs. A probe through a real `Collection.stop()` did not crash either.
+  - So the ADR's "fail closed" is unproven for a close under a running statement. The close can hold `db_lock`, and on DELETE also `_load_lock`, for as long as an orphaned read runs.
+- **Minor 2: the stress storm has no overall timeout.** The stress tests could also flake on CI through R2's stale `_allow_cache`, a turbovec `KeyError`. The reviewer suggested a timeout, and allow-listing that `KeyError` until plan F.
+- **Minor 3: a cancelled eviction can leave a collection running.** At shutdown the lifespan cancels housekeeping without awaiting it. An idle eviction cancelled after it popped its collection leaves that collection never stopped.
+- **Minor 4:** the eviction filter misses a victim that is in the middle of a PATCH, a document delete, or an index swap.
+- **The challenge:** "up to one write section" understated the DELETE stall; see the dated note at 09:14Z. The reviewer preferred a tombstone-first delete: rename the directory under `_load_lock`, then run `stop()` outside it.
+
+**10:34–10:41Z. Rulings on the final review, then one fix wave.**
+- **The Important finding is fixed in B, not deferred.** Spec §3.1 B1 is binding: "returns 404 … never 500". The fix stays inside B's files. The search endpoint maps an exception from the embedding call on a deleted collection to `CollectionDeletedError`, which answers 404, and a closed collection refuses to build an embedder. `embeddings.py` stays unchanged: it is outside the plan's files, and the status code does not need the change. So the 404 still arrives after the embedder's ~7 s of retries, and the ADR says so.
+- **Minor 1:** both close comments are reworded (`stop()` and `_close_conns`), and the ADR's "fail closed" is qualified with the probe results. A close-under-reader test that runs in a subprocess becomes an issue proposal; plan F owns the orphans.
+- **Minor 2:** the storm gets `asyncio.wait_for(..., STRESS_SECONDS + 60)`. The `KeyError` is not allow-listed. It is the symptom through which an unguarded cancel-first `stop()` failed 1 of 50 runs when the plan was written, so allow-listing it would blind the test to R3 regressions. 100 of 100 runs and the soak were clean.
+- **Minor 3** is deferred to plan D2 ("`stop()` never raises"), with an issue proposal. It happens only at shutdown and only to idle victims, and committed data stays durable.
+- **Minor 4** is covered by the stall wording.
+- **The challenge:** the wording fix is accepted, and plan C's acceptance gets a number: p99 on other collections while one is deleted mid-ingest. The tombstone-first redesign is rejected for B, for two reasons. Windows, the development and test platform, cannot rename a directory with open SQLite handles. And running `stop()` outside `_load_lock` without that rename widens the name-reuse race: the old collection's `stop()` would sync its index into the re-created collection's directory.
+- **The 13 deferred minors:** the fix wave closes two of them, Task 5's gather timeout and Task 3's `_close_conns` comment. Task 3's `stop()` exception safety stays with D2.
+- **10:41Z: one Sonnet fixer dispatched** with the whole list (BASE 300294e). Its brief:
+  - two commits;
+  - three new tests: a gated embedder parks the embedding call while DELETE lands (parametrized on whether the parked call fails after the close), and a closed collection never builds an embedder;
+  - the two comments, the storm timeout, and seven exact ADR edits;
+  - a re-run of the 50-run loop on the final module.
+  One scoped re-review follows. There is no second fix wave.
+
+**10:57–11:01Z. B's fix wave lands, and the scoped re-review passes.**
+- **The fixer** (Sonnet, 16 min, 38,456 tokens) made two commits:
+  - **5b79aec: a search that the server embeds now answers 404 when a DELETE lands.**
+    - **RED:** the case where the parked embedding call fails after the close gave `(200, 500, 404) != (200, 404, 404)`. That is the 500 the final review predicted, returned through the ASGI transport. The case where the parked call returns a vector passed, as the guard it was meant to be. "A closed collection never builds an embedder" failed with `DID NOT RAISE`.
+    - **After the fix:** the module is at 20/20 and the suite at 182.
+  - **b876b68: the two comments, the storm timeout and seven ADR edits.**
+    - The ADR is still 64 lines, all CRLF.
+    - The 50-run loop passed on the final module, 50/50 (367 s and 363 s). It is the third 50/50, so the ADR now says "measured three times".
+- **The scoped re-review** (Sonnet, 25 s, 40,858 tokens) found all four findings addressed, no new breakage and nothing out of scope. It checked that a live collection's failed embedding call still answers 500 (400 for a `ValueError`), never 404. The mapping fires only when `deleted` is set, and `delete_collection` sets it before `stop()`.
+- **Controller check on b876b68:** 182 passed, 1 warning (39 s).
+- **Branch totals:** ff48930..b876b68 is 9 commits, 4 files, +969/−29.
+- **Dispatches over the whole plan:**
+  - one three-agent pre-flight workflow;
+  - 14 task dispatches;
+  - one Opus final review;
+  - one fixer;
+  - one re-review.
+- **Rulings:** 27 in B's ledger, each with its cost if wrong. The 09:14Z ruling's cost, "seconds", was understated; the 10:34Z ruling on the final review's challenge corrects it.
+- **Next:** the maintainer chooses how B lands. Task 8, the gn100 race re-run, follows the merge.
+
+**11:02–11:10Z. B merged into `main` locally with a merge commit (d096fde), the maintainer's choice.** The maintainer answered "Merge back to main locally" and "Merge commit, keep 9 commits".
+- **Why a merge commit:** B's commits carry no ssh path, so there is nothing to squash away, unlike PR 1. Keeping them gives one commit per fix, each with its own RED and GREEN evidence. `d096fde^1` is ff48930, which is exactly the `pre` that Task 8 needs.
+- **Checks:** the merged tree is identical to b876b68, and the suite on merged `main` is 182 passed, 1 warning.
+- **Clean-up:** the worktree was removed and the branch deleted. Nothing is pushed; `main` is now 2 commits ahead of `origin/main` (ff48930 and B's merge).
+- **Issues:** the maintainer chose to file all five drafts (section 9.5), labelled `needs-triage`. They are not filed yet, because the GitHub CLI on the workstation is not logged in. They are filed once the maintainer logs in.
+- **Docs:** the maintainer chose to commit this journal and plan A's `git archive` line-ending fix locally on `docs/perf-plans-2026-09` now. Task 8's entries go on `docs/planB-race-rerun`, branched from it.
+
 ## 3. Decision register
 
 ID prefixes:
@@ -434,9 +667,13 @@ ID prefixes:
 | W-5 | 2026-09-28 18:51Z | Fix the shell outage by disabling the codex plugin. | "Patch it locally", the recommended option (a 3-line duplicate check in the plugin's hook, which a plugin update would overwrite): overridden; the maintainer gave no reason. "Leave it" (watch and trim the file): not chosen. | The plugin's hook had grown the session env file to 298 lines. | Maintainer, overriding the recommendation | Transcript | Done |
 | W-6 | 2026-09-28 20:32Z and 20:33Z | Recreate the Weaviate container `bench-wv` on its existing volume with the flags from `docs/benchmark-arxiv.md`, created but not started. | "Leave it gone"; "I'll handle it myself"; then "Create and start it" and "Not now". | The 09-27 removal (section 7.5). A running Weaviate with a 32 GiB cap would load the host during DGX A/Bs. | Maintainer (chose the recommended options) | Transcript | Done, 20:33:45Z |
 | W-7 | 2026-09-28 22:27Z | Workflow agents run on Sonnet 5.5 (`model: 'sonnet'` on every `agent()` call). The main loop stays on the session model, Opus 5.5. | Keep Opus for the verifiers (the orchestrator's suggestion): not taken. | Before this, every workflow agent had inherited Opus 5.5. | Maintainer ("Sonnet 5.5 is out, use that as workflow model") | Transcript | Standing; applied to the remaining steps of both running workflows from about 22:28Z |
-| W-8 | 2026-09-28 ~22:40Z | The workstation's ssh config path stays in the plans' ssh commands for now (about 144 places; it contains the local username). It is decided again before any push or PR. | Replace it with a variable in every plan and the spec now, and rewrite the unpushed commit 2a46bc0 later. | The path is how the plans reach gn100. The branch has no upstream. | Maintainer (chose "Keep it for now", recommended) | Transcript | Open until the branch is pushed |
+| W-8 | 2026-09-28 ~22:40Z | The workstation's ssh config path stays in the plans' ssh commands for now (about 144 places; it contains the local username). It is decided again before any push or PR. | Replace it with a variable in every plan and the spec now, and rewrite the unpushed commit 2a46bc0 later. | The path is how the plans reach gn100. The branch has no upstream. | Maintainer (chose "Keep it for now", recommended) | Transcript | Superseded by W-10 (2026-09-29) |
+| W-9 | 2026-09-28 23:00Z | Plan A's PR 1 runs in a git worktree (`.worktrees/bench-hardening`, branch `bench-hardening` from `main` @ 19a8a2e); the SDD ledger and artifacts stay in the main checkout; implementers and task reviewers run on Sonnet 5.5, the final review on Opus 5.5. | Switching the main checkout to the new branch (the plans, spec and journal would leave the working tree mid-run); the cheapest model for implementers whose tasks carry complete code (more turns on Windows and Git Bash quirks); the harness's own worktree tool (it names the branch itself and branches from the remote). | Plan A: "PR 1: Tasks 1–6 on `git switch -c bench-hardening` from `main` @ 19a8a2e". W-7's Sonnet preference. | Orchestrator (ruling under the subagent-driven skill; local and reversible) | Transcript | Standing for plan A |
+| W-10 | 2026-09-29, answered by 07:57Z | The ssh config path becomes an environment variable with no default: `deploy.sh` stops with a message when `SSH_CONFIG` is unset, and the spec and plans read `-F "$SSH_CONFIG"`. The path is never committed again. | "Keep the default path" (the local username stays in the repo); "Decide at push time". | bench-hardening `eccdc6c` (a guard rail against operator paths in the runbook scripts, and a test; suite 162); docs branch `f7a7e8d` (142 sites). | Maintainer (chose "Env var, no default", recommended) | Transcript | Done locally. The earlier local commits still hold the path, so the publish is a squash or a rewrite, chosen at finish. |
+| R-A3 | 2026-09-29, answered by 07:57Z | PR 1's equivalence gate failed twice (a-equiv, a-equiv2). First run a control: baseline3's own bench on today's host, with the same image and volume, in the hardened runbook's layout. Then decide the re-baseline. | "Accept as re-baseline" (the host drift explains the failure, but the bench and the host stay confounded); "Hold PR 1" (investigate the flat-scan drift first). | a-equiv: 7 rows better and 1 worse. a-equiv2: 5 better and 1 worse. The IVF build took 49 s against baseline3's 213 s, on the same image and data. Page cache: 40.5 GB against 6.1 GB. | Maintainer (chose "Control run first", recommended) | Transcript | Done: control1 ran 07:59–08:20Z; closed by R-A4 |
+| R-A4 | 2026-09-29, by 08:27Z | PR 1's equivalence gate closes as passed. The one row outside the band against the same-day control (IVF hybrid p95, +1.0 ms, 0.6%) is recorded as a run-order effect, not a bench effect. a-equiv2 plus control1 are PR 1's reference. | "Paired replication first" (about 45 min on gn100: the old bench, then the new one, IVF first after a restart, in the same order; it would have removed the order confound). | control1 vs a-equiv2: 1 row outside the band, in code identical in both benches; control1's build1 read 158.0 ms right after a build. baseline3 vs control1: 8 rows "better" with the same bench, so the host. IVF build: 50.3 s with the old bench, 49.0 s with the new. | Maintainer (chose "Accept equivalence", recommended) | Transcript | PR 1 moves to finishing |
 
-Register total: 51 entries (P 3, D 16, R 19, X 5, W 8). (Dated note, 22:45Z: R-G8, R-G9 and W-8 added. Dated note, 21:20Z: R-G7 added. Dated note, 21:23Z: X4 added. Dated note, 21:45Z: X5 added. Dated note, 22:30Z: W-7 added.) (Dated note, 20:40Z: R-B1, R-B2, R-G5, R-G6, W-6 and X3 were added after p4; before them the total was 38 (P 3, D 16, R 12, X 2, W 5).) R-D3, R-G3 and R-G4 were added at 20:05Z, and R-D4 at about 20:15Z; the backfill written at about 19:30Z had 34.
+Register total: 55 entries (P 3, D 16, R 21, X 5, W 10). (Dated note, 2026-09-29 08:30Z: R-A4 added. Dated note, 08:05Z: R-A3 and W-10 added; W-8 superseded. Dated note, 23:00Z: W-9 added. Dated note, 22:45Z: R-G8, R-G9 and W-8 added. Dated note, 21:20Z: R-G7 added. Dated note, 21:23Z: X4 added. Dated note, 21:45Z: X5 added. Dated note, 22:30Z: W-7 added.) (Dated note, 20:40Z: R-B1, R-B2, R-G5, R-G6, W-6 and X3 were added after p4; before them the total was 38 (P 3, D 16, R 12, X 2, W 5).) R-D3, R-G3 and R-G4 were added at 20:05Z, and R-D4 at about 20:15Z; the backfill written at about 19:30Z had 34.
 
 Three recommended options were overridden: the review scope at 18:46:59Z (R-EX, "Go through the key ones" instead of "Accept all defaults"), and R-A1 and W-5 at 18:51:48Z. At 18:46:59Z the commit question's recommended "I commit in my terminal" was also answered with free text instead: "I already committed, let's debug the shell, I can also reboot if necessary". Separately, spec §3.1 says two of its rows override a plan's default: A1 and the fallback in G2.
 
@@ -711,6 +948,35 @@ gn100 context from p2: SQL-only PBS throughput plateaus at about 39–48 q/s, so
 
 Spec §7 G sets no numeric gate: the full suite is green on 3.14t with the GIL guard; a QPS/latency ABAB (A1 B1 A2 B2, one boot, OB1 in both arms) is run; the report says whether to continue. Plan G's decision rule: a win counts only on concurrent vector QPS, or on concurrent hybrid QPS when both arms report the same `sqlite_version`. Outcomes are Continue (B wins and turbovec ships a cp314t wheel), Hold (B wins, no wheel) or Park. Thresholds proposed by briefs 4a and 4b (for example hybrid concurrent ≥ 1.5×, memory ≤ 1.25× or ≤ 15 %) were not adopted. (Dated note, 20:40Z: after p4 the maintainer added R-G5. A hybrid win now also needs a hybrid p99 that is not `worse` in both tables, and every run records CPU per query.)
 
+### 4.8 PR 1's equivalence sessions: host against bench
+
+Four sessions on gn100, same image (`66aadc92`), same data, 4 GiB. Median (band, counted runs n); the band is max − min, and run0 is the warm-up, not counted.
+- **baseline3:** the old bench (pre-PR, with two safety patches), 2026-09-28 01:14Z, 1 h 49 min after a reboot, 6.1 GB page cache.
+- **control1:** the same old bench, 2026-09-29 07:59Z, 40.6 GB page cache, on a-equiv2's index.
+- **a-equiv2:** PR 1's bench (caa93b1), 2026-09-29 00:01Z, 40.3 GB page cache; flat first, then an IVF build in run0.
+- **a-equiv:** PR 1's bench (d312711), 2026-09-28 23:39Z, 40.5 GB page cache, on baseline3's index (recall 0.9928).
+
+| Engine | Metric | baseline3 | control1 | a-equiv2 | a-equiv |
+|---|---|---|---|---|---|
+| raggio | Search p50 (ms) | 21.0 (0.7, n=2) | 18.7 (1.6, n=3) | 19.0 (2.0, n=3) | 17.8 (1.2, n=3) |
+| raggio | Search p95 (ms) | 23.4 (0.0, n=2) | 20.4 (1.8, n=3) | 20.8 (1.9, n=3) | 20.1 (1.6, n=3) |
+| raggio | QPS serial | 47 (1, n=2) | 53 (4, n=3) | 52 (5, n=3) | 55 (4, n=3) |
+| raggio | Memory after ingest (MB) | 1550 (2, n=2) | 1549 (1, n=3) | 1550 (4, n=3) | 1529 (18, n=3) |
+| raggio-ivf | Search p50 (ms) | 11.2 (0.1, n=2) | 10.9 (0.1, n=3) | 11.0 (0.1, n=3) | 11.1 (0.1, n=3) |
+| raggio-ivf | QPS serial | 88 (0, n=2) | 89 (1, n=3) | 88 (1, n=3) | 87 (0, n=3) |
+| raggio-ivf | Filtered p50 (ms) | 63.0 (15.1, n=2) | 37.0 (1.2, n=3) | 37.0 (1.0, n=3) | 37.1 (16.9, n=3) |
+| raggio-ivf | Hybrid p50 (ms) | 87.9 (5.3, n=2) | 88.1 (1.7, n=3) | 88.4 (2.4, n=3) | 86.8 (3.5, n=3) |
+| raggio-ivf | Hybrid p95 (ms) | 156.9 (0.2, n=2) | 157.1 (0.2, n=3) | 158.1 (0.8, n=3) | 159.2 (3.5, n=3) |
+| raggio-ivf | Hybrid p99 (ms) | 556.8 (0.9, n=2) | 590.3 (6.1, n=3) | 558.7 (32.4, n=3) | 562.8 (20.6, n=3) |
+| raggio-ivf | Recall@10 vs exact | 0.994 (0.002, n=2) | 0.995 (0.000, n=3) | 0.995 (0.000, n=3) | 0.993 (0.000, n=3) |
+| raggio-ivf | IVF build at 4 GiB (s) | 213 (n=1) | 50.3 (n=1, build1) | 49.0 (n=1, run0) | - |
+
+Reading it:
+- baseline3 → control1 is the host (same bench); control1 → a-equiv2 is the bench (same day, same index).
+- The host moved flat latency by about 11%, IVF filtered p50 by 41%, and the IVF build by 4×.
+- The bench moved one row, IVF hybrid p95, by 0.6%. The maintainer accepted it as a run-order effect (R-A4).
+- a-equiv's IVF column is a different index, and its flat memory is unexplained (section 9.4).
+
 ## 5. Negative results and surprises
 
 ### 5.1 Audience batching lost on NEON
@@ -799,6 +1065,10 @@ Plan G described its optional C1 arm (3.14 with the GIL, `UV_NO_BINARY_PACKAGE=t
 ### 5.15 Plan B's bugs over HTTP, on every build, and rarer on 3.14t
 
 R1 reproduced over HTTP on all four builds. At c=16 with a collection key, 5.4–6.8 % of requests failed on the GIL builds and 0.46 % on 3.14t. The failures were 500s (`sqlite3.InterfaceError` in `get_config`, 155 tracebacks; one `IndexError` on `row[7]`, meaning another statement's row came back) and silent 401s on a valid key. Why 3.14t fails 12–15× less often was not investigated; it does not fix the bug. The bench phases use the root key, so they never see R1. Searches racing `DELETE /collections/{name}` returned 171–704 500s per run on every build, with `OperationalError`s, a `FileNotFoundError` on the IVF directory, and dropped connections, but no crash or deadlock. R2 and R4 were not observed. These results led to R-B1 (404, not 500) and R-B2 (an HTTP-level acceptance and a DGX re-run after B).
+
+### 5.16 The host moved the numbers more than the bench did
+
+PR 1's bench failed its own equivalence gate twice against baseline3, on up to 8 rows, all but one "better". A control run of baseline3's own bench, a day later on the same image and data, reproduced every one of those gains. The host state had changed: 6.1 GB of page cache a couple of hours after a reboot, against about 40 GB a day later. The IVF build went from 213 s to 50 s with nothing else changed. Against the same-day control, PR 1's bench differs on one row, by 0.6%. What this means for the plans: a baseline taken on a freshly rebooted host is not comparable with a candidate taken a day later, whatever the label says. The `host-warm` label had been set by hand, and it was wrong for baseline3.
 
 ## 6. Method: how we measured
 
@@ -954,7 +1224,9 @@ State as of 2026-09-28, about 19:30Z.
 - Dated note, 22:12Z: the plan G run failed at its rule editor and was resumed with the rule change in five stages (section 2). The small fixes from the Task 6 cross-check wait until the running workflows finish.
 - Dated note, 22:45Z: both workflows finished at 22:36Z, and the Task 6 fixes are in (section 2). `raggio-apply-g8-g9-and-final-check` applies R-G8 and R-G9 to plan G and runs a last cross-plan check. After its review, the spec, plans, journal and p4 note are committed together.
 - Dated note, 22:58Z: the last check finished at 22:55Z and was reviewed (section 2). The planning docs are committed together; execution starts with plan A's bench tasks, subagent-driven.
+- Dated note, 23:00Z: committed as fb57288. Plan A's PR 1 is being executed in `.worktrees/bench-hardening` (W-9); the pre-flight scan runs first.
 - **Next: execution, subagent-driven** (the maintainer's choice), starting with plan A's bench tasks (Tasks 1–6), then the merge order in section 8.
+- Dated note, 2026-09-29 11:01Z: plan A's PR 1 is merged into `main` locally (ff48930). Plan B is complete on its branch (b876b68, 9 commits, final review passed after one fix wave) and waits for the maintainer's merge choice. B's Task 8, the gn100 race re-run, follows the merge. Plan A's PR 2 (Tasks 7–10) comes after B in the merge order.
 
 ### 9.2 Open questions in the plans
 
@@ -962,7 +1234,7 @@ State as of 2026-09-28, about 19:30Z.
 - **D1 probe-only option.** A probe-only D1 run (about 90 min instead of about 4 h) records `D1-bench` as SKIP. Whether a probe-only D1 result is acceptable is an open question in the plan.
 - **G gates at c=8, but p4 saw the 3.14t hybrid gain only at c=16** (dated 21:15Z). At c=8 the three PBS arms tied on hybrid QPS (about 18); 3.14t pulled ahead only at c=16 (22.4 against 14.8), and at a cost (section 5.11). `bench.py`'s default concurrency is 8, and plan G's ABAB runs it. So G's `Hybrid QPS concurrent` row may show no free-threading win even where one exists at higher load. Whether G should add a c=16 pass is open. The orchestrator has not changed the plan. (Dated note, 21:20Z: answered. The maintainer chose a c=16 session after each ABAB arm session, reported and not gated (R-G7).)
 - **D's close steps and F's Step 3j** (dated 21:15Z): if D2 ever merged before F, F's pool-close line would bypass D's `close_step`. The spec order runs F first, so this is recorded, not fixed.
-- **The ssh config path in the plans** (dated 22:45Z, W-8): it stays for now and is decided again before any push or PR.
+- **The ssh config path in the plans** (dated 22:45Z, W-8): it stays for now and is decided again before any push or PR. (Dated note, 2026-09-29 08:30Z: resolved by W-10; the earlier local commits still carry the path, so the publish is a squash or a rewrite.)
 - **C detach headroom stays unscaled.** p1's swapless run passed with a need of 1,372 MiB (final VmHWM 3,646 MiB), but p1 did not measure the detach's own growth, so there is nothing to scale by. A refused or OOM-killed swapless detach on gn100 is to be reported as an open finding.
 
 ### 9.3 Not measured yet
@@ -981,7 +1253,8 @@ State as of 2026-09-28, about 19:30Z.
 - One base-cold first GET took 150.4 s, against 119–125 s in the other p1 runs.
 - The first GET after fadvise eviction took 147–161 s in every p2 configuration, against 120–125 s in p1.
 - Cold single-query scans: 43–51 s standalone, 38–40 s inside the load script (p1).
-- The IVF build at 4 GiB, from flat and warm, took 213 s in baseline3 (published 337 s) and 52.0 s in p1. The harness and the preceding state differed; neither source explains the gap.
+- The IVF build at 4 GiB, from flat and warm, took 213 s in baseline3 (published 337 s) and 52.0 s in p1. The harness and the preceding state differed; neither source explains the gap. (Dated note, 2026-09-29 08:30Z: the same old bench built it in 50.3 s in control1, with 40.6 GB of page cache against baseline3's 6.1 GB. Page cache is the leading explanation; no eviction experiment has tested it.)
+- **a-equiv's flat memory** (2026-09-29): 1528–1529 MB in runs 2 and 3, against 1547–1551 MB in baseline3, control1 and a-equiv2. It is not the run order, because control1 ran in the same order, and not the bench, because a-equiv2 ran the same bench.
 - **From p4 (20:40Z):** the two states of the flat concurrent row (section 5.8); the multi-second hybrid p99 tails on every arm at c=8 and c=16; why R1 fails 12–15× less often on 3.14t (section 5.15).
 - p3 attributes the server gap (203–408 QPS against an in-process ceiling of 610–662) to "serial drain plus event-loop pipeline", inferred from per-thread CPU sampling, not a per-stage trace.
 
@@ -991,6 +1264,14 @@ State as of 2026-09-28, about 19:30Z.
 - **Metadata-filtered and metadata-sorted listings** still scan the 3.57 GB records table at 43–51 s cold per request under 4 GiB. No plan addresses this; p1 suggests an expression or generated-column index.
 - **Plan code checked only against stand-ins** (dated 22:45Z). Plan G's decision code and scenarios ran against a stand-in `compare.py`; the real one comes with plan A, and its first real run is G's Task 10 Step 4. Plan A's Task 5 was run from the plan text in a scratch copy, but its suite totals (161 to 171) are sums, not runs.
 - **CI.** At critic time `.github/workflows` held only `docs.yml`; plan A adds `tests.yml`.
+- **Re-creating a collection while its delete is still running** (found in B's pre-flight, 2026-09-29): a same-name create that lands between the delete's catalog DELETE and its `rmtree` loses its directory. The next request answers 500. This exists at 19a8a2e too, and B leaves it alone. A likely fix: rename the directory to a tombstone under `_load_lock`, then remove the tombstone outside the lock.
+- **A DELETE mid-ingest briefly stalls every collection** (B's pre-flight, 2026-09-29): accepted in B, see 09:14Z. Plan C, which moves collection construction off the event loop, is the place to move `stop()` out of `_load_lock`. (Dated note, 10:45Z: the stall is longer than one write section; see the 09:14Z note and 10:33Z. Plan C's acceptance should measure it as p99 on other collections while one is deleted mid-ingest.)
+- **Issue candidates from B's final review** (2026-09-29; drafted, not filed. Dated note, 11:10Z: the maintainer chose to file all five; they wait for a GitHub CLI login):
+  - the same-name create that races a delete (the item above);
+  - a subprocess test for closing a connection under a running statement: `close()` blocked in the Windows probes, and a connection with no earlier statement segfaulted;
+  - a shutdown that cancels an idle eviction after it popped its collection, leaving that collection unstopped (plan D2);
+  - optionally, `Embedder` failing fast on errors that cannot succeed, which would cut the ~7 s a racing search waits for its 404;
+  - optionally, writes and unlocked reads that race `DELETE` and still answer 500 (the ADR's Deferred row).
 - **Sample sizes.** In p1 many figures are n=1 (every memory variant, the cold IVF build, first-search cold starts, cold list timings); the baseline server cold start is n=2. p1 evicted only the data directories; image layers and Python stayed host-cached. In p3, in-process run-to-run spread is about 10 %; the server client shared host CPUs with the OpenBLAS spinners in default-BLAS configs; one synthetic probe was OOM-killed at 4 GiB and rerun uncapped (all real-data and server runs were capped).
 
 ## 10. Source index

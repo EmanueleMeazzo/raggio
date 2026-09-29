@@ -1605,7 +1605,7 @@ if ! git diff --quiet HEAD --; then
 fi
 SHA=$(git rev-parse --short=7 HEAD)
 echo "deploying $SHA to $DGX_HOST"
-git archive HEAD | ssh_dgx "$(cat "$(dirname "$0")/unpack.sh")"
+git -c core.autocrlf=false archive HEAD | ssh_dgx "$(cat "$(dirname "$0")/unpack.sh")"
 ssh_dgx "bash ~/raggio/bench/dgx/setup.sh $SHA"
 ```
 
