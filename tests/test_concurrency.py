@@ -6,6 +6,8 @@ structurally (lock spies, identity checks) instead of by timing."""
 import ast
 import asyncio
 import collections
+import os
+import random
 import re
 import sqlite3
 import sys
@@ -13,6 +15,7 @@ import threading
 import time
 import zlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import numpy as np
@@ -512,3 +515,178 @@ def test_no_in_place_indexed_counts_mutation_in_store_source():
     assert not re.search(r"indexed_counts\[[^\n]*?\]\s*(=(?!=)|\+=|-=)", src)
     assert not re.search(r"del\s+[\w.]*indexed_counts\[", src)
     assert not re.search(r"indexed_counts\.(update|pop|popitem|setdefault|clear)\(", src)
+
+
+# ---- mixed-workload stress: a regression guard, checked after quiescence ----
+
+# test-only knobs (not Settings): a longer soak is RAGGIO_STRESS_SECONDS=60
+STRESS_SECONDS = float(os.environ.get("RAGGIO_STRESS_SECONDS", "3"))
+STRESS_CLIENTS = int(os.environ.get("RAGGIO_STRESS_CLIENTS", "16"))
+SEED_DOCS = 300
+WORDS = [f"w{i}" for i in range(400)] + ["alpha", "beta", "gamma", "delta", "planet", "star"]
+_CLOSED = re.compile(
+    r"RuntimeError: collection '\w+' is closed|ProgrammingError: Cannot operate on a closed database"
+)
+
+
+def _text(rng) -> str:
+    # Zipf-ish: low word ids are common, so the pruner hits its budget (two-stage BM25)
+    return " ".join(WORDS[min(int(rng.zipf(1.3)), len(WORDS) - 1)] for _ in range(rng.integers(8, 40)))
+
+
+def _doc(rng, i: int) -> dict:
+    g = int(rng.integers(0, 30))
+    return {
+        "doc_id": f"d{i}",
+        "summary": {"text": _text(rng), "metadata": {"g": g}} if rng.random() < 0.5 else None,
+        "chunks": [
+            {"id": f"d{i}c{j}", "position": j, "text": _text(rng), "metadata": {"g": g, "p": j}}
+            for j in range(int(rng.integers(1, 5)))
+        ],
+    }
+
+
+async def _drain(col: Collection, timeout: float = 60) -> None:
+    deadline = time.monotonic() + timeout
+    while col.pending_jobs():
+        assert time.monotonic() < deadline, "ingest jobs did not drain"
+        await asyncio.sleep(0.05)
+
+
+async def _seeded(tmp_path) -> Collection:
+    col = make_collection(tmp_path)
+    col.start_worker()
+    rng = np.random.default_rng(1)
+    for s in range(0, SEED_DOCS, 100):
+        await col.enqueue({"documents": [_doc(rng, i) for i in range(s, s + 100)]})
+    await _drain(col)
+    return col
+
+
+async def _storm(col: Collection, seed: int, stop_after: float | None = None):
+    """STRESS_CLIENTS clients for STRESS_SECONDS: searches (15% cancelled mid-flight,
+    leaving orphaned to_thread work), upserts and re-upserts, metadata patches,
+    deletes, and the unlocked reads (list_records, get_document, stats). With
+    stop_after, the collection is stopped mid-storm. Returns (errors, ops)."""
+    rng, prng = np.random.default_rng(seed), random.Random(seed)
+    emb = FakeEmbedder()
+    errors, ops = collections.Counter(), collections.Counter()
+    next_doc = SEED_DOCS
+    deadline = time.monotonic() + STRESS_SECONDS
+
+    async def search():
+        mode = prng.choice(["vector", "vector", "text", "hybrid"])
+        q = " ".join(prng.choice(WORDS[:60]) for _ in range(prng.randint(2, 6)))
+        qvec = None
+        if mode != "text":
+            qvec = store._normalize(np.array(await emb.embed([q]), dtype=np.float32))
+        expand = None
+        if prng.random() < 0.2:
+            expand = SimpleNamespace(siblings_topk=prng.choice([None, 3]),
+                                     siblings_all=prng.random() < 0.3, summary=prng.random() < 0.5)
+        filt = prng.choice([None, {"g": prng.randrange(30)},
+                            {"g": {"in": [prng.randrange(30), prng.randrange(30)]}}])
+        coro = col.search(mode, qvec, q, prng.choice([5, 10, 50]),
+                          prng.choice(["chunks", "summaries", "both"]), filt, expand)
+        if prng.random() < 0.15:
+            try:
+                await asyncio.wait_for(coro, prng.choice([0.0005, 0.002, 0.01]))
+            except TimeoutError:  # cancelled; its to_thread body runs on, unlocked
+                ops["search_cancelled"] += 1
+            return
+        await coro
+        ops["search"] += 1
+
+    async def write():
+        nonlocal next_doc
+        r = prng.random()
+        if r < 0.45:
+            docs = [_doc(rng, next_doc)]
+            if prng.random() < 0.5:  # re-upsert an existing doc: the remove + add path
+                docs.append(_doc(rng, prng.randrange(next_doc)))
+            next_doc += 1
+            await col.enqueue({"documents": docs})
+        elif r < 0.75:
+            await col.patch_metadata(f"d{prng.randrange(next_doc)}", {"g": prng.randrange(30)}, True)
+        else:
+            await col.delete_document(f"d{prng.randrange(next_doc)}")
+        ops["write"] += 1
+
+    async def read():
+        r = prng.random()
+        if r < 0.5:
+            await asyncio.to_thread(
+                col.list_records, prng.choice(["chunks", "both"]),
+                prng.choice([None, {"g": prng.randrange(30)}]), prng.choice([None, "-g", "p"]),
+                20, 0, prng.random() < 0.3,
+            )
+        elif r < 0.8:
+            col.get_document(f"d{prng.randrange(next_doc)}")
+        else:
+            col.stats()
+        ops["read"] += 1
+
+    async def client():
+        while time.monotonic() < deadline:
+            r = prng.random()
+            try:
+                await (search() if r < 0.70 else write() if r < 0.85 else read())
+            except Exception as e:
+                errors[f"{type(e).__name__}: {str(e)[:80]}"] += 1
+            await asyncio.sleep(0)
+
+    async def stopper():
+        await asyncio.sleep(stop_after)
+        await col.stop()
+        ops["stopped"] += 1
+
+    await asyncio.gather(*(client() for _ in range(STRESS_CLIENTS)),
+                         *([stopper()] if stop_after is not None else []))
+    return errors, ops
+
+
+def test_mixed_workload_keeps_index_and_counts_consistent(tmp_path):
+    async def run():
+        col = await _seeded(tmp_path)
+        errors, ops = await _storm(col, seed=7)
+        await _drain(col)
+        await asyncio.sleep(0.5)  # orphaned to_thread bodies of cancelled searches land
+        db = col._rdb()
+        indexed = db.execute("SELECT COUNT(*) FROM records WHERE indexed=1").fetchone()[0]
+        by_type = dict(db.execute(
+            "SELECT type, COUNT(*) FROM records WHERE indexed=1 GROUP BY type").fetchall())
+        state = len(col.index), indexed, {k: v for k, v in col.indexed_counts.items() if v}, by_type
+        await col.stop()
+        return errors, ops, state
+
+    errors, ops, (index_len, indexed, counts, by_type) = asyncio.run(run())
+    assert errors == {}
+    assert ops["search"] and ops["search_cancelled"] and ops["write"] and ops["read"]
+    assert index_len == indexed  # every indexed row is in the vector index, nothing else
+    assert counts == by_type  # indexed_counts never drifted from the table
+
+
+def test_stop_under_load_fails_closed_and_closes_every_connection(tmp_path, monkeypatch):
+    opened = []
+    real_connect = sqlite3.connect
+
+    def spy_connect(*args, **kw):
+        conn = real_connect(*args, **kw)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(store.sqlite3, "connect", spy_connect)
+
+    async def run():
+        col = await _seeded(tmp_path)
+        out = await _storm(col, seed=11, stop_after=STRESS_SECONDS / 2)
+        await asyncio.sleep(0.5)  # orphaned to_thread bodies finish (and fail closed)
+        return out
+
+    errors, ops = asyncio.run(run())
+    assert ops["stopped"] == 1
+    assert errors, "no operation ran against the stopped collection"
+    assert {k: v for k, v in errors.items() if not _CLOSED.match(k)} == {}
+    for conn in opened:  # the write connection and every per-thread read connection
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
