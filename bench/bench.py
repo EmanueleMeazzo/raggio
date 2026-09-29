@@ -21,6 +21,9 @@ import httpx
 import numpy as np
 import orjson
 
+from bench_reuse import (STATE_TIMEOUT_S, BenchAbort, decide, fingerprint_path, prepare_engine,
+                         read_fingerprint, wait_idle, weaviate_state)
+
 # local SSD copies of D:\EKB\kb\.ekb\* — the D: drive is slow/contended and ingest
 # reads vectors inside the timed window (cp them here before running)
 VEC_PATH = "bench/corpus/embed-vecs.npy"
@@ -130,6 +133,55 @@ def podman_disk(volume: str) -> float:
     return int(out.split()[0]) / 1e6  # MB
 
 
+CGROUP_ROOT = "/sys/fs/cgroup"
+CPU_KEYS = {"cpu_ms_per_q_c", "hybrid_cpu_ms_per_q_c"}  # absent, never 0, without a cgroup read
+
+
+def cpu_stat_path(container):
+    """The container's cgroup v2 cpu.stat, found as DGX probe p4 did: /sys/fs/cgroup plus
+    `podman inspect --format {{.State.CgroupPath}}`. OSError when podman or the inspect fails."""
+    r = subprocess.run(["podman", "inspect", container, "--format", "{{.State.CgroupPath}}"],
+                       capture_output=True, text=True)
+    cgroup = r.stdout.strip()
+    if r.returncode != 0 or not cgroup.startswith("/"):
+        raise OSError(f"podman inspect {container} gave no cgroup path (exit {r.returncode})")
+    return f"{CGROUP_ROOT}{cgroup}/cpu.stat"
+
+
+def read_usage_usec(path):
+    """usage_usec (the cgroup's total CPU time, microseconds) from a cgroup v2 cpu.stat."""
+    for line in Path(path).read_text().splitlines():
+        field, _, value = line.partition(" ")
+        if field == "usage_usec":
+            return int(value)
+    raise OSError(f"{path} has no usage_usec line")
+
+
+async def cpu_phase(name, key, container, phase):
+    """Run one concurrent phase and read the server container's cgroup CPU around it (spec §3.1
+    G5). Returns (the phase's result, {key: CPU ms per request}); the dict is empty, with one
+    line saying why, when --cpu-container is unset or another engine's, or a read fails."""
+    before = why = None
+    if not container:
+        why = "no --cpu-container"
+    elif container != ENGINES[name]["container"]:
+        why = f"--cpu-container {container} is not {name}'s container"
+    else:
+        try:
+            path = cpu_stat_path(container)
+            before = read_usage_usec(path)
+        except (OSError, ValueError) as e:
+            why = str(e)
+    out = await phase()
+    if why is None:
+        try:
+            return out, {key: (read_usage_usec(path) - before) / 1000 / len(out[0])}
+        except (OSError, ValueError) as e:
+            why = str(e)
+    print(f"[{name}] {key} absent: {why}")
+    return out, {}
+
+
 # ---------- ingest ----------
 
 def batches_by_doc(paths, years, ingest_rows, batch_size):
@@ -215,12 +267,9 @@ async def ensure_no_index():
             print("  dropped leftover IVF index")
 
 
-async def ingest_raggio_ivf(vecs, paths, years, ingest_rows, batch_size, concurrency):
-    """Reuse the flat collection's ingested data; the measured step is the IVF index build."""
-    async with httpx.AsyncClient(headers=TR_HDRS, timeout=600) as client:
-        r = await client.get(f"{TR}/collections/{COLL}")
-        if r.status_code != 200 or r.json()["chunks"] != len(ingest_rows):
-            await ingest_raggio(vecs, paths, years, ingest_rows, batch_size, concurrency)
+async def build_ivf_index():
+    """The measured raggio-ivf step: (re)build the IVF index over the flat collection's data."""
+    async with httpx.AsyncClient(headers=TR_HDRS, timeout=STATE_TIMEOUT_S) as client:
         t0 = time.time()
         r = await client.post(f"{TR}/collections/{COLL}/index", json={})
         r.raise_for_status()
@@ -228,7 +277,7 @@ async def ingest_raggio_ivf(vecs, paths, years, ingest_rows, batch_size, concurr
         elapsed = time.time() - t0
         info = (await client.get(f"{TR}/collections/{COLL}")).json()
         print(f"  ivf index built in {elapsed:.0f}s: {info.get('index')}")
-        return elapsed, info["chunks"]
+        return elapsed
 
 
 async def ingest_weaviate(vecs, paths, years, ingest_rows, batch_size, concurrency):
@@ -326,6 +375,15 @@ def pct(lat, p):
     return statistics.quantiles(lat, n=100)[p - 1]
 
 
+def hybrid_first_pass(lat_h, n=10):
+    """The first n serial hybrid queries apart from the rest (spec §6: after a load the first
+    ~10 take 470-980 ms). With concurrency 1 the queries run in list order, so lat_h[:n] are
+    the first n sent."""
+    if len(lat_h) < n + 2:
+        return {}
+    return {"hybrid_first10_max_ms": max(lat_h[:n]), "hybrid_p99_after10": pct(lat_h[n:], 99)}
+
+
 def cold_start(container, engine, probe_vec, headers):
     subprocess.run(["podman", "restart", "-t", "2", container], capture_output=True)
     t0 = time.time()
@@ -347,31 +405,28 @@ def cold_start(container, engine, probe_vec, headers):
 
 # ---------- main ----------
 
+# "fp": whose data the column measures. raggio-ivf runs on the flat collection's data
+# (plus an index), so both raggio columns share one fingerprint.
 ENGINES = {
-    "raggio": {"container": "bench-tv", "hdrs": TR_HDRS, "volume": "bench-tv", "ingest": ingest_raggio},
-    "raggio-ivf": {"container": "bench-tv", "hdrs": TR_HDRS, "volume": "bench-tv", "ingest": ingest_raggio_ivf},
-    "weaviate": {"container": "bench-wv", "hdrs": WV_HDRS, "volume": "bench-wv", "ingest": ingest_weaviate},
+    "raggio": {"container": "bench-tv", "hdrs": TR_HDRS, "volume": "bench-tv", "fp": "raggio",
+               "ingest": ingest_raggio, "build_index": None},
+    "raggio-ivf": {"container": "bench-tv", "hdrs": TR_HDRS, "volume": "bench-tv", "fp": "raggio",
+                   "ingest": ingest_raggio, "build_index": build_ivf_index},
+    "weaviate": {"container": "bench-wv", "hdrs": WV_HDRS, "volume": "bench-wv", "fp": "weaviate",
+                 "ingest": ingest_weaviate, "build_index": None},
 }
 
 
-async def current_count(name):
-    """Chunk count already in the engine, or None if unreachable/missing."""
-    try:
-        async with httpx.AsyncClient(headers=ENGINES[name]["hdrs"], timeout=30) as client:
-            if name.startswith("raggio"):
-                r = await client.get(f"{TR}/collections/{COLL}")
-                if r.status_code != 200:
-                    return None
-                info = r.json()
-                if name == "raggio-ivf" and (info.get("index") or {}).get("type") != "ivf":
-                    return None  # data present but no ivf index: force the "ingest" (index build)
-                return info["chunks"]
-            agg = {"query": f'{{Aggregate {{{WCLASS} {{meta {{count}}}}}}}}'}
-            r = await client.post(f"{WV}/v1/graphql", json=agg)
-            data = (r.json().get("data") or {}).get("Aggregate", {}).get(WCLASS)
-            return data[0]["meta"]["count"] if data else None
-    except (httpx.HTTPError, ValueError, KeyError):
-        return None
+async def engine_state(name, timeout):
+    """What the engine holds; raggio is read once its job queue has drained."""
+    async with httpx.AsyncClient(headers=ENGINES[name]["hdrs"], timeout=timeout) as client:
+        if name.startswith("raggio"):
+            return await wait_idle(client, TR, COLL)
+        return await weaviate_state(client, WV, WCLASS)
+
+
+def fp_file(name, args):
+    return fingerprint_path(args.fingerprint_dir, ENGINES[name]["fp"], args.limit)
 
 
 def fingerprint(args):
@@ -380,26 +435,28 @@ def fingerprint(args):
             "text_v": f"{CORPUS_LABEL}/d{DIM}" if TEXTS is not None else doc_text("emails/2000/01/probe.md")}
 
 
+async def preflight(names, expected, args):
+    """Every engine's reuse decision before the ground-truth pass (minutes at 2.5M rows):
+    a wrong --limit, a missing fingerprint or an unreachable engine aborts here."""
+    for name in names:
+        st = await engine_state(name, args.state_timeout)
+        fp_path = fp_file(name, args)
+        action = decide(name, st, expected, read_fingerprint(fp_path), fingerprint(args),
+                        reingest=args.reingest, adopt=args.adopt, limit=args.limit, fp_path=fp_path)
+        print(f"[{name}] preflight: {st.chunks} chunks, ivf={st.ivf} -> {action}")
+
+
 async def bench_engine(name, vecs, paths, years, ingest_rows, queries, gt_rows, hybrid_texts, hybrid_paths, args):
     e = ENGINES[name]
-    res = {}
-    fp = Path(f"bench/fingerprint-{name}.json")
-    reuse = (not args.reingest and fp.exists() and json.loads(fp.read_text()) == fingerprint(args)
-             and await current_count(name) == len(ingest_rows))
-    if not reuse:
-        print(f"[{name}] ingest {len(ingest_rows)} vectors...")
-        elapsed, count = await e["ingest"](vecs, paths, years, ingest_rows, args.batch_size, args.ingest_concurrency)
-        assert count == len(ingest_rows), f"{name}: indexed {count}, expected {len(ingest_rows)}"
-        res["ingest_s"] = elapsed
-        res["ingest_vps"] = len(ingest_rows) / elapsed
-        fp.write_text(json.dumps(fingerprint(args)))
-    else:
-        print(f"[{name}] reusing {len(ingest_rows)} ingested chunks (pass --reingest to rebuild)")
+    res = await prepare_engine(
+        name, state=lambda: engine_state(name, args.state_timeout),
+        ingest=lambda: e["ingest"](vecs, paths, years, ingest_rows, args.batch_size, args.ingest_concurrency),
+        build_index=e["build_index"], fp_path=fp_file(name, args), expected=len(ingest_rows),
+        fp_now=fingerprint(args), reingest=args.reingest, adopt=args.adopt, limit=args.limit)
     if name == "raggio":
         await ensure_no_index()  # flat column must measure the brute-force scan, never a leftover index
-    if name == "raggio-ivf" and "ingest_s" in res:
-        res["index_build_s"] = res.pop("ingest_s")  # the "ingest" measured above is the index build
-        res.pop("ingest_vps", None)
+    if name.startswith("raggio"):
+        await engine_state(name, args.state_timeout)  # measure only once the job queue is empty
     res["mem_after_ingest_mb"] = podman_mem(e["container"])
     res["disk_mb"] = podman_disk(e["volume"])
 
@@ -412,9 +469,11 @@ async def bench_engine(name, vecs, paths, years, ingest_rows, queries, gt_rows, 
 
     print(f"[{name}] concurrent search (x{args.concurrency})...")
     mem_probe = asyncio.create_task(asyncio.to_thread(podman_mem, e["container"]))
-    lat_c, wall_c, _ = await run_queries(name, queries, args.concurrency, e["hdrs"])
+    (lat_c, wall_c, _), cpu = await cpu_phase(
+        name, "cpu_ms_per_q_c", args.cpu_container,
+        lambda: run_queries(name, queries, args.concurrency, e["hdrs"]))
     res.update(qps_concurrent=len(lat_c) / wall_c, lat_c_p95=pct(lat_c, 95),
-               mem_under_load_mb=await mem_probe)
+               mem_under_load_mb=await mem_probe, **cpu)
 
     year = statistics.mode(years[r] for r in ingest_rows)
     print(f"[{name}] filtered search (year={year})...")
@@ -426,14 +485,17 @@ async def bench_engine(name, vecs, paths, years, ingest_rows, queries, gt_rows, 
     lat_h, wall_h, hits_h = await run_queries(name, queries, 1, e["hdrs"], texts=hybrid_texts)
     res.update(hybrid_p50=pct(lat_h, 50), hybrid_p95=pct(lat_h, 95), hybrid_p99=pct(lat_h, 99),
                hybrid_qps_serial=len(lat_h) / wall_h)
+    res.update(hybrid_first_pass(lat_h))  # the text index's warm-up, reported on its own
     # did the doc whose path tokens we queried surface through fusion?
     res["hybrid_text_hit_rate"] = statistics.mean(
         any(paths[int(h[1:])] == p for h in hits) for hits, p in zip(hits_h, hybrid_paths))
     assert all(hits_h), f"{name}: hybrid queries returned empty hits"
 
     print(f"[{name}] hybrid concurrent search (x{args.concurrency})...")
-    lat_hc, wall_hc, _ = await run_queries(name, queries, args.concurrency, e["hdrs"], texts=hybrid_texts)
-    res["hybrid_qps_concurrent"] = len(lat_hc) / wall_hc
+    (lat_hc, wall_hc, _), cpu = await cpu_phase(
+        name, "hybrid_cpu_ms_per_q_c", args.cpu_container,
+        lambda: run_queries(name, queries, args.concurrency, e["hdrs"], texts=hybrid_texts))
+    res.update(hybrid_qps_concurrent=len(lat_hc) / wall_hc, hybrid_c_p99=pct(lat_hc, 99), **cpu)
 
     print(f"[{name}] cold start...")
     res["cold_start_s"] = cold_start(e["container"], name, queries[0], e["hdrs"])
@@ -448,11 +510,17 @@ ROWS = [("Ingest wall time (s)", "ingest_s", "{:.0f}"), ("Ingest throughput (vec
         ("Search p50 (ms)", "lat_p50", "{:.1f}"), ("Search p95 (ms)", "lat_p95", "{:.1f}"),
         ("Search p99 (ms)", "lat_p99", "{:.1f}"), ("QPS serial", "qps_serial", "{:.0f}"),
         ("QPS concurrent", "qps_concurrent", "{:.0f}"), ("p95 under concurrency (ms)", "lat_c_p95", "{:.1f}"),
+        ("CPU per query under concurrency (ms)", "cpu_ms_per_q_c", "{:.1f}"),
         ("Filtered p50 (ms)", "lat_filtered_p50", "{:.1f}"), ("Filtered p95 (ms)", "lat_filtered_p95", "{:.1f}"),
         ("Recall@10 vs exact", "recall_at_10", "{:.3f}"),
         ("Hybrid p50 (ms)", "hybrid_p50", "{:.1f}"), ("Hybrid p95 (ms)", "hybrid_p95", "{:.1f}"),
-        ("Hybrid p99 (ms)", "hybrid_p99", "{:.1f}"), ("Hybrid QPS serial", "hybrid_qps_serial", "{:.1f}"),
+        ("Hybrid p99 (ms)", "hybrid_p99", "{:.1f}"),
+        ("Hybrid first 10 queries, slowest (ms)", "hybrid_first10_max_ms", "{:.1f}"),
+        ("Hybrid p99 without the first 10 (ms)", "hybrid_p99_after10", "{:.1f}"),
+        ("Hybrid QPS serial", "hybrid_qps_serial", "{:.1f}"),
         ("Hybrid QPS concurrent", "hybrid_qps_concurrent", "{:.1f}"),
+        ("Hybrid p99 under concurrency (ms)", "hybrid_c_p99", "{:.1f}"),
+        ("Hybrid CPU per query under concurrency (ms)", "hybrid_cpu_ms_per_q_c", "{:.1f}"),
         ("Hybrid text-hit@10", "hybrid_text_hit_rate", "{:.3f}"),
         ("Cold start to first query (s)", "cold_start_s", "{:.1f}")]
 
@@ -467,6 +535,8 @@ def report(results, args, n_ingested):
              f"property; query = held-out vector + {hybrid_src} of a sampled ingested doc.", "",
              "| Metric | " + " | ".join(names) + " |", "|---|" + "---|" * len(names)]
     for label, key, fmt in ROWS:
+        if key in CPU_KEYS and not any(key in results[n] for n in names):
+            continue  # no cgroup read on this host: the row is absent, never 0
         vals = [fmt.format(results[n][key]) if key in results[n] else "—" for n in names]
         lines.append(f"| {label} | " + " | ".join(vals) + " |")
     lines += ["", "Notes: raggio = single Python asyncio process, brute-force scan over 4-bit quantized "
@@ -474,32 +544,57 @@ def report(results, args, n_ingested):
               "generation + full-query rescore), per-collection lock. raggio-ivf = the same store and "
               "data with the optional IVF index built (approximate, default nprobe, same rescore). "
               "Weaviate = Go, HNSW approximate index, uncompressed vectors. All queried via REST with "
-              "client-supplied vectors; identical stored payloads."]
+              "client-supplied vectors; identical stored payloads. The concurrent phases repeat the "
+              "serial phases' queries (warm caches). The first 10 serial hybrid queries are also "
+              "reported on their own: after a container start they include the text index's warm-up. "
+              "CPU per query is the server container's cgroup CPU time over a concurrent phase, "
+              "divided by its requests; its rows are absent where the cgroup is not readable."]
     return "\n".join(lines)
 
 
-async def main():
+def build_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--engine", default="all", choices=["all", "raggio", "raggio-ivf", "weaviate"])
     ap.add_argument("--limit", type=int, default=553_015)
     ap.add_argument("--queries", type=int, default=500)
     ap.add_argument("--filtered-queries", type=int, default=200)
     ap.add_argument("--concurrency", type=int, default=8)
+    ap.add_argument("--cpu-container", metavar="NAME",
+                    help="container whose cgroup cpu.stat gives the server CPU per query of the "
+                         "concurrent phases (the DGX runbook passes bench-tv); without it, or when "
+                         "the cgroup is not readable, the CPU rows are absent")
     ap.add_argument("--ingest-concurrency", type=int, default=2)
     ap.add_argument("--batch-size", type=int, default=250)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--reingest", action="store_true",
-                    help="wipe and re-ingest even if the engine already holds the corpus")
+                    help="wipe and re-ingest even if the engine already holds the corpus "
+                         "(raggio-ivf: rebuild only the index when the data matches)")
+    ap.add_argument("--adopt", action="store_true",
+                    help="trust the engine's data when its chunk count matches and no fingerprint "
+                         "is on file, e.g. a volume carried over from another checkout; records "
+                         "this run's fingerprint (a different fingerprint on file still aborts)")
+    ap.add_argument("--fingerprint-dir", default="bench",
+                    help="directory for fingerprint-<data>-<limit>.json; keep it outside a checkout "
+                         "that a deploy wipes")
+    ap.add_argument("--state-timeout", type=float, default=STATE_TIMEOUT_S,
+                    help="seconds to wait for an engine's state (the first request after a "
+                         "container start opens the collection)")
     ap.add_argument("--out", default="bench/results.md")
     ap.add_argument("--host", default=f"{platform.system()}/{platform.machine()}, {os.cpu_count()} CPUs",
                     help="host description for the report header (default: autodetected)")
     ap.add_argument("--caps-note", default="raggio container capped at 1 GiB (4-bit quantized flat "
                     "index), Weaviate at 8 GiB (HNSW, float32, defaults).",
                     help="container memory-caps sentence for the report header")
-    args = ap.parse_args()
+    return ap
+
+
+async def main(argv=None):
+    args = build_parser().parse_args(argv)
+    names = list(ENGINES) if args.engine == "all" else [args.engine]
 
     vecs, paths, years, ingest_rows, _, queries = load_corpus(args.limit, args.queries, args.seed)
     print(f"corpus: {len(ingest_rows)} ingest rows, {len(queries)} queries")
+    await preflight(names, len(ingest_rows), args)
     # dim in the cache name: swapping the corpus in place must not reuse a stale ground truth
     gt = ground_truth(vecs, ingest_rows, queries, Path(f"bench/gt-{args.limit}-{args.seed}-d{DIM}.npz"))
 
@@ -511,7 +606,7 @@ async def main():
 
     partial = Path("bench/results-partial.json")
     results = json.loads(partial.read_text()) if partial.exists() else {}
-    for name in (list(ENGINES) if args.engine == "all" else [args.engine]):
+    for name in names:
         res = await bench_engine(name, vecs, paths, years, ingest_rows, queries, gt, hybrid_texts, hybrid_paths, args)
         results[name] = {**results.get(name, {}), **res}  # keep checkpointed ingest stats on reuse runs
         partial.write_text(json.dumps(results))  # survive a crash of the other engine
@@ -522,4 +617,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except BenchAbort as e:
+        raise SystemExit(f"bench aborted: {e}")

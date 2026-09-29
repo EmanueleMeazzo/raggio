@@ -5,5 +5,7 @@ bench/*.npz
 bench/*.log
 bench/*.err
 bench/snapshot/
+bench/fingerprint-*.json
+bench/results-partial.json
 site/
 NUL

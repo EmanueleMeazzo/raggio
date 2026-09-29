@@ -231,8 +231,9 @@ podman run -d --name bench-wv --memory 32g -p 18080:8080 -v bench-wv:/var/lib/we
   -e PERSISTENCE_DATA_PATH=/var/lib/weaviate \
   docker.io/semitechnologies/weaviate:1.38.11
 
-# if you previously ran the email benchmark, clear its checkpoints
-rm -f bench/fingerprint-*.json bench/results-partial.json
+# if you previously ran the email benchmark, clear its result checkpoint
+# (fingerprints are per corpus size, so they never mix)
+rm -f bench/results-partial.json
 ```
 
 Smoke first, then the full run detached. `--limit` must be the N printed by
@@ -242,16 +243,18 @@ the text stage — `bench.py`'s default is the email corpus size:
 uv run python bench/bench.py --limit 20000 --queries 100 \
   --out bench/results-arxiv-smoke.md
 
-nohup env PYTHONUNBUFFERED=1 uv run python bench/bench.py --limit <N> \
+nohup env PYTHONUNBUFFERED=1 uv run python bench/bench.py --limit <N> --reingest \
   --out bench/results-arxiv.md \
   --caps-note "raggio 4 GiB, Weaviate 32 GiB" > bench/arxiv-run.log 2>&1 &
 ```
 
 The harness computes ground truth, ingests both engines, runs the serial /
 concurrent / filtered / hybrid query phases, and writes the results table to
-`bench/results-arxiv.md`. It checkpoints `bench/results-partial.json` after
-each phase and fingerprints ingested data, so a re-run skips straight to the
-phases that remain.
+`bench/results-arxiv.md`. The volumes still hold the smoke run's chunks, so
+the first full run passes `--reingest`; without it the harness stops at its
+preflight check rather than wipe data it can't vouch for. It checkpoints
+`bench/results-partial.json` after each phase and fingerprints ingested data,
+so a re-run (without `--reingest`) skips straight to the phases that remain.
 
 ### Monitoring
 

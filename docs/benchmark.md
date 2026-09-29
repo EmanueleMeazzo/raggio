@@ -103,8 +103,15 @@ uv run python bench/bench.py --limit 20000 --queries 100    # quick smoke
 The harness (`bench/bench.py`) ingests, then measures serial / concurrent /
 filtered / hybrid search, recall against cached exact ground truth, memory,
 disk, and cold start, and writes `bench/results.md`. Ingested data stays in
-the volumes and is fingerprinted, so repeat runs start straight at the search
-phases; ingest wall time is measured on `--reingest` runs. Supporting
+the volumes and is fingerprinted per corpus size
+(`bench/fingerprint-<raggio|weaviate>-<limit>.json`, untracked; raggio-ivf shares raggio's), so repeat runs start
+straight at the search phases; ingest wall time is measured on `--reingest`
+runs. Before the ground-truth pass the harness checks every engine: if one
+doesn't answer, holds a different chunk count (a wrong `--limit`, or the
+smoke run's data), or has no matching fingerprint, it stops instead of
+re-ingesting. Pass `--reingest` to wipe and re-ingest, or `--adopt` to accept
+a volume that has no fingerprint on file yet but was ingested from the same
+corpus (e.g. by another checkout). Supporting
 decomposition tools live next to it: `bench/microbench.py` (kernel / FTS /
 hydration cost split), `bench/ivf_probe.py` (IVF feasibility sweep), and
 `bench/cal_probe.py` (TQ+ calibration flows).
