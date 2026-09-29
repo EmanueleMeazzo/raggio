@@ -181,7 +181,7 @@ curl -s localhost:8001/v1/embeddings \
 ### 2. Build the corpus
 
 ```bash
-nohup env PYTHONUNBUFFERED=1 uv run --with pyarrow --with huggingface_hub \
+nohup env PYTHONUNBUFFERED=1 uv run --group bench --with pyarrow --with huggingface_hub \
   python bench/prep_arxiv.py --stage all > bench/prep.log 2>&1 &
 ```
 
@@ -202,7 +202,7 @@ The embed stage checkpoints a contiguous prefix to
 off, nothing is re-embedded. That also enables a cheap calibration pass:
 
 ```bash
-uv run --with pyarrow --with huggingface_hub \
+uv run --group bench --with pyarrow --with huggingface_hub \
   python bench/prep_arxiv.py --stage embed --limit 20000
 ```
 
@@ -240,10 +240,10 @@ Smoke first, then the full run detached. `--limit` must be the N printed by
 the text stage — `bench.py`'s default is the email corpus size:
 
 ```bash
-uv run python bench/bench.py --limit 20000 --queries 100 \
+uv run --group bench python bench/bench.py --limit 20000 --queries 100 \
   --out bench/results-arxiv-smoke.md
 
-nohup env PYTHONUNBUFFERED=1 uv run python bench/bench.py --limit <N> --reingest \
+nohup env PYTHONUNBUFFERED=1 uv run --group bench python bench/bench.py --limit <N> --reingest \
   --out bench/results-arxiv.md \
   --caps-note "raggio 4 GiB, Weaviate 32 GiB" > bench/arxiv-run.log 2>&1 &
 ```

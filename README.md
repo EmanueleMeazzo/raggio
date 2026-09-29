@@ -184,7 +184,7 @@ Setup and full table: [docs/benchmark.md](docs/benchmark.md).
 ## Develop
 
 ```bash
-uv sync
+uv sync --group bench
 uv run pytest
 ```
 

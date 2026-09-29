@@ -1,7 +1,7 @@
 # Path B/C probe: (C) served per-request overhead floor — vector search against a
 # ~100-row collection is pure HTTP + pydantic parse + dispatch, the scan is free;
 # (B) stdlib json vs orjson serialization of a real 10-hit search response.
-# Usage: uv run python bench/floor_probe.py   (bench-tv container must be up)
+# Usage: uv run --group bench python bench/floor_probe.py   (bench-tv container must be up)
 import json
 import statistics as st
 import time

@@ -7,7 +7,7 @@ Stage embed: embed abstracts.jsonl against a local vLLM OpenAI endpoint into
              bench/corpus/embed-vecs.npy    float32 N x DIM, crash-resumable via
              bench/corpus/prep-progress.json (contiguous-prefix checkpoint)
 
-Run:  uv run --with pyarrow --with huggingface_hub python bench/prep_arxiv.py --stage all
+Run:  uv run --group bench --with pyarrow --with huggingface_hub python bench/prep_arxiv.py --stage all
 Smoke/calibrate: --stage embed --limit 20000  (prints rows/s + extrapolated full ETA;
                  a later full run resumes from the checkpoint, nothing is re-embedded)
 """

@@ -110,9 +110,13 @@ See [Search](search.md) for the three modes, filtering, and result expansion.
 ## Develop
 
 ```bash
-uv sync
+uv sync --group bench
 uv run pytest
 ```
+
+The project needs uv 0.12 or newer (`required-version` in `pyproject.toml`). The
+`bench` group adds orjson, which the benchmark harness in `bench/` (and its
+tests) imports; the server itself never needs it.
 
 Build these docs locally:
 

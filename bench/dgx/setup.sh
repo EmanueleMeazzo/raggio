@@ -10,9 +10,7 @@ echo "$SHA" > .deployed-sha
 run ln -sfn "$HOME/turborag/bench/corpus" bench/corpus
 run cp "$HOME/turborag/bench/gt-$LIMIT-42-d1024.npz" bench/
 run "$HOME/.local/bin/uv" --version
-# orjson sits in the default dev group until the packaging change moves it to "bench"
-if grep -q '^bench = \[' pyproject.toml; then GROUP=(--group bench); else GROUP=(); fi
-run "$HOME/.local/bin/uv" sync --frozen "${GROUP[@]}"
+run "$HOME/.local/bin/uv" sync --frozen --group bench
 run podman build -t "localhost/raggio:$SHA" .
 mkdir -p "$STATE"
 log "deployed $SHA as localhost/raggio:$SHA"
