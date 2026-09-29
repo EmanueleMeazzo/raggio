@@ -66,6 +66,8 @@ def test_guard_rails():
     assert "2549119" not in joined  # the ingested count, never a --limit
     assert "LIMIT=2549619" in text["lib.sh"]
     assert re.search(r"^CONTAINER=bench-tv\s", text["lib.sh"], re.M)
+    # no operator paths: the ssh config comes from SSH_CONFIG, the DGX home from $HOME
+    assert not re.search(r"[A-Za-z]:/Users/|/home/", joined)
     for verb in ("podman kill", "podman container rm", "podman container kill", "podman container stop",
                  "prune", "podman rmi", "podman volume"):
         assert verb not in joined
@@ -375,6 +377,16 @@ def test_flat_runs_can_be_raised_for_a_concurrent_qps_claim(tmp_path):
         with pytest.raises(subprocess.CalledProcessError):
             dry_session(sub, (var, bad))
         assert not (sub / "bench-home" / "s1").exists()
+
+
+@needs_bash
+def test_deploy_refuses_without_an_ssh_config(tmp_path):
+    env = {k: v for k, v in os.environ.items() if k != "SSH_CONFIG"}
+    r = subprocess.run([BASH, (DGX / "deploy.sh").resolve().as_posix()], env=env, cwd=tmp_path,
+                       capture_output=True, text=True)
+    assert r.returncode != 0
+    assert "set SSH_CONFIG" in r.stderr
+    assert "deploying" not in r.stdout  # it stops before git or ssh
 
 
 def test_image_facts_snippet_reports_sqlite_and_blas_threads():
