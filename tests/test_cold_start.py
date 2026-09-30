@@ -804,3 +804,109 @@ def test_attach_guard_receives_the_scaled_need(tmp_path, monkeypatch):
     with pytest.raises(Refused):
         asyncio.run(col._process_job({"op": "attach_index", "nlist": 8}))
     assert seen == [(store._attach_need(300, DIM, 4, 8), "index build")]
+
+
+# ---- Task 9: missing vectors found from the stream ----
+
+
+def delete_vecs(col, ids, drop_text=False):
+    """Make `ids` legacy rows: indexed, but without a retained fp16 original."""
+    marks = ",".join("?" * len(ids))
+    with col.db_lock:
+        col.db.execute(f"DELETE FROM vecs WHERE id IN ({marks})", list(ids))
+        if drop_text:
+            col.db.execute(f"UPDATE records SET text=NULL WHERE id IN ({marks})", list(ids))
+        col.db.commit()
+
+
+def test_backfill_by_ids_embeds_only_those_rows_and_feeds_add(tmp_path):
+    col = make_collection(tmp_path)
+    ingest(col, 300)
+    delete_vecs(col, [4, 5, 6])
+    got = []
+    wrote = asyncio.run(col._backfill_vecs(
+        np.array([4, 6], dtype=np.uint64), lambda i, m: got.append((i, m)),
+    ))
+    assert wrote == 2
+    ids = np.concatenate([i for i, _ in got])
+    mats = np.concatenate([m for _, m in got])
+    assert ids.dtype == np.uint64 and sorted(ids.tolist()) == [4, 6]
+    assert mats.dtype == np.float32 and mats.shape == (2, DIM)
+    for rid, row in zip(ids.tolist(), mats):  # add() sees exactly what a stream would read
+        blob = col.db.execute("SELECT vec FROM vecs WHERE id=?", (rid,)).fetchone()[0]
+        assert np.array_equal(row, np.frombuffer(blob, dtype=np.float16).astype(np.float32))
+    assert col.db.execute("SELECT COUNT(*) FROM vecs WHERE id=5").fetchone()[0] == 0
+
+
+def test_attach_backfills_rows_the_stream_missed(tmp_path, monkeypatch):
+    monkeypatch.setattr(store, "IVF_TRAIN_SAMPLE", 128)  # n=300: the sample fills from 295 rows
+    col = make_collection(tmp_path)
+    ingest(col, 300)
+    legacy = [3, 50, 150, 222, 300]
+    delete_vecs(col, legacy)
+    log = record_sql(col)
+    asyncio.run(col._process_job({"op": "attach_index", "nlist": 8}))
+    assert isinstance(col.index, _IvfIndex) and len(col.index) == 300
+    assert all(col.index.contains(i) for i in legacy)
+    assert col.db.execute("SELECT COUNT(*) FROM vecs").fetchone()[0] == 300
+    assert not any("LEFT JOIN" in s for s, _ in log)  # found from the stream, no pre-scan
+
+
+def test_attach_backfills_a_legacy_collection_before_training(tmp_path):
+    col = make_collection(tmp_path)
+    ingest(col, 300)
+    delete_vecs(col, range(1, 301))  # every row predates vector retention
+    asyncio.run(col._process_job({"op": "attach_index", "nlist": 8}))
+    assert isinstance(col.index, _IvfIndex) and len(col.index) == 300
+    assert col.db.execute("SELECT COUNT(*) FROM vecs").fetchone()[0] == 300
+
+
+def test_attach_fails_after_the_stream_for_textless_rows(tmp_path, monkeypatch):
+    monkeypatch.setattr(store, "IVF_TRAIN_SAMPLE", 128)
+    col = make_collection(tmp_path)
+    ingest(col, 300)
+    delete_vecs(col, [7, 8], drop_text=True)
+    streamed, real = [], col._iter_vec_blocks
+    col._iter_vec_blocks = lambda: streamed.append(1) or real()
+    with pytest.raises(ValueError, match="2 records have neither a retained vector nor text"):
+        asyncio.run(col._process_job({"op": "attach_index", "nlist": 8}))
+    assert streamed == [1]  # detected from the stream, not a records x vecs pre-scan
+    assert isinstance(col.index, IdMapIndex) and len(col.index) == 300
+    assert not col.ivf_dir.exists() and col.cfg.index_config is None
+
+
+def test_detach_refuses_rows_without_vectors(tmp_path):
+    col = make_collection(tmp_path)
+    ingest(col, 300)
+    asyncio.run(col._process_job({"op": "attach_index", "nlist": 8}))
+    delete_vecs(col, [11, 12, 13])
+    with pytest.raises(ValueError, match="3 records lack a retained vector; re-ingest them first"):
+        asyncio.run(col._process_job({"op": "detach_index"}))
+    assert isinstance(col.index, _IvfIndex) and len(col.index) == 300
+    assert col.ivf_dir.exists() and col.cfg.index_config == {"nlist": 8, "nprobe": 16}
+    assert not col.index_path.exists()
+
+
+def test_index_jobs_run_no_anti_join_or_count(tmp_path):
+    col = make_collection(tmp_path)
+    ingest(col, 300)
+    log = record_sql(col)
+    asyncio.run(col._process_job({"op": "attach_index", "nlist": 8}))
+    asyncio.run(col._process_job({"op": "detach_index"}))
+    sqls = [s for s, _ in log]
+    assert not any("LEFT JOIN" in s or "COUNT(" in s for s in sqls)  # p1: 178 s cold
+    # per job: one live scan after the stream (missing vectors), one under the lock (swap)
+    assert sqls.count("SELECT id FROM records WHERE indexed=1") == 4
+
+
+def test_attach_logs_its_phase_timings(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger=LOG)
+    col = make_collection(tmp_path)
+    ingest(col, 300)
+    asyncio.run(col._process_job({"op": "attach_index", "nlist": 8}))
+    msgs = [r.getMessage() for r in caplog.records
+            if r.name == LOG and r.getMessage().startswith("attach_index t:")]
+    assert len(msgs) == 1
+    for field in ("n=300", "nlist=8", "prework=", "sample=", "legacy_backfill=0", "build=",
+                  "live_scan=", "backfill=0 rows", "swap=", "total="):
+        assert field in msgs[0]

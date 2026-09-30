@@ -1094,19 +1094,33 @@ class Collection:
         mat = np.frombuffer(b"".join(r[0] for r in rows), dtype=np.float16)
         return mat.reshape(len(rows), -1).astype(np.float32)
 
-    async def _backfill_vecs(self) -> None:
+    async def _backfill_vecs(self, ids: np.ndarray | None = None, add=None) -> int:
         """Records ingested before vector retention lack the fp16 original a rebuild
         needs. Re-embed from text where possible (assumes the collection's configured
         embedding model produced the stored vectors); otherwise fail the job with a
-        count so the caller knows to re-ingest."""
-        rows = await asyncio.to_thread(
-            lambda: self._rdb().execute(
-                "SELECT r.id, r.text FROM records r LEFT JOIN vecs v ON v.id=r.id"
-                " WHERE r.indexed=1 AND v.id IS NULL"
-            ).fetchall()
-        )
+        count so the caller knows to re-ingest.
+
+        ids=None finds them with the records x vecs anti-join, a full records scan
+        (p1: minutes cold at 2.55M rows) that attach only runs when too few retained
+        vectors exist to train on. Otherwise `ids` are the rows the attach stream
+        skipped, point-read by id. add(ids, f32 matrix) receives each written batch on
+        a worker thread, so the caller never holds them all. Returns rows written."""
+        if ids is None:
+            rows = await asyncio.to_thread(
+                lambda: self._rdb().execute(
+                    "SELECT r.id, r.text FROM records r LEFT JOIN vecs v ON v.id=r.id"
+                    " WHERE r.indexed=1 AND v.id IS NULL"
+                ).fetchall()
+            )
+        else:
+            rows = await asyncio.to_thread(
+                lambda: list(_rows_by_id(
+                    self._rdb(), "SELECT id, text FROM records WHERE indexed=1 AND id IN ({})",
+                    ids.tolist(),
+                ))
+            )
         if not rows:
-            return
+            return 0
         no_text = sum(1 for _, t in rows if not t)
         if no_text:
             raise ValueError(
@@ -1127,6 +1141,13 @@ class Collection:
                     self.db.commit()
 
             await asyncio.to_thread(write)
+            if add is not None:
+                await asyncio.to_thread(
+                    add,
+                    np.array([rid for rid, _ in batch], dtype=np.uint64),
+                    vecs16.astype(np.float32),  # the fp16 round trip a stream would read
+                )
+        return len(rows)
 
     async def _attach_index(self, payload: dict) -> None:
         """Build IVF shards from retained vectors and swap them in. The build runs
@@ -1138,6 +1159,7 @@ class Collection:
             self.index.nprobe = int(nprobe_req)  # retune the default, no rebuild
             self._save_index_config({"nlist": self.index.nlist, "nprobe": self.index.nprobe})
             return
+        t0 = time.monotonic()
         # guard first (D13): validate and refuse before any SQL, so a full container
         # fails in milliseconds instead of after minutes of cold pre-work. n comes from
         # the in-memory per-type counts, which equal COUNT(*) WHERE indexed=1
@@ -1148,20 +1170,50 @@ class Collection:
         if n < 8 * nlist:
             raise ValueError(f"nlist={nlist} too large for {n} records (need >=8 rows per shard)")
         _require_headroom(_attach_need(n, self.cfg.dim, self.cfg.bit_width, nlist), "index build")
-        await self._backfill_vecs()
+        t1 = time.monotonic()
+        # no records x vecs anti-join before the build (p1: 178 s cold with the COUNT):
+        # rows without a retained vector are found from the stream below. A short sample
+        # means retained vectors are scarce (ingested before retention): backfill them all
+        # first, as before plan C, so k-means trains on a full sample
+        sample = await asyncio.to_thread(self._vec_sample, IVF_TRAIN_SAMPLE)
+        legacy = 0
+        if len(sample) < min(n, IVF_TRAIN_SAMPLE):
+            legacy = await self._backfill_vecs()
+            sample = await asyncio.to_thread(self._vec_sample, IVF_TRAIN_SAMPLE)
+        t2 = time.monotonic()
 
         def build():
+            nonlocal sample
+            tb = time.monotonic()
             ivf = _IvfIndex.train(
-                self._vec_sample(IVF_TRAIN_SAMPLE), nlist, self.cfg.dim, self.cfg.bit_width,
+                sample, nlist, self.cfg.dim, self.cfg.bit_width,
                 int(nprobe_req or IVF_DEFAULT_NPROBE),
             )
+            sample = None  # free the f32 sample before the stream, as before plan C
             seen = [np.empty(0, dtype=np.uint64)]
             for ids, mat in self._iter_vec_blocks():
                 ivf.add_with_ids(mat, ids)
                 seen.append(ids)
-            return ivf, np.concatenate(seen)
+            seen = np.concatenate(seen)
+            tl = time.monotonic()
+            # the indexed rows the stream skipped are exactly those without a retained
+            # vector (this worker is the only adder); the live ids come from the covering
+            # index, never the records pages
+            missing = np.setdiff1d(_live_ids(self._rdb()), seen, assume_unique=True)
+            return ivf, seen, missing, tl - tb, time.monotonic() - tl
 
-        ivf, seen = await asyncio.to_thread(build)
+        ivf, seen, missing, build_s, live_s = await asyncio.to_thread(build)
+        t3 = time.monotonic()
+        if len(missing):
+            parts = [seen]
+
+            def add(ids, mat):  # each re-embedded batch goes straight into the new index
+                ivf.add_with_ids(mat, ids)
+                parts.append(ids)
+
+            await self._backfill_vecs(missing, add)
+            seen = np.concatenate(parts)  # the swap diff covers them too
+        t4 = time.monotonic()
         tmp = self.dir / "ivf.tmp"
         async with self.lock.write():
 
@@ -1186,6 +1238,13 @@ class Collection:
             self.index = ivf
             self._cal_reservoir = None  # shards were calibrated at train time
             self.index_path.unlink(missing_ok=True)  # flat file is stale from here on
+        t5 = time.monotonic()
+        _log.info(
+            "attach_index %s: n=%d nlist=%d prework=%.2fs sample=%.2fs legacy_backfill=%d"
+            " build=%.2fs live_scan=%.2fs backfill=%d rows %.2fs swap=%.2fs total=%.2fs",
+            self.cfg.name, n, nlist, t1 - t0, t2 - t1, legacy, build_s, live_s,
+            len(missing), t4 - t3, t5 - t4, t5 - t0,
+        )
 
     async def _detach_index(self) -> None:
         """Rebuild the flat index from retained vectors and drop the shards."""
@@ -1195,18 +1254,10 @@ class Collection:
             if self.ivf_dir.exists():
                 await asyncio.to_thread(shutil.rmtree, self.ivf_dir, True)
             return
-        # guard first (D13): a refusal must not cost the missing-vector scan
+        # guard first (D13): a refusal costs no SQL
         _require_headroom(
             len(self.index) * self.cfg.dim * self.cfg.bit_width // 8, "index removal"
         )
-        missing = await asyncio.to_thread(
-            lambda: self._rdb().execute(
-                "SELECT COUNT(*) FROM records r LEFT JOIN vecs v ON v.id=r.id"
-                " WHERE r.indexed=1 AND v.id IS NULL"
-            ).fetchone()[0]
-        )
-        if missing:
-            raise ValueError(f"{missing} records lack a retained vector; re-ingest them first")
 
         def build():
             flat = IdMapIndex(dim=self.cfg.dim, bit_width=self.cfg.bit_width)
@@ -1217,7 +1268,14 @@ class Collection:
             for ids, mat in self._iter_vec_blocks():
                 flat.add_with_ids(mat, ids)
                 seen.append(ids)
-            return flat, np.concatenate(seen)
+            seen = np.concatenate(seen)
+            # rows the stream skipped have no retained vector. Every attach backfills
+            # them all, so on an IVF collection this only trips if vecs rows were lost;
+            # a stream before the refusal beats an anti-join on every detach
+            missing = len(np.setdiff1d(_live_ids(self._rdb()), seen, assume_unique=True))
+            if missing:
+                raise ValueError(f"{missing} records lack a retained vector; re-ingest them first")
+            return flat, seen
 
         flat, seen = await asyncio.to_thread(build)
         tmp = self.dir / "index.tvim.tmp"
