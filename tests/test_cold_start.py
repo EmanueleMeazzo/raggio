@@ -368,3 +368,164 @@ def test_rows_deleted_during_a_build_are_diffed_out(tmp_path):
     assert isinstance(col.index, _IvfIndex) and len(col.index) == 299
     asyncio.run(col._process_job({"op": "detach_index"}))
     assert isinstance(col.index, IdMapIndex) and len(col.index) == 298
+
+
+# ---- Task 4: off-loop, cancel-safe construction (§5.1) ----
+
+GATE_TIMEOUT = 3.0
+
+
+class Gate:
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.done = {"n": 0, "thread": None}
+
+
+@pytest.fixture
+def gated(monkeypatch):
+    """Swap store.Collection for a subclass whose construction parks on `release`,
+    so a test can hold a load mid-flight and see which thread built it."""
+    gate, real = Gate(), store.Collection
+
+    class GatedCollection(real):
+        def __init__(self, *args, **kwargs):
+            gate.entered.set()
+            if not gate.release.wait(GATE_TIMEOUT):
+                raise RuntimeError("gate never released")
+            super().__init__(*args, **kwargs)
+            gate.done["n"] += 1
+            gate.done["thread"] = threading.get_ident()
+
+    monkeypatch.setattr(store, "Collection", GatedCollection)
+    return gate
+
+
+def test_touch_builds_the_collection_off_the_event_loop(tmp_path, monkeypatch, gated):
+    m = make_manager(tmp_path, monkeypatch)
+    gated.release.set()
+
+    async def run():
+        await m.create_collection("x", DIM, 4, None, None, None)
+        c = await m.touch("x")
+        return threading.get_ident(), c
+
+    loop_thread, c = asyncio.run(run())
+    assert gated.done["n"] == 1
+    assert gated.done["thread"] != loop_thread
+    assert m.resident["x"] is c and c._worker is not None
+
+
+def test_off_loop_built_collection_serves_ingest_and_search(tmp_path, monkeypatch):
+    # its asyncio.Condition/Event were created on a worker thread: they must still work
+    m = make_manager(tmp_path, monkeypatch)
+
+    async def run():
+        await m.create_collection("x", DIM, 4, None, None, None)
+        c = await m.touch("x")
+        await c.enqueue({"documents": [
+            {"doc_id": "d1", "chunks": [{"id": "c1", "text": "one", "vector": rowvec(1)}]},
+        ]})
+        for _ in range(500):
+            if c.pending_jobs() == 0:
+                break
+            await asyncio.sleep(0.01)
+        q = np.array([rowvec(1)], dtype=np.float32)
+        hits = await c.search("vector", q, None, 5, "chunks", None, None)
+        return c.pending_jobs(), [h["id"] for h in hits]
+
+    assert asyncio.run(run()) == (0, ["c1"])
+
+
+def test_healthz_answers_while_a_collection_loads(tmp_path, monkeypatch, gated):
+    monkeypatch.setenv("ROOT_API_KEY", "root-key")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
+    app = create_app(embedder_factory=lambda cfg: FakeEmbedder())
+
+    async def run():
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+                r = await c.post("/collections", headers=ROOT, json={"name": "x"})
+                assert r.status_code == 201, r.text
+                load = asyncio.create_task(c.get("/collections/x", headers=ROOT))
+                await asyncio.to_thread(gated.entered.wait, GATE_TIMEOUT)
+                h = await asyncio.wait_for(c.get("/healthz"), 1.0)
+                gated.release.set()
+                r = await load
+                return (h.status_code, h.json()["resident_collections"],
+                        gated.entered.is_set(), r.status_code)
+
+    assert asyncio.run(run()) == (200, [], True, 200)
+
+
+def test_resident_collection_is_served_while_another_loads(tmp_path, monkeypatch, gated):
+    m = make_manager(tmp_path, monkeypatch)
+
+    async def run():
+        for n in ("x", "y"):
+            await m.create_collection(n, DIM, 4, None, None, None)
+        gated.release.set()
+        x = await m.touch("x")
+        gated.release.clear()
+        gated.entered.clear()
+        load = asyncio.create_task(m.touch("y"))
+        await asyncio.to_thread(gated.entered.wait, GATE_TIMEOUT)
+        again = await asyncio.wait_for(m.touch("x"), 1.0)  # must not queue behind y's load
+        gated.release.set()
+        y = await load
+        return again is x, m.resident["y"] is y
+
+    assert asyncio.run(run()) == (True, True)
+
+
+def test_cancelled_load_still_registers_the_built_collection(tmp_path, monkeypatch, gated):
+    m = make_manager(tmp_path, monkeypatch)
+
+    async def run():
+        await m.create_collection("x", DIM, 4, None, None, None)
+        first = asyncio.create_task(m.touch("x"))
+        await asyncio.to_thread(gated.entered.wait, GATE_TIMEOUT)
+        first.cancel()  # the client disconnected mid-load
+        await asyncio.sleep(0)
+        second = asyncio.create_task(m.touch("x"))
+        await asyncio.sleep(0.05)  # second is now queued on _load_lock
+        gated.release.set()
+        c = await second
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        worker_live = c._worker is not None and not c._worker.done()
+        return m.resident.get("x") is c, gated.done["n"], worker_live
+
+    assert asyncio.run(run()) == (True, 1, True)
+
+
+def test_resident_touch_does_not_wait_for_another_collections_delete(tmp_path, monkeypatch):
+    """B's delete holds _load_lock through stop(). A resident collection must not
+    queue behind it; only loads of non-resident collections still do."""
+    m = make_manager(tmp_path, monkeypatch)
+
+    async def run():
+        for n in ("x", "y"):
+            await m.create_collection(n, DIM, 4, None, None, None)
+        x = await m.touch("x")
+        y = await m.touch("y")
+        held, release = asyncio.Event(), asyncio.Event()
+        real_stop = y.stop
+
+        async def slow_stop():
+            held.set()
+            await release.wait()
+            await real_stop()
+
+        y.stop = slow_stop
+        delete = asyncio.create_task(m.delete_collection("y"))
+        await asyncio.wait_for(held.wait(), GATE_TIMEOUT)
+        locked = m._load_lock.locked()
+        again = await asyncio.wait_for(m.touch("x"), 1.0)  # must not queue behind y's delete
+        release.set()
+        await delete
+        return locked, again is x, "y" in m.resident
+
+    assert asyncio.run(run()) == (True, True, False)

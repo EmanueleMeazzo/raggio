@@ -1819,6 +1819,10 @@ class CollectionManager:
 
     async def touch(self, name: str) -> Collection:
         """Return the resident collection, loading (and LRU-evicting) as needed."""
+        c = self.resident.get(name)
+        if c is not None:  # resident: never queue behind another collection's load
+            c.last_used = time.monotonic()
+            return c
         async with self._load_lock:
             c = self.resident.get(name)
             if c is None:
@@ -1833,14 +1837,42 @@ class CollectionManager:
                     if not victims:
                         break  # everyone is busy ingesting; allow going over budget
                     await self._evict(victims[0].cfg.name)
-                c = Collection(
-                    cfg, self._dir(name), lambda: self.embedder_factory(cfg),
-                    lambda ic, name=name: self.set_index_config(name, ic),
-                )
-                c.start_worker()
-                self.resident[name] = c
+                c = await self._construct(name, cfg)
             c.last_used = time.monotonic()
             return c
+
+    async def _construct(self, name: str, cfg: CollectionConfig) -> Collection:
+        """Build a Collection on a worker thread (index load, the one-time meta.db
+        migration, the reconcile scans: seconds to minutes cold), so the loop keeps
+        serving /healthz and the resident collections. The caller holds _load_lock.
+        If the awaiting request is cancelled mid-build, the build still finishes and
+        is registered before the cancellation propagates. Releasing the lock early
+        would let the next request build a second copy, and the orphan would keep open
+        SQLite handles while its replayed jobs had no worker."""
+        t0 = time.monotonic()
+        build = asyncio.ensure_future(asyncio.to_thread(
+            Collection, cfg, self._dir(name), lambda: self.embedder_factory(cfg),
+            lambda ic, name=name: self.set_index_config(name, ic),
+        ))
+        try:
+            c = await asyncio.shield(build)
+        except asyncio.CancelledError:
+            while not build.done():
+                try:
+                    await asyncio.wait({build})
+                except asyncio.CancelledError:
+                    pass  # cancelled again: still must not orphan the build
+            if build.cancelled() or build.exception() is not None:
+                raise
+            self._register(name, build.result())
+            raise
+        self._register(name, c)
+        _log.info("collection %s loaded in %.2f s", name, time.monotonic() - t0)
+        return c
+
+    def _register(self, name: str, c: Collection) -> None:
+        c.start_worker()  # on the loop: create_task needs the running loop
+        self.resident[name] = c
 
     async def _evict(self, name: str) -> None:
         c = self.resident.pop(name, None)
