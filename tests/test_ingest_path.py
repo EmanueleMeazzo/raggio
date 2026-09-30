@@ -664,3 +664,66 @@ def test_ingest_prep_runs_off_the_event_loop(tmp_path, monkeypatch):
     assert embedder.texts == ["text 12"]  # only the vectorless chunk was embedded
     assert stored == [("c0",), ("c10",), ("c1",), ("c11",), ("c2",), ("c12",)]
     assert indexed == [1, 2, 3, 4, 5, 6]  # both kinds reached the vector index
+
+
+# ---- vacuum policy
+
+
+def big_payload(job, dim=8):
+    """One document of 50 chunks of 5000 characters: about 62 pages of job_payloads
+    data at SQLite's default 4 KiB page size, all freed when the job finishes done."""
+    return {"documents": [{"doc_id": f"v{job}", "summary": None, "chunks": [
+        {"text": "x" * 5000, "vector": vec(j, dim), "metadata": None,
+         "id": f"v{job}-{j}", "position": None}
+        for j in range(50)
+    ]}]}
+
+
+def test_vacuum_is_deferred_while_jobs_are_open(tmp_path):
+    # before: every _finish_job ran a full incremental_vacuum, even with a backlog
+    # queued behind it. Now only the finish that leaves the queue empty does. The
+    # default VACUUM_FREELIST_PAGES (16_384) is far above five jobs' ~310 pages, so no
+    # trimming vacuum runs either
+    col = make_collection(tmp_path)
+    try:
+        ids = [col._enqueue_row(big_payload(n)) for n in range(5)]
+        traced = []
+        col.db.set_trace_callback(traced.append)
+        try:
+            vacuums = []
+            for job_id in ids:
+                traced.clear()
+                col._finish_job(job_id, "done", None)
+                vacuums.append([s for s in traced if "incremental_vacuum" in s])
+        finally:
+            col.db.set_trace_callback(None)
+        assert vacuums == [[], [], [], [], ["PRAGMA incremental_vacuum"]]
+        assert not col.db.in_transaction
+        assert col.db.execute("PRAGMA freelist_count").fetchone()[0] <= 1
+        assert fetch(col, "SELECT COUNT(*) FROM job_payloads") == [(0,)]
+    finally:
+        asyncio.run(col.stop())
+
+
+def test_freelist_bounded_during_backlog(tmp_path, monkeypatch):
+    # deferring the full vacuum must not let a backlog grow meta.db without bound: a
+    # finish that sees VACUUM_FREELIST_PAGES or more free pages trims the freelist back
+    # below it, however many pages one job freed (~62 here, against a chunk of 16)
+    monkeypatch.setattr(store, "VACUUM_FREELIST_PAGES", 64)
+    monkeypatch.setattr(store, "VACUUM_CHUNK_PAGES", 16)
+    col = make_collection(tmp_path)
+    try:
+        ids = [col._enqueue_row(big_payload(n)) for n in range(20)]
+        # the backlog's payloads span far more pages than the threshold (~1240 vs 64)
+        [(total,)] = fetch(col, "SELECT SUM(LENGTH(data)) FROM job_payloads")
+        assert total > 20 * 50 * 5000
+        free = []
+        for job_id in ids:
+            col._finish_job(job_id, "done", None)
+            free.append(col.db.execute("PRAGMA freelist_count").fetchone()[0])
+        backlog, idle = free[:-1], free[-1]
+        assert max(backlog) <= 64, backlog  # bounded while jobs are open ...
+        assert max(backlog) > 1, backlog  # ... without a full vacuum at every finish
+        assert idle <= 1  # the finish that empties the queue vacuums in full
+    finally:
+        asyncio.run(col.stop())

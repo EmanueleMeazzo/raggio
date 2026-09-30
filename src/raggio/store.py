@@ -72,6 +72,14 @@ FTS_SCAN_BUDGET_MIN_ROWS = 1000
 CAL_THRESHOLD = 10_000
 CAL_SAMPLE = 1024  # ~1024 representative rows is enough per turbovec docs
 
+# meta.db vacuum policy after a job finishes (Collection._vacuum_after_finish): a full
+# incremental_vacuum only once no job is open; while a backlog drains, a freelist of
+# VACUUM_FREELIST_PAGES or more (64 MB at 4 KiB pages) is trimmed back to
+# VACUUM_FREELIST_PAGES - VACUUM_CHUNK_PAGES, so one trim returns about the pages freed
+# since the last trim plus 8 MB and never stalls enqueues on a whole-file vacuum
+VACUUM_FREELIST_PAGES = 16_384
+VACUUM_CHUNK_PAGES = 2_048
+
 # Optional ScaNN-style IVF index, attached/removed per collection via the index API.
 # Measured (bench/ivf_probe.py, ADR 0002): at ~550k rows every recall-preserving cell
 # is slower or barely faster than the flat scan (~0.4ms fixed cost per probed shard),
@@ -1035,10 +1043,34 @@ class Collection:
             if status == "done":
                 self.db.execute("DELETE FROM job_payloads WHERE job_id=?", (job_id,))
             self.db.commit()
-            # return the cleared payload's pages to the OS between jobs. fetchall() is
-            # load-bearing: the pragma frees pages per STEP, and pysqlite's execute()
-            # steps once — without exhausting the cursor it frees a single page
+            # return freed pages to the OS: in full once the queue is empty, in bounded
+            # trims while a backlog drains
+            self._vacuum_after_finish()
+
+    def _vacuum_after_finish(self) -> None:
+        """Return freed meta.db pages to the OS after a job's finish commit (caller
+        holds db_lock; no transaction is open). A full incremental_vacuum after every
+        job cost 38-54 ms per job while a backlog drained, so it runs only once no job
+        is open. Until then a freelist of VACUUM_FREELIST_PAGES or more is trimmed
+        back to VACUUM_FREELIST_PAGES - VACUUM_CHUNK_PAGES: the file stays bounded
+        however many pages one job freed, and no trim is a whole-file vacuum that
+        holds enqueues behind db_lock."""
+        # the literal predicate, byte for byte pending_jobs' query: idx_jobs_open
+        # serves it, so counting open jobs never scans the journal
+        open_jobs = self.db.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status IN ('pending','processing')"
+        ).fetchone()[0]
+        # fetchall() is load-bearing on both vacuum pragmas: the pragma frees pages per
+        # STEP, and pysqlite's execute() steps once -- without exhausting the cursor it
+        # frees a single page
+        if open_jobs == 0:
             self.db.execute("PRAGMA incremental_vacuum").fetchall()
+            return
+        free = self.db.execute("PRAGMA freelist_count").fetchone()[0]
+        if free >= VACUUM_FREELIST_PAGES:
+            # a pragma argument cannot be a bound parameter; n is an int computed here
+            n = int(free - VACUUM_FREELIST_PAGES + VACUUM_CHUNK_PAGES)
+            self.db.execute(f"PRAGMA incremental_vacuum({n})").fetchall()
 
     async def _run_worker(self) -> None:
         while True:

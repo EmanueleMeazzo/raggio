@@ -78,8 +78,9 @@ compression. And hybrid concurrent QPS by a hair (93.4 vs 88.3).
 
 **Ingestion.** raggio journals each batch to SQLite before returning 202,
 replays interrupted jobs after a crash, marks a job done only after the
-vector index is synced to disk, and returns the journal's pages to the OS as
-jobs complete — the 1,105 vec/s and the 8.3-minute wall time include all of
+vector index is synced to disk, and returns the journal's pages to the OS (in
+full once the queue drains, in bounded trims during a backlog) — the 1,105
+vec/s and the 8.3-minute wall time include all of
 that. Peak transient disk during a deep ingest backlog is roughly the size of
 the un-drained journaled payloads on top of the steady-state footprint.
 
