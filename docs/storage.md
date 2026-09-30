@@ -53,15 +53,17 @@ collection after the upgrade runs a one-time migration in its `meta.db`: it
 builds the covering index `idx_records_doc_type` (doc_id, type, indexed), then
 drops the old `idx_records_doc`, and adds a small partial index over open jobs.
 
-- **Time:** about 16 s per 1M records when the file is not in the page cache
-  (40.8 s at 2.55M records on a DGX Spark under a 4 GiB cap), 1.7 s at 2.55M
+- **Time:** about 20 s per 1M records when the file is not in the page cache
+  (49.6 s at 2.55M records on a DGX Spark under a 4 GiB cap), 1.5 s at 2.55M
   when it is. Requests for any collection that is not loaded yet wait for it
   (loads and migrations run one at a time); `/healthz` and collections that are
   already loaded keep answering. A collection with unfinished jobs is loaded, and
   migrated, at start-up, before the server begins answering.
-- **Disk:** `meta.db` grows by the new index (+96 MB at 2.55M records). About
-  86 MB of free pages from the dropped index stay in the file until a `VACUUM`,
-  and the WAL peaks around 105 MB during the build.
+- **Disk:** `meta.db` grows by the new index (+92 MB at 2.55M records). About
+  82 MB of free pages from the dropped index stay in the file until the next
+  finished job returns them (`PRAGMA incremental_vacuum`); a `meta.db` created
+  before incremental auto-vacuum keeps them until a `VACUUM`. The WAL peaks
+  around 105 MB during the build.
 - **Logs:** the start (`one-time migration`), a heartbeat every 10 s
   (`still building`) and the finish (`built idx_records_doc_type in`) are logged
   at INFO.

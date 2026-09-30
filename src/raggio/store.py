@@ -399,7 +399,7 @@ def _ensure_indexes(db: sqlite3.Connection, label: str) -> None:
         if rows:
             _log.info(
                 "meta.db %s: one-time migration, building idx_records_doc_type over"
-                " ~%d records (~16 s per 1M rows cold)", label, rows,
+                " ~%d records (~20 s per 1M rows cold)", label, rows,
             )
 
             def beat() -> int:
