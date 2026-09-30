@@ -46,6 +46,28 @@ before start; interrupted jobs replay as after a crash. For a logical export
 that survives version changes, page through
 `GET /collections/{name}/documents?include_vector=true` and re-ingest.
 
+## Upgrading
+
+**2026-09 release (cold start and loop hygiene).** The first open of each
+collection after the upgrade runs a one-time migration in its `meta.db`: it
+builds the covering index `idx_records_doc_type` (doc_id, type, indexed), then
+drops the old `idx_records_doc`, and adds a small partial index over open jobs.
+
+- **Time:** about 16 s per 1M records when the file is not in the page cache
+  (40.8 s at 2.55M records on a DGX Spark under a 4 GiB cap), 1.7 s at 2.55M
+  when it is. Requests for any collection that is not loaded yet wait for it
+  (loads and migrations run one at a time); `/healthz` and collections that are
+  already loaded keep answering. A collection with unfinished jobs is loaded, and
+  migrated, at start-up, before the server begins answering.
+- **Disk:** `meta.db` grows by the new index (+96 MB at 2.55M records). About
+  86 MB of free pages from the dropped index stay in the file until a `VACUUM`,
+  and the WAL peaks around 105 MB during the build.
+- **Logs:** the start (`one-time migration`), a heartbeat every 10 s
+  (`still building`) and the finish (`built idx_records_doc_type in`) are logged
+  at INFO.
+- **Interruption is safe:** the old index is dropped only after the new one is
+  built, and the next open finishes whatever is missing.
+
 ## Memory management
 
 Collections load into memory on first touch and are offloaded (synced +
@@ -65,6 +87,14 @@ used collections pay the RAM cost.
     A *resident* collection's vector index lives fully in RAM, so out-of-memory
     scaling applies **across** collections, not within one. Size individual
     collections to fit memory and spread data over multiple collections.
+
+Index jobs (attach and remove) hold a second copy of the index while they build.
+When a job ends, raggio calls glibc's `malloc_trim(0)`, and the image sets
+`ENV MALLOC_TRIM_THRESHOLD_=134217728`, so the build's buffers go back to the OS
+instead of staying in the process heap. Without them, a 2.55M × 1024-d collection
+stayed at about 3.0 GiB after a build against 1.5 GiB loaded, the next index job was
+refused, and a container without swap was OOM-killed mid-build. Images built
+without the shipped `Dockerfile` should set the same variable.
 
 ## Sizing
 
