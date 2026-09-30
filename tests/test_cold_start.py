@@ -687,3 +687,63 @@ def test_vec_sample_is_uniform_over_ids(tmp_path):
     ingest(col, 2000)
     means = [np.mean(vec_ids(col, col._vec_sample(250))) for _ in range(20)]
     assert abs(np.mean(means) - 1000.5) < 60
+
+
+# ---- Task 7: memory release (D13) ----
+
+
+def test_malloc_trim_returns_a_bool_and_never_raises():
+    assert isinstance(store._malloc_trim(), bool)  # real call: glibc on Linux CI, no-op on Windows
+
+
+def test_malloc_trim_is_a_no_op_off_glibc(monkeypatch):
+    def missing(name):
+        raise OSError(f"{name}: cannot open shared object file")  # musl, or no libc.so.6
+
+    monkeypatch.setattr(store.sys, "platform", "linux")
+    monkeypatch.setattr(store.ctypes, "CDLL", missing)
+    assert store._malloc_trim() is False
+    monkeypatch.setattr(store.sys, "platform", "win32")
+    monkeypatch.setattr(store.ctypes, "CDLL", lambda name: pytest.fail("CDLL loaded off Linux"))
+    assert store._malloc_trim() is False
+
+
+def test_malloc_trim_calls_glibc_with_size_t(monkeypatch):
+    calls = []
+
+    class FakeTrim:
+        argtypes = restype = None
+
+        def __call__(self, pad):
+            calls.append(pad)
+            return 1
+
+    trim = FakeTrim()
+    monkeypatch.setattr(store.sys, "platform", "linux")
+    monkeypatch.setattr(store.ctypes, "CDLL", lambda name: type("Libc", (), {"malloc_trim": trim})())
+    assert store._malloc_trim() is True
+    assert calls == [0]
+    assert trim.argtypes == [ctypes.c_size_t] and trim.restype is ctypes.c_int
+
+
+def test_malloc_trim_runs_after_every_index_job(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(store, "_malloc_trim", lambda: calls.append(1) or False)
+    col = make_collection(tmp_path)
+    ingest(col, 300)
+    assert calls == []  # ingest jobs don't trim
+    asyncio.run(col._process_job({"op": "attach_index", "nlist": 8}))
+    assert len(calls) == 1
+    asyncio.run(col._process_job({"op": "detach_index"}))
+    assert len(calls) == 2
+    with pytest.raises(ValueError, match="too large"):
+        asyncio.run(col._process_job({"op": "attach_index", "nlist": 64}))  # 300 < 8*64
+    assert len(calls) == 3  # a failed job's transient memory is released too
+
+
+def test_dockerfile_sets_the_trim_threshold_in_the_runtime_stage():
+    text = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text(encoding="utf-8")
+    runtime = text.rsplit("\nFROM ", 1)[1]  # the last stage is the image that runs
+    assert runtime.count("ENV MALLOC_TRIM_THRESHOLD_=134217728") == 1
+    assert text.count("MALLOC_TRIM_THRESHOLD_=") == 1
+    assert "MALLOC_ARENA_MAX=" not in text  # spec D13: never set (the comment names it)

@@ -1,4 +1,5 @@
 import asyncio
+import ctypes
 import hashlib
 import itertools
 import json
@@ -8,6 +9,7 @@ import os
 import re
 import shutil
 import sqlite3
+import sys
 import threading
 import time
 import unicodedata
@@ -123,6 +125,23 @@ def _require_headroom(need: int, what: str) -> None:
             f"{what} needs ~{(need + 128 * 1024 * 1024) >> 20} MB free memory,"
             f" container has ~{max(free, 0) >> 20} MB — raise the memory limit and retry"
         )
+
+
+def _malloc_trim() -> bool:
+    """Hand freed heap back to the OS after an index job (D13). A build frees GBs of
+    transient buffers (the second code copy, the f32 sample, streamed blocks), and
+    glibc keeps them in its arenas, so without this the container's RSS stays at the
+    build's peak until restart. glibc-only: a no-op returning False on Windows, macOS
+    and musl."""
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        trim = ctypes.CDLL("libc.so.6").malloc_trim
+    except (OSError, AttributeError):
+        return False
+    trim.argtypes = [ctypes.c_size_t]
+    trim.restype = ctypes.c_int
+    return bool(trim(0))
 
 
 def _retry_fs(fn) -> None:
@@ -852,11 +871,14 @@ class Collection:
 
     async def _process_job(self, payload: dict) -> None:
         op = payload.get("op")
-        if op == "attach_index":
-            await self._attach_index(payload)
-            return
-        if op == "detach_index":
-            await self._detach_index()
+        if op in ("attach_index", "detach_index"):
+            try:
+                if op == "attach_index":
+                    await self._attach_index(payload)
+                else:
+                    await self._detach_index()
+            finally:
+                await asyncio.to_thread(_malloc_trim)  # D13: failed builds free memory too
             return
         # flatten documents into records: (external_id, doc_id, type, position, text, metadata, vector)
         rows = []

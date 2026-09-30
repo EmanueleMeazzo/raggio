@@ -33,6 +33,12 @@ ENV LANG=C.UTF-8 DATA_DIR=/data PATH="/app/.venv/bin:$PATH"
 VOLUME /data
 EXPOSE 8000
 
+# D13: an explicit trim threshold makes glibc return heap above 128 MiB to the OS at
+# free() time and stops its dynamic mmap-threshold growth, so the multi-GB transient
+# buffers of an index job are unmapped when freed. raggio also calls malloc_trim(0)
+# after every index job. MALLOC_ARENA_MAX stays unset (spec D13).
+ENV MALLOC_TRIM_THRESHOLD_=134217728
+
 # no per-request access log: it costs a stdout write through the container log
 # pipe on every query; set --access-log if you need request tracing
 CMD ["uvicorn", "raggio.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
