@@ -375,7 +375,7 @@ Completed agents replay from the cache when the same run is resumed. gn100 was i
 
 **23:00Z. Execution starts with plan A's PR 1** (Tasks 1–6: the bench hardening, the DGX runbook, the new bench rows and the equivalence re-baseline), subagent-driven. The setup is recorded as W-9:
 - The code goes to a git worktree, `.worktrees/bench-hardening`, on a new branch `bench-hardening` from `main` at 19a8a2e, as plan A says. The main checkout stays on the docs branch, so the plans, the spec and this journal stay readable and editable while the code changes elsewhere. A `.gitignore` of `*` inside `.worktrees/` keeps it out of `git status` without a commit.
-- The base suite in the worktree: `46 passed, 1 warning`, the count plan A starts from. The dev box's uv is still 0.5.24; plan A moves it to 0.12.19 only in Task 7, after asking.
+- The base suite in the worktree: `46 passed, 1 warning`, the count plan A starts from. The dev box's uv is still 0.5.24; plan A moves it to 0.12.19 only in Task 7, after asking. (Dated note, 2026-09-29 21:05Z: asked at 11:19Z; the maintainer chose the latest release, and uv is now 0.12.20. See 2026-09-29, 11:19Z–21:00Z, and W-11.)
 - Plan A's progress ledger, task briefs, reports and review packages live in the main checkout under `.superpowers/sdd/` (ignored by git), so they outlive this worktree and carry over to PR 2's branch.
 - Every implementer and task reviewer runs on Sonnet 5.5; the final whole-branch review runs on Opus 5.5.
 - A Sonnet agent runs the pre-flight conflict scan over Tasks 1–6 before Task 1 is dispatched.
@@ -603,7 +603,7 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
 - **Why a merge commit:** B's commits carry no ssh path, so there is nothing to squash away, unlike PR 1. Keeping them gives one commit per fix, each with its own RED and GREEN evidence. `d096fde^1` is ff48930, which is exactly the `pre` that Task 8 needs.
 - **Checks:** the merged tree is identical to b876b68, and the suite on merged `main` is 182 passed, 1 warning.
 - **Clean-up:** the worktree was removed and the branch deleted. Nothing is pushed; `main` is now 2 commits ahead of `origin/main` (ff48930 and B's merge).
-- **Issues:** the maintainer chose to file all five drafts (section 9.5), labelled `needs-triage`. They are not filed yet, because the GitHub CLI on the workstation is not logged in. They are filed once the maintainer logs in.
+- **Issues:** the maintainer chose to file all five drafts (section 9.5), labelled `needs-triage`. They are not filed yet, because the GitHub CLI on the workstation is not logged in. They are filed once the maintainer logs in. (Dated note, 2026-09-29 21:10Z: filed as #1–#5; see 21:10Z.)
 - **Docs:** the maintainer chose to commit this journal and plan A's `git archive` line-ending fix locally on `docs/perf-plans-2026-09` now. Task 8's entries go on `docs/planB-race-rerun`, branched from it.
 
 **11:12Z. Plan B's race re-run on gn100 (DGX Spark) starts.** This is plan B's Task 8. B merged as d096fde onto ff48930. Both images are built from the repository `Dockerfile`, which uses Python 3.12 on Debian bookworm:
@@ -687,6 +687,170 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
 
 **Status:** done.
 
+**11:19Z–21:00Z. Plan A's PR 2 (Tasks 7–10) starts, and the workstation's uv moves to the latest release.**
+- **The question (11:19Z).** PR 2 sets a uv floor, `required-version = ">=0.12"`. The workstation's standalone uv was still 0.5.24, which would refuse the project once the floor lands. Task 7 Step 3 updates it only after asking, because it replaces the maintainer's own tool. The options were:
+  - "Update to 0.12.19" (recommended; the plan's pin);
+  - "Side-by-side copy only" (a scratch uv for PR 2, leaving the maintainer's at 0.5.24);
+  - "Don't touch uv yet" (pause PR 2).
+- **The answer (20:57Z), in free text:** "Update, always use the latest version". `uv self update` took the workstation from 0.5.24 to 0.12.20, a release newer than the plans. The work waited on the answer from 11:19Z to 20:57Z.
+- **Ruling:** the answer also sets PR 2's exact uv pins, the Dockerfile's `ARG UV_VERSION` and the CI workflow's setup-uv `version`, to the latest release at execution time: 0.12.20 in place of the plan's 0.12.19. The `>=0.12` floor stays a floor.
+  - Why: the answer is general, and the workstation, the image and CI should lock with the same uv.
+  - Cost if wrong: a one-token revert per pin.
+- **Worktree:** `.worktrees/packaging-foundation`, branch `packaging-foundation` from `main` at d096fde (PR 1 plus B). Baseline: 182 passed, 1 warning.
+- **Ruling:** PR 2's expected suite counts become 182 plus A's new tests. The plan's 183, 185 and 188 assumed a different starting count: `main` has PR 1's 162 (one more than planned, from its fix wave) plus B's 20 (17 planned). Cost if wrong: none, because the check is that the new tests pass and nothing else changes.
+- **Pre-flight (21:00Z).** The workflow `planA-pr2-preflight` runs three Sonnet agents in parallel:
+  - a conflict scan of Tasks 7–10 against `main` and the Global Constraints;
+  - a replay of Tasks 7–9 in a scratch copy, with uv 0.12.20;
+  - the current version facts: the latest setup-uv release and its commit SHA, the CPython 3.12 build that uv 0.12.20 installs, and its SQLite.
+
+**21:10Z. Plan B's five issue candidates are filed on GitHub as #1–#5, labelled `needs-triage`.** The maintainer logged the GitHub CLI in, and the drafts were filed as written. The only change was dropping "(optional)" from the titles of #4 and #5; that word was a marker for choosing which drafts to file, not part of the title. The repository is public, so the drafts were checked first: they hold no credentials, paths, usernames or addresses. They do name plan B, plans D2 and F, and ADR 0001's concurrency addendum, which are not pushed yet.
+- #1: a same-name create that races a collection delete loses its directory.
+- #2: pin what happens when a connection closes under a running statement (a subprocess test).
+- #3: shutdown can cancel an idle eviction after it popped its collection (plan D2).
+- #4: the embedder retries errors that cannot succeed.
+- #5: writes and unlocked reads that race `DELETE` answer 500.
+
+**21:17Z. PR 2's pre-flight is done. There is no conflict between tasks, and there is one plan bug.** The workflow ran three Sonnet agents for 16.5 minutes and used 249k tokens.
+
+**Conflict scan:** 60 rows over Tasks 7–10. No pair of tasks conflicts. The shared test file grows from 5 to 7 to 10 tests.
+
+**Replay of Tasks 7–9** in a scratch copy of `main` with uv 0.12.20:
+- Every expected RED and GREEN matched the plan: Task 7 had 5 failures, then 5 passes; Task 8 had 2 failures, then 7 passes; Task 9 had 3 failures, then 10 passes.
+- The suite went from 182 to 187, 189 and 192 passed.
+- The re-lock matched the plan's shape: 54 packages, lock revision 2 → 3, 6 lines in and 6 out.
+- gn100's uv 0.12.5 reads the new lock.
+- The plan's Dockerfile, built with uv 0.12.20 on the workstation (x86_64), reports Python 3.12.14, SQLite 3.53.1, `OPENBLAS_NUM_THREADS=1`, uid 1000 and `C.UTF-8`. Those are the same interpreter and SQLite that p4 read with uv 0.12.19 on aarch64.
+- A Linux run of `main`'s tests in podman gave 182 passed.
+
+**Version facts:**
+- uv 0.12.20 (released 2026-09-28) is the latest, and its `ghcr.io/astral-sh/uv:0.12.20` image exists.
+- setup-uv v10.2.0 is the latest, and the plan's commit SHA for it is correct.
+- `actions/checkout` is at v7.0.1; the plan used the floating tag `v4`.
+- Debian trixie is stable.
+- Nothing in uv's changelog from 0.12.19 to 0.12.20 changes the lock format, `required-version` or `uv python install`.
+
+**The plan bug:** Task 9 Step 6, the check that a volume written by the old image still works with the new one, fails as written. It builds the old Dockerfile against the working tree. After Task 7, that tree declares `required-version = ">=0.12"`, and the old base image's uv 0.9.30 refuses it (exit 2). Ruling: build the old image from a `git archive` of `main`, the tree the old images were built from. In the replay, that version wrote a volume with the old image and read it back with the new one: 2,100 chunks, 0 pending jobs.
+
+**Other rulings:**
+- **`actions/checkout`:** pinned to v7.0.1 by commit SHA, like setup-uv, following W-11. `docs.yml` keeps its unpinned tags because it is outside PR 2's files; the PR text names it as a follow-up.
+- **pyproject comment:** the `[tool.uv]` comment drops the version number, so the pin lives in only two places, and a test keeps those two equal.
+- **Order:** Tasks 7, 8 and 9, then the final review and its one fix wave, then Task 10 on gn100, then finishing. Task 10 changes no repository file, and running it after the fix wave means gn100 measures the image that will merge.
+- **Pushing PR 2:** Task 9's "push and open PR 2" waits for the finish menu, because a push is outward-facing. Task 10 deploys from local commits, since `deploy.sh` ships a `git archive` of a checkout.
+- **Checkouts:** Task 10 deploys `main` from a temporary worktree and PR 2 from its own worktree. The plan's `git switch` steps cannot run here, because the main checkout holds the docs branch.
+- **Task 10's Gate 2:** a failure is handled the way PR 1's equivalence gate was. The per-run values and host facts are read first, then the maintainer is asked. It does not fail automatically.
+- **gn100's uv:** it stays at 0.12.5, because the image brings its own uv 0.12.20 and 0.12.5 meets the floor. W-11 covered the workstation and the pins, not the maintainer's tools on gn100.
+- **Suite counts:** 187, 189 and 192 after Tasks 7, 8 and 9.
+
+**Stale figures in plan A's Task 10.** It expects a detach of about 285 s and a 53-minute session; both come from the research baseline. On this host, PR 1 measured a detach of 34 s and sessions of 18–21 minutes.
+
+**Cross-plan note for plans C–G.** Task 7's test requires `--group bench` on every documented `uv run … bench/…` line whose script imports orjson. Any later probe that imports orjson needs `--group bench` in its usage line.
+
+**Task 7 dispatched at 21:18Z.**
+
+**21:18Z–21:22Z. PR 2's Task 7 is done: orjson moves to a `bench` group, and uv gets a `>=0.12` floor.** Two commits, 6fc7e36 and ace7498.
+- **What it changes.** orjson leaves the runtime dependencies for a `bench` dependency group, and every documented `uv run … bench/…` line whose script imports orjson gains `--group bench`. `pyproject.toml` gains `[tool.uv] required-version = ">=0.12"`. The re-lock with uv 0.12.20 moved `uv.lock` from revision 2 to 3: 54 packages, 6 lines in and 6 out, the shape the replay predicted. A new `tests/test_packaging.py` holds 5 tests: 5 failures before the change, 5 passes after it. The suite went from 182 to 187 passed.
+- **The review caught a dropped backslash.** The implementer retyped the test file instead of copying it. The helper that joins shell continuations lost one backslash in its regex, so it matched a literal backslash followed by `n` instead of a backslash-newline. The tests still passed, because every documented `uv run` line for an orjson script names its script on the same physical line. The check would have missed a future line wrapped with a backslash. The Sonnet reviewer compared the file with the brief and flagged the line in 28 seconds; three copies (the brief, the plan and the replay) agreed on the correct form.
+- **Fix round 1.** The implementer restored the line in its own commit (ace7498), then proved in Python that the whole test file equals the brief's block. A scoped re-review found both findings addressed and nothing new.
+- **Ruling:** from Task 8 on, implementers copy plan code blocks by a method that cannot eat backslashes (a Python copy out of the brief, or the file tools), and prove equality with a Python comparison before committing. Why: Tasks 8 and 9 carry regex-heavy tests and a Dockerfile, and a shell on Windows mangles backslashes in more than one way. Cost if wrong: one extra check per task.
+- **Task 8 (the CI workflow) dispatched at 21:22Z.**
+
+**21:22Z–21:26Z. PR 2's Task 8 is done: a first CI workflow.** One commit, fa8c1c5.
+- **What it adds.** `.github/workflows/tests.yml` holds one job, `test`: ubuntu-latest, a 15-minute timeout, read-only repository permissions. It runs on pushes to `main`, on pull requests and by hand. Its steps are `uv lock --check`, `uv sync --frozen --group bench` (so the bench-harness tests run instead of skipping) and the suite. Both actions are pinned by commit SHA: setup-uv v10.2.0 with uv 0.12.20 and Python 3.12, and checkout v7.0.1 (the plan had the floating tag `v4`). Two new tests keep the workflow honest: 2 failures before, 7 passes after in the packaging tests. The suite went from 187 to 189 passed.
+- **The backslash ruling held.** The implementer copied the plan's code blocks with Python and proved both equal to the brief; the only YAML differences were the two rulings. The Sonnet reviewer approved it in 12 seconds with no Critical or Important findings.
+- **One unverified claim, closed by the controller.** The review could not confirm that the checkout SHA is v7.0.1. `git ls-remote` shows `v7.0.1` is a lightweight tag on that commit.
+- **Parked for plans E and G.** The test helper that reads one job ends the job at the next line indented two spaces or less, comments included. A comment written at that depth inside a job, between its steps, would cut the job short. Plans E and G add jobs next to `test`.
+- **The workflow has not run on GitHub yet.** Nothing is pushed; its first run comes with PR 2's push, which waits for the maintainer.
+- **Task 9 (the Dockerfile) dispatched at 21:27Z.**
+
+**21:27Z–21:32Z. PR 2's Task 9 is done: the image moves to python-build-standalone CPython on Debian trixie. The Linux run is green, and the final review starts.** One commit, 8382eb6.
+- **The new Dockerfile.** uv comes from `ghcr.io/astral-sh/uv:0.12.20`. A `debian:trixie-slim` builder installs CPython 3.12 into `/python` with `uv python install` and syncs `/app`. The runtime stage is plain `debian:trixie-slim` with `/python` and `/app` copied in. It keeps what the old base gave existing users: uid 1000 (the owner of every existing `/data` volume), `LANG=C.UTF-8` and the same command line. It adds `OPENBLAS_NUM_THREADS=1` (spec D16). Three new tests: 3 failures before, 10 passes after in the packaging tests. The suite went from 189 to 192 passed.
+- **The image, measured on the workstation (x86_64):** Python 3.12.14, SQLite 3.53.1, one OpenBLAS thread, uid 1000, `C.UTF-8`. The controller re-ran the check against the built image and got the same line.
+- **Old volumes still work.** Using the pre-flight's corrected Step 6, the old image wrote a volume (2,000 chunks and an IVF collection). The new image then read it, appended 100 documents and re-indexed: 2,100 chunks, 0 pending jobs.
+- **Review.** The copy was exact: the Sonnet reviewer compared the tests and the Dockerfile with the brief character by character, and the only difference was the ruled 0.12.20 pin. It approved in 16 seconds with two Minor notes, both parked.
+- **The first Linux proof of PR 2 (the G1 ruling).** A script pipes an LF `git archive` of the branch into a throwaway `uv:0.12.20-trixie-slim` container and runs the CI workflow's three steps, so no volume or path mapping is involved. At 8382eb6: uv 0.12.20, CPython 3.12.14, SQLite 3.53.1, lock check ok, 192 passed with the one existing warning; the suite itself took 17 seconds.
+- **Pace.** Tasks 7–9 took 11 minutes from the first dispatch (21:18Z) to the last approval (21:30Z): four commits, three reviews and one fix round. The corrected pre-flight did most of the work: every count and command the implementers ran had already been replayed.
+- **A correction to this log.** The controller first wrote several times for Tasks 7–9 as estimates. They are fixed here from the transcript and the commit times; from now on the times come from the clock.
+- **The final whole-branch review dispatched at 21:32Z** (Opus), over `main`..8382eb6: 4 commits, 13 files, 225 lines in and 28 out.
+
+**21:32Z–21:57Z. PR 2's final review asks for fixes. One fix wave, a rollback proof and errata for plans E and G follow, and the gn100 re-baseline starts.**
+- **The final review** (Opus, over `main`..8382eb6) returned at 21:42:40Z: "With fixes". It found 0 Critical, 2 Important and 5 Minor issues, plus 11 items it declined to judge.
+- **I1: CI would have tested an interpreter the image doesn't ship.** setup-uv's `python-version` only sets `UV_PYTHON`, and uv prefers a runner's system Python over its managed builds. CI would have run Ubuntu's CPython 3.12.3 with SQLite 3.45.1 on ubuntu-24.04, not the image's PBS 3.12.14 with SQLite 3.53.1 (section 5.17). The fix is a workflow-level `env: UV_PYTHON_PREFERENCE: only-managed`. It sits at workflow level so the jobs plans E and G add inherit it.
+- **I2: plans E and G still pinned uv 0.12.19 and `actions/checkout@v4`,** and the pin test read only the `test` job, so their new jobs would have drifted silently. Fixed both ways:
+  - The tests now read every job. Every `uses:` must be commit-pinned with its tag in a comment, and every setup-uv `version:` must equal the Dockerfile's `ARG UV_VERSION`.
+  - The plans' operative lines were corrected in place (E: 5 lines, G: 7 lines), with an erratum under each plan's header. p4's historical 0.12.19 facts stay.
+- **The Minor findings:**
+  - M1, fixed: getting-started's `uv sync --group docs` would have removed orjson again, and 16 bench tests would then skip silently. A test now fails on any `uv sync` line in the README or getting-started without `--group bench`.
+  - M2, fixed: the README states the uv 0.12 floor.
+  - M5, fixed: the runtime-contract test pins the `/app` copy.
+  - M3, accepted: the runtime has no `ca-certificates` or `netbase`. raggio's outbound HTTPS goes through httpx with certifi, so only an operator's stdlib script inside the container is affected. Adding them would change the image Task 10 measures, for a need nobody has documented. The PR text names it.
+  - M4, deferred to the finish menu: squashing Task 7's fix into Task 7. A squash rewrites SHAs that the ledger, this journal and the gn100 deploy name. The PR text gets a bisect note instead: 6fc7e36, ace7498 and fa8c1c5 can't build the image, because the old base's uv 0.9.30 refuses `>=0.12`.
+  - Of the declined items, `docs.yml` (still `setup-uv@v5` and `checkout@v4`) becomes a follow-up in the PR text. The rollback path was run (below).
+- **The fix wave.** One Sonnet implementer made one commit.
+  - RED: 2 failed, 9 passed.
+  - Two mutation checks proved that the tests which already passed can fail. A `checkout@v4` line fails the new pin test, and a setup-uv `version: "0.12.19"` fails the Dockerfile test.
+  - GREEN: 11 passed; the suite went from 192 to 193 passed.
+- **The controller amended the commit twice.**
+  - The trailer: the implementer wrote Sonnet, and the program's commits carry Opus (ruling C11).
+  - A line continuation: Git Bash's backslash handling had collapsed it into one line of about 190 characters, the same failure as Task 7's dropped backslash. A named local replaced it.
+  - The tree was re-tested after each change. The head is 21e272d. A scoped re-review (Sonnet) found I1, I2, M1, M2 and M5 addressed, with no new breakage.
+- **The rollback proof, in 32 seconds on the workstation.** The new image (8382eb6; CPython 3.12.14, SQLite 3.53.1) wrote a fresh volume: 2,000 chunks and an IVF collection. The old image (`main` at d096fde; CPython 3.12.12, SQLite 3.40.1) then read it, served vector and full-text hits, appended 100 documents and re-indexed: 2,100 chunks, 0 pending jobs. A user who upgrades and then rolls back keeps a working `/data`, in both directions now (Task 9 proved old to new).
+- **G1 on 21e272d:** 193 passed on Linux, with CPython 3.12.14 and SQLite 3.53.1.
+- **Task 10, the gn100 re-baseline, started at 21:53Z on the reviewed head.**
+  - The pre-check found load 0.21 and no bench running.
+  - `main` (d096fde) deployed in 8 seconds from cached layers.
+  - The detach script moved the volume's IVF index back to flat in 35 seconds.
+  - Session a-main started at 21:56:14Z: `FLAT_RUNS=3`, `IVF_BUILDS=2`, a 65-minute cap.
+  - Next: deploy 21e272d, run the same session as a-ref, then compare the two.
+
+**21:57Z–23:50Z. Task 10 on gn100: both sessions run, Gate 2 passes, Gate 1 fails by 2.3 s, and a probe finds the cause.**
+- **a-main** (`main` at d096fde: Debian's CPython 3.12.12, SQLite 3.40.1, OpenBLAS unset) ran 21:56Z–22:18Z, 22 minutes. The brief expected about 53: its timings came from the research baseline, when a build took 213 s. The IVF builds took 49.97 s (run0) and 51.07 s (build2). The detach before build2 took 35 s.
+- **The deploy of 21e272d took 15 seconds** (22:18:49Z–22:19:04Z). It pulled `uv:0.12.20`, and `uv python install` reported "Installed Python 3.12.14" on aarch64.
+- **Old volumes on gn100.** The new image detached the IVF index that the old image had built, in 35 s, and the collection was flat after it. This was the first gn100 test of Task 9's volume compatibility, and it passed.
+- **a-ref** (21e272d: PBS CPython 3.12.14, SQLite 3.53.1, one OpenBLAS thread) ran 22:20Z–22:38Z, 18.5 minutes. The builds took 52.78 s and 52.89 s; the detach before build2 took 34 s. It started at load 2.35 / 7.17 / 7.29, just after a-main; its builds came 7 and 16 minutes later.
+- **Step 11: the labels were as expected** in both sessions, and the two `regime.json` files were identical. Image sizes: 408 MB for d096fde and 317 MB for 21e272d, the same as p4's 408 and 317.4 MB.
+- **Gate 2 passed.** No gated vector row was worse. 20 rows were better beyond the band: every hybrid row of both engines, plus raggio-ivf's CPU per query under concurrency (37.0 → 4.9 ms) and its filtered p95 (74.2 → 37.0 ms). See section 4.9.
+- **Gate 1 failed.** The IVF build's median went from 50.52 to 52.84 s (+2.32 s, +4.6 %) against a band of 1.1 s. R-A1 has no tolerance and no rerun rule, so PR 2 could not merge on this result.
+  - Three variables moved at once: Python, SQLite and the OpenBLAS thread count.
+  - The build's k-means assignment is a BLAS matmul (`mat @ C.T` in `store.py`), which made OB1 the suspect. It was not proven.
+- **The maintainer chose "Find the cause first"** (recommended). The other options were "Accept, override Gate 1" and "Plan D16's fallback now".
+- **The probe, probe-ob1, ran 23:30Z–23:49Z (19 minutes).** It was not in the plan; the maintainer asked for it.
+  - The design was a 2×2: image (main, PR 2) × OpenBLAS threads (unset, 1), three builds per cell, in ABBA order over three rounds.
+  - `podman run -e OPENBLAS_NUM_THREADS=1` gave main's image one thread, and `--unsetenv OPENBLAS_NUM_THREADS` removed the variable from PR 2's image.
+  - Each build repeated session.sh's shape: detach at 8 GiB, a fresh 4 GiB container, then `POST /index` polled every 0.25 s.
+  - The container's environment was checked before each build, and the server's thread count was sampled every 10 s.
+- **The result: OB1 accounts for the whole regression, and the new image is slightly faster.** The medians are in section 4.9.
+  - One OpenBLAS thread costs +4.74 s on main's image and +3.64 s on PR 2's.
+  - The image change costs −0.46 s with OpenBLAS unset and −1.56 s with one thread.
+  - The server ran 47 threads with OpenBLAS unset and 28 with one thread. The 19 extra threads are OpenBLAS's pool.
+  - All 12 builds produced the same index: IVF, nlist 256, nprobe 16.
+- **What the fallback would buy.** D16's fallback, threadpoolctl around the build, would recover about 3.6 s of a 53 s build, about 7 %. The OpenBLAS thread count is process-wide, so searches served during a build would get the spinning threads back for as long as the build runs.
+
+### 2026-09-30
+
+**00:02Z–00:08Z. The maintainer overrides Gate 1 (R-A5). a-ref becomes the reference baseline, and Task 10 closes.**
+- The question put the trade this way: 3.6 s more on a build that runs only on `POST /index`, against 5–8× less CPU per search and a hybrid p99 under concurrency about 70 % lower.
+- **The maintainer chose "Accept, override Gate 1"** (recommended). The rejected options were:
+  - "Accept now, fallback later": the same acceptance, with D16's fallback kept as an open follow-up.
+  - "Plan the fallback first": PR 2 would wait for a threadpoolctl change in plan A and a new a-ref2 session.
+- **The consequences:**
+  - PR 2 ships D16 as it is.
+  - Later plans compare against `~/raggio-bench/a-ref` (PBS CPython 3.12.14, SQLite 3.53.1, `OPENBLAS_NUM_THREADS=1`), not against baseline3 or the research baseline.
+  - D16's fallback is recorded as not needed.
+- **Task 10 closed.** `bench-tv` was stopped, and `bench-wv` stayed as it was. Both sessions and the probe were copied off gn100. PR 2's description got the DGX section the plan asks for. PR 2 goes to the maintainer's finish choices.
+
+**00:08Z–00:19Z. PR 2 is merged into `main` locally, and plan A is complete.**
+- **The suite on 21e272d:** 193 passed, 1 warning (the Starlette/httpx deprecation).
+- **The maintainer's finish choices**, all three recommended:
+  - "Merge back to main locally". The alternatives were a push with a PR on the public repo, which would first have published the 11 unpushed commits of PR 1 and plan B, or keeping the branch.
+  - M4: "Keep the 5 commits", with no squash. The ledger, this journal and gn100's deploy all name the existing SHAs.
+  - Commit this journal and the plan E and G errata now.
+- **Before merging**, the unpublished history (`origin/main`..21e272d) was scanned. No ssh or key path appears. The only `/home/` is the regex in the test that forbids it.
+- **The merge:** 00c70a1, a merge commit with parents d096fde and 21e272d, the same shape as plan B's. Its tree is identical to 21e272d. On the merged `main`: 193 passed.
+- **Cleanup.**
+  - The worktree was removed. As in PR 1, a Windows lock on the shell's working directory left an empty folder, which `rmdir` removed.
+  - `git branch -d` refused, because the main checkout is on the docs branch, not on `main`. The branch was deleted with `-D` after `git merge-base --is-ancestor` confirmed that `main` contains it.
+- **Where things stand.** `main` is 17 commits ahead of `origin/main`, and nothing is pushed. The next plan in the merge order is C.
+
 ## 3. Decision register
 
 ID prefixes:
@@ -718,9 +882,9 @@ ID prefixes:
 | D13 | 2026-09-28 | `ENV MALLOC_TRIM_THRESHOLD_=134217728` in the image; `malloc_trim(0)` (ctypes, glibc only) after every index job; no `MALLOC_ARENA_MAX`; headroom guard runs before the pre-work, with the attach need raised to the measured growth (about 2.2 GiB); memory gates run swapless. | Default glibc: OOM-killed swapless (anon-rss 4.18 GB, exit 137, 2 of 2 runs) after the guard passed. `malloc_trim` alone: killed the same way. `MALLOC_ARENA_MAX=2`: no benefit, builds 10–20 % slower (57–63 s). | p1, gn100, swapless 4 GiB: threshold plus trim gave peak 3,631 MiB, final VmHWM 3,646 MiB (about 450 MiB of slack); the trim took 0.007 s. | Default adopted | spec §3; p1 | Planned (C, incl. the ENV line) |
 | D14 | 2026-09-28 | `_prune_common` switches from `\w+` to the stage-2 tokenizer (`[^\W_]+` + `_fold`). It is reported as a ranking change and lands as its own task and DGX arm, before the native scorer. | Keeping `\w+` (it causes the p99 tail). Folding it into the native arm (the native arm must be bit-identical; this change alters ranking). | p2, gn100, warm, 4 GiB: Python text-leg p99 534.6 → 104.6 ms; ranked-OR p99 496–501 → 43.7 ms; estimated warm hybrid p99 ~541 → ~117 ms; top-10 identical on 98.2 % of queries; hit@10 0.994 in both. | Default adopted | spec §3; p2 | Planned (E Task 1) |
 | D15 | 2026-09-28 | Adopt PBS's bundled SQLite 3.50.4 with the base migration. Plan A records a new reference baseline and claims no hybrid equivalence. Every row records `sqlite3.sqlite_version`. E's concurrent-QPS target is reported, not gated. G's verdict must account for the mutex. | Turning memstatus off: possible only through a ctypes hack on Debian 3.40.1, impossible on PBS (`sqlite3_config` not exported). A custom SQLite build: out of scope. A JSON-aggregate query shape: falsified on gn100 (0/300 mismatches, same collapse). | p2, host-warm, 4 GiB, q/s at T=1/2/4/8. SQL only, Debian: 27.9 / 36.5 / 18.4 / 16.8. SQL only, PBS: 28.6 / 47.6 / 45.4 / 39.4. End to end on PBS, native vs Python concurrent QPS 33.9 vs 16.1 (2.1×). | Default adopted | spec §3; p2 | Planned (A, E, G) |
-| D16 | 2026-09-28, added after p3 (07:44–07:51Z) | `ENV OPENBLAS_NUM_THREADS=1` in the image. Both arms of every A/B share it, and every row records it. | Default OpenBLAS threading: 20 busy-spinning threads burn about 15–16 cores even at c=1. threadpoolctl on the search path only: kept as the fallback if the IVF build regresses (R-A1). | p3 server A/B, 6 passes, concurrent QPS: base 165.3 [125.0..196.1]; base + OB1 189.2 [162.8..207.3]; fan-out T=12, default BLAS 203.0 [200.7..205.8]; fan-out T=12 + OB1 324.7 [308.6..381.4]. | Default adopted | spec §3; p3 | Planned (A); build impact gated by R-A1 |
+| D16 | 2026-09-28, added after p3 (07:44–07:51Z) | `ENV OPENBLAS_NUM_THREADS=1` in the image. Both arms of every A/B share it, and every row records it. | Default OpenBLAS threading: 20 busy-spinning threads burn about 15–16 cores even at c=1. threadpoolctl on the search path only: kept as the fallback if the IVF build regresses (R-A1). | p3 server A/B, 6 passes, concurrent QPS: base 165.3 [125.0..196.1]; base + OB1 189.2 [162.8..207.3]; fan-out T=12, default BLAS 203.0 [200.7..205.8]; fan-out T=12 + OB1 324.7 [308.6..381.4]. | Default adopted | spec §3; p3 | Planned (A); build impact gated by R-A1. (Dated note, 2026-09-30: in PR 2. The gate failed, and R-A5 accepted the build's +3.6 s.) |
 | R-EX | 2026-09-28 18:46Z | Execute the plans subagent-driven (a fresh implementer and a fresh reviewer per task, plus a whole-branch review). Go through the 7 key open decisions one at a time ("Go through the key ones"). | Execution "Native": every task implemented in the main session with one whole-branch review at the end, "Cheaper and faster, but nothing is reviewed until the end". Review scope "Accept all defaults", the recommended option: declined; no reason given. | The question text: 71 tasks across 7 PRs depend on each other's exact names, so a per-task review catches mistakes early. | Maintainer: chose the recommended execution option; overrode the recommended review scope | Transcript; spec §3.1 | Adopted |
-| R-A1 | 2026-09-28 18:51Z | IVF build-time gate for `OPENBLAS_NUM_THREADS=1`: build the IVF index twice per arm and compare medians against the band. No single-build tolerance, no rerun rule. threadpoolctl is added only if the gate fails. | "10 % tolerance, rerun on a miss" (one build per arm; a build more than 10 % slower triggers one rerun), the recommended option: overridden; the maintainer gave no reason. The question listed the cost of the chosen option: about 30 extra DGX minutes per A/B. | p3 never measured the IVF build with the setting. Build times on record: 213 s (baseline3, 4 GiB, warm, from flat; published 337 s) and 52.0 s [51.7–52.2] n=6 (p1, warm `POST /index`). The gap between them is unexplained. | Maintainer, overriding the recommendation | spec §3.1 A1; [plan A](../plans/2026-09-28-bench-and-packaging-foundation.md) | Planned (plan A, `IVF_BUILDS=2`; applied by `raggio-apply-plan-decisions`, 19:32Z) |
+| R-A1 | 2026-09-28 18:51Z | IVF build-time gate for `OPENBLAS_NUM_THREADS=1`: build the IVF index twice per arm and compare medians against the band. No single-build tolerance, no rerun rule. threadpoolctl is added only if the gate fails. | "10 % tolerance, rerun on a miss" (one build per arm; a build more than 10 % slower triggers one rerun), the recommended option: overridden; the maintainer gave no reason. The question listed the cost of the chosen option: about 30 extra DGX minutes per A/B. | p3 never measured the IVF build with the setting. Build times on record: 213 s (baseline3, 4 GiB, warm, from flat; published 337 s) and 52.0 s [51.7–52.2] n=6 (p1, warm `POST /index`). The gap between them is unexplained. | Maintainer, overriding the recommendation | spec §3.1 A1; [plan A](../plans/2026-09-28-bench-and-packaging-foundation.md) | Planned (plan A, `IVF_BUILDS=2`; applied by `raggio-apply-plan-decisions`, 19:32Z). (Dated note, 2026-09-30: run in Task 10. The gate failed; R-A5 overrode it, and threadpoolctl was not added.) |
 | R-A2 | 2026-09-28 18:51Z | The deploy may replace the raggio checkout on gn100 after moving the previous bench files into a timestamped `pre-deploy-<UTC time>` folder. It never touches the Weaviate container `bench-wv` or the separate turborag directory. | "Deploy to a separate directory": one directory per commit SHA, leaving the checkout as is; the runbook scripts would need a path variable, "a small change to A's Task 3". | Spec §6 already limits `podman rm -f` to `bench-tv`. | Maintainer (chose the recommended "Yes, with backup") | spec §3.1 A2 | Planned (A) |
 | R-D1 | 2026-09-28 18:50Z | Seed-7 tuning may change the phase-D2 defaults `SYNC_BATCH_JOBS=8` / `SYNC_BATCH_MS=1000`; seed 42 confirms; the PR states the chosen values. | "Keep 8 / 1,000 fixed": tuning results only reported, defaults changed only in a later PR. The question called 8 / 1,000 "a starting point, not a measured value". Brief 2a had compared a fixed 8 jobs / 1 s bound with an adaptive max(1 s, 2 × last sync). | The seed-7 / seed-42 anti-overfitting rule (section 6). | Maintainer (chose the recommended "Let tuning set them") | spec §3.1 D1 | Planned (D phase D2) |
 | R-D2 | 2026-09-28 18:50Z | If the final sync in `stop()` fails, it is logged and shutdown completes. Jobs stay `processing` with payloads kept; the startup replay recovers them. Nothing is raised. | "Raise the error": `stop()` raises after cleanup and the same replay recovers the jobs; trade-off given: a noisier shutdown, and callers that call `stop()` in a `finally` block must handle the error. | D8. | Maintainer (chose the recommended "Log it, replay on start") | spec §3.1 D2 | Planned (D phase D2) |
@@ -755,8 +919,10 @@ ID prefixes:
 | W-10 | 2026-09-29, answered by 07:57Z | The ssh config path becomes an environment variable with no default: `deploy.sh` stops with a message when `SSH_CONFIG` is unset, and the spec and plans read `-F "$SSH_CONFIG"`. The path is never committed again. | "Keep the default path" (the local username stays in the repo); "Decide at push time". | bench-hardening `eccdc6c` (a guard rail against operator paths in the runbook scripts, and a test; suite 162); docs branch `f7a7e8d` (142 sites). | Maintainer (chose "Env var, no default", recommended) | Transcript | Done locally. The earlier local commits still hold the path, so the publish is a squash or a rewrite, chosen at finish. |
 | R-A3 | 2026-09-29, answered by 07:57Z | PR 1's equivalence gate failed twice (a-equiv, a-equiv2). First run a control: baseline3's own bench on today's host, with the same image and volume, in the hardened runbook's layout. Then decide the re-baseline. | "Accept as re-baseline" (the host drift explains the failure, but the bench and the host stay confounded); "Hold PR 1" (investigate the flat-scan drift first). | a-equiv: 7 rows better and 1 worse. a-equiv2: 5 better and 1 worse. The IVF build took 49 s against baseline3's 213 s, on the same image and data. Page cache: 40.5 GB against 6.1 GB. | Maintainer (chose "Control run first", recommended) | Transcript | Done: control1 ran 07:59–08:20Z; closed by R-A4 |
 | R-A4 | 2026-09-29, by 08:27Z | PR 1's equivalence gate closes as passed. The one row outside the band against the same-day control (IVF hybrid p95, +1.0 ms, 0.6%) is recorded as a run-order effect, not a bench effect. a-equiv2 plus control1 are PR 1's reference. | "Paired replication first" (about 45 min on gn100: the old bench, then the new one, IVF first after a restart, in the same order; it would have removed the order confound). | control1 vs a-equiv2: 1 row outside the band, in code identical in both benches; control1's build1 read 158.0 ms right after a build. baseline3 vs control1: 8 rows "better" with the same bench, so the host. IVF build: 50.3 s with the old bench, 49.0 s with the new. | Maintainer (chose "Accept equivalence", recommended) | Transcript | PR 1 moves to finishing |
+| W-11 | 2026-09-29, asked 11:19Z, answered 20:57Z | Tool versions: always the latest release. The workstation's uv went from 0.5.24 to 0.12.20, and PR 2's exact uv pins (the Dockerfile's `ARG UV_VERSION`, the CI setup-uv `version`) take the latest release at execution time in place of the plan's 0.12.19. Floors such as `required-version = ">=0.12"` stay floors. | "Update to 0.12.19" (the plan's pin, recommended); "Side-by-side copy only"; "Don't touch uv yet". | uv 0.12.20 was the latest release on 2026-09-29. | Maintainer (free text: "Update, always use the latest version") | Transcript | Applied to the workstation; the pins land with PR 2 |
+| R-A5 | 2026-09-30, answered about 00:02Z | Gate 1 (R-A1) failed and is overridden. PR 2 ships `OPENBLAS_NUM_THREADS=1` (D16) as it is, and a-ref becomes the reference baseline. D16's fallback (threadpoolctl for the build) is not needed. | "Accept now, fallback later" (the same acceptance, with the fallback left as an open follow-up). "Plan the fallback first" (PR 2 waits for a threadpoolctl change and an a-ref2 session; the OpenBLAS thread count is process-wide, so searches during a build would get the spinning threads back). Earlier, before the probe: "Accept, override Gate 1" and "Plan D16's fallback now", when the maintainer chose "Find the cause first". | Gate 1: IVF build median 50.52 → 52.84 s (+2.32 s), band 1.1 s. probe-ob1, a 2×2 with 3 builds per cell: main unset 49.88, main OB1 54.62, PR 2 unset 49.42, PR 2 OB1 53.06 s. One BLAS thread costs 3.64–4.74 s; the image change is −0.46 to −1.56 s. What OB1 buys: raggio-ivf CPU per query under concurrency 37.0 → 4.9 ms. The hybrid gains (p99 under concurrency 3,823 → 1,230 ms) come partly from the interpreter and SQLite (p4). | Maintainer (chose "Accept, override Gate 1", recommended) | Transcript; section 4.9 | PR 2 moves to finishing |
 
-Register total: 55 entries (P 3, D 16, R 21, X 5, W 10). (Dated note, 2026-09-29 08:30Z: R-A4 added. Dated note, 08:05Z: R-A3 and W-10 added; W-8 superseded. Dated note, 23:00Z: W-9 added. Dated note, 22:45Z: R-G8, R-G9 and W-8 added. Dated note, 21:20Z: R-G7 added. Dated note, 21:23Z: X4 added. Dated note, 21:45Z: X5 added. Dated note, 22:30Z: W-7 added.) (Dated note, 20:40Z: R-B1, R-B2, R-G5, R-G6, W-6 and X3 were added after p4; before them the total was 38 (P 3, D 16, R 12, X 2, W 5).) R-D3, R-G3 and R-G4 were added at 20:05Z, and R-D4 at about 20:15Z; the backfill written at about 19:30Z had 34.
+Register total: 57 entries (P 3, D 16, R 22, X 5, W 11). (Dated note, 2026-09-30 00:08Z: R-A5 added. Dated note, 2026-09-29 21:05Z: W-11 added. Dated note, 08:30Z: R-A4 added. Dated note, 08:05Z: R-A3 and W-10 added; W-8 superseded. Dated note, 23:00Z: W-9 added. Dated note, 22:45Z: R-G8, R-G9 and W-8 added. Dated note, 21:20Z: R-G7 added. Dated note, 21:23Z: X4 added. Dated note, 21:45Z: X5 added. Dated note, 22:30Z: W-7 added.) (Dated note, 20:40Z: R-B1, R-B2, R-G5, R-G6, W-6 and X3 were added after p4; before them the total was 38 (P 3, D 16, R 12, X 2, W 5).) R-D3, R-G3 and R-G4 were added at 20:05Z, and R-D4 at about 20:15Z; the backfill written at about 19:30Z had 34.
 
 Three recommended options were overridden: the review scope at 18:46:59Z (R-EX, "Go through the key ones" instead of "Accept all defaults"), and R-A1 and W-5 at 18:51:48Z. At 18:46:59Z the commit question's recommended "I commit in my terminal" was also answered with free text instead: "I already committed, let's debug the shell, I can also reboot if necessary". Separately, spec §3.1 says two of its rows override a plan's default: A1 and the fallback in G2.
 
@@ -1060,6 +1226,67 @@ Reading it:
 - The bench moved one row, IVF hybrid p95, by 0.6%. The maintainer accepted it as a run-order effect (R-A4).
 - a-equiv's IVF column is a different index, and its flat memory is unexplained (section 9.4).
 
+### 4.9 PR 2's reference baseline: a-main against a-ref
+
+Two sessions on gn100, 2026-09-29. Both used the same data and PR 2's bench (`FLAT_RUNS=3`, `IVF_BUILDS=2`), at 4 GiB and host-warm (40.5 and 41.1 GB of page cache).
+- **a-main:** `main` at d096fde, image `8d0ea119dc04` (408 MB): Debian's CPython 3.12.12, SQLite 3.40.1, OpenBLAS unset. It ran 21:56Z–22:18Z.
+- **a-ref:** PR 2 at 21e272d, image `432b9ecffd13` (317 MB): PBS CPython 3.12.14, SQLite 3.53.1, `OPENBLAS_NUM_THREADS=1`. It ran 22:20Z–22:38Z.
+
+The A/B changes three variables on purpose (D15, D16). It is a re-baseline, not a win for any one of them.
+
+Each cell is the median over n=3 counted runs, with the band (max − min) in brackets. The build row has n=2: run0 and build2.
+
+| Engine | Metric | a-main | a-ref | Verdict |
+|---|---|---|---|---|
+| raggio | Search p50 (ms) | 18.8 (1.3) | 18.2 (0.6) | within band |
+| raggio | QPS concurrent | 120 (14) | 133 (118) | within band |
+| raggio | CPU per query under concurrency (ms) | 147.5 (18.5) | 118.2 (65.9) | within band |
+| raggio | Hybrid p50 (ms) | 86.0 (0.7) | 77.9 (1.3) | better |
+| raggio | Hybrid QPS concurrent | 13.6 (0.2) | 17.7 (0.4) | better |
+| raggio | Hybrid p99 under concurrency (ms) | 4,211 (1,392) | 1,203 (250) | better |
+| raggio | Hybrid CPU per query under concurrency (ms) | 934.8 (118.2) | 282.3 (31.2) | better |
+| raggio-ivf | IVF build at 4 GiB (s) | 50.52 (1.10) | 52.84 (0.11) | **worse** |
+| raggio-ivf | Search p50 (ms) | 10.9 (0.1) | 8.1 (5.1) | within band |
+| raggio-ivf | QPS serial | 88 (1) | 116 (47) | within band |
+| raggio-ivf | QPS concurrent | 221 (8) | 223 (20) | within band |
+| raggio-ivf | CPU per query under concurrency (ms) | 37.0 (1.4) | 4.9 (0.6) | better |
+| raggio-ivf | Filtered p50 (ms) | 36.4 (0.8) | 35.7 (1.1) | within band |
+| raggio-ivf | Filtered p95 (ms) | 74.2 (0.7) | 37.0 (1.2) | better |
+| raggio-ivf | Hybrid p50 (ms) | 88.1 (2.5) | 74.1 (0.3) | better |
+| raggio-ivf | Hybrid first 10 queries, slowest (ms) | 562.6 (38.4) | 446.6 (6.0) | better |
+| raggio-ivf | Hybrid QPS serial | 9.8 (0.1) | 12.1 (0.1) | better |
+| raggio-ivf | Hybrid QPS concurrent | 13.0 (0.1) | 19.5 (0.2) | better |
+| raggio-ivf | Hybrid p99 under concurrency (ms) | 3,823 (1,356) | 1,230 (596) | better |
+| raggio-ivf | Hybrid CPU per query under concurrency (ms) | 974.1 (90.9) | 195.2 (23.9) | better |
+
+Memory, disk, recall and text-hit@10 were within the band on both engines. The cold start (4.4 and 4.5 → 3.9 s) is not claimable. compare.py prints the build rounded to whole seconds (51 → 53); the medians above come from the run JSONs.
+
+Reading it:
+- **Hybrid moved on both engines, flat included.** p4 had seen the interpreter and SQLite move hybrid on the IVF data, with one BLAS thread on both arms. At c=8 it measured 12.7 → 17.9 QPS, p99 6,731 → 3,981 ms, and CPU per query 556.5 → 343.0 ms. a-ref lands at 19.5 QPS, 1,230 ms and 195.2 ms. a-main's hybrid CPU per query (974.1 ms) is far above p4's base312 (556.5 ms), which ran with one BLAS thread. The spinning pool is the likely difference; it was not measured.
+- **raggio-ivf's CPU per query fell 7.5×, but its concurrent QPS did not move** (221 → 223). In p3's server A/B, OB1 took the base from 165.3 to 189.2 QPS, and a-main already runs at 221. p3's large gain (203 → 324.7 QPS) came with F's fan-out, which `main` does not have yet. Here OB1 frees about 32 ms of CPU per query without raising throughput.
+- **The filtered p95 halved; the p50 did not move.** In a-main, filtered p50 is 36.4 ms and p95 74.2 ms. With OB1, both sit at 36–37 ms. This matches, in kind, p3's core placement effect (in process: 32.5 ms on an X925 core, 69.5 ms on an A725 core; section 5.3).
+- **raggio-ivf's serial rows got noisier.** a-ref's serial p50 per run was 8.9, 7.9, 12.9 and 8.1 ms, against 10.9–11.0 ms in a-main. The band grew from 0.1 to 5.1 ms, so these rows cannot show a win here. The median, 8.1 ms, is near p3's 8.44 ms with OB1.
+- **Flat CPU per query sorts the flat runs into p4's two states** (section 5.8). R-G9 is why the flat QPS concurrent row decides nothing.
+  - a-ref's runs, run0 to run3: 117.9, 53.3, 118.2 and 119.3 ms.
+  - run1 is in the fast state: it ran 249 QPS, and p4's fast state was 50.8–56.8 ms at 234–258 QPS. The other three runs are in the slow state: 131–136 QPS, against p4's 115.9–117.6 ms at 132.7–135.8 QPS.
+  - a-main's runs: 155.9, 147.5, 137.3 and 155.8 ms, at 114–128 QPS. All are slow, and 20–40 ms above p4's slow state, which ran with one BLAS thread.
+  - a-ref's QPS concurrent band of 118 is that split between the two states, not ordinary noise.
+- **The image shrank from 408 to 317 MB**, matching p4's 408 and 317.4 MB.
+- **The IVF build is 2.3 s slower.** It is the one row outside the band, and it is why the probe below was run.
+
+**The attribution probe, probe-ob1** (2026-09-29, 23:30Z–23:49Z). Same host, volume and data. Each cell is three IVF builds at 4 GiB from flat, in ABBA order, as median [min..max] in seconds:
+
+| Image | OpenBLAS unset | `OPENBLAS_NUM_THREADS=1` | Cost of one thread |
+|---|---|---|---|
+| main (d096fde: CPython 3.12.12, SQLite 3.40.1) | 49.88 [49.73..50.94] | 54.62 [52.94..55.22] | +4.74 |
+| PR 2 (21e272d: PBS 3.12.14, SQLite 3.53.1) | 49.42 [49.38..50.06] | 53.06 [51.13..53.43] | +3.64 |
+| Image effect | −0.46 | −1.56 | |
+
+- In every build, the server ran 47 threads with OpenBLAS unset and 28 with one thread.
+- The sessions sit on the probe's diagonal. a-main (main, unset) built in 50.52 s, against the probe's 49.88. a-ref (PR 2, one thread) built in 52.84 s, against 53.06. The probe's diagonal gap is +3.18 s: Gate 1's +2.32 s, measured again and larger.
+- The probe's detaches at 8 GiB took 23–27 s, timed from the DELETE. The sessions and detach.sh took 34–35 s. The difference was not investigated.
+- The maintainer accepted the build cost (R-A5).
+
 ## 5. Negative results and surprises
 
 ### 5.1 Audience batching lost on NEON
@@ -1076,7 +1303,7 @@ On gn100 (p2, host-warm, 4 GiB), SQL-only throughput with no Python work fell fr
 
 ### 5.3 OpenBLAS spinner threads were the main noise source
 
-The default scipy-openblas starts 20 pthreads that busy-spin and keep about 15–16 cores busy even at c=1 (16.4–16.8 cores sampled; p3). Query and event-loop threads then land on the slower A725 cores. Pinned in process to an X925 core (cpu5): serial 4.06–4.08 ms, filtered 32.5–32.6 ms. Pinned to an A725 core (cpu0): 8.31–8.33 ms and 69.5 ms. The spec names the OpenBLAS spinners and X925/A725 thread placement as "the main source of IVF noise"; separately it records that warm IVF runs vary 16–24 % on concurrent QPS and filtered p50. With OB1 the base moved too: serial p50 11.27 → 8.44 ms, filtered p50 71.1 → 36.6 ms (medians of 6 passes), and the F prototype's concurrent QPS at c=8 went from 203.0 to 324.7. Not yet checked: whether OB1 slows the IVF build's k-means (gated by R-A1). Decision D16.
+The default scipy-openblas starts 20 pthreads that busy-spin and keep about 15–16 cores busy even at c=1 (16.4–16.8 cores sampled; p3). Query and event-loop threads then land on the slower A725 cores. Pinned in process to an X925 core (cpu5): serial 4.06–4.08 ms, filtered 32.5–32.6 ms. Pinned to an A725 core (cpu0): 8.31–8.33 ms and 69.5 ms. The spec names the OpenBLAS spinners and X925/A725 thread placement as "the main source of IVF noise"; separately it records that warm IVF runs vary 16–24 % on concurrent QPS and filtered p50. With OB1 the base moved too: serial p50 11.27 → 8.44 ms, filtered p50 71.1 → 36.6 ms (medians of 6 passes), and the F prototype's concurrent QPS at c=8 went from 203.0 to 324.7. Not yet checked: whether OB1 slows the IVF build's k-means (gated by R-A1). Decision D16. (Dated note, 2026-09-30 00:08Z: checked on gn100. One BLAS thread makes the 4 GiB build 3.6–4.7 s slower, 7–9 %, whichever image runs it. The server drops from 47 threads to 28. The maintainer accepted the cost (R-A5; section 4.9).)
 
 ### 5.4 An underscore tokenizer mismatch made the hybrid p99 tail
 
@@ -1152,6 +1379,12 @@ R1 reproduced over HTTP on all four builds. At c=16 with a collection key, 5.4�
 ### 5.16 The host moved the numbers more than the bench did
 
 PR 1's bench failed its own equivalence gate twice against baseline3, on up to 8 rows, all but one "better". A control run of baseline3's own bench, a day later on the same image and data, reproduced every one of those gains. The host state had changed: 6.1 GB of page cache a couple of hours after a reboot, against about 40 GB a day later. The IVF build went from 213 s to 50 s with nothing else changed. Against the same-day control, PR 1's bench differs on one row, by 0.6%. What this means for the plans: a baseline taken on a freshly rebooted host is not comparable with a candidate taken a day later, whatever the label says. The `host-warm` label had been set by hand, and it was wrong for baseline3.
+
+### 5.17 CI's Python 3.12 was Ubuntu's, not the image's
+
+PR 2's `tests.yml` asked setup-uv for `python-version: "3.12"`, and its tests checked that value. The final review checked uv's and setup-uv's documentation (through Context7) instead. setup-uv only exports `UV_PYTHON`, and uv's default preference, `managed`, "still prefers system Python installations over downloading a managed Python version". On ubuntu-24.04 that is CPython 3.12.3 with SQLite 3.45.1. The image ships python-build-standalone 3.12.14 with SQLite 3.53.1. D15 treats the SQLite build as a performance variable, so CI would have tested a different SQLite from the one users run.
+
+The controller's Linux proof could not have caught it. G1 runs in a `uv:0.12.20-trixie-slim` container, which has no system Python, so uv downloaded the managed build there. The gap shows only on a runner that has a system 3.12. One workflow-level line fixes it (`UV_PYTHON_PREFERENCE: only-managed`), and a test pins that line. The first GitHub run should show CPython 3.12.14 being downloaded.
 
 ## 6. Method: how we measured
 
@@ -1311,6 +1544,10 @@ State as of 2026-09-28, about 19:30Z.
 - **Next: execution, subagent-driven** (the maintainer's choice), starting with plan A's bench tasks (Tasks 1–6), then the merge order in section 8.
 - Dated note, 2026-09-29 11:01Z: plan A's PR 1 is merged into `main` locally (ff48930). Plan B is complete on its branch (b876b68, 9 commits, final review passed after one fix wave) and waits for the maintainer's merge choice. B's Task 8, the gn100 race re-run, follows the merge. Plan A's PR 2 (Tasks 7–10) comes after B in the merge order.
 - Dated note, 2026-09-29 11:16Z: B is merged into `main` locally (d096fde), and its Task 8 gn100 re-run passed: 0 failures on `post` (section 2, 11:16Z). Next in the merge order is plan A's PR 2.
+- Dated note, 2026-09-29 21:05Z: plan A's PR 2 (Tasks 7–10) is in progress in `.worktrees/packaging-foundation`, from `main` at d096fde. The workstation's uv is now 0.12.20 (W-11). The pre-flight runs first.
+- Dated note, 2026-09-29 21:57Z: PR 2's final review passed after one fix wave, and the head is 21e272d (section 2, 21:32Z–21:57Z). Plans E and G carry errata for the uv 0.12.20 and checkout pins. Task 10, the gn100 re-baseline, is running: session a-main is under way, and a-ref follows on 21e272d.
+- Dated note, 2026-09-30 00:08Z: Task 10 is done (section 2, 21:57Z–00:08Z). Gate 2 passed. Gate 1 failed by 2.3 s; a probe traced the loss to OB1, and the maintainer overrode the gate (R-A5). `~/raggio-bench/a-ref` is the reference baseline for plans C–G. PR 2 (21e272d) waits for the maintainer's finish choice.
+- Dated note, 2026-09-30 00:19Z: PR 2 is merged into `main` locally as 00c70a1 (section 2, 00:08Z–00:19Z), so plan A is complete. Nothing is pushed: `main` is 17 commits ahead of `origin/main`. Next in the merge order: plan C.
 
 ### 9.2 Open questions in the plans
 
@@ -1323,7 +1560,7 @@ State as of 2026-09-28, about 19:30Z.
 
 ### 9.3 Not measured yet
 
-- **OB1 side effects.** IVF train/attach (k-means matmuls), CREATE INDEX, ingest and text/hybrid search with `OPENBLAS_NUM_THREADS=1`. A's gn100 step checks the IVF build (R-A1). Fallback: restrict BLAS threads to the search path (threadpoolctl).
+- **OB1 side effects.** IVF train/attach (k-means matmuls), CREATE INDEX, ingest and text/hybrid search with `OPENBLAS_NUM_THREADS=1`. A's gn100 step checks the IVF build (R-A1). Fallback: restrict BLAS threads to the search path (threadpoolctl). (Dated note, 2026-09-30: the build is measured, at +3.6–4.7 s (section 4.9), and R-A5 recorded the fallback as not needed. CREATE INDEX and ingest under OB1 are still not measured.)
 - **Plan C:** a cold IVF build under C; migration plus load end to end in the server; CREATE INDEX RSS; `MALLOC_MMAP_THRESHOLD_`; anything above 2.55M rows. The cold `POST /index` bounds are targets, not measurements.
 - **Plan F's own filtered design** (intersect up front) was measured only in process; the server prototype intersected inside each task.
 - **R2b** (IVF id cache) rests on reasoning only; no repro was built.
@@ -1350,7 +1587,7 @@ State as of 2026-09-28, about 19:30Z.
 - **CI.** At critic time `.github/workflows` held only `docs.yml`; plan A adds `tests.yml`.
 - **Re-creating a collection while its delete is still running** (found in B's pre-flight, 2026-09-29): a same-name create that lands between the delete's catalog DELETE and its `rmtree` loses its directory. The next request answers 500. This exists at 19a8a2e too, and B leaves it alone. A likely fix: rename the directory to a tombstone under `_load_lock`, then remove the tombstone outside the lock.
 - **A DELETE mid-ingest briefly stalls every collection** (B's pre-flight, 2026-09-29): accepted in B, see 09:14Z. Plan C, which moves collection construction off the event loop, is the place to move `stop()` out of `_load_lock`. (Dated note, 10:45Z: the stall is longer than one write section; see the 09:14Z note and 10:33Z. Plan C's acceptance should measure it as p99 on other collections while one is deleted mid-ingest.)
-- **Issue candidates from B's final review** (2026-09-29; drafted, not filed. Dated note, 11:10Z: the maintainer chose to file all five; they wait for a GitHub CLI login):
+- **Issue candidates from B's final review** (2026-09-29; drafted, not filed. Dated note, 11:10Z: the maintainer chose to file all five; they wait for a GitHub CLI login. Dated note, 21:10Z: filed as #1–#5, in the order below):
   - the same-name create that races a delete (the item above);
   - a subprocess test for closing a connection under a running statement: `close()` blocked in the Windows probes, and a connection with no earlier statement segfaulted;
   - a shutdown that cancels an idle eviction after it popped its collection, leaving that collection unstopped (plan D2);

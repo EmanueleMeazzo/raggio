@@ -2,6 +2,17 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Erratum (2026-09-29, from plan A PR 2's final review):** plan A shipped uv **0.12.20**, not
+> 0.12.19 (the maintainer: "always use the latest version"), and `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1`, not
+> `actions/checkout@v4`. The pins, anchors, CI job and prerequisites below are corrected to match. Where
+> this plan reports p4 or its rehearsals (uv 0.12.19's PBS interpreters and their SQLite 3.53.1),
+> 0.12.19 is history and stays. A's `tests.yml` also sets `UV_PYTHON_PREFERENCE: only-managed` in a
+> workflow-level `env:`, so every job, this plan's included, runs uv's managed CPython, not the
+> runner's. A's `tests/test_packaging.py` fails if any `uses:` in `tests.yml` is not commit-pinned
+> (`@<40-hex> # vX.Y.Z`), or if any setup-uv `version:` differs from the Dockerfile's `ARG UV_VERSION`.
+> The upstream-issue draft keeps "built from its sdist by uv 0.12.19" and `uv:0.12.19` in its Reproduce
+> block only if the build it reports is p4's; for a build of this plan's image, write 0.12.20.
+
 **Goal:** Build raggio on free-threaded CPython 3.14t from the one Dockerfile, as an experimental image. Guard it against a silent GIL re-enable at build time, at run time and in CI. Add the `GC_FREEZE` knob and a non-blocking 3.14t CI job. Measure 3.14t against 3.12 in an ABAB on the DGX, and record in ADR 0006 whether to continue.
 
 **Architecture:**
@@ -11,7 +22,7 @@
 - **Native code per interpreter.** `raggio_native` is rebuilt for each image's own interpreter (cp312, cp314t; never abi3), through Plan E's builder (`PYO3_PYTHON` names the uv-installed `/python`). turbovec is the one dependency without a cp314t wheel. Spec §8's probe p4 ran on gn100 on 2026-09-28 (`docs/superpowers/research/2026-09-28-dgx-probe-p4-freethreaded.md`), on the 19a8a2e tree, which has no `raggio_native`: turbovec 1.0.0 built from its sdist as `cp314-cp314t-linux_aarch64` with 0 builder-stage fixes and no build arg, and the GIL stayed off. So G2's failure paths below are unlikely for turbovec. Still open, and Task 11 runs it first: `raggio_native`'s cp314t build, and G's real `check_image.py` on G's real Dockerfile. If turbovec's sdist does not build, Task 11 fixes a build-dependency, toolchain or build-flag cause in the Dockerfile's builder stage only, in at most 3 attempts; if 3 attempts fail, or no builder-stage line can express a fix that needs no source change, it stops and asks the maintainer, and ADR 0006 stays `Pending:` (spec §3.1 G3); if only a change to turbovec's own source would fix it, it drafts an upstream issue for the maintainer to post and parks the evaluation without asking (spec §3.1 G2; raggio never forks turbovec, D6).
 - **Evaluation.** A (3.12) and B (3.14t) are built from one commit and run as four sessions, A1 B1 A2 B2, on one boot, with Plan A's `session.sh` at `FLAT_RUNS=3` and `CONCURRENCY=8`. Each of them is followed, on the same image, by a c=16 session (`CONCURRENCY=16`, spec §3.1 G7), so the chain is eight sessions: A1 A1c16 B1 B1c16 A2 A2c16 B2 B2c16. The c=16 speed tables are reported, not gated; their GIL, Traceback and /healthz checks gate like any session's (G8). Every image runs `OPENBLAS_NUM_THREADS=1` (D16), and every table row carries its `sqlite3.sqlite_version` (D15). The decision reads the flat rows of Plan A's `compare.py` tables. It separates the CPU-bound vector rows from the SQLite-bound hybrid rows, because SQLite's global memstatus mutex caps concurrent text search whatever the GIL does. It is Continue, Hold or Park, under a rule ADR 0006 writes down before the run.
 
-**Tech Stack:** CPython 3.12 and 3.14t (uv-managed), uv 0.12.19, turbovec 1.0.0 (abi3 wheels; built from its sdist on 3.14t, Rust >= 1.89), PyO3 0.29, FastAPI, sqlite3, pytest, GitHub Actions, MkDocs Material. On the DGX: rootless podman 4.9.3, bash, and GNU coreutils `timeout`.
+**Tech Stack:** CPython 3.12 and 3.14t (uv-managed), uv 0.12.20, turbovec 1.0.0 (abi3 wheels; built from its sdist on 3.14t, Rust >= 1.89), PyO3 0.29, FastAPI, sqlite3, pytest, GitHub Actions, MkDocs Material. On the DGX: rootless podman 4.9.3, bash, and GNU coreutils `timeout`.
 
 **Spec:** `docs/superpowers/specs/2026-09-28-raggio-performance-design.md`:
 - §1 item 4 and §2 order 8 (scope);
@@ -1276,7 +1287,7 @@ git commit -m "Add the build-time image check" -m "Co-Authored-By: Claude Opus 5
 
 **Interfaces:**
 - Consumes the Dockerfile as Plans A, C and E leave it:
-  - global `ARG UV_VERSION=0.12.19`, `ARG PYTHON=3.12` and `ARG RUST_VERSION=1.98.1`;
+  - global `ARG UV_VERSION=0.12.20`, `ARG PYTHON=3.12` and `ARG RUST_VERSION=1.98.1`;
   - E's builder stage `FROM docker.io/library/rust:${RUST_VERSION}-slim-trixie AS builder`, with `ARG PYTHON`, `ENV UV_PYTHON=${PYTHON}` and `CARGO_TARGET_DIR=/tmp/cargo-target`. `RUN uv python install ${PYTHON}` is followed by the `RUN bash -c 'set -euo pipefail; py="$(uv python find "${PYTHON}")"; ln -s "$py" /usr/local/bin/python3; ...'` link and `ENV PYO3_PYTHON=/usr/local/bin/python3`. Then come `COPY native ./native`, `RUN uv sync --frozen --no-install-project --no-dev --extra native`, `COPY src ./src`, and last `RUN uv sync --frozen --no-dev --extra native`. With `PYTHON=3.14t`, the link and `PYO3_PYTHON` name the free-threaded interpreter, so maturin builds `raggio_native` (and turbovec's sdist) as cp314t, not abi3 (spec §4.2);
   - A's `debian:trixie-slim` runtime stage, in which `USER app` is followed by A's D16 comment, `ENV OPENBLAS_NUM_THREADS=1`, `ENV LANG=C.UTF-8 DATA_DIR=/data PATH="/app/.venv/bin:$PATH"`, `VOLUME /data` and `EXPOSE 8000`;
   - C's block after `EXPOSE 8000`: four comment lines and the single `ENV MALLOC_TRIM_THRESHOLD_=134217728` (D13). This task writes that variable name nowhere in the Dockerfile, because C's test counts it;
@@ -1373,7 +1384,7 @@ The asserts on A's, C's and E's lines come after those, and pass on the base tha
 
 - [ ] **Step 4: Implement**
 
-4a. In `Dockerfile`, append four comment lines after the header comment's last line, `# same pin as the native job in .github/workflows/tests.yml.`, so that they directly precede `ARG UV_VERSION=0.12.19`:
+4a. In `Dockerfile`, append four comment lines after the header comment's last line, `# same pin as the native job in .github/workflows/tests.yml.`, so that they directly precede `ARG UV_VERSION=0.12.20`:
 
 ```dockerfile
 # PYTHON=3.14t is the experimental free-threaded image (ADR 0006): turbovec ships no
@@ -1472,7 +1483,7 @@ git commit -m "Build the 3.14t image and fail on a GIL re-enable" -m "Co-Authore
 
 **Interfaces:**
 - Consumes the jobs of `tests.yml` as Plans A and E leave them:
-  - `test`, with `astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0`, `version: "0.12.19"` and `python-version: "3.12"`;
+  - `test`, with `astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0`, `version: "0.12.20"` and `python-version: "3.12"`, after `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1`;
   - `native`, with the matrix `runner: [ubuntu-latest, ubuntu-24.04-arm]`, the step `Install Rust (same pin as ARG RUST_VERSION in the Dockerfile)`, and `REQUIRE_NATIVE: "1"`.
 - It also consumes Plan B's stress tests in `tests/test_concurrency.py`: the names match `mixed_workload` and `stop_under_load`, and they read `RAGGIO_STRESS_SECONDS`.
 - Produces the job `freethreaded`:
@@ -1571,10 +1582,10 @@ Add one blank line, then:
     env:
       PYTHONWARNINGS: "error:The global interpreter lock (GIL) has been enabled:RuntimeWarning"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
-          version: "0.12.19"  # same pin as ARG UV_VERSION in the Dockerfile
+          version: "0.12.20"  # same pin as ARG UV_VERSION in the Dockerfile
           python-version: "3.14t"
       - name: Install Rust (same pin as ARG RUST_VERSION in the Dockerfile)
         run: |
@@ -3620,7 +3631,7 @@ Then complete the entry with the Edit tool, below its `- log:` line:
 The uv check, for any `UV_*` line. It runs on the laptop, with the Dockerfile's uv version, and `<NAME>` is the variable's name:
 
 ```bash
-uvx --from uv==0.12.19 uv sync --help | grep -F "[env: <NAME>="
+uvx --from uv==0.12.20 uv sync --help | grep -F "[env: <NAME>="
 ```
 
 Expected: one line, such as `[env: UV_NO_BINARY_PACKAGE=]` for the variable Task 6 uses. If nothing prints, `uv sync` does not read that variable, and the fix cannot be that line. A value that is the path of a file (a constraints file, for example) needs that file in the builder, and no allowed line adds one: such a fix cannot be expressed either.
@@ -4414,7 +4425,7 @@ Every code block in Tasks 1–9, and the Task 12 test section, was taken verbati
 ### Cross-plan assumptions
 
 - **Plan A:**
-  - uv 0.12.19 with `required-version`. Plan A upgrades the laptop's global uv, which is 0.5.24 today.
+  - uv 0.12.20 with `required-version`. Plan A upgraded the laptop's global uv from 0.5.24 to 0.12.20.
   - the Dockerfile layout:
     - the builder's `uv sync` into `/app/.venv`;
     - `ARG PYTHON=3.12` and `uv python install` into `/python`;
