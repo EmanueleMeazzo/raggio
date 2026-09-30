@@ -424,3 +424,243 @@ def test_payload_codec_runs_off_the_event_loop(tmp_path, monkeypatch):
     loop_thread = asyncio.run(run())
     assert (len(calls["encode"]), len(calls["decode"])) == (3, 3)
     assert loop_thread not in calls["encode"] + calls["decode"]
+
+
+# ---- upsert ordering and rollback
+
+
+def index_ids(col):
+    """Every id in a flat collection's vector index, sorted: a search whose k is the
+    index size returns them all (the probe _reconcile_ghosts uses)."""
+    if not len(col.index):
+        return []
+    probe = np.zeros((1, col.cfg.dim), dtype=np.float32)
+    probe[0, 0] = 1.0
+    return sorted(int(i) for i in col.index.search(probe, k=len(col.index))[1][0])
+
+
+def index_state(col):
+    """What a failed write must leave untouched: the committed records and vecs, the
+    vector index's ids and the published indexed_counts."""
+    return (
+        fetch(col, "SELECT id, external_id FROM records ORDER BY id"),
+        fetch(col, "SELECT id FROM vecs ORDER BY id"),
+        index_ids(col),
+        dict(col.indexed_counts),
+    )
+
+
+def test_upsert_failure_rolls_back_and_keeps_index(tmp_path):
+    # before: a failure mid-upsert had already removed the replaced ids from the index
+    # and left the transaction open, and the worker's own _finish_job('error') commit
+    # then persisted the half-applied upsert under a terminal job that never replays
+    col = make_collection(tmp_path)
+
+    async def run():
+        col.start_worker()
+        try:
+            await col.enqueue(docs_payload([1, 2, 3]))  # job 1: records 1, 2, 3
+            await drain(col)
+            before = index_state(col)
+            with col.db_lock:  # TEMP: only col.db (the worker's upserts) fires it
+                col.db.execute(
+                    "CREATE TEMP TRIGGER boom BEFORE INSERT ON vecs WHEN NEW.id = 5"
+                    " BEGIN SELECT RAISE(ABORT, 'boom'); END"
+                )
+            # job 2 replaces all three rows with ids 4, 5, 6: the second vec INSERT aborts
+            await col.enqueue(docs_payload([1, 2, 3]))
+            await drain(col)
+            # read after job 2's _finish_job('error') committed: nothing partial rode on it
+            after, in_txn = index_state(col), col.db.in_transaction
+            with col.db_lock:
+                col.db.execute("DROP TRIGGER boom")
+            await col.enqueue(docs_payload([1, 2, 3]))  # job 3: the same upsert succeeds
+            await drain(col)
+            final = index_state(col)
+            # an orphan vecs row at the next record id, as an older release's backfill
+            # could leave for a record deleted mid-embed: job 4 must replace it, not fail
+            orphan = fetch(col, "SELECT MAX(id) + 1 FROM records")[0][0]
+            with col.db_lock:
+                col.db.execute("INSERT INTO vecs(id, vec) VALUES (?, ?)", (orphan, bytes(16)))
+                col.db.commit()
+            await col.enqueue(docs_payload([4]))  # job 4: record 7, over the orphan
+            await drain(col)
+            jobs = fetch(col, "SELECT id, status, error FROM jobs ORDER BY id")
+            blob = fetch(col, "SELECT vec FROM vecs WHERE id = ?", orphan)
+            return before, after, in_txn, jobs, final, orphan, blob, index_state(col)
+        finally:
+            await col.stop()
+
+    before, after, in_txn, jobs, final, orphan, blob, healed = asyncio.run(run())
+    assert before == ([(1, "c1"), (2, "c2"), (3, "c3")], [(1,), (2,), (3,)], [1, 2, 3], {"chunk": 3})
+    assert jobs[:3] == [(1, "done", None), (2, "error", "boom"), (3, "done", None)]
+    assert after == before  # records, vecs, index ids and counts all unchanged
+    assert in_txn is False
+    # the rollback left MAX(id) at 3, so job 3's rows are 4, 5, 6
+    assert final == ([(4, "c1"), (5, "c2"), (6, "c3")], [(4,), (5,), (6,)], [4, 5, 6], {"chunk": 3})
+    # job 4's record 7 replaced the orphan: one vec per record, holding its own vector
+    assert (orphan, jobs[3]) == (7, (4, "done", None))
+    unit = store._normalize(np.array([vec(4)], dtype=np.float32))
+    assert blob == [(unit.astype(np.float16).tobytes(),)]
+    assert healed == (
+        [(4, "c1"), (5, "c2"), (6, "c3"), (7, "c4")], [(4,), (5,), (6,), (7,)], [4, 5, 6, 7], {"chunk": 4}
+    )
+    reopened = make_collection(tmp_path)  # what reached disk: no partial rows, no ghosts
+    try:
+        assert index_state(reopened) == healed
+    finally:
+        asyncio.run(reopened.stop())
+
+
+def test_delete_failure_rolls_back_and_keeps_index(tmp_path):
+    # before: delete_document removed the ids from the index first, and a failing
+    # DELETE left the vecs deletion in an open transaction for the next commit
+    col = make_collection(tmp_path)
+
+    async def run():
+        try:
+            await col._process_job(docs_payload([1, 2]))  # records 1 (d1), 2 (d2)
+            before = index_state(col)
+            with col.db_lock:
+                col.db.execute(
+                    "CREATE TEMP TRIGGER boom BEFORE DELETE ON records"
+                    " BEGIN SELECT RAISE(ABORT, 'boom'); END"
+                )
+            with pytest.raises(sqlite3.IntegrityError, match="boom"):
+                await col.delete_document("d1")
+            in_txn = col.db.in_transaction
+            await col.enqueue(docs_payload([9]))  # a later writer commits on col.db
+            after = index_state(col)
+            with col.db_lock:
+                col.db.execute("DROP TRIGGER boom")
+            deleted = await col.delete_document("d1")
+            return before, in_txn, after, deleted, index_state(col)
+        finally:
+            await col.stop()
+
+    before, in_txn, after, deleted, final = asyncio.run(run())
+    assert before == ([(1, "c1"), (2, "c2")], [(1,), (2,)], [1, 2], {"chunk": 2})
+    assert (in_txn, after) == (False, before)
+    assert deleted == 1
+    assert final == ([(2, "c2")], [(2,)], [2], {"chunk": 1})
+
+
+def test_indexed_counts_published_after_commit(tmp_path):
+    # the rebind used to run inside the open transaction; now it runs after the commit, still
+    # under db_lock and still once per write, so no reader ever sees counts for rows a
+    # rollback then discards
+    col = make_collection(tmp_path)
+    seen = []
+
+    class Spy(Collection):
+        def __setattr__(self, name, value):
+            if name == "indexed_counts":
+                seen.append((self.db_lock.locked(), self.db.in_transaction))
+            super().__setattr__(name, value)
+
+    col.__class__ = Spy
+
+    async def run():
+        try:
+            await col._process_job(docs_payload([1, 2]))
+            await col._process_job(docs_payload([2, 3]))  # replaces c2: -1 then +1
+            await col.delete_document("d1")
+            return dict(col.indexed_counts)
+        finally:
+            await col.stop()
+
+    counts = asyncio.run(run())
+    assert seen == [(True, False)] * 3  # one rebind per write: under db_lock, committed
+    assert counts == {"chunk": 2}
+
+
+def test_upsert_old_row_lookup_is_set_based(tmp_path):
+    # before: one `WHERE external_id=?` point query per row, all under db_lock
+    col = make_collection(tmp_path)
+    statements = []
+
+    async def run():
+        try:
+            await col._process_job(docs_payload(range(300)))  # records 1..300
+            with col.db_lock:
+                col.db.set_trace_callback(statements.append)
+            await col._process_job(docs_payload(range(300)))  # replaces all 300
+            with col.db_lock:
+                col.db.set_trace_callback(None)
+            return (
+                fetch(col, "SELECT COUNT(*), MIN(id), MAX(id) FROM records"),
+                fetch(col, "SELECT COUNT(*) FROM vecs"),
+                index_ids(col),
+                dict(col.indexed_counts),
+            )
+        finally:
+            await col.stop()
+
+    records, vecs, ids, counts = asyncio.run(run())
+    # the trace shows expanded SQL (external_id='c7'), so match on the spaceless text
+    flat = [s.replace(" ", "") for s in statements]
+    assert sum("WHEREexternal_id=" in s for s in flat) == 0
+    assert sum("WHEREexternal_idIN(" in s for s in flat) == 1  # 300 ids: one 512-id chunk
+    assert records == [(300, 301, 600)]
+    assert vecs == [(300,)]
+    assert ids == list(range(301, 601))
+    assert counts == {"chunk": 300}
+
+
+def test_ingest_prep_runs_off_the_event_loop(tmp_path, monkeypatch):
+    # np.array over a 250x1024 job's nested float lists is ~13 ms of CPU, plus the
+    # flatten loop: on the loop it stalled every request the process served meanwhile
+    col = make_collection(tmp_path)
+    real_rows, real_matrix = store._payload_rows, store._rows_matrix
+    calls = {"rows": [], "matrix": []}
+
+    def rows_spy(payload):
+        calls["rows"].append(threading.get_ident())
+        return real_rows(payload)
+
+    def matrix_spy(rows):
+        calls["matrix"].append(threading.get_ident())
+        return real_matrix(rows)
+
+    monkeypatch.setattr(store, "_payload_rows", rows_spy)
+    monkeypatch.setattr(store, "_rows_matrix", matrix_spy)
+
+    class FakeEmbedder:  # embeds the chunks that arrive without a vector
+        def __init__(self):
+            self.texts = []
+
+        async def embed(self, texts):
+            self.texts += texts
+            return [vec(100 + n) for n in range(len(texts))]
+
+        async def aclose(self):
+            pass
+
+    col._embedder = embedder = FakeEmbedder()  # the collection's lazily built embedder
+
+    async def run():
+        col.start_worker()
+        try:
+            for i in range(2):
+                await col.enqueue(docs_payload([i, i + 10]))
+            # one job mixing a supplied vector with one the worker must embed
+            mixed = docs_payload([2])
+            mixed["documents"] += docs_payload([12], with_vectors=False)["documents"]
+            await col.enqueue(mixed)
+            await drain(col)
+            return (
+                threading.get_ident(),
+                fetch(col, "SELECT COUNT(*) FROM records"),
+                fetch(col, "SELECT external_id FROM records JOIN vecs USING (id) ORDER BY id"),
+                index_ids(col),
+            )
+        finally:
+            await col.stop()
+
+    loop_thread, records, stored, indexed = asyncio.run(run())
+    assert (len(calls["rows"]), len(calls["matrix"])) == (3, 3)
+    assert loop_thread not in calls["rows"] + calls["matrix"]
+    assert records == [(6,)]
+    assert embedder.texts == ["text 12"]  # only the vectorless chunk was embedded
+    assert stored == [("c0",), ("c10",), ("c1",), ("c11",), ("c2",), ("c12",)]
+    assert indexed == [1, 2, 3, 4, 5, 6]  # both kinds reached the vector index

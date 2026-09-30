@@ -287,6 +287,32 @@ _CLAIM_SQL = (
 )
 
 
+def _payload_rows(payload: dict) -> list[list]:
+    """Flatten an ingest payload's documents into record rows [external_id, doc_id,
+    type, position, text, metadata, vector]; vector None means "embed this". Rows are
+    lists because the worker fills in embedded vectors. Pure CPU: _process_job runs it
+    in a worker thread."""
+    rows = []
+    for d in payload["documents"]:
+        if d.get("summary"):
+            s = d["summary"]
+            rows.append([d["doc_id"], d["doc_id"], "summary", None, s.get("text"), s.get("metadata"), s.get("vector")])
+        for i, c in enumerate(d.get("chunks") or []):
+            pos = c.get("position") if c.get("position") is not None else i
+            rows.append([c["id"], d["doc_id"], "chunk", pos, c.get("text"), c.get("metadata"), c.get("vector")])
+    # last occurrence wins: _upsert_rows inserts a job's rows with one executemany, so
+    # a duplicate external_id within one payload would violate UNIQUE and fail the job
+    # (and the first copy would only have been replaced by the second anyway)
+    return list({r[0]: r for r in rows}.values())
+
+
+def _rows_matrix(rows: list[list]) -> np.ndarray:
+    """The rows' vectors as one unit-norm float32 matrix (ValueError on a zero vector).
+    np.array over nested float lists is ~13 ms per 250x1024 job: _process_job runs it
+    in a worker thread."""
+    return _normalize(np.array([r[6] for r in rows], dtype=np.float32))
+
+
 def _filter_sql(scope: str, filt: dict | None) -> tuple[str, list]:
     """Build WHERE clause for records: type scope + metadata filters, all ANDed.
     Per key: scalar = equality; list = `in`; object = range ops / `in` / `contains`."""
@@ -1048,34 +1074,29 @@ class Collection:
             finally:
                 await asyncio.to_thread(_malloc_trim)  # D13: failed builds free memory too
             return
-        # flatten documents into records: (external_id, doc_id, type, position, text, metadata, vector)
-        rows = []
-        for d in payload["documents"]:
-            if d.get("summary"):
-                s = d["summary"]
-                rows.append([d["doc_id"], d["doc_id"], "summary", None, s.get("text"), s.get("metadata"), s.get("vector")])
-            for i, c in enumerate(d.get("chunks") or []):
-                pos = c.get("position") if c.get("position") is not None else i
-                rows.append([c["id"], d["doc_id"], "chunk", pos, c.get("text"), c.get("metadata"), c.get("vector")])
+        # flatten documents into records (external_id, doc_id, type, position, text,
+        # metadata, vector) and build the matrix in worker threads: both are pure CPU
+        # the event loop should not carry
+        rows = await asyncio.to_thread(_payload_rows, payload)
         if not rows:
             return
-        # last occurrence wins: a duplicate external_id within one payload would
-        # otherwise leave the first copy's id in the vector index (the in-batch
-        # replace can't remove it — it isn't added until after the row loop)
-        rows = list({r[0]: r for r in rows}.values())
         need = [i for i, r in enumerate(rows) if r[6] is None]
         for start in range(0, len(need), 64):
             batch = need[start : start + 64]
             vecs = await self.embedder.embed([rows[i][4] for i in batch])
             for i, v in zip(batch, vecs):
                 rows[i][6] = v
-        mat = _normalize(np.array([r[6] for r in rows], dtype=np.float32))
+        mat = await asyncio.to_thread(_rows_matrix, rows)
 
         async with self.lock.write():
             # off the event loop: the FTS triggers tokenize every row (expensive with
-            # trigram). Batch atomicity relies on job replay + idempotent upserts, not
-            # on one transaction, so an interleaved commit (e.g. enqueue) is harmless.
-            ids, fresh = await asyncio.to_thread(self._upsert_rows, rows, mat)
+            # trigram). The upsert is one transaction that rolls back on any failure and
+            # touches neither the index nor indexed_counts before it commits, so a
+            # failed job leaves the collection as it was. The rows it replaced leave the
+            # index only after that commit.
+            ids, fresh, replaced = await asyncio.to_thread(self._upsert_rows, rows, mat)
+            if replaced:
+                await asyncio.to_thread(self._unindex, replaced)
             idarr = np.array(ids, dtype=np.uint64)
             # while the reservoir is armed, add in threshold-sized slices so even one
             # bulk job calibrates AT the threshold (calibrating after a large
@@ -1120,43 +1141,79 @@ class Collection:
             return np.vstack(self._cal_reservoir)  # caller disarms after calibrate succeeds
         return None
 
-    def _upsert_rows(self, rows: list, mat: np.ndarray) -> tuple[list[int], list[bool]]:
+    def _upsert_rows(self, rows: list, mat: np.ndarray) -> tuple[list[int], list[bool], list[int]]:
+        """Insert `rows` (_payload_rows' shape) with `mat` as their vectors, replacing
+        any record with the same external_id: one transaction, rolled back on any
+        failure. Returns (ids, fresh, replaced): the new record ids in row order, per
+        row whether its external_id was new, and the replaced records' ids that are in
+        the vector index. The index is not touched here: the caller (holding
+        lock.write()) removes `replaced` with _unindex once this has committed, so a
+        failed upsert is a pure database rollback."""
         # fp16 originals retained on disk (half the f32 size, negligible loss vs the
         # 4-bit codes): the only way to rebuild the index representation later, since
         # turbovec can't enumerate or reconstruct vectors
         vecs16 = mat.astype(np.float16)
-        ids, fresh = [], []
+        # row CPU before db_lock: the lock serializes every write on self.db
+        blobs = [v.tobytes() for v in vecs16]
+        metas = [json.dumps(r[5] or {}) for r in rows]
         with self.db_lock:
-            counts = dict(self.indexed_counts)  # copy-on-write, published below
-            # explicit ids, not lastrowid: records are only inserted here, in the single worker
-            next_id = self.db.execute("SELECT COALESCE(MAX(id),0) FROM records").fetchone()[0] + 1
-            for n, (ext_id, doc_id, rtype, pos, text, meta, _) in enumerate(rows):
-                old = self.db.execute(
-                    "SELECT id, indexed, type FROM records WHERE external_id=?", (ext_id,)
-                ).fetchone()
-                fresh.append(old is None)
-                if old:  # upsert: replace record; makes crash-replay of a job idempotent
-                    if old[1]:
-                        self.index.remove(old[0])
-                        counts[old[2]] -= 1
-                    self.db.execute("DELETE FROM records WHERE id=?", (old[0],))
-                    self.db.execute("DELETE FROM vecs WHERE id=?", (old[0],))
-                self.db.execute(
+            try:
+                # one IN query per 512 rows instead of a point query per row
+                old = {
+                    ext_id: (rid, indexed, rtype)
+                    for ext_id, rid, indexed, rtype in _rows_by_id(
+                        self.db,
+                        "SELECT external_id, id, indexed, type FROM records WHERE external_id IN ({})",
+                        [r[0] for r in rows],
+                    )
+                }
+                # explicit ids, not lastrowid: records are only inserted here, in the single worker
+                first = self.db.execute("SELECT COALESCE(MAX(id),0) FROM records").fetchone()[0] + 1
+                ids = list(range(first, first + len(rows)))
+                # upsert = DELETE then INSERT in one transaction: external_id stays UNIQUE,
+                # and replaying a job after a crash is idempotent
+                gone = [(rid,) for rid, _, _ in old.values()]
+                self.db.executemany("DELETE FROM records WHERE id=?", gone)
+                self.db.executemany("DELETE FROM vecs WHERE id=?", gone)
+                self.db.executemany(
                     "INSERT INTO records(id, external_id, doc_id, type, position, text, metadata, indexed)"
                     " VALUES (?,?,?,?,?,?,?,1)",
-                    (next_id, ext_id, doc_id, rtype, pos, text, json.dumps(meta or {}), ),
+                    [(i, *r[:5], m) for i, r, m in zip(ids, rows, metas)],
                 )
-                self.db.execute(
-                    "INSERT INTO vecs(id, vec) VALUES (?,?)", (next_id, vecs16[n].tobytes())
+                # OR REPLACE: a vecs row already at a new id (past MAX(records.id)) is an
+                # orphan with no record; a plain INSERT would fail this job and, as the
+                # rollback leaves MAX(id) where it was, every later one
+                self.db.executemany(
+                    "INSERT OR REPLACE INTO vecs(id, vec) VALUES (?,?)", list(zip(ids, blobs))
                 )
-                counts[rtype] = counts.get(rtype, 0) + 1
-                ids.append(next_id)
-                next_id += 1
+                self.db.commit()
+            except BaseException:
+                # the transaction is still open after a failed statement: without this,
+                # the next commit on self.db (the worker's own _finish_job('error'))
+                # would persist the half-applied upsert
+                self.db.rollback()
+                raise
+            # published after the commit, still under db_lock: copy-on-write, one rebind
+            # per job, none when the transaction rolled back
+            counts = dict(self.indexed_counts)
+            for _, indexed, rtype in old.values():
+                if indexed:
+                    counts[rtype] -= 1
+            for r in rows:
+                counts[r[2]] = counts.get(r[2], 0) + 1
             self.indexed_counts = counts  # one reference store: readers see old or new
-            self.db.commit()
         self._allow_cache.clear()
         self._df_cache_churn += len(rows)
-        return ids, fresh
+        fresh = [r[0] not in old for r in rows]
+        replaced = [rid for rid, indexed, _ in old.values() if indexed]
+        return ids, fresh, replaced
+
+    def _unindex(self, rids: list[int]) -> None:
+        """Remove records whose rows a committed transaction replaced or deleted from
+        the vector index (the .tvim drops them at the next _sync_index). The caller
+        holds lock.write(), so no search runs meanwhile; db_lock is not needed."""
+        for rid in rids:
+            self.index.remove(rid)
 
     # ---- optional IVF index (attach / detach) ----
 
@@ -1907,20 +1964,26 @@ class Collection:
 
     def _delete_doc_rows(self, doc_id: str) -> int:
         with self.db_lock:
-            rows = self.db.execute(
-                "SELECT id, indexed, type FROM records WHERE doc_id=?", (doc_id,)
-            ).fetchall()
-            counts = dict(self.indexed_counts)  # copy-on-write, as in _upsert_rows
-            for rid, indexed, rtype in rows:
+            try:
+                rows = self.db.execute(
+                    "SELECT id, indexed, type FROM records WHERE doc_id=?", (doc_id,)
+                ).fetchall()
+                self.db.execute(
+                    "DELETE FROM vecs WHERE id IN (SELECT id FROM records WHERE doc_id=?)", (doc_id,)
+                )
+                self.db.execute("DELETE FROM records WHERE doc_id=?", (doc_id,))
+                self.db.commit()
+            except BaseException:
+                self.db.rollback()  # as in _upsert_rows: the next commit must not persist half a delete
+                raise
+            # published after the commit, still under db_lock: copy-on-write, one rebind
+            counts = dict(self.indexed_counts)
+            for _, indexed, rtype in rows:
                 if indexed:
-                    self.index.remove(rid)
                     counts[rtype] -= 1
-            self.db.execute(
-                "DELETE FROM vecs WHERE id IN (SELECT id FROM records WHERE doc_id=?)", (doc_id,)
-            )
-            self.db.execute("DELETE FROM records WHERE doc_id=?", (doc_id,))
             self.indexed_counts = counts
-            self.db.commit()
+        # the rows are gone for good: only now do their ids leave the index
+        self._unindex([rid for rid, indexed, _ in rows if indexed])
         self._allow_cache.clear()
         self._df_cache_churn += len(rows)
         return len(rows)
