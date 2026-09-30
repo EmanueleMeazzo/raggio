@@ -1171,6 +1171,49 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
   - The host's CPython 3.12.14 is a different build from the images' (built 14 August against 24 September): gn100's uv is 0.12.5, the images' is 0.12.20. Both probe arms run on the same host interpreter.
 - **The A/B started at 13:13:08Z**, with a 330-minute cap. Its first rows: flat base at 2,132 vec/s (the warm-up, discarded), then 2,275 vec/s (run 1).
 
+**13:20Z–14:04Z. Plan E is pre-flighted while the D1 A/B runs; the pre-flight finds the plan's prune key backwards, and uv 0.12.21 is readied for `main`.**
+- **The D1 A/B's probes finished at 13:31:07Z**, and the four reingests started. Base run 1 took 30.8 minutes (13:31:07Z–14:01:53Z); candidate run 1 followed. The A/B ends after candidate run 2, around 15:35Z.
+- **Plan E's pre-flight** ran in one workflow while gn100 was busy (13:23Z–13:53Z, 7 Sonnet agents, 1.08M tokens, 0 errors):
+  - two drift scans, one for Tasks 1–6 and one for Tasks 7–10 plus Task 11's repo edits;
+  - a consistency scan against the spec, plans D–G and D1's hand-offs;
+  - a version scan (W-11);
+  - a DGX scan of Task 11;
+  - a replay of Tasks 1–10 on a scratch copy of D1's candidate (2274a6a), in two stages.
+- **What the replay found.**
+  - Every anchor in Tasks 1–10 matched exactly once, except two context lines that the files wrap differently.
+  - Every RED and GREEN step behaved as written, and every suite total matched the plan's P+4 … P+107 (P = 289 in the sandbox).
+  - The Rust crate built cleanly in 14–26 s (rustc 1.98.1, PyO3 0.29.2, maturin 1.15.0).
+  - The image built on x86_64 with a `rust:1.98.1-slim-trixie` builder stage. The in-image check printed "native 15.0.0 15.0.0 glibc need 2.34 have 2.41", and the runtime stage has no Rust toolchain.
+  - `/healthz` reports `bm25: "native"`, or `"python"` with `NATIVE_BM25=0`.
+  - Without the extension, after Task 10, the suite gives P+39 passed and 68 skipped.
+- **The one substantive defect: the prune's df key (section 5.19).**
+  - Plan E's Task 1 switches `_prune_common` to the stage-2 tokenizer (D14). It keys the df cache by each token as it is, with the comment that `_fold` is not idempotent (math bold A → A → a), "so never fold twice".
+  - The drift scan read it the other way: FTS5 lowercases the query's terms, so the key has to be the lowercase term.
+  - Before ruling, the controller reproduced the case in the sandbox: 40 rows `ab filler<i>`, one row `x 1 rare`, a budget floor of 10, and the query `x_1 𝐀𝐁 rare`. Keyed as is, `'AB'` has df 0 against 40 for `'ab'`. So the prune keeps it, and the ranked OR matches 41 rows against a budget of 10. That is the df-0 failure D14 exists to remove (section 5.4).
+- **The ruling (E-R1).** The key becomes `_fold` of each stage-2 token: `keys = [_fold(t) for t in toks]` for both tokenizers.
+  - A second `_fold` changes only the math alphanumerics, which is exactly the case that needs it.
+  - Task 1's third test is replaced by `test_prune_keys_df_by_the_fts5_term`, which pins the tokens, the cache keys, the kept list and a 1-row match.
+  - In the sandbox the prune tests pass (4) and the suite still totals P+107. The plan's version fails only the new test, and the base store fails 3 and passes 1, as Task 1's Step 2 says.
+  - ADR 0004's D14 row will say the cache is keyed "by the term FTS5 matches". The plan file is not edited; the ledger's rulings supersede it.
+- **The other rulings (E-R2 to E-R12)**, in the SDD ledger:
+  - **uv 0.12.21, released 2026-09-29, lands on `main` before E (X7).**
+  - The Collection is constructed in `CollectionManager._construct()` since plan C, so Task 6 edits it there, not in `touch()`.
+  - Every edit goes in by anchor with the Edit tool, never a raw patch onto the CRLF working files.
+  - The CI test slices out the native job alone, so that G's later free-threaded job cannot satisfy its pin.
+  - ADR 0003's addendum names the `\w+` prune as the cause of its p99 tail.
+  - ADR 0004 says the D14 prune is not behind `NATIVE_BM25`, names `_expand` as the prune's second caller, and says `bench/text_probe.py` keeps the pre-D14 prune.
+  - ADR 0004 is dated on the day Task 10 commits.
+  - The probe fixture uses `monkeypatch.syspath_prepend`.
+  - Task 2 records the installed wheel's layout, for plan G.
+  - The CI fallback that installs rustup with `curl … | sh` stays, and is flagged (section 9.5).
+- **Nine rulings for Task 11 (gn100).** Deploys wait on a wider guard that covers every bench and probe script. The arms script stops `bench-tv` on exit. The host venv is re-synced after the last deploy. A one-query flip of the text-hit gate is reported, never tuned.
+- **uv 0.12.21, readied (X7).**
+  - The workstation's uv self-updated from 0.12.20 to 0.12.21.
+  - Branch `uv-0.12.21`, from `main` at cd3cbf2, changes the Dockerfile's `ARG UV_VERSION` and the CI's setup-uv `version` (56e8e6b).
+  - `uv lock --check` passes; `uv.lock` has no `[manifest]` table, so the pin does not reach the lock. `test_packaging` gives 11 passed, and the full suite 261 passed.
+  - A local image build took 38 s. It has CPython 3.12.14 and SQLite 3.53.1, as before, but it is a different CPython build: built 29 September, where 0.12.20's is from 24 September. turbovec is 1.0.0.
+  - It lands on `main` after D1's merge, so that every Task 11 arm of plan E shares one uv and one CPython build.
+
 ## 3. Decision register
 
 ID prefixes:
@@ -1228,6 +1271,7 @@ ID prefixes:
 | X4 | 2026-09-28 ~21:21Z | For R-G7, plan A's `bench/dgx/lib.sh` gets `CONCURRENCY` (env, default 8), passed to every `bench.py` run as `--concurrency`. Plan G sets it to 16 for its c=16 sessions. Fixed in spec §4.2. | Let G override `bench_run` in its own scripts; it would duplicate A's run logic and drift from it. | Plan A's `bench_run` passes no `--concurrency`. | Orchestrator | spec §4.2 | Planned (plan A Task 5, 22:36Z) |
 | X5 | 2026-09-28 ~21:42Z | Spec §7 B: B's gn100 re-run needs 0 failures only in the classes B owns: R1 in the mixed phase, 500s and dropped connections on searches racing `DELETE`, and R4. An R2 stale read, if seen, is recorded for F and does not fail B. | Fail B on any `post` failure, R2 included. B's tasks do not touch R2, so B could fail on a race that only F can fix. | Plan B Task 8 required `stale_ids=0` (R2) on `post`. Spec §2 row 6 gives R2/R2b to F, and plan B already lists `_allow_cache` as F's. | Orchestrator | spec §7 B | Planned (plan B Task 8, 22:36Z) |
 | X6 | 2026-09-30, about 13:10Z | No mmap threshold ships. Plan C's `MALLOC_TRIM_THRESHOLD_` (D13) stays as it is. The IVF filtered-search regression it causes in restarted containers (section 5.18) is left to plan F's Task 2. Its `_intersect` binary-searches the smaller side into the larger, so the per-shard temporaries shrink from about 2 MB to shard size (about 64 KB), under glibc's 128 KiB threshold. Plan F's A/B shows the recovery; its F3 gate (filtered p50 ≤ 10 ms) is absolute. | Ship `MALLOC_MMAP_THRESHOLD_=1048576` now: it passes C7 at +3 MB, but wins back only 8.3 of about 13 ms, and E's and F's A/Bs would carry it as one more variable, to drop or re-measure after F. Ship 4 MiB: full recovery at +13 MB, but 49 MiB over C7's VmHWM cap. 16 or 32 MiB: killed in the swapless build. Measure 2 MiB: more gn100 time for a value between a partial fix and a failing one, which plan F makes moot. | Sections 4.12–4.14. | Controller (W-14: the recommended option) | Section 2, 12:20Z | In force |
+| X7 | 2026-09-30, about 13:58Z | uv 0.12.21 (released 2026-09-29) lands on `main` as its own commit, after D1's merge and before plan E's branch: the Dockerfile's `ARG UV_VERSION` and the CI's setup-uv `version`. E's Task 7 and Task 8 then carry 0.12.21. Plan G's nine 0.12.20 anchors are fixed at G's pre-flight. | Bump inside E (its Task 11 arms would straddle two uv versions and possibly two CPython builds, and Task 11 needs Task 1 to be E's first commit). Keep 0.12.20 until a later plan (W-11 asks for the latest). | E's version scan. The 0.12.21 image has the same CPython 3.12.14 and SQLite 3.53.1 as 0.12.20's, but a CPython built 29 September, not 24 September. Suite 261 passed on the bump branch. | Controller (W-11, W-14) | Section 2, 13:20Z | Committed on `uv-0.12.21` (56e8e6b); lands after D1 |
 | W-1 | 2026-09-27 23:27Z | "Answer, don't act": a question such as "is it OK to X?" gets an answer and an offer, never an unrequested action. | None. | The gn100 restart incident (section 7). | Maintainer (correction) | Transcript | Standing rule |
 | W-2 | 2026-09-27 23:09Z to 2026-09-28 01:11Z | Offload work to gn100 "when it makes sense". First baseline: "not more than 65m". Later: "no limits" for this program while the PC stays on. The spec keeps a rule that DGX runs over about 5 minutes need a go-ahead with a time cap. | None. | None. | Maintainer | Transcript; spec §6 | Standing |
 | W-3 | 2026-09-28 18:45Z | Every question to the maintainer goes through the structured question tool. | None. | None. | Maintainer | Transcript | Standing |
@@ -1874,6 +1918,10 @@ Dated note, 2026-09-30 00:28Z: confirmed. The first Actions run on `main` (00c70
 
 Plan C set `MALLOC_TRIM_THRESHOLD_` (D13) so that glibc gives freed heap back and a swapless 4 GiB IVF build is not OOM-killed (section 5.6). glibc treats that variable as a request to stop adjusting the mmap threshold, which stays at 128 KiB. A container that loaded its index from disk then got each filtered query's large temporaries as fresh `mmap`s. Filtered p50 went from 36 to 49 ms, but only in restarted containers, which is why a-ref2's built-index runs looked normal (sections 4.10 and 4.12). No gate caught it at merge time, because plan C's acceptance run measured memory, not search. A fixed mmap threshold brings the latency back and keeps the knob, at a cost of about 110 MB of RSS at 32 MiB. But at 32 MiB, the swapless 4 GiB build is OOM-killed again (section 4.13), so the fix is not that simple. The threshold has to clear the query's temporaries without keeping the build's large blocks in the heap. sweep1 and mem2 (section 4.14) found no such threshold. 1 MiB passes C7 but wins back only 8.3 of about 13 ms. 4 MiB wins it all back but peaks 49 MiB over C7's cap, and 16 MiB is killed like 32 MiB. No threshold ships (X6). Plan F's `_intersect` rewrite shrinks the temporaries below the knob's 128 KiB threshold instead.
 
+### 5.19 The plan's reason for the prune key pointed the wrong way
+
+Plan E's Task 1 keyed the prune's df cache by each stage-2 token as it is, because `_fold` is not idempotent: math bold A folds to A, and A folds again to a. The fact is right, but it argues for the second fold. FTS5 lowercases the query's terms, so for `𝐀𝐁` it matches `ab`. A df looked up for `AB` is 0, so the prune keeps the token whatever the df of `ab`. That is the failure D14 was written to remove (section 5.4), brought back by the fix. The pre-flight's drift scan caught it by reading the code against FTS5's behaviour. The controller reproduced it in a sandbox before ruling: `AB` at df 0 against 40, and a ranked OR over 41 rows against a budget of 10 (section 2, 13:20Z; ruling E-R1). Every step of the plan had been replayed green before that, because none of its tests used a character whose fold changes twice.
+
 ## 6. Method: how we measured
 
 Spec §6 sets one protocol for every plan. Each rule below gives the reason the sources record, or says "reason not recorded".
@@ -2052,6 +2100,7 @@ State as of 2026-09-28, about 19:30Z.
 - Dated note, 2026-09-30 12:10Z: plan D1's Tasks 1–5 are approved, and ADR 0001 has its D1 addendum (24bcc90, 288 passed; section 2, 11:25Z). The final whole-branch review on Opus runs before Task 6's gn100 A/B, so any fix lands before the A/B pins its candidate. mtt2 traced the IVF filtered regression to the malloc knob (section 4.12). `mem1` (C7 for a fixed 32 MiB mmap threshold) and `sweep1` (the threshold sweep) are running on gn100; the D1 A/B follows them.
 - Dated note, 2026-09-30 12:20Z: the final review's I1 (a cancelled delete could hand its ids to the next upsert) is fixed at e6e1e44, the wording fixes are at 2274a6a, and the re-review approved both (289 passed). The A/B's scripts are at revision 2. D1's candidate is 2274a6a0d60d. mem1 ruled out a 32 MiB mmap threshold, which is OOM-killed in the swapless build (section 4.13). `sweep1`, then `mem2` (C7 for 1, 4 and 16 MiB), then the D1 A/B run on gn100.
 - Dated note, 2026-09-30 13:20Z: sweep1 and mem2 are done (section 4.14). No mmap threshold ships; plan F's `_intersect` rewrite carries the filtered-search recovery (X6). D1's gn100 A/B is running (13:13:08Z, cap 330 minutes): candidate 2274a6a0d60d against base cd3cbf2266ab, with the reingests.
+- Dated note, 2026-09-30 14:04Z: plan E's pre-flight is done and ruled (section 2, 13:20Z), including a fix to the plan's prune key (E-R1, section 5.19). uv 0.12.21 is committed on `uv-0.12.21` and lands on `main` after D1's merge (X7). D1's A/B is in its reingests on gn100.
 
 ### 9.2 Open questions in the plans
 
@@ -2098,6 +2147,8 @@ State as of 2026-09-28, about 19:30Z.
   - optionally, `Embedder` failing fast on errors that cannot succeed, which would cut the ~7 s a racing search waits for its 404;
   - optionally, writes and unlocked reads that race `DELETE` and still answer 500 (the ADR's Deferred row).
 - **Sample sizes.** In p1 many figures are n=1 (every memory variant, the cold IVF build, first-search cold starts, cold list timings); the baseline server cold start is n=2. p1 evicted only the data directories; image layers and Python stayed host-cached. In p3, in-process run-to-run spread is about 10 %; the server client shared host CPUs with the OpenBLAS spinners in default-BLAS configs; one synthetic probe was OOM-killed at 4 GiB and rerun uncapped (all real-data and server runs were capped).
+- **Stage 2's IDF for math alphanumerics** (found in E's pre-flight, 2026-09-30). Stage 2 looks up each query token's df as it is (`self._df(t)`), and D10's parity tests pin that. So a token such as `AB` (from `𝐀𝐁`) gets df 0 in stage 2, the largest IDF, whatever the df of `ab`. It predates plan E, both scorers share it, and E's ruling E-R1 fixes only the prune's key.
+- **An unpinned `curl … | sh` in CI** (plan E's native job, found in E's pre-flight). The job installs rustup from `sh.rustup.rs` when the runner has none. Plan A's pinning test covers `uses:` actions only. The fallback stays as the plan wrote it. It is flagged for the PR, and it can go once a CI run shows rustup on both runners.
 
 ## 10. Source index
 
