@@ -145,9 +145,12 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
 
     @app.get("/collections/{name}")
     async def collection_info(c=Depends(get_collection)):
+        # off the loop: the GROUP BY and COUNT(DISTINCT doc_id) walk every record
+        # (the covering index since plan C: about 96 MB read cold at 2.55M rows, p1)
+        stats = await asyncio.to_thread(c.stats)
         return {"name": c.cfg.name, "dim": c.cfg.dim, "bit_width": c.cfg.bit_width,
                 "model": c.cfg.model, "tokenizer": c.cfg.tokenizer,
-                "index": c.index_info(), **c.stats()}
+                "index": c.index_info(), **stats}
 
     # ---- optional IVF index: an additional object, added/removed per collection ----
 

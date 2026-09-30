@@ -529,3 +529,99 @@ def test_resident_touch_does_not_wait_for_another_collections_delete(tmp_path, m
         return locked, again is x, "y" in m.resident
 
     assert asyncio.run(run()) == (True, True, False)
+
+
+# ---- Task 5: records scans on request paths stay off the loop (§5.2) ----
+
+
+def _off_loop() -> bool:
+    """True inside an asyncio.to_thread worker: no running loop in this thread."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return True
+    return False
+
+
+def api_app(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROOT_API_KEY", "root-key")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
+    return create_app(embedder_factory=lambda cfg: FakeEmbedder())
+
+
+async def wait_job(c, name, job_id):
+    for _ in range(500):
+        r = await c.get(f"/collections/{name}/jobs/{job_id}", headers=ROOT)
+        if r.json()["status"] in ("done", "error"):
+            return r.json()
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"job {job_id} never finished")
+
+
+def api_docs(n):
+    return [
+        {"doc_id": f"d{i}", "chunks": [{
+            "id": f"c{i}", "text": f"chunk {i}", "vector": rowvec(i),
+            "metadata": {"src": "wiki" if i % 2 else "arxiv", "year": 2000 + i},
+        }]}
+        for i in range(n)
+    ]
+
+
+def test_collection_info_runs_stats_off_the_loop(tmp_path, monkeypatch):
+    where, real = [], store.Collection.stats
+
+    def spy(self):
+        where.append(_off_loop())
+        return real(self)
+
+    monkeypatch.setattr(store.Collection, "stats", spy)
+    app = api_app(tmp_path, monkeypatch)
+
+    async def run():
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+                await c.post("/collections", headers=ROOT, json={"name": "x"})
+                r = await c.post("/collections/x/documents", headers=ROOT,
+                                 json={"documents": api_docs(1)})
+                assert (await wait_job(c, "x", r.json()["job_id"]))["status"] == "done"
+                return (await c.get("/collections/x", headers=ROOT)).json()
+
+    info = asyncio.run(run())
+    assert where == [True]
+    assert (info["documents"], info["chunks"], info["summaries"], info["pending_jobs"]) == (1, 1, 0, 0)
+    assert info["name"] == "x" and info["index"] == {"type": "flat"}
+
+
+def test_request_paths_that_scan_records_run_off_the_loop(tmp_path, monkeypatch):
+    # §5.2 audit: filtered/sorted listings and filtered allowlists take 43-54 s cold at
+    # 4 GiB, so every request-path _filter_sql caller must run in a worker thread
+    where, real = [], store._filter_sql
+
+    def spy(scope, filt):
+        where.append(_off_loop())
+        return real(scope, filt)
+
+    monkeypatch.setattr(store, "_filter_sql", spy)
+    app = api_app(tmp_path, monkeypatch)
+
+    async def run():
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+                await c.post("/collections", headers=ROOT, json={"name": "x"})
+                r = await c.post("/collections/x/documents", headers=ROOT,
+                                 json={"documents": api_docs(6)})
+                assert (await wait_job(c, "x", r.json()["job_id"]))["status"] == "done"
+                listing = await c.get("/collections/x/documents", headers=ROOT, params={
+                    "scope": "chunks", "filter": '{"src": "wiki"}', "sort": "-year"})
+                vector = await c.post("/collections/x/search", headers=ROOT, json={
+                    "query": {"vector": rowvec(1)}, "filter": {"src": "wiki"}, "k": 3})
+                text = await c.post("/collections/x/search", headers=ROOT, json={
+                    "query": {"text": "chunk"}, "mode": "text", "filter": {"src": "wiki"}, "k": 3})
+                return [r.status_code for r in (listing, vector, text)]
+
+    assert asyncio.run(run()) == [200, 200, 200]
+    assert len(where) >= 3 and all(where), where
