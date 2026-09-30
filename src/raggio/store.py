@@ -1,11 +1,15 @@
 import asyncio
+import ctypes
 import hashlib
+import itertools
 import json
+import logging
 import math
 import os
 import re
 import shutil
 import sqlite3
+import sys
 import threading
 import time
 import unicodedata
@@ -77,6 +81,26 @@ IVF_MIN_ROWS = 1024  # k-means needs a training corpus; below this, attach is re
 IVF_TRAIN_SAMPLE = 65_536
 IVF_BUILD_BLOCK = 16_384  # rows per streamed rebuild block (~100 MB f32 at 1536-d)
 
+# one-time meta.db index migration (D9): heartbeat cadence of the progress log, and
+# how many SQLite VM instructions run between progress-handler checks
+MIGRATION_LOG_EVERY_S = 10.0
+MIGRATION_PROGRESS_OPS = 1_000_000
+
+# _vec_sample (k-means training / calibration sample): ids are MAX+1-allocated, so
+# random rowids hit live rows at rate n/max_id. Point-read those while that rate is at
+# least VEC_SAMPLE_MIN_DENSITY; mass deletes below it fall back to ORDER BY RANDOM()
+VEC_SAMPLE_MIN_DENSITY = 0.2
+VEC_SAMPLE_ROUNDS = 8
+
+# attach headroom (D13): the summed transient terms under-reserve. p1 measured 2176-2186
+# MiB of growth at 2.55M x 1024-d 4-bit (nlist 256) against 1757 MiB summed; x1.25
+# covers it. The guard stays conservative; the swapless DGX run is the gate (§5.4)
+ATTACH_NEED_FACTOR = 1.25
+
+# uvicorn configures this logger with its stderr handler, so these lines reach
+# `podman logs`; under pytest the records propagate to the root logger (caplog)
+_log = logging.getLogger("uvicorn.error")
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -106,6 +130,33 @@ def _require_headroom(need: int, what: str) -> None:
             f"{what} needs ~{(need + 128 * 1024 * 1024) >> 20} MB free memory,"
             f" container has ~{max(free, 0) >> 20} MB — raise the memory limit and retry"
         )
+
+
+def _attach_need(n: int, dim: int, bit_width: int, nlist: int) -> int:
+    """Bytes an IVF build adds on top of the loaded collection: a second copy of the
+    codes, the f32 k-means sample, ~1 MB fixed per shard, scaled to the measured
+    growth by ATTACH_NEED_FACTOR."""
+    return int(
+        (n * dim * bit_width // 8 + min(n, IVF_TRAIN_SAMPLE) * dim * 4 + nlist * (1 << 20))
+        * ATTACH_NEED_FACTOR
+    )
+
+
+def _malloc_trim() -> bool:
+    """Hand freed heap back to the OS after an index job (D13). A build frees GBs of
+    transient buffers (the second code copy, the f32 sample, streamed blocks), and
+    glibc keeps them in its arenas, so without this the container's RSS stays at the
+    build's peak until restart. glibc-only: a no-op returning False on Windows, macOS
+    and musl."""
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        trim = ctypes.CDLL("libc.so.6").malloc_trim
+    except (OSError, AttributeError):
+        return False
+    trim.argtypes = [ctypes.c_size_t]
+    trim.restype = ctypes.c_int
+    return bool(trim(0))
 
 
 def _retry_fs(fn) -> None:
@@ -170,6 +221,18 @@ def _rows_by_id(db, sql: str, ids: list[int]):
     for s in range(0, len(ids), 512):
         chunk = ids[s : s + 512]
         yield from db.execute(sql.format(",".join("?" * len(chunk))), chunk)
+
+
+def _live_ids(db) -> np.ndarray:
+    """Every indexed record id as a uint64 array. The planner answers this from the
+    covering idx_records_doc_type (pinned in tests), never the text-heavy records
+    pages. The order is the index's (doc_id, type, id), not id order;
+    np.setdiff1d(assume_unique=True) needs no sort, and both sides must be uint64 (an
+    int64/uint64 mix promotes to float64 and loses ids above 2**53)."""
+    return np.fromiter(
+        itertools.chain.from_iterable(db.execute("SELECT id FROM records WHERE indexed=1")),
+        dtype=np.uint64,
+    )
 
 
 def _fold(token: str) -> str:
@@ -302,7 +365,6 @@ def open_meta_db(path: Path, tokenizer: str = "unicode61") -> sqlite3.Connection
             id INTEGER PRIMARY KEY,
             vec BLOB
         );
-        CREATE INDEX IF NOT EXISTS idx_records_doc ON records(doc_id);
         CREATE TABLE IF NOT EXISTS jobs(
             id INTEGER PRIMARY KEY,
             payload TEXT,
@@ -313,11 +375,60 @@ def open_meta_db(path: Path, tokenizer: str = "unicode61") -> sqlite3.Connection
         );
         """
     )
+    _ensure_indexes(db, str(path))
     _ensure_fts(db, tokenizer)
     # doc-frequency lookups for query-token pruning; references records_fts by name so
     # it survives an _ensure_fts rebuild
     db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS records_fts_v USING fts5vocab(records_fts, 'row')")
     return db
+
+
+def _ensure_indexes(db: sqlite3.Connection, label: str) -> None:
+    """Secondary indexes, plus the one-time migration from the pre-2026-09 layout (D9).
+    idx_records_doc_type covers every doc_id/type/indexed scan (cold start's per-type
+    counts and live-id set, stats(), the per-document lookups) without reading the
+    records table's text pages, and replaces idx_records_doc, whose (doc_id) prefix it
+    contains. Build first, drop second: a kill in between leaves both, and the next
+    open drops the old one. idx_jobs_open is partial, so the open-job lookups stop
+    scanning the whole job journal. Runs inside Collection() construction, which is
+    off the event loop (CollectionManager._construct)."""
+    have = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+    if "idx_records_doc_type" not in have:
+        rows = db.execute("SELECT MAX(rowid) FROM records").fetchone()[0]
+        t0 = last = time.monotonic()
+        if rows:
+            _log.info(
+                "meta.db %s: one-time migration, building idx_records_doc_type over"
+                " ~%d records (~20 s per 1M rows cold)", label, rows,
+            )
+
+            def beat() -> int:
+                nonlocal last
+                now = time.monotonic()
+                if now - last >= MIGRATION_LOG_EVERY_S:
+                    last = now
+                    _log.info(
+                        "meta.db %s: still building idx_records_doc_type (%.0f s)", label, now - t0
+                    )
+                return 0  # non-zero would abort the CREATE INDEX
+
+            db.set_progress_handler(beat, MIGRATION_PROGRESS_OPS)
+        try:
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_records_doc_type ON records(doc_id, type, indexed)"
+            )
+        finally:
+            db.set_progress_handler(None, 0)
+        if rows:
+            _log.info(
+                "meta.db %s: built idx_records_doc_type in %.1f s", label, time.monotonic() - t0
+            )
+    if "idx_records_doc" in have:
+        db.execute("DROP INDEX idx_records_doc")
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_jobs_open ON jobs(id)"
+        " WHERE status IN ('pending','processing')"
+    )
 
 
 def _ensure_fts(db: sqlite3.Connection, tokenizer: str) -> None:
@@ -654,11 +765,14 @@ class Collection:
             probe = np.zeros((1, self.cfg.dim), dtype=np.float32)
             probe[0, 0] = 1.0
             all_ids = self.index.search(probe, k=len(self.index))[1][0]  # every id
-        live = {r[0] for r in self.db.execute("SELECT id FROM records WHERE indexed=1")}
-        ghosts = [int(i) for i in all_ids if int(i) not in live]
-        for g in ghosts:
-            self.index.remove(g)
-        if ghosts:
+        # numpy set difference: a 2.55M-entry Python set plus a per-id membership loop
+        # cost seconds on every cold start (brief 2b; the SQL scan is covering, Task 1)
+        ghosts = np.setdiff1d(
+            np.asarray(all_ids, dtype=np.uint64), _live_ids(self.db), assume_unique=True
+        )
+        for g in ghosts:  # evict only: a record the index lacks is never re-added (§4.3)
+            self.index.remove(int(g))
+        if len(ghosts):
             self._sync_index()
 
     # ---- worker / ingest queue ----
@@ -772,11 +886,14 @@ class Collection:
 
     async def _process_job(self, payload: dict) -> None:
         op = payload.get("op")
-        if op == "attach_index":
-            await self._attach_index(payload)
-            return
-        if op == "detach_index":
-            await self._detach_index()
+        if op in ("attach_index", "detach_index"):
+            try:
+                if op == "attach_index":
+                    await self._attach_index(payload)
+                else:
+                    await self._detach_index()
+            finally:
+                await asyncio.to_thread(_malloc_trim)  # D13: failed builds free memory too
             return
         # flatten documents into records: (external_id, doc_id, type, position, text, metadata, vector)
         rows = []
@@ -940,7 +1057,35 @@ class Collection:
             )
 
     def _vec_sample(self, k: int) -> np.ndarray:
-        rows = self._rdb().execute(
+        """Up to k distinct, uniformly random retained vectors of indexed records.
+        ORDER BY RANDOM() reads and sorts every vecs page (p1: 152 s cold at 2.55M rows),
+        so while ids are dense, draw random rowids and point-read only those. Every
+        live id is equally likely to be drawn, so the pick stays uniform. Too sparse,
+        k above n/2, or too few hits after VEC_SAMPLE_ROUNDS falls back to the scan."""
+        db = self._rdb()
+        n = sum(self.indexed_counts.values())
+        max_id = db.execute("SELECT MAX(id) FROM records").fetchone()[0] or 0
+        if n and max_id and n / max_id >= VEC_SAMPLE_MIN_DENSITY and 2 * k <= n:
+            rng = np.random.default_rng()
+            got: dict[int, bytes] = {}
+            tried = np.empty(0, dtype=np.int64)
+            for _ in range(VEC_SAMPLE_ROUNDS):
+                draws = rng.integers(1, max_id + 1, size=int((k - len(got)) * max_id / n * 1.3) + 64)
+                cand = np.setdiff1d(draws, tried)
+                tried = np.union1d(tried, cand)
+                got.update(_rows_by_id(
+                    db,
+                    "SELECT v.id, v.vec FROM vecs v JOIN records r ON r.id=v.id"
+                    " WHERE r.indexed=1 AND v.id IN ({})",
+                    cand.tolist(),
+                ))
+                if len(got) >= k:
+                    keys = list(got)
+                    pick = rng.choice(len(keys), k, replace=False)
+                    blob = b"".join(got[keys[i]] for i in pick)
+                    mat = np.frombuffer(blob, dtype=np.float16)
+                    return mat.reshape(k, self.cfg.dim).astype(np.float32)
+        rows = db.execute(
             "SELECT v.vec FROM vecs v JOIN records r ON r.id=v.id WHERE r.indexed=1"
             " ORDER BY RANDOM() LIMIT ?", (k,),
         ).fetchall()
@@ -949,39 +1094,67 @@ class Collection:
         mat = np.frombuffer(b"".join(r[0] for r in rows), dtype=np.float16)
         return mat.reshape(len(rows), -1).astype(np.float32)
 
-    async def _backfill_vecs(self) -> None:
+    async def _backfill_vecs(self, ids: np.ndarray | None = None, add=None) -> int:
         """Records ingested before vector retention lack the fp16 original a rebuild
         needs. Re-embed from text where possible (assumes the collection's configured
         embedding model produced the stored vectors); otherwise fail the job with a
-        count so the caller knows to re-ingest."""
-        rows = await asyncio.to_thread(
-            lambda: self._rdb().execute(
-                "SELECT r.id, r.text FROM records r LEFT JOIN vecs v ON v.id=r.id"
-                " WHERE r.indexed=1 AND v.id IS NULL"
-            ).fetchall()
-        )
+        count so the caller knows to re-ingest.
+
+        ids=None finds them with the records x vecs anti-join, a full records scan
+        (p1: minutes cold at 2.55M rows) that attach only runs when too few retained
+        vectors exist to train on. Otherwise `ids` are the rows the attach stream
+        skipped, point-read by id. add(ids, f32 matrix) receives each written batch on
+        a worker thread, so the caller never holds them all. Returns rows written."""
+        if ids is None:
+            rows = await asyncio.to_thread(
+                lambda: self._rdb().execute(
+                    "SELECT r.id, r.text FROM records r LEFT JOIN vecs v ON v.id=r.id"
+                    " WHERE r.indexed=1 AND v.id IS NULL"
+                ).fetchall()
+            )
+        else:
+            rows = await asyncio.to_thread(
+                lambda: list(_rows_by_id(
+                    self._rdb(), "SELECT id, text FROM records WHERE indexed=1 AND id IN ({})",
+                    ids.tolist(),
+                ))
+            )
         if not rows:
-            return
+            return 0
         no_text = sum(1 for _, t in rows if not t)
         if no_text:
             raise ValueError(
                 f"{no_text} records have neither a retained vector nor text;"
                 " re-ingest them before attaching an index"
             )
+        written = 0
         for s in range(0, len(rows), 64):
             batch = rows[s : s + 64]
             vecs = await self.embedder.embed([t for _, t in batch])
             vecs16 = _normalize(np.array(vecs, dtype=np.float32)).astype(np.float16)
 
             def write():
+                # A DELETE can land while the batch is embedded; an orphan vecs row would
+                # collide with the next ingest's MAX(id)+1, so write only live records.
                 with self.db_lock:
+                    n = 0
                     for (rid, _), v in zip(batch, vecs16):
-                        self.db.execute(
-                            "INSERT OR REPLACE INTO vecs(id, vec) VALUES (?,?)", (rid, v.tobytes())
-                        )
+                        n += self.db.execute(
+                            "INSERT OR REPLACE INTO vecs(id, vec) SELECT ?, ?"
+                            " WHERE EXISTS (SELECT 1 FROM records WHERE id=? AND indexed=1)",
+                            (rid, v.tobytes(), rid),
+                        ).rowcount
                     self.db.commit()
+                    return n
 
-            await asyncio.to_thread(write)
+            written += await asyncio.to_thread(write)
+            if add is not None:
+                await asyncio.to_thread(
+                    add,
+                    np.array([rid for rid, _ in batch], dtype=np.uint64),
+                    vecs16.astype(np.float32),  # the fp16 round trip a stream would read
+                )
+        return written
 
     async def _attach_index(self, payload: dict) -> None:
         """Build IVF shards from retained vectors and swap them in. The build runs
@@ -993,39 +1166,68 @@ class Collection:
             self.index.nprobe = int(nprobe_req)  # retune the default, no rebuild
             self._save_index_config({"nlist": self.index.nlist, "nprobe": self.index.nprobe})
             return
-        await self._backfill_vecs()
+        t0 = time.monotonic()
+        # guard first (D13): validate and refuse before any SQL, so a full container
+        # fails in milliseconds instead of after minutes of cold pre-work. n comes from
+        # the in-memory per-type counts, which equal COUNT(*) WHERE indexed=1
+        n = sum(self.indexed_counts.values())
+        if n < IVF_MIN_ROWS:
+            raise ValueError(f"index needs at least {IVF_MIN_ROWS} indexed records, have {n}")
+        nlist = nlist_req or _ivf_auto_nlist(n)
+        if n < 8 * nlist:
+            raise ValueError(f"nlist={nlist} too large for {n} records (need >=8 rows per shard)")
+        _require_headroom(_attach_need(n, self.cfg.dim, self.cfg.bit_width, nlist), "index build")
+        t1 = time.monotonic()
+        # no records x vecs anti-join before the build (p1: 178 s cold with the COUNT):
+        # rows without a retained vector are found from the stream below. A short sample
+        # means retained vectors are scarce (ingested before retention): backfill them all
+        # first, as before plan C, so k-means trains on a full sample
+        sample = await asyncio.to_thread(self._vec_sample, IVF_TRAIN_SAMPLE)
+        legacy = 0
+        if len(sample) < min(n, IVF_TRAIN_SAMPLE):
+            legacy = await self._backfill_vecs()
+            sample = await asyncio.to_thread(self._vec_sample, IVF_TRAIN_SAMPLE)
+        t2 = time.monotonic()
 
         def build():
-            n = self._rdb().execute("SELECT COUNT(*) FROM records WHERE indexed=1").fetchone()[0]
-            if n < IVF_MIN_ROWS:
-                raise ValueError(f"index needs at least {IVF_MIN_ROWS} indexed records, have {n}")
-            nlist = nlist_req or _ivf_auto_nlist(n)
-            if n < 8 * nlist:
-                raise ValueError(f"nlist={nlist} too large for {n} records (need >=8 rows per shard)")
-            _require_headroom(
-                n * self.cfg.dim * self.cfg.bit_width // 8  # second copy of the codes
-                + min(n, IVF_TRAIN_SAMPLE) * self.cfg.dim * 4  # f32 k-means sample
-                + nlist * (1 << 20),  # per-shard fixed overhead
-                "index build",
-            )
+            nonlocal sample
+            tb = time.monotonic()
             ivf = _IvfIndex.train(
-                self._vec_sample(IVF_TRAIN_SAMPLE), nlist, self.cfg.dim, self.cfg.bit_width,
+                sample, nlist, self.cfg.dim, self.cfg.bit_width,
                 int(nprobe_req or IVF_DEFAULT_NPROBE),
             )
-            seen = []
+            sample = None  # free the f32 sample before the stream, as before plan C
+            seen = [np.empty(0, dtype=np.uint64)]
             for ids, mat in self._iter_vec_blocks():
                 ivf.add_with_ids(mat, ids)
                 seen.append(ids)
-            return ivf, set(map(int, np.concatenate(seen)))
+            seen = np.concatenate(seen)
+            tl = time.monotonic()
+            # the indexed rows the stream skipped are exactly those without a retained
+            # vector (this worker is the only adder); the live ids come from the covering
+            # index, never the records pages
+            missing = np.setdiff1d(_live_ids(self._rdb()), seen, assume_unique=True)
+            return ivf, seen, missing, tl - tb, time.monotonic() - tl
 
-        ivf, seen = await asyncio.to_thread(build)
+        ivf, seen, missing, build_s, live_s = await asyncio.to_thread(build)
+        t3 = time.monotonic()
+        if len(missing):
+            parts = [seen]
+
+            def add(ids, mat):  # each re-embedded batch goes straight into the new index
+                ivf.add_with_ids(mat, ids)
+                parts.append(ids)
+
+            await self._backfill_vecs(missing, add)
+            seen = np.concatenate(parts)  # the swap diff covers them too
+        t4 = time.monotonic()
         tmp = self.dir / "ivf.tmp"
         async with self.lock.write():
 
             def swap():
-                live = {r[0] for r in self._rdb().execute("SELECT id FROM records WHERE indexed=1")}
-                for gone in seen - live:  # deleted while the build streamed
-                    ivf.remove(gone)
+                # deleted while the build streamed
+                for gone in np.setdiff1d(seen, _live_ids(self._rdb()), assume_unique=True):
+                    ivf.remove(int(gone))
                 if tmp.exists():
                     shutil.rmtree(tmp)
                 ivf.sync(tmp)
@@ -1043,6 +1245,13 @@ class Collection:
             self.index = ivf
             self._cal_reservoir = None  # shards were calibrated at train time
             self.index_path.unlink(missing_ok=True)  # flat file is stale from here on
+        t5 = time.monotonic()
+        _log.info(
+            "attach_index %s: n=%d nlist=%d prework=%.2fs sample=%.2fs legacy_backfill=%d"
+            " build=%.2fs live_scan=%.2fs backfill=%d rows %.2fs swap=%.2fs total=%.2fs",
+            self.cfg.name, n, nlist, t1 - t0, t2 - t1, legacy, build_s, live_s,
+            len(missing), t4 - t3, t5 - t4, t5 - t0,
+        )
 
     async def _detach_index(self) -> None:
         """Rebuild the flat index from retained vectors and drop the shards."""
@@ -1052,37 +1261,36 @@ class Collection:
             if self.ivf_dir.exists():
                 await asyncio.to_thread(shutil.rmtree, self.ivf_dir, True)
             return
-        missing = await asyncio.to_thread(
-            lambda: self._rdb().execute(
-                "SELECT COUNT(*) FROM records r LEFT JOIN vecs v ON v.id=r.id"
-                " WHERE r.indexed=1 AND v.id IS NULL"
-            ).fetchone()[0]
+        # guard first (D13): a refusal costs no SQL
+        _require_headroom(
+            len(self.index) * self.cfg.dim * self.cfg.bit_width // 8, "index removal"
         )
-        if missing:
-            raise ValueError(f"{missing} records lack a retained vector; re-ingest them first")
 
         def build():
-            _require_headroom(
-                len(self.index) * self.cfg.dim * self.cfg.bit_width // 8, "index removal"
-            )
             flat = IdMapIndex(dim=self.cfg.dim, bit_width=self.cfg.bit_width)
             sample = self._vec_sample(CAL_SAMPLE)
             if len(sample) >= 64:
                 flat.calibrate(sample)  # calibrate-early holds for rebuilds too
-            seen = []
+            seen = [np.empty(0, dtype=np.uint64)]
             for ids, mat in self._iter_vec_blocks():
                 flat.add_with_ids(mat, ids)
                 seen.append(ids)
-            return flat, set(map(int, np.concatenate(seen))) if seen else set()
+            seen = np.concatenate(seen)
+            # rows the stream skipped have no retained vector. Every attach backfills
+            # them all, so on an IVF collection this only trips if vecs rows were lost;
+            # a stream before the refusal beats an anti-join on every detach
+            missing = len(np.setdiff1d(_live_ids(self._rdb()), seen, assume_unique=True))
+            if missing:
+                raise ValueError(f"{missing} records lack a retained vector; re-ingest them first")
+            return flat, seen
 
         flat, seen = await asyncio.to_thread(build)
         tmp = self.dir / "index.tvim.tmp"
         async with self.lock.write():
 
             def swap():
-                live = {r[0] for r in self._rdb().execute("SELECT id FROM records WHERE indexed=1")}
-                for gone in seen - live:
-                    flat.remove(gone)
+                for gone in np.setdiff1d(seen, _live_ids(self._rdb()), assume_unique=True):
+                    flat.remove(int(gone))
                 tmp.unlink(missing_ok=True)
                 flat.sync(str(tmp))
                 _retry_fs(lambda: os.replace(tmp, self.index_path))
@@ -1576,7 +1784,7 @@ class Collection:
             if not re.fullmatch(r"-?[\w.]+", sort):
                 raise ValueError("sort must be a metadata key, optionally prefixed with '-' for descending")
             # ponytail: ORDER BY json_extract scans the filtered set (no expression index);
-            # add one per hot sort key if listing large collections gets slow
+            # an expression index per hot sort key is the follow-up (spec §5.2), not C
             order = f"json_extract(metadata, ?) {'DESC' if sort[0] == '-' else 'ASC'}, id"
             oparams = ["$." + sort.lstrip("-")]
         db = self._rdb()
@@ -1584,7 +1792,12 @@ class Collection:
         ids = [
             r[0]
             for r in db.execute(
-                f"SELECT id FROM records WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
+                # NOT INDEXED (D9): with idx_records_doc_type present the planner walks
+                # the covering index in doc_id order and fetches each row by rowid (p1:
+                # 0.91 -> 2.73 s warm at 2.55M; ANALYZE does not fix it). NOT INDEXED
+                # keeps the rowid-order table scan and still allows rowid lookups, so
+                # the default ORDER BY id page still stops after LIMIT rows.
+                f"SELECT id FROM records NOT INDEXED WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
                 [*params, *oparams, limit, offset],
             )
         ]
@@ -1741,6 +1954,10 @@ class CollectionManager:
 
     async def touch(self, name: str) -> Collection:
         """Return the resident collection, loading (and LRU-evicting) as needed."""
+        c = self.resident.get(name)
+        if c is not None:  # resident: never queue behind another collection's load
+            c.last_used = time.monotonic()
+            return c
         async with self._load_lock:
             c = self.resident.get(name)
             if c is None:
@@ -1755,14 +1972,42 @@ class CollectionManager:
                     if not victims:
                         break  # everyone is busy ingesting; allow going over budget
                     await self._evict(victims[0].cfg.name)
-                c = Collection(
-                    cfg, self._dir(name), lambda: self.embedder_factory(cfg),
-                    lambda ic, name=name: self.set_index_config(name, ic),
-                )
-                c.start_worker()
-                self.resident[name] = c
+                c = await self._construct(name, cfg)
             c.last_used = time.monotonic()
             return c
+
+    async def _construct(self, name: str, cfg: CollectionConfig) -> Collection:
+        """Build a Collection on a worker thread (index load, the one-time meta.db
+        migration, the reconcile scans: seconds to minutes cold), so the loop keeps
+        serving /healthz and the resident collections. The caller holds _load_lock.
+        If the awaiting request is cancelled mid-build, the build still finishes and
+        is registered before the cancellation propagates. Releasing the lock early
+        would let the next request build a second copy, and the orphan would keep open
+        SQLite handles while its replayed jobs had no worker."""
+        t0 = time.monotonic()
+        build = asyncio.ensure_future(asyncio.to_thread(
+            Collection, cfg, self._dir(name), lambda: self.embedder_factory(cfg),
+            lambda ic, name=name: self.set_index_config(name, ic),
+        ))
+        try:
+            c = await asyncio.shield(build)
+        except asyncio.CancelledError:
+            while not build.done():
+                try:
+                    await asyncio.wait({build})
+                except asyncio.CancelledError:
+                    pass  # cancelled again: still must not orphan the build
+            if build.cancelled() or build.exception() is not None:
+                raise
+            self._register(name, build.result())
+            raise
+        self._register(name, c)
+        _log.info("collection %s loaded in %.2f s", name, time.monotonic() - t0)
+        return c
+
+    def _register(self, name: str, c: Collection) -> None:
+        c.start_worker()  # on the loop: create_task needs the running loop
+        self.resident[name] = c
 
     async def _evict(self, name: str) -> None:
         c = self.resident.pop(name, None)

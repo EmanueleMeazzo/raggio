@@ -60,9 +60,12 @@ Rules of thumb:
 - **Rebuild**: attaching/removing streams the collection through a rebuild — tens of
   seconds per million vectors, run as a background job. Searches keep serving from the
   old representation until the swap; expect transiently ~2x index RAM plus ~0.4 GB
-  for the k-means training sample at 1536 dims. If the container lacks that headroom
-  the job fails with a clear error (instead of an OOM kill) — raise the memory limit
-  and re-attach.
+  for the k-means training sample at 1536 dims. The memory check runs first,
+  before any pre-work, and reserves the measured growth (about 2.2 GB for 2.55M ×
+  1024-d at 4 bits with `nlist=256`). If the container lacks that headroom the job fails at
+  once with a clear error (instead of an OOM kill) — raise the memory limit and
+  re-attach. After each index job raggio hands the freed build memory back to the
+  OS, so a following remove or re-attach finds it free again.
 
 ## API
 
@@ -101,5 +104,9 @@ attached — new vectors are routed to their nearest shard.
   doubles or its content distribution shifts), re-POST the index to retrain.
 - **Legacy rows**: collections ingested before vector retention lack the fp16 copy.
   Attach backfills them by re-embedding text through the collection's embedding
-  endpoint — correct only if that endpoint produced the original vectors. Vector-only
-  legacy rows make the attach job fail with a count; re-ingest them first.
+  endpoint — correct only if that endpoint produced the original vectors. They are
+  found from the rebuild itself: a few legacy rows are re-embedded after the rest has
+  streamed, and a collection with too few retained vectors to train on backfills them
+  all first. Vector-only legacy rows make the attach job fail with a count, before
+  anything is swapped: after the stream when only a few rows lack a vector, before it
+  when too few retained vectors exist to train on. Re-ingest them first.
