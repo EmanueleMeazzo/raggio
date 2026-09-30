@@ -4,14 +4,17 @@ Evidence for ADR 0003: rebuilds the 4-bit flat index from the bench corpus, sear
 the 500 held-out queries at k=200, and measures recall@10 before and after re-ranking
 the top-C candidates against fp16-precision originals. Measured on the 2.55M arXiv
 corpus: base 0.9650, C=20..200 all 1.0000 at ~0.1-0.3 ms/query.
-Run on the bench host (paths below assume the staged repo layout).
+Run on the bench host. Paths default to the staged repo layout under ~/raggio/bench;
+set BENCH_DIR to point elsewhere.
 """
+import os
 import time
 import numpy as np
 from turbovec import IdMapIndex
 
-VEC = "/home/emeazzo/raggio/bench/corpus/embed-vecs.npy"
-GT = "/home/emeazzo/raggio/bench/gt-2549619-42-d1024.npz"
+BENCH = os.path.expanduser(os.environ.get("BENCH_DIR", "~/raggio/bench"))
+VEC = f"{BENCH}/corpus/embed-vecs.npy"
+GT = f"{BENCH}/gt-2549619-42-d1024.npz"
 N, DIM, NQ = 2_549_619, 1024, 500
 
 vecs = np.load(VEC, mmap_mode="r")

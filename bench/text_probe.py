@@ -5,10 +5,12 @@ runs the proposed candidate-generation + Python BM25 pipeline over random ingest
 titles (seed 7 -- independent of the seed-42 bench queries) and reports the target doc's
 rank. Measured on the 2.55M arXiv corpus: hit@5 0.975 / hit@10 0.983 / hit@50 1.000,
 median 85 ms. Read-only; run on the bench host via `podman unshare` (volume file perms).
+BENCH_DB overrides the default path of the bench-tv volume's meta.db.
 """
-import sqlite3, re, unicodedata, random, statistics, time, math
+import os, sqlite3, re, unicodedata, random, statistics, time, math
 
-DB = "/home/emeazzo/.local/share/containers/storage/volumes/bench-tv/_data/collections/bench/meta.db"
+DB = os.path.expanduser(os.environ.get(
+    "BENCH_DB", "~/.local/share/containers/storage/volumes/bench-tv/_data/collections/bench/meta.db"))
 db = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
 N_ROWS = db.execute("SELECT COUNT(*) FROM records WHERE indexed=1").fetchone()[0]
 budget = max(1000, int(0.02 * N_ROWS))
