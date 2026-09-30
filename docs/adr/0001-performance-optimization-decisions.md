@@ -82,3 +82,52 @@ Date: 2026-09-30 · Plan C of the 2026-09-28 performance program (`docs/superpow
 | A `DELETE` keeps `stop()` under `_load_lock` (plan B's Deferred row) | **Unchanged** | Requests to resident collections no longer wait for it: `touch()` returns a resident collection without taking the lock (`test_resident_touch_does_not_wait_for_another_collections_delete`). A request for a collection that is not loaded yet still waits for a running delete's `stop()`. Moving `stop()` out of the lock was rejected: without renaming the directory to a tombstone first it widens the name-reuse race, and Windows cannot rename a directory while SQLite handles are open in it. Plan C does not measure this stall on gn100 |
 | `GET /collections/{name}` while a `DELETE` or an eviction closes the collection | **Deferred** | `stats()` now runs in a worker thread, so the close can land mid-call and the request answers 500 ("collection is closed"). This is the class of unlocked reads that plan B's Deferred row lists (`list_records`, `get_document`, job status): an error, never a wrong answer |
 | The k=n probe in `_reconcile_ghosts` | **Unchanged** | `IdMapIndex` still exposes no id enumeration |
+
+### Acceptance run
+
+Session `c1`, 2026-09-30, on gn100 (DGX Spark, aarch64). Image `localhost/raggio:022674c` (`sha256:5c7819694ccf`): Python 3.12.14, SQLite 3.53.1 (`sqlite3.sqlite_version`), `OPENBLAS_NUM_THREADS=1`, turbovec 1.0.0. Collection `bench`: 2,549,119 chunks × 1024 dims. Every container ran with `--memory 4g`; the memory run added `--memory-swap 4g`, so it had no swap. **true-cold**: every file of the volume fsynced and dropped with `posix_fadvise(POSIX_FADV_DONTNEED)`, with `mincore` confirming at most 16 MB still cached (D12). **host-warm**: every file of the volume read once just before. Each row states its regime.
+
+| Index | Start (true-cold) | → `/healthz` | → first GET | Slowest `/healthz` | Later GETs | VmRSS |
+|---|---|---|---|---|---|---|
+| ivf | `p2-ivf-1` | 0.43 s | 4.88 s | 0.002 s (18 probes) | 0.44 / 0.45 / 0.44 s | 1,464 MiB |
+| ivf | `p2-ivf-2` | 0.32 s | 4.53 s | 0.003 s (17 probes) | 0.44 / 0.48 / 0.45 s | 1,464 MiB |
+| ivf | `p2-ivf-3` | 0.34 s | 4.82 s | 0.001 s (18 probes) | 0.44 / 0.44 / 0.44 s | 1,464 MiB |
+| flat | `p2-flat-1` | 0.32 s | 4.14 s | 0.002 s (15 probes) | 0.45 / 0.45 / 0.48 s | 1,460 MiB |
+| flat | `p2-flat-2` | 0.45 s | 4.32 s | 0.001 s (16 probes) | 0.45 / 0.45 / 0.49 s | 1,461 MiB |
+| flat | `p2-flat-3` | 0.33 s | 4.18 s | 0.002 s (15 probes) | 0.44 / 0.44 / 0.48 s | 1,461 MiB |
+
+| Index | Regime | `touch()` | Read | Index files | `_vec_sample(65536)` | List page, median of 3 |
+|---|---|---|---|---|---|---|
+| ivf | true-cold | 4.12 s | 1,650 MB | 1,550 MB | 10.39 s | – |
+| ivf | host-warm | 2.15 s | 0 MB | 1,550 MB | 0.42 s | 0.92 s |
+| flat | true-cold | 3.21 s | 1,374 MB | 1,275 MB | 11.12 s | – |
+| flat | host-warm | 1.76 s | 0 MB | 1,275 MB | 0.42 s | 0.94 s |
+
+Memory run (`--memory 4g --memory-swap 4g`, starting from the flat state):
+
+| Snapshot | Regime | VmRSS | VmHWM | cgroup | VmSwap | `oom_kill` |
+|---|---|---|---|---|---|---|
+| loaded | true-cold | 1,460 MiB | 1,540 MiB | 2,828 MiB | 0 MiB | 0 |
+| after_attach1 | true-cold | 1,686 MiB | 3,515 MiB | 2,474 MiB | 0 MiB | 0 |
+| after_attach1_15s | true-cold | 1,695 MiB | 3,515 MiB | 2,472 MiB | 0 MiB | 0 |
+| after_detach | host-warm | 1,500 MiB | 3,515 MiB | 2,334 MiB | 0 MiB | 0 |
+| after_detach_15s | host-warm | 1,514 MiB | 3,515 MiB | 2,334 MiB | 0 MiB | 0 |
+| after_attach2 | host-warm | 1,741 MiB | 3,527 MiB | 2,541 MiB | 0 MiB | 0 |
+| after_attach2_15s | host-warm | 1,754 MiB | 3,527 MiB | 2,540 MiB | 0 MiB | 0 |
+
+Jobs: attach1 done in 185.5 s (true-cold); detach done in 15.5 s (host-warm); attach2 done in 42.8 s (host-warm).
+First attach (true-cold), from its `attach_index` line: n=2,549,119, nlist 256; pre-work 0.00 s, sample 10.88 s, build 170.68 s, live-id diff 1.63 s, backfill 0 rows 0.00 s, swap 2.30 s, total 185.49 s.
+Migration `CREATE INDEX idx_records_doc_type`: 49.6 s true-cold, 1.5 s host-warm.
+
+Checks (spec §7 C):
+
+- PASS: C1 — start → first `GET /collections/bench`, true-cold: ivf 4.82 s (≤ 6 s, median of 3), flat 4.18 s (≤ 5 s, median of 3)
+- PASS: C2 — slowest `/healthz` while the first GET loaded the collection 0.003 s (≤ 0.1 s; 99 probes over 6 starts)
+- PASS: C3 — later GETs, median over starts of each start's slowest of 3: ivf 0.45 s, flat 0.48 s (≤ 1.0 s)
+- PASS: C4 — `Collection()` true-cold read: ivf 1,650 MB with 1,550 MB of index files (≤ 1,700 MB) in 4.12 s; flat 1,374 MB with 1,275 MB of index files (≤ 1,425 MB) in 3.21 s
+- PASS: C5 — migration `CREATE INDEX` 49.6 s true-cold (≤ 60 s), 1.5 s host-warm (≤ 3 s); growth 91.5 MB (≤ 120 MB; file 91.5 MB, covering index 91.4 MB, first migration of this volume: yes)
+- PASS: C6 — `_vec_sample(65536)` slowest 11.12 s true-cold (≤ 15 s), 0.42 s host-warm (≤ 1 s)
+- PASS: C7 — swapless POST → DELETE → POST: jobs done/done/done; no swap and no OOM kill: yes; max VmHWM 3,527 MiB (≤ 3,891 MiB); VmRSS 15 s after each job vs loaded 1,460 MiB: +235, +54, +294 MiB (≤ +512 MiB)
+- PASS: C8 — host-warm list page (`chunks`, sort `-year`, 20 rows), median: ivf 0.92 s over 3 pages; flat 0.94 s over 3 pages (≤ 1.0 s)
+- PASS: C9 — true-cold `POST /index` pre-work 1.63 s (≤ 10 s): guard 0.00 s + live-id diff 1.63 s + backfill of 0 rows 0.00 s
+- PASS: labels — 31 rows, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1; every measurement row states its regime and memory cap

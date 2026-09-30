@@ -910,3 +910,18 @@ def test_attach_logs_its_phase_timings(tmp_path, caplog):
     for field in ("n=300", "nlist=8", "prework=", "sample=", "legacy_backfill=0", "build=",
                   "live_scan=", "backfill=0 rows", "swap=", "total="):
         assert field in msgs[0]
+
+
+def test_adr_records_the_acceptance_run():
+    adr = Path(__file__).resolve().parents[1] / "docs" / "adr" / "0001-performance-optimization-decisions.md"
+    text = adr.read_text(encoding="utf-8")
+    head = "## Addendum 2026-09 — cold start and loop hygiene"
+    start = text.index(head)
+    end = text.find("\n## ", start + len(head))
+    section = text[start:] if end < 0 else text[start:end]
+    assert "### Acceptance run" in section
+    for n in range(1, 10):
+        assert f"- PASS: C{n} —" in section
+    assert "- FAIL:" not in section
+    for phrase in ("sqlite3.sqlite_version", "OPENBLAS_NUM_THREADS", "true-cold", "--memory-swap 4g"):
+        assert phrase in section
