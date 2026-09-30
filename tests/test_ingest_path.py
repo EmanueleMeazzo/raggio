@@ -545,6 +545,32 @@ def test_delete_failure_rolls_back_and_keeps_index(tmp_path):
     assert final == ([(2, "c2")], [(2,)], [2], {"chunk": 1})
 
 
+# a cancelled delete releases lock.write() while its thread runs on, so the ids must
+# leave the index before db_lock lets the next upsert reuse them
+def test_delete_unindexes_before_releasing_db_lock(tmp_path):
+    col = make_collection(tmp_path)
+    real, held = col._unindex, []
+
+    def spy(rids):
+        held.append(col.db_lock.locked())
+        return real(rids)
+
+    col._unindex = spy
+
+    async def run():
+        try:
+            await col._process_job(docs_payload([1, 2]))  # records 1 (d1), 2 (d2)
+            deleted = await col.delete_document("d1")
+            return deleted, index_ids(col)
+        finally:
+            await col.stop()
+
+    deleted, ids = asyncio.run(run())
+    assert deleted == 1
+    assert held == [True]
+    assert ids == [2]
+
+
 def test_indexed_counts_published_after_commit(tmp_path):
     # the rebind used to run inside the open transaction; now it runs after the commit, still
     # under db_lock and still once per write, so no reader ever sees counts for rows a

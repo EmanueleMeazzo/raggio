@@ -2015,8 +2015,10 @@ class Collection:
                 if indexed:
                     counts[rtype] -= 1
             self.indexed_counts = counts
-        # the rows are gone for good: only now do their ids leave the index
-        self._unindex([rid for rid, indexed, _ in rows if indexed])
+            # the rows are gone for good, so only now do their ids leave the index; still
+            # under db_lock, as the next upsert reads MAX(id) there and would reuse them,
+            # even when a cancelled caller has already released lock.write()
+            self._unindex([rid for rid, indexed, _ in rows if indexed])
         self._allow_cache.clear()
         self._df_cache_churn += len(rows)
         return len(rows)
