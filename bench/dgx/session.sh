@@ -7,8 +7,9 @@
 #   4-5. both engine groups, the one matching the index state first, so the session makes
 #      one IVF <-> flat transition. Per engine a discarded warm-up run0, then the measured
 #      runs (flat run1-run2, IVF run1-run3; compare.py takes the median and max - min).
-#      IVF first: the detach runs in a transient 8 GiB container (refused at 4 GiB until
-#      plan C). Flat first: raggio-ivf run0 builds the index at 4 GiB and measures the build.
+#      IVF first: the detach runs in a fresh container at DETACH_MEMORY (4 GiB; 8 GiB for an
+#      image from before plan C). Flat first: raggio-ivf run0 builds the index at 4 GiB and
+#      measures the build.
 #   Every run starts from a fresh 4 GiB bench-tv container and waits for pending_jobs == 0.
 # Outputs go to ~/raggio-bench/<label>/: facts.txt and <run>-<engine>.md/.json. Launch
 # detached, capped at the agreed run window (timeout stops the harness and bench.py, not
@@ -20,11 +21,14 @@
 # IMAGE=<ref>: measure another image (default localhost/raggio:<deployed sha>).
 # ADOPT=1: pass --adopt to the first run (first session on a volume with no fingerprint yet).
 # FLAT_RUNS=3: a third measured flat run, needed before a vector concurrent-QPS row is claimed.
-# MEMORY_SWAP=4g: the swapless memory gate (--memory-swap on every 4 GiB start, not the detach).
+# MEMORY_SWAP=4g: the swapless memory gate (--memory-swap on every 4 GiB start, the detach's too
+#   unless DETACH_MEMORY raises it).
+# DETACH_MEMORY=8g: the detach's cap for an image from before plan C, which refuses a 4 GiB detach
+#   (default: MEMORY).
 # FIRST_START=true-cold: label the first start true-cold (host rebooted, or the volume's files
 # fadvise-evicted, before the session); default host-warm.
-# IVF_BUILDS=2 (flat start only): after every measured run, detach at 8 GiB and build the IVF
-# index once more at 4 GiB (build2-raggio-ivf); compare.py counts only its build time (spec §3.1 A1).
+# IVF_BUILDS=2 (flat start only): after every measured run, detach (at DETACH_MEMORY) and build
+# the IVF index once more at 4 GiB (build2-raggio-ivf); compare.py counts only its build time (spec §3.1 A1).
 # CONCURRENCY=16: bench.py --concurrency of every run (default 8; spec §3.1 G7). Every run also
 # passes --cpu-container bench-tv, for the server CPU per query of the concurrent phases.
 # regime.json (page cache, first start, memory, swap, concurrency) and image.json (python,
@@ -51,6 +55,10 @@ esac
 case "$CONCURRENCY" in
   [1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;;
   *) echo "CONCURRENCY=$CONCURRENCY: use a whole number, 1 or more" >&2; exit 1 ;;
+esac
+case "$DETACH_MEMORY" in
+  [1-9]g|[1-9][0-9]g) ;;
+  *) echo "DETACH_MEMORY=$DETACH_MEMORY: use whole GiB, e.g. 4g or 8g" >&2; exit 1 ;;
 esac
 if [ -n "$MEMORY_SWAP" ]; then CAPS="$CAPS Swap capped too: --memory-swap $MEMORY_SWAP."; fi
 
@@ -139,7 +147,7 @@ wait_pending() {
 
 fresh_container() {  # $1 = label for facts.txt, $2 = memory cap
   local t0 swap=()
-  # the swapless gate caps the measured 4 GiB starts; the transient 8 GiB detach keeps the default
+  # the swapless gate caps every start at MEMORY, the detach's too; a detach raised by DETACH_MEMORY keeps the default
   if [ -n "$MEMORY_SWAP" ] && [ "$2" = "$MEMORY" ]; then swap=(--memory-swap "$MEMORY_SWAP"); fi
   run podman stop -t 60 --ignore "$CONTAINER"  # clean shutdown of the previous run's server
   run podman rm -f --ignore "$CONTAINER"

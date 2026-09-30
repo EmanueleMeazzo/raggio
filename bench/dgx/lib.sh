@@ -9,7 +9,7 @@ PORT=18000
 MEMORY=4g             # every measured run
 MEMORY_SWAP="${MEMORY_SWAP:-}"           # empty: podman's default swap; 4g = the swapless memory gate (spec §6, D13)
 FIRST_START="${FIRST_START:-host-warm}"  # host-warm, or true-cold after a reboot or an fadvise eviction (D12)
-DETACH_MEMORY=8g      # IVF -> flat detach: refused at 4 GiB until plan C releases build memory
+DETACH_MEMORY="${DETACH_MEMORY:-$MEMORY}"  # IVF -> flat detach; 8g only for an image from before plan C (ADR 0001, C7)
 FLAT_RUNS="${FLAT_RUNS:-2}"  # measured flat runs after run0; 3 when a concurrent-QPS row is claimed (spec §6)
 CONCURRENCY="${CONCURRENCY:-8}"  # bench.py --concurrency of every run; G's c=16 sessions set 16 (spec §3.1 G7)
 IVF_BUILDS="${IVF_BUILDS:-1}"  # IVF builds of a flat-start session; 2 = one more after the measured runs (spec §3.1 A1)
