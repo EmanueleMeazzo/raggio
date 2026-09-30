@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -76,6 +77,15 @@ IVF_DEFAULT_NPROBE = 16
 IVF_MIN_ROWS = 1024  # k-means needs a training corpus; below this, attach is refused
 IVF_TRAIN_SAMPLE = 65_536
 IVF_BUILD_BLOCK = 16_384  # rows per streamed rebuild block (~100 MB f32 at 1536-d)
+
+# one-time meta.db index migration (D9): heartbeat cadence of the progress log, and
+# how many SQLite VM instructions run between progress-handler checks
+MIGRATION_LOG_EVERY_S = 10.0
+MIGRATION_PROGRESS_OPS = 1_000_000
+
+# uvicorn configures this logger with its stderr handler, so these lines reach
+# `podman logs`; under pytest the records propagate to the root logger (caplog)
+_log = logging.getLogger("uvicorn.error")
 
 
 def _now() -> str:
@@ -302,7 +312,6 @@ def open_meta_db(path: Path, tokenizer: str = "unicode61") -> sqlite3.Connection
             id INTEGER PRIMARY KEY,
             vec BLOB
         );
-        CREATE INDEX IF NOT EXISTS idx_records_doc ON records(doc_id);
         CREATE TABLE IF NOT EXISTS jobs(
             id INTEGER PRIMARY KEY,
             payload TEXT,
@@ -313,11 +322,60 @@ def open_meta_db(path: Path, tokenizer: str = "unicode61") -> sqlite3.Connection
         );
         """
     )
+    _ensure_indexes(db, str(path))
     _ensure_fts(db, tokenizer)
     # doc-frequency lookups for query-token pruning; references records_fts by name so
     # it survives an _ensure_fts rebuild
     db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS records_fts_v USING fts5vocab(records_fts, 'row')")
     return db
+
+
+def _ensure_indexes(db: sqlite3.Connection, label: str) -> None:
+    """Secondary indexes, plus the one-time migration from the pre-2026-09 layout (D9).
+    idx_records_doc_type covers every doc_id/type/indexed scan (cold start's per-type
+    counts and live-id set, stats(), the per-document lookups) without reading the
+    records table's text pages, and replaces idx_records_doc, whose (doc_id) prefix it
+    contains. Build first, drop second: a kill in between leaves both, and the next
+    open drops the old one. idx_jobs_open is partial, so the open-job lookups stop
+    scanning the whole job journal. Runs inside Collection() construction, which is
+    off the event loop (CollectionManager._construct)."""
+    have = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+    if "idx_records_doc_type" not in have:
+        rows = db.execute("SELECT MAX(rowid) FROM records").fetchone()[0]
+        t0 = last = time.monotonic()
+        if rows:
+            _log.info(
+                "meta.db %s: one-time migration, building idx_records_doc_type over"
+                " ~%d records (~16 s per 1M rows cold)", label, rows,
+            )
+
+            def beat() -> int:
+                nonlocal last
+                now = time.monotonic()
+                if now - last >= MIGRATION_LOG_EVERY_S:
+                    last = now
+                    _log.info(
+                        "meta.db %s: still building idx_records_doc_type (%.0f s)", label, now - t0
+                    )
+                return 0  # non-zero would abort the CREATE INDEX
+
+            db.set_progress_handler(beat, MIGRATION_PROGRESS_OPS)
+        try:
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_records_doc_type ON records(doc_id, type, indexed)"
+            )
+        finally:
+            db.set_progress_handler(None, 0)
+        if rows:
+            _log.info(
+                "meta.db %s: built idx_records_doc_type in %.1f s", label, time.monotonic() - t0
+            )
+    if "idx_records_doc" in have:
+        db.execute("DROP INDEX idx_records_doc")
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_jobs_open ON jobs(id)"
+        " WHERE status IN ('pending','processing')"
+    )
 
 
 def _ensure_fts(db: sqlite3.Connection, tokenizer: str) -> None:
