@@ -92,6 +92,11 @@ MIGRATION_PROGRESS_OPS = 1_000_000
 VEC_SAMPLE_MIN_DENSITY = 0.2
 VEC_SAMPLE_ROUNDS = 8
 
+# attach headroom (D13): the summed transient terms under-reserve. p1 measured 2176-2186
+# MiB of growth at 2.55M x 1024-d 4-bit (nlist 256) against 1757 MiB summed; x1.25
+# covers it. The guard stays conservative; the swapless DGX run is the gate (§5.4)
+ATTACH_NEED_FACTOR = 1.25
+
 # uvicorn configures this logger with its stderr handler, so these lines reach
 # `podman logs`; under pytest the records propagate to the root logger (caplog)
 _log = logging.getLogger("uvicorn.error")
@@ -125,6 +130,16 @@ def _require_headroom(need: int, what: str) -> None:
             f"{what} needs ~{(need + 128 * 1024 * 1024) >> 20} MB free memory,"
             f" container has ~{max(free, 0) >> 20} MB — raise the memory limit and retry"
         )
+
+
+def _attach_need(n: int, dim: int, bit_width: int, nlist: int) -> int:
+    """Bytes an IVF build adds on top of the loaded collection: a second copy of the
+    codes, the f32 k-means sample, ~1 MB fixed per shard, scaled to the measured
+    growth by ATTACH_NEED_FACTOR."""
+    return int(
+        (n * dim * bit_width // 8 + min(n, IVF_TRAIN_SAMPLE) * dim * 4 + nlist * (1 << 20))
+        * ATTACH_NEED_FACTOR
+    )
 
 
 def _malloc_trim() -> bool:
@@ -1123,21 +1138,19 @@ class Collection:
             self.index.nprobe = int(nprobe_req)  # retune the default, no rebuild
             self._save_index_config({"nlist": self.index.nlist, "nprobe": self.index.nprobe})
             return
+        # guard first (D13): validate and refuse before any SQL, so a full container
+        # fails in milliseconds instead of after minutes of cold pre-work. n comes from
+        # the in-memory per-type counts, which equal COUNT(*) WHERE indexed=1
+        n = sum(self.indexed_counts.values())
+        if n < IVF_MIN_ROWS:
+            raise ValueError(f"index needs at least {IVF_MIN_ROWS} indexed records, have {n}")
+        nlist = nlist_req or _ivf_auto_nlist(n)
+        if n < 8 * nlist:
+            raise ValueError(f"nlist={nlist} too large for {n} records (need >=8 rows per shard)")
+        _require_headroom(_attach_need(n, self.cfg.dim, self.cfg.bit_width, nlist), "index build")
         await self._backfill_vecs()
 
         def build():
-            n = self._rdb().execute("SELECT COUNT(*) FROM records WHERE indexed=1").fetchone()[0]
-            if n < IVF_MIN_ROWS:
-                raise ValueError(f"index needs at least {IVF_MIN_ROWS} indexed records, have {n}")
-            nlist = nlist_req or _ivf_auto_nlist(n)
-            if n < 8 * nlist:
-                raise ValueError(f"nlist={nlist} too large for {n} records (need >=8 rows per shard)")
-            _require_headroom(
-                n * self.cfg.dim * self.cfg.bit_width // 8  # second copy of the codes
-                + min(n, IVF_TRAIN_SAMPLE) * self.cfg.dim * 4  # f32 k-means sample
-                + nlist * (1 << 20),  # per-shard fixed overhead
-                "index build",
-            )
             ivf = _IvfIndex.train(
                 self._vec_sample(IVF_TRAIN_SAMPLE), nlist, self.cfg.dim, self.cfg.bit_width,
                 int(nprobe_req or IVF_DEFAULT_NPROBE),
@@ -1182,6 +1195,10 @@ class Collection:
             if self.ivf_dir.exists():
                 await asyncio.to_thread(shutil.rmtree, self.ivf_dir, True)
             return
+        # guard first (D13): a refusal must not cost the missing-vector scan
+        _require_headroom(
+            len(self.index) * self.cfg.dim * self.cfg.bit_width // 8, "index removal"
+        )
         missing = await asyncio.to_thread(
             lambda: self._rdb().execute(
                 "SELECT COUNT(*) FROM records r LEFT JOIN vecs v ON v.id=r.id"
@@ -1192,9 +1209,6 @@ class Collection:
             raise ValueError(f"{missing} records lack a retained vector; re-ingest them first")
 
         def build():
-            _require_headroom(
-                len(self.index) * self.cfg.dim * self.cfg.bit_width // 8, "index removal"
-            )
             flat = IdMapIndex(dim=self.cfg.dim, bit_width=self.cfg.bit_width)
             sample = self._vec_sample(CAL_SAMPLE)
             if len(sample) >= 64:

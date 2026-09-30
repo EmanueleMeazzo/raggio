@@ -747,3 +747,60 @@ def test_dockerfile_sets_the_trim_threshold_in_the_runtime_stage():
     assert runtime.count("ENV MALLOC_TRIM_THRESHOLD_=134217728") == 1
     assert text.count("MALLOC_TRIM_THRESHOLD_=") == 1
     assert "MALLOC_ARENA_MAX=" not in text  # spec D13: never set (the comment names it)
+
+
+# ---- Task 8: guard first, measured need (D13) ----
+
+
+def count_rdb(col) -> list:
+    calls, real = [], col._rdb
+    col._rdb = lambda: calls.append(1) or real()
+    return calls
+
+
+def test_attach_refusal_does_no_prework(tmp_path, monkeypatch):
+    col = make_collection(tmp_path)
+    ingest(col, 300)
+    monkeypatch.setattr(store, "_cgroup_mem_free", lambda: 0)  # a full container
+    calls = count_rdb(col)
+    with pytest.raises(ValueError, match="raise the memory limit"):
+        asyncio.run(col._process_job({"op": "attach_index", "nlist": 8}))
+    assert calls == []  # no backfill anti-join, no COUNT(*), no sample: minutes cold (p1)
+
+
+def test_detach_refusal_does_no_prework(tmp_path, monkeypatch):
+    col = make_collection(tmp_path)
+    ingest(col, 300)
+    asyncio.run(col._process_job({"op": "attach_index", "nlist": 8}))
+    monkeypatch.setattr(store, "_cgroup_mem_free", lambda: 0)
+    calls = count_rdb(col)
+    with pytest.raises(ValueError, match="raise the memory limit"):
+        asyncio.run(col._process_job({"op": "detach_index"}))
+    assert calls == [] and isinstance(col.index, _IvfIndex)
+
+
+def test_attach_need_matches_the_measured_growth():
+    # p1, 2.55M x 1024-d, 4-bit, nlist 256: growth 2176-2186 MiB; the unscaled sum
+    # was 1757 MiB (1884 with the 128 MiB margin) and under-reserved
+    # (2,549,119 rows is the bench-tv volume; --limit 2549619 is only the bench flag)
+    need_mib = store._attach_need(2_549_119, 1024, 4, 256) >> 20
+    assert 2176 <= need_mib <= 2400
+    assert need_mib == 2195  # (1305148928 + 268435456 + 268435456) * 1.25 >> 20
+
+
+def test_attach_guard_receives_the_scaled_need(tmp_path, monkeypatch):
+    col = make_collection(tmp_path)
+    ingest(col, 300)
+    seen = []
+
+    class Refused(Exception):
+        pass
+
+    def guard(need, what):
+        seen.append((need, what))
+        raise Refused
+
+    monkeypatch.setattr(store, "_require_headroom", guard)
+    with pytest.raises(Refused):
+        asyncio.run(col._process_job({"op": "attach_index", "nlist": 8}))
+    assert seen == [(store._attach_need(300, DIM, 4, 8), "index build")]
