@@ -1089,6 +1089,34 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
   - several documented `ValueError` branches of the decoder are untested.
 - Task 2 (wiring the binary journal) was dispatched right after.
 
+**11:25Z–12:05Z. D1's Tasks 2–5 and its ADR land, the malloc A/B convicts the knob, and the final review moves ahead of the A/B.**
+- **Task 2** (the binary journal wired into enqueue and claim) came back DONE at e5552c7 at 11:26:24Z, with 278 passed. The review approved it with 0 Critical and 0 Important findings. Three minors were deferred to the final review:
+  - the claim's failure branches for legacy-only rows (an undecodable TEXT payload, a JSON value that is not an object) are untested;
+  - a comment on the claim query names plan C, which will go stale;
+  - when `stop()` has closed the connection, `_enqueue_row`'s rollback raises a `ProgrammingError` chained over the original error.
+- **Task 3** (the failure-safe, set-based upsert) came back at 11:36:33Z as two commits: 801b980, and e4956ab for the attach log's `backfill=` count. 283 passed. Before the fix, 5 of the new tests failed, as the plan says. The ruling's revert check was run: with a plain `INSERT`, job 4 fails with `UNIQUE constraint failed: vecs.id`, so the test pins `INSERT OR REPLACE`. The review found nothing, not even a minor.
+- **Task 4** (the vacuum policy) came back at a8cc0d8 at 11:42:38Z, with 285 passed. The ruled measurement found 62 freed pages per job, not the 64 ± 1 the pre-flight expected, so the plan's "~62" comments stay. The review had two minors, both in the plan's own wording; no action.
+- **Task 5** (`bench/ingest_probe.py`) came back at 35b567e at 11:46:42Z, with 288 passed: N0 + 27, as the replay predicted. Two minors were deferred:
+  - `--prefill 0 --ivf N` fails inside the attach, not in the argument parser;
+  - the ordering of `enqueue_s` and `drain_s`.
+- **Task 6's scripts** were written from 11:42:56Z, in parallel with Tasks 4 and 5, by a Sonnet agent working on the laptop only. It flagged a flaw in the ruled load-average wait. A wait before every probe would measure the load of the previous probe and add minutes between probes.
+  - The revision waits twice: before the first probe, and before the reingest phase. The wait counts against the run's absolute deadline.
+  - Before each probe, only the process and container guard runs again.
+  - The revision also ran the real probe on the laptop (flat, and IVF with 256 lists) and fed its output through the summary's parser. Every flag and key matched.
+  - The controller added the malloc probes' script names to the guard's pattern.
+- **Task 6 Step 2, the ADR addendum** (24bcc90, 11:49:25Z), is the plan's text plus the rulings:
+  - two added rows, for the `INSERT OR REPLACE` self-heal and the `backfill=` count;
+  - "before the binary job journal" instead of "before 2026-09";
+  - the date.
+- **The final review moved ahead of the A/B.** The plan runs the Opus whole-branch review after Task 6's gn100 A/B. gn100 was busy with the malloc A/B, so the review started at 11:50:07Z, over cd3cbf2..24bcc90.
+  - Any fix lands before the A/B pins its candidate SHA, so the A/B measures the code that merges.
+  - The A/B's own commits (the gate test and the ADR's results) get a scoped re-review.
+- **mtt2 convicted the knob** (11:23:08Z–11:57:38Z; section 4.12). IVF filtered p50 was 48.7 ms with `MALLOC_TRIM_THRESHOLD_` as shipped, 36.3 ms without it, and 36.2 ms with the knob plus a fixed 32 MiB mmap threshold. The 32 MiB threshold costs about 110 MB of resident memory. Hybrid did not move in any arm, so the 3–4 % hybrid regression in section 4.10 has another cause.
+- **Next on gn100, chained:**
+  - `mem1` (11:57:59Z) runs a swapless attach → detach → attach → detach at 4 GiB for `knob` and `mmap32m`, checked against C7's criteria.
+  - `sweep1` then sweeps the mmap threshold on IVF only (1, 4, 16 and 32 MiB, against the knob), to find the smallest threshold that recovers filtered search.
+  - The D1 A/B waits for both. Its two arms share the knob, so the malloc question does not bias it.
+
 ## 3. Decision register
 
 ID prefixes:
@@ -1594,6 +1622,35 @@ Reading it:
 - **The ingest stall did not move, and it is large:** p50 69–83 ms and p99 about 305 ms, against a quiet p50 of 7.4–7.9 ms. The worker's payload decoding, flattening and matrix building run on the event loop and stall every collection's requests. Plan D1 moves them into threads. The probe runs again on D1's image, against cd3cbf2.
 - Caveat: the victim ingests 50-document batches of 10 records. Larger batches would stall longer.
 
+### 4.12 The malloc knob: mtt2
+
+A scratch A/B on gn100 (`mtt-ab.sh`), 2026-09-30, 11:23Z–11:58Z. It used one image (cd3cbf2), fresh 4 GiB containers, host-warm, and the bench's reuse mode (no ingest). Each engine got a discarded warm-up, then 3 rounds with the arm order rotated. The arms:
+- `knob`: the image as shipped (`MALLOC_TRIM_THRESHOLD_=134217728`, D13);
+- `noknob`: the variable unset;
+- `mmap32`: the knob plus `MALLOC_MMAP_THRESHOLD_=33554432`.
+
+Median of 3, band in brackets. Verdicts are against `knob`. "Memory after ingest" is compare.py's row name; in reuse mode it is the server's RSS after loading.
+
+| Engine | Metric | knob | noknob | mmap32 |
+|---|---|---|---|---|
+| raggio-ivf | Filtered p50 (ms) | 48.7 (0.6) | 36.3 (1.4) better | 36.2 (0.6) better |
+| raggio-ivf | Filtered p95 (ms) | 50.7 (0.6) | 38.1 (1.3) better | 37.8 (1.1) better |
+| raggio-ivf | QPS serial | 110 (7) | 120 (5) better | 112 (9) |
+| raggio-ivf | Hybrid p50 (ms) | 77.1 (0.4) | 76.7 (1.8) | 76.3 (2.7) |
+| raggio-ivf | Memory after ingest (MB) | 1,508 (1) | 1,535 (1) worse | 1,611 (1) worse |
+| raggio | Filtered p50 (ms) | 25.6 (1.9) | 27.9 (9.1) | 24.9 (3.2) |
+| raggio | Hybrid p50 (ms) | 80.0 (0.6) | 79.8 (0.3) | 80.4 (0.5) |
+| raggio | Memory after ingest (MB) | 1,502 (0) | 1,528 (27) | 1,621 (15) worse |
+
+Every other row was within band, except three flat rows "better" for `noknob` (search p95 and p99, hybrid p99; 0.3–4.1 ms) and flat search p50, "better" for `mmap32` by 0.4 ms. `mmap32` against `noknob` was within band on IVF filtered search.
+
+Reading it:
+- **The knob is the filtered regression in section 4.10.** Without it, or with a fixed mmap threshold above the query's temporaries, IVF filtered p50 is back at a-ref's 35.7 ms.
+- **The mechanism.** glibc serves a large request from the arena's free space when it can. It calls `mmap` only when the heap cannot serve the request and the request is at or above the mmap threshold. Setting `MALLOC_TRIM_THRESHOLD_` freezes that threshold at 128 KiB (section 2, 10:46Z). A restarted container that only loaded the index has little free heap, so each filtered query's large temporaries are fresh mappings: page faults on first touch, and a `munmap` on free. A container that has just built the index keeps a large free heap and does not pay this. That matches a-ref2's per-run table.
+- **The cost of a fixed threshold is resident memory.** `mmap32` held about 110 MB (7 %) more than `knob` on both engines; `noknob` held about 27 MB more.
+- **Hybrid is not the knob.** Hybrid p50 moved by less than 1 ms in every arm, inside the bands. a-ref2's 3–4 % hybrid regression is still unexplained.
+- **What is left:** whether `mmap32` keeps C7's headroom in a swapless attach → detach cycle (`mem1`), and whether a smaller threshold recovers filtered search for less memory (`sweep1`).
+
 ## 5. Negative results and surprises
 
 ### 5.1 Audience batching lost on NEON
@@ -1694,6 +1751,10 @@ PR 2's `tests.yml` asked setup-uv for `python-version: "3.12"`, and its tests ch
 The controller's Linux proof could not have caught it. G1 runs in a `uv:0.12.20-trixie-slim` container, which has no system Python, so uv downloaded the managed build there. The gap shows only on a runner that has a system 3.12. One workflow-level line fixes it (`UV_PYTHON_PREFERENCE: only-managed`), and a test pins that line. The first GitHub run should show CPython 3.12.14 being downloaded.
 
 Dated note, 2026-09-30 00:28Z: confirmed. The first Actions run on `main` (00c70a1, pushed at 00:22:18Z) downloaded `cpython-3.12.14-linux-x86_64-gnu` and passed 193 tests.
+
+### 5.18 The knob that saved the 4 GiB build slowed filtered IVF search by a third
+
+Plan C set `MALLOC_TRIM_THRESHOLD_` (D13) so that glibc gives freed heap back and a swapless 4 GiB IVF build is not OOM-killed (section 5.6). glibc treats that variable as a request to stop adjusting the mmap threshold, which stays at 128 KiB. A container that loaded its index from disk then got each filtered query's large temporaries as fresh `mmap`s. Filtered p50 went from 36 to 49 ms, but only in restarted containers, which is why a-ref2's built-index runs looked normal (sections 4.10 and 4.12). No gate caught it at merge time, because plan C's acceptance run measured memory, not search. A fixed mmap threshold brings the latency back and keeps the knob, at a cost of about 110 MB of RSS at 32 MiB.
 
 ## 6. Method: how we measured
 
@@ -1870,6 +1931,7 @@ State as of 2026-09-28, about 19:30Z.
 - Dated note, 2026-09-30 10:05Z: plan C is merged into main locally (bb907ac), followed by the probe-path fix (d7f4b01); 260 passed; not pushed (section 2, 09:25Z). Next: the a-ref2 re-baseline on gn100, the `DETACH_MEMORY=8g` removal and the p99-during-delete probe, then plan D1.
 - Dated note, 2026-09-30 10:46Z: `main` is pushed (d7f4b01, then cd3cbf2: the detach at 4 GiB, 261 passed). a-ref2 is running on gn100 (10:39Z), and the p99-during-delete probe is built and smoke-tested locally (section 2, 10:05Z). Next: a-ref2's comparison with a-ref, the probe on gn100, then plan D1.
 - Dated note, 2026-09-30 11:25Z: a-ref2 and the p99 probe are done (sections 4.10 and 4.11). a-ref2 shows plan C's build and memory wins, a 3–4 % hybrid regression, and a filtered regression in restarted IVF containers. A malloc A/B (`mtt2`) runs on gn100 to test the lead (section 2, 10:46Z). Plan D1 is pre-flighted and ruled; Task 1 is approved (f7918ff, 269 passed), and Task 2 is running.
+- Dated note, 2026-09-30 12:10Z: plan D1's Tasks 1–5 are approved, and ADR 0001 has its D1 addendum (24bcc90, 288 passed; section 2, 11:25Z). The final whole-branch review on Opus runs before Task 6's gn100 A/B, so any fix lands before the A/B pins its candidate. mtt2 traced the IVF filtered regression to the malloc knob (section 4.12). `mem1` (C7 for a fixed 32 MiB mmap threshold) and `sweep1` (the threshold sweep) are running on gn100; the D1 A/B follows them.
 
 ### 9.2 Open questions in the plans
 
