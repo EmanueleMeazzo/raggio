@@ -1,7 +1,7 @@
 # One parameterized image (spec D2): uv installs the interpreter named by PYTHON into
 # /python; the runtime stage is plain debian:trixie-slim with /python and /app copied in.
 # UV_VERSION is the same pin as .github/workflows/tests.yml.
-ARG UV_VERSION=0.12.20
+ARG UV_VERSION=0.12.21
 ARG PYTHON=3.12
 
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
