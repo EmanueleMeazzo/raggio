@@ -13,12 +13,21 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "orjson>=3.12.0",
     "pytest>=8",
+]
+# bench/ harness only (bench.py, floor_probe.py, prep_arxiv.py): no free-threaded
+# wheel exists, so it stays out of the default sync (ADR 0001:31 keeps runtime JSON on stdlib)
+bench = [
+    "orjson>=3.12.0",
 ]
 docs = [
     "mkdocs-material>=9",
 ]
+
+[tool.uv]
+# floor for every uv that touches uv.lock; the exact pin lives in the Dockerfile
+# (ARG UV_VERSION) and .github/workflows/tests.yml (setup-uv version)
+required-version = ">=0.12"
 
 [build-system]
 requires = ["hatchling"]

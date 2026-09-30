@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.12"
 
 [[package]]
@@ -887,8 +887,10 @@ dependencies = [
 ]
 
 [package.dev-dependencies]
-dev = [
+bench = [
     { name = "orjson" },
+]
+dev = [
     { name = "pytest" },
 ]
 docs = [
@@ -905,10 +907,8 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
-dev = [
-    { name = "orjson", specifier = ">=3.12.0" },
-    { name = "pytest", specifier = ">=8" },
-]
+bench = [{ name = "orjson", specifier = ">=3.12.0" }]
+dev = [{ name = "pytest", specifier = ">=8" }]
 docs = [{ name = "mkdocs-material", specifier = ">=9" }]
 
 [[package]]

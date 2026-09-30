@@ -1,8 +1,8 @@
 """Benchmark raggio vs Weaviate, side by side in podman, same corpus & protocol.
 
 Corpus: real email embeddings from D:\\EKB (553k x 1536 float32, text-embedding-3-large).
-Run:  uv run python bench/bench.py --limit 20000          # smoke
-      uv run python bench/bench.py                         # full run
+Run:  uv run --group bench python bench/bench.py --limit 20000   # smoke
+      uv run --group bench python bench/bench.py                  # full run
 """
 
 import argparse

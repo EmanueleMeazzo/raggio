@@ -95,9 +95,9 @@ podman run -d --name bench-wv --memory 8g -p 18080:8080 -v bench-wv:/var/lib/wea
   -e PERSISTENCE_DATA_PATH=/var/lib/weaviate \
   semitechnologies/weaviate
 
-uv run python bench/bench.py                  # full run, both engines
-uv run python bench/bench.py --engine raggio --reingest   # one engine, wipe first
-uv run python bench/bench.py --limit 20000 --queries 100    # quick smoke
+uv run --group bench python bench/bench.py                  # full run, both engines
+uv run --group bench python bench/bench.py --engine raggio --reingest   # one engine, wipe first
+uv run --group bench python bench/bench.py --limit 20000 --queries 100    # quick smoke
 ```
 
 The harness (`bench/bench.py`) ingests, then measures serial / concurrent /
