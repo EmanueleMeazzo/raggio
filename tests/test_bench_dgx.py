@@ -114,13 +114,13 @@ def test_session_starting_on_ivf_detaches_once_between_the_groups(tmp_path):
     assert [(tag, engine) for _, tag, engine in runs] == [
         ("run0", "raggio-ivf"), ("run1", "raggio-ivf"), ("run2", "raggio-ivf"), ("run3", "raggio-ivf"),
         ("run0", "raggio"), ("run1", "raggio"), ("run2", "raggio")]
-    # the one transition: after the IVF group, in a transient 8 GiB container, waited out
+    # the one transition: after the IVF group, in a fresh 4 GiB container, waited out
     (d,) = [i for i, c in enumerate(cmds) if "-X DELETE" in c]
     assert cmds[d] == DETACH
     assert runs[3][0] < d < runs[4][0]
-    assert cmds[d - 5:d] == [STOP, RM, podman_run("8g"), STARTED, IDLE]
+    assert cmds[d - 5:d] == [STOP, RM, podman_run("4g"), STARTED, IDLE]
     assert cmds[d + 1] == IDLE
-    assert [c for c in cmds if "--memory 8g" in c] == [podman_run("8g")]
+    assert {c for c in cmds if c.startswith("podman run -d ")} == {podman_run("4g")}
 
 
 @needs_bash
@@ -130,7 +130,7 @@ def test_session_starting_flat_builds_the_index_in_the_ivf_warm_up(tmp_path):
         ("run0", "raggio"), ("run1", "raggio"), ("run2", "raggio"),
         ("run0", "raggio-ivf"), ("run1", "raggio-ivf"), ("run2", "raggio-ivf"), ("run3", "raggio-ivf")]
     # raggio-ivf run0 finds a flat index and builds it (bench.py's build-index path): no detach
-    assert not [c for c in cmds if "-X DELETE" in c or "--memory 8g" in c]
+    assert not [c for c in cmds if "-X DELETE" in c]
 
 
 @needs_bash
@@ -311,7 +311,7 @@ def test_compare_covers_every_bench_metric():
 # ---- regime labels (Task 4): spec §6, every row states its regime ------------------------
 
 REGIME = {"page_cache": "host-warm", "first_start": "host-warm", "memory": "4g",
-          "memory_swap": "host-default", "detach_memory": "8g", "concurrency": "8"}
+          "memory_swap": "host-default", "detach_memory": "4g", "concurrency": "8"}
 BOOKWORM = {"python": "3.12.11", "sqlite_version": "3.40.1", "turbovec": "1.0.0",
             "openblas_num_threads": "unset"}
 TRIXIE = {"python": "3.12.14", "sqlite_version": "3.53.1", "turbovec": "1.0.0",
@@ -341,15 +341,33 @@ def test_session_records_the_regime_labels(tmp_path):
 
 
 @needs_bash
-def test_swapless_gate_caps_swap_on_the_measured_runs_only(tmp_path):
+def test_swapless_gate_caps_swap_on_every_start(tmp_path):
     home, cmds = dry_session(tmp_path, ("MEMORY_SWAP", "4g"))
     starts = [c for c in cmds if c.startswith("podman run -d ")]
-    # the first start and 4 IVF runs, the 8 GiB detach (podman's default swap), 3 flat runs
-    assert [" --memory 4g --memory-swap 4g " in c for c in starts] == [True] * 5 + [False] + [True] * 3
-    assert starts[5] == podman_run("8g")
+    # the first start and 4 IVF runs, the detach, 3 flat runs
+    assert [" --memory 4g --memory-swap 4g " in c for c in starts] == [True] * 9
     assert json.loads((home / "s1" / "regime.json").read_text())["memory_swap"] == "4g"
     runs = [c for c in cmds if c.startswith(BENCH_CMD)]
     assert len(runs) == 7 and all("Swap capped too: --memory-swap 4g." in r for r in runs)
+
+
+@needs_bash
+def test_detach_memory_can_be_raised_for_an_image_before_plan_c(tmp_path):
+    home, cmds = dry_session(tmp_path, ("MEMORY_SWAP", "4g"), ("DETACH_MEMORY", "8g"))
+    starts = [c for c in cmds if c.startswith("podman run -d ")]
+    # only the detach runs at 8 GiB, with podman's default swap; every 4 GiB start keeps the gate
+    assert [" --memory 4g --memory-swap 4g " in c for c in starts] == [True] * 5 + [False] + [True] * 3
+    assert starts[5] == podman_run("8g")
+    (d,) = [i for i, c in enumerate(cmds) if "-X DELETE" in c]
+    assert cmds[d - 3] == podman_run("8g")
+    assert json.loads((home / "s1" / "regime.json").read_text())["detach_memory"] == "8g"
+    # a bad value refuses before the label directory exists
+    for bad in ("8", "8G", "0g", "8g "):
+        sub = tmp_path / f"bad-{len(bad)}{bad.strip()}"
+        sub.mkdir()
+        with pytest.raises(subprocess.CalledProcessError):
+            dry_session(sub, ("DETACH_MEMORY", bad))
+        assert not (sub / "bench-home" / "s1").exists()
 
 
 @needs_bash
@@ -464,8 +482,8 @@ def test_a_second_ivf_build_runs_after_every_measured_run(tmp_path):
     # the measured runs keep the one transition (run0's build); the extra detach comes after them
     (d,) = [i for i, c in enumerate(cmds) if "-X DELETE" in c]
     assert runs[6][0] < d < runs[7][0]
-    assert cmds[d - 5:d + 1] == [STOP, RM, podman_run("8g"), STARTED, IDLE, DETACH]
-    assert [c for c in cmds if "--memory 8g" in c] == [podman_run("8g")]
+    assert cmds[d - 5:d + 1] == [STOP, RM, podman_run("4g"), STARTED, IDLE, DETACH]
+    assert {c for c in cmds if c.startswith("podman run -d ")} == {podman_run("4g")}
     # build2 builds from flat in a fresh 4 GiB container, like any bench run
     b = runs[7][0]
     assert cmds[b - 6:b] == [STOP, RM, podman_run("4g"), STARTED, IDLE, "rm -f bench/results-partial.json"]
