@@ -1149,6 +1149,28 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
   - `mem2`, queued behind it, runs C7 for 1, 4 and 16 MiB;
   - the D1 A/B follows.
 
+**12:20Z–13:20Z. sweep1 and mem2 box in the malloc fix, it is left to plan F, and the D1 A/B starts.**
+- **sweep1** (12:12:52Z–12:46:35Z; section 4.14) ran IVF search only, for five arms: the knob alone, and the knob plus a fixed mmap threshold of 1, 4, 16 or 32 MiB.
+  - Every threshold beat the knob on filtered p50, beyond the band: 49.5 ms against 41.2 (1 MiB), 35.7 (4 MiB), 36.6 (16 MiB) and 36.8 ms (32 MiB).
+  - Resident memory after ingest grew with the threshold: +3, +13, +17 and +104 MB.
+  - The prediction that 1 MiB would not help was half wrong. It won back 8.3 ms, but its filtered p95 stayed within the band.
+- **mem2** (12:46:57Z–13:07:21Z; section 4.14) ran C7 for 1, 4 and 16 MiB.
+  - 1 MiB passed, with a peak VmHWM of 3,584 MiB.
+  - 4 MiB finished every job but peaked at 3,940 MiB, 49 MiB over the cap.
+  - 16 MiB was killed 162 s into the first swapless attach (exit 137 at 13:01:25Z). A knob server brought the volume back to flat (157.1 s).
+- **The decision (X6, under W-14): no mmap threshold ships.**
+  - The one threshold that passes C7 wins back about 60 % of the loss. The ones that win it all back fail C7 or are killed.
+  - Plan F's Task 2 removes the large temporaries themselves.
+  - The branch `malloc-mmap-threshold` had no commit and was deleted.
+  - Plan F's Task 2 now carries a note that its base arm's filtered p50 is about 49 ms, not 36.6 ms.
+- **The D1 A/B's preparation** (13:11Z–13:13Z):
+  - The preflight found gn100 idle (load 0.06) and `bench-tv` stopped.
+  - The candidate was deployed through plan A's `deploy.sh` at 2274a6a (13:12:43Z). Its image `localhost/raggio:2274a6a` built from cached layers.
+  - The base image is plan C's `localhost/raggio:cd3cbf2`, the one a-ref2 measured. Both images were tagged `planD-<sha>`.
+  - The host venv that plan A's `setup.sh` builds was on CPython 3.13.3 with SQLite 3.47.1. The ruling's re-sync (uv-managed CPython 3.12) gave 3.12.14 with SQLite 3.53.1, the same pair as the images, and the driver checks it.
+  - The host's CPython 3.12.14 is a different build from the images' (built 14 August against 24 September): gn100's uv is 0.12.5, the images' is 0.12.20. Both probe arms run on the same host interpreter.
+- **The A/B started at 13:13:08Z**, with a 330-minute cap. Its first rows: flat base at 2,132 vec/s (the warm-up, discarded), then 2,275 vec/s (run 1).
+
 ## 3. Decision register
 
 ID prefixes:
@@ -1205,6 +1227,7 @@ ID prefixes:
 | X3 | 2026-09-28 ~20:45Z | Plan A adds three bench rows for R-G5: `hybrid_c_p99` (hybrid p99 in the concurrent phase), `cpu_ms_per_q_c` and `hybrid_cpu_ms_per_q_c` (server CPU per query in the two concurrent phases, from the container cgroup's `cpu.stat`). G reads them. | G measures them in its own session scripts: rejected, because `bench.py` runs the phases internally, so a wrapper cannot attribute CPU to one phase, and spec §4.1 forbids other plans from editing `bench.py`. | R-G5 needs a concurrent hybrid p99 and CPU per query; base `bench.py` has neither. | Orchestrator (forced by R-G5 and §4.1) | spec §4.2 | Planned (plan A Task 5 and plan G, 22:36Z) |
 | X4 | 2026-09-28 ~21:21Z | For R-G7, plan A's `bench/dgx/lib.sh` gets `CONCURRENCY` (env, default 8), passed to every `bench.py` run as `--concurrency`. Plan G sets it to 16 for its c=16 sessions. Fixed in spec §4.2. | Let G override `bench_run` in its own scripts; it would duplicate A's run logic and drift from it. | Plan A's `bench_run` passes no `--concurrency`. | Orchestrator | spec §4.2 | Planned (plan A Task 5, 22:36Z) |
 | X5 | 2026-09-28 ~21:42Z | Spec §7 B: B's gn100 re-run needs 0 failures only in the classes B owns: R1 in the mixed phase, 500s and dropped connections on searches racing `DELETE`, and R4. An R2 stale read, if seen, is recorded for F and does not fail B. | Fail B on any `post` failure, R2 included. B's tasks do not touch R2, so B could fail on a race that only F can fix. | Plan B Task 8 required `stale_ids=0` (R2) on `post`. Spec §2 row 6 gives R2/R2b to F, and plan B already lists `_allow_cache` as F's. | Orchestrator | spec §7 B | Planned (plan B Task 8, 22:36Z) |
+| X6 | 2026-09-30, about 13:10Z | No mmap threshold ships. Plan C's `MALLOC_TRIM_THRESHOLD_` (D13) stays as it is. The IVF filtered-search regression it causes in restarted containers (section 5.18) is left to plan F's Task 2. Its `_intersect` binary-searches the smaller side into the larger, so the per-shard temporaries shrink from about 2 MB to shard size (about 64 KB), under glibc's 128 KiB threshold. Plan F's A/B shows the recovery; its F3 gate (filtered p50 ≤ 10 ms) is absolute. | Ship `MALLOC_MMAP_THRESHOLD_=1048576` now: it passes C7 at +3 MB, but wins back only 8.3 of about 13 ms, and E's and F's A/Bs would carry it as one more variable, to drop or re-measure after F. Ship 4 MiB: full recovery at +13 MB, but 49 MiB over C7's VmHWM cap. 16 or 32 MiB: killed in the swapless build. Measure 2 MiB: more gn100 time for a value between a partial fix and a failing one, which plan F makes moot. | Sections 4.12–4.14. | Controller (W-14: the recommended option) | Section 2, 12:20Z | In force |
 | W-1 | 2026-09-27 23:27Z | "Answer, don't act": a question such as "is it OK to X?" gets an answer and an offer, never an unrequested action. | None. | The gn100 restart incident (section 7). | Maintainer (correction) | Transcript | Standing rule |
 | W-2 | 2026-09-27 23:09Z to 2026-09-28 01:11Z | Offload work to gn100 "when it makes sense". First baseline: "not more than 65m". Later: "no limits" for this program while the PC stays on. The spec keeps a rule that DGX runs over about 5 minutes need a go-ahead with a time cap. | None. | None. | Maintainer | Transcript; spec §6 | Standing |
 | W-3 | 2026-09-28 18:45Z | Every question to the maintainer goes through the structured question tool. | None. | None. | Maintainer | Transcript | Standing |
@@ -1223,7 +1246,7 @@ ID prefixes:
 | W-13 | 2026-09-30, asked 10:05Z, answered 10:24Z | `main` is pushed after plan C: a fast-forward from 00c70a1 to d7f4b01 (plan C's 13 commits, its merge bb907ac, and the probe-path fix), no force. The docs branches and `bench-hardening` stay local. | "Not yet" (keep `main` local and ask again later). | Pushed 10:24:36Z; Actions green (tests, docs). A scan of 00c70a1..cd3cbf2, run after the pushes, finds no added home path, IP or key path; the only home-path lines are the ones d7f4b01 removes. | Maintainer (chose "Push main now", recommended) | Transcript; section 2 | Done. cd3cbf2 (the 4 GiB detach) followed at 10:37:21Z under W-14. |
 | W-14 | 2026-09-30, about 10:24Z | Routine decisions no longer go to the maintainer: "just assume that the reply is the same and ask only really blocking questions. If something needs to be double checked, just do it, assume I'm not at the desk and you have time to do stuff". The controller takes the usual answer for a local merge commit, pushing `main`, committing the journal, the recommended option, archiving ledgers and starting the next plan in the agreed order. It still asks before a history rewrite, a force-push, anything posted outside the repo (issues, upstream), deleting data, or touching the maintainer's containers. | None offered: a free-text instruction. | "I have replied in the same way for the past 10 times you've asked the same stuff". | Maintainer (free text) | Transcript; section 2 | In force |
 
-Register total: 60 entries (P 3, D 16, R 22, X 5, W 14). (Dated note, 2026-09-30 10:46Z: W-13 and W-14 added. Dated note, 2026-09-30 00:28Z: W-12 added. Dated note, 2026-09-30 00:08Z: R-A5 added. Dated note, 2026-09-29 21:05Z: W-11 added. Dated note, 08:30Z: R-A4 added. Dated note, 08:05Z: R-A3 and W-10 added; W-8 superseded. Dated note, 23:00Z: W-9 added. Dated note, 22:45Z: R-G8, R-G9 and W-8 added. Dated note, 21:20Z: R-G7 added. Dated note, 21:23Z: X4 added. Dated note, 21:45Z: X5 added. Dated note, 22:30Z: W-7 added.) (Dated note, 20:40Z: R-B1, R-B2, R-G5, R-G6, W-6 and X3 were added after p4; before them the total was 38 (P 3, D 16, R 12, X 2, W 5).) R-D3, R-G3 and R-G4 were added at 20:05Z, and R-D4 at about 20:15Z; the backfill written at about 19:30Z had 34.
+Register total: 61 entries (P 3, D 16, R 22, X 6, W 14). (Dated note, 2026-09-30 13:20Z: X6 added. Dated note, 2026-09-30 10:46Z: W-13 and W-14 added. Dated note, 2026-09-30 00:28Z: W-12 added. Dated note, 2026-09-30 00:08Z: R-A5 added. Dated note, 2026-09-29 21:05Z: W-11 added. Dated note, 08:30Z: R-A4 added. Dated note, 08:05Z: R-A3 and W-10 added; W-8 superseded. Dated note, 23:00Z: W-9 added. Dated note, 22:45Z: R-G8, R-G9 and W-8 added. Dated note, 21:20Z: R-G7 added. Dated note, 21:23Z: X4 added. Dated note, 21:45Z: X5 added. Dated note, 22:30Z: W-7 added.) (Dated note, 20:40Z: R-B1, R-B2, R-G5, R-G6, W-6 and X3 were added after p4; before them the total was 38 (P 3, D 16, R 12, X 2, W 5).) R-D3, R-G3 and R-G4 were added at 20:05Z, and R-D4 at about 20:15Z; the backfill written at about 19:30Z had 34.
 
 Three recommended options were overridden: the review scope at 18:46:59Z (R-EX, "Go through the key ones" instead of "Accept all defaults"), and R-A1 and W-5 at 18:51:48Z. At 18:46:59Z the commit question's recommended "I commit in my terminal" was also answered with free text instead: "I already committed, let's debug the shell, I can also reboot if necessary". Separately, spec §3.1 says two of its rows override a plan's default: A1 and the fallback in G2.
 
@@ -1709,6 +1732,43 @@ Reading it:
 - **The knob's pass** reproduces plan C's C7 at the merged image (max VmHWM 3,556 MiB against 3,891).
 - **Afterwards.** A knob server replayed the killed attach and then detached (162.3 s), so the volume ended flat for the next run.
 
+### 4.14 The malloc knob: sweep1 and mem2, a threshold between two walls
+
+Two scratch runs on gn100, 2026-09-30, with image cd3cbf2. Every arm keeps the knob (`MALLOC_TRIM_THRESHOLD_`); an `mmapN` arm adds `MALLOC_MMAP_THRESHOLD_` at N MiB.
+
+**sweep1** (`mtt-sweep.sh`, 12:12:52Z–12:46:35Z) covers IVF (`raggio-ivf`) only:
+- a discarded warm-up, then three rounds, each rotating the arm order by one more place;
+- 4 GiB with swap, host-warm, with a detach at 4 GiB; it ends flat.
+
+`compare.py`, each arm against `knob`:
+
+| Arm | Filtered p50 (ms), band | Filtered p95 (ms) | Memory after ingest (MB) | Hybrid p50 (ms) | Search p50 (ms) |
+|---|---|---|---|---|---|
+| `knob` | 49.5, 2.7 | 51.8 | 1,507 | 76.4 | 8.3 |
+| `mmap1m` | 41.2, 4.2: better | 43.6: within band | 1,510: worse | 75.8: within band | 8.4: within band |
+| `mmap4m` | 35.7, 1.8: better | 38.2: better | 1,520: worse | 75.7: within band | 7.7: within band |
+| `mmap16m` | 36.6, 0.9: better | 38.5: better | 1,524: worse | 75.9: within band | 8.2: within band |
+| `mmap32m` | 36.8, 0.6: better | 39.0: better | 1,611: worse | 75.8: within band | 9.1: within band |
+
+`mmap4m` against `mmap32m` is within the band on every latency row.
+
+**mem2** (`mem-arm.sh`, 12:46:57Z–13:07:21Z) repeats plan C's C7 per arm, as in section 4.13:
+
+| Arm | Loaded RSS (MiB) | Attach 1 | Detach | Attach 2 | Detach 2 | Max VmHWM (MiB) | Max RSS 15 s after a job (MiB) | C7 |
+|---|---|---|---|---|---|---|---|---|
+| `mmap1m` | 1,461 | 187.6 s | 20.3 s | 45.7 s | 20.4 s | 3,584 | 1,774 (cap 1,973) | PASS |
+| `mmap4m` | 1,472 | 187.7 s | 20.4 s | 40.6 s | 15.2 s | 3,940 | 1,906 (cap 1,984) | FAIL (VmHWM) |
+| `mmap16m` | 1,498 | killed at 162.2 s | not run | not run | not run | not sampled | not sampled | FAIL |
+
+Reading it:
+- **Latency: 4 MiB is enough.** `mmap4m` is as fast as `mmap32m` at an eighth of its memory cost.
+- **Where the temporaries come from.** IVF filtered search calls `_IvfIndex._intersect(allowlist, j)` once per probed shard. That builds three int64 arrays as long as the whole allowlist: the `searchsorted` positions, the `np.minimum` copy and the gather. They are about 2 MB each for a filter of 255k ids, plus a bool mask of 255 KB. Flat filtered search passes the allowlist once, which is why flat did not move.
+- **1 MiB's partial gain** fits the query's mid-sized buffers (between 128 KiB and 1 MiB, such as the mask) moving back to the heap while the 2 MB arrays still map. It was not checked further.
+- **Memory: the peak rises with the threshold.** Max VmHWM was 3,556 MiB for the knob (section 4.13), 3,584 at 1 MiB and 3,940 at 4 MiB. 16 and 32 MiB were killed. A higher threshold keeps more of the build's freed blocks in the heap, as in section 5.6. The cap, 3,891 MiB, is 95 % of the 4 GiB limit.
+- **`mmap4m` failed only the peak.** Every job finished, and RSS 15 s after each job stayed under its cap. Its faster second attach and detach are single runs.
+- **The 16 MiB kill** looks like mem1's: exit 137 at 13:01:25Z, and a server log that ends at "collection bench loaded", with no traceback. A knob server replayed the killed attach and then detached (157.1 s), so the volume ended flat.
+- **No threshold wins both ways.** The one that passes C7 recovers 8.3 of the 12.7–13.8 ms that the larger thresholds recover. Plan F's Task 2 binary-searches the smaller side into the larger, so the arrays become shard-sized (about 64 KB), under the knob's 128 KiB threshold. Hence X6: nothing ships, and plan F's A/B carries the recovery.
+
 ## 5. Negative results and surprises
 
 ### 5.1 Audience batching lost on NEON
@@ -1812,7 +1872,7 @@ Dated note, 2026-09-30 00:28Z: confirmed. The first Actions run on `main` (00c70
 
 ### 5.18 The knob that saved the 4 GiB build slowed filtered IVF search by a third
 
-Plan C set `MALLOC_TRIM_THRESHOLD_` (D13) so that glibc gives freed heap back and a swapless 4 GiB IVF build is not OOM-killed (section 5.6). glibc treats that variable as a request to stop adjusting the mmap threshold, which stays at 128 KiB. A container that loaded its index from disk then got each filtered query's large temporaries as fresh `mmap`s. Filtered p50 went from 36 to 49 ms, but only in restarted containers, which is why a-ref2's built-index runs looked normal (sections 4.10 and 4.12). No gate caught it at merge time, because plan C's acceptance run measured memory, not search. A fixed mmap threshold brings the latency back and keeps the knob, at a cost of about 110 MB of RSS at 32 MiB. But at 32 MiB, the swapless 4 GiB build is OOM-killed again (section 4.13), so the fix is not that simple. The threshold has to clear the query's temporaries without keeping the build's large blocks in the heap.
+Plan C set `MALLOC_TRIM_THRESHOLD_` (D13) so that glibc gives freed heap back and a swapless 4 GiB IVF build is not OOM-killed (section 5.6). glibc treats that variable as a request to stop adjusting the mmap threshold, which stays at 128 KiB. A container that loaded its index from disk then got each filtered query's large temporaries as fresh `mmap`s. Filtered p50 went from 36 to 49 ms, but only in restarted containers, which is why a-ref2's built-index runs looked normal (sections 4.10 and 4.12). No gate caught it at merge time, because plan C's acceptance run measured memory, not search. A fixed mmap threshold brings the latency back and keeps the knob, at a cost of about 110 MB of RSS at 32 MiB. But at 32 MiB, the swapless 4 GiB build is OOM-killed again (section 4.13), so the fix is not that simple. The threshold has to clear the query's temporaries without keeping the build's large blocks in the heap. sweep1 and mem2 (section 4.14) found no such threshold. 1 MiB passes C7 but wins back only 8.3 of about 13 ms. 4 MiB wins it all back but peaks 49 MiB over C7's cap, and 16 MiB is killed like 32 MiB. No threshold ships (X6). Plan F's `_intersect` rewrite shrinks the temporaries below the knob's 128 KiB threshold instead.
 
 ## 6. Method: how we measured
 
@@ -1991,6 +2051,7 @@ State as of 2026-09-28, about 19:30Z.
 - Dated note, 2026-09-30 11:25Z: a-ref2 and the p99 probe are done (sections 4.10 and 4.11). a-ref2 shows plan C's build and memory wins, a 3–4 % hybrid regression, and a filtered regression in restarted IVF containers. A malloc A/B (`mtt2`) runs on gn100 to test the lead (section 2, 10:46Z). Plan D1 is pre-flighted and ruled; Task 1 is approved (f7918ff, 269 passed), and Task 2 is running.
 - Dated note, 2026-09-30 12:10Z: plan D1's Tasks 1–5 are approved, and ADR 0001 has its D1 addendum (24bcc90, 288 passed; section 2, 11:25Z). The final whole-branch review on Opus runs before Task 6's gn100 A/B, so any fix lands before the A/B pins its candidate. mtt2 traced the IVF filtered regression to the malloc knob (section 4.12). `mem1` (C7 for a fixed 32 MiB mmap threshold) and `sweep1` (the threshold sweep) are running on gn100; the D1 A/B follows them.
 - Dated note, 2026-09-30 12:20Z: the final review's I1 (a cancelled delete could hand its ids to the next upsert) is fixed at e6e1e44, the wording fixes are at 2274a6a, and the re-review approved both (289 passed). The A/B's scripts are at revision 2. D1's candidate is 2274a6a0d60d. mem1 ruled out a 32 MiB mmap threshold, which is OOM-killed in the swapless build (section 4.13). `sweep1`, then `mem2` (C7 for 1, 4 and 16 MiB), then the D1 A/B run on gn100.
+- Dated note, 2026-09-30 13:20Z: sweep1 and mem2 are done (section 4.14). No mmap threshold ships; plan F's `_intersect` rewrite carries the filtered-search recovery (X6). D1's gn100 A/B is running (13:13:08Z, cap 330 minutes): candidate 2274a6a0d60d against base cd3cbf2266ab, with the reingests.
 
 ### 9.2 Open questions in the plans
 

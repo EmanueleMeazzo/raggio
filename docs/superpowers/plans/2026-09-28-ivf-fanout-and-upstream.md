@@ -854,6 +854,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ### Task 2: Shard-side allowlist intersection
 
+> **Note (2026-09-30, journal section 4.14, register X6).** Since plan C, the image sets `MALLOC_TRIM_THRESHOLD_`, which keeps glibc's mmap threshold at 128 KiB. In a restarted container, the current `_intersect`'s allowlist-sized temporaries (about 2 MB each) are then fresh mappings, so the base arm's IVF filtered p50 is about 49 ms, not 36.6 ms. This task's rewrite makes them shard-sized, under 128 KiB, which also removes that regression. No `MALLOC_MMAP_THRESHOLD_` ships.
+
 **Files:**
 - Modify: `src/raggio/store.py`:
   - the new `_sorted_ids`, before `class _ShardPool:`;
