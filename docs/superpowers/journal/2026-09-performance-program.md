@@ -1046,6 +1046,49 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
     - In pre, the window's slowest request follows the DELETE's own duration (137 → 108 ms, 110 → 102 ms). Readers queue on `_load_lock` for as long as the delete holds it.
   - Caveat: the victim's batches are 50 documents of 10 records, so the stall covers one short write section. A production-size write section would stall longer.
 
+**10:46Z–11:25Z. a-ref2 lands, the p99 probe runs on gn100, a malloc lead turns up, and plan D1 starts.**
+- **a-ref2 finished at 10:56:36Z**, 17.5 minutes after launch. The comparison with a-ref is in section 4.10. Plan C's wins are there: the IVF build went from 52.8 to 41.1 s, and flat memory after ingest from 1,546 to 1,503 MB. Two things got worse, beyond the band and in every run:
+  - hybrid search, by about 3.5 % on both engines (flat p50 77.9 → 80.6 ms);
+  - raggio-ivf's filtered search (p50 35.7 → 49.4 ms).
+  - The filtered regression has a pattern. The two containers that built the index answered in 36.6 and 37.1 ms, like a-ref. The three restarted containers, which loaded the index from disk, answered in 48.3–49.4 ms. a-ref's restarted containers answered in 35.5–36.6 ms.
+  - The session leaves its last container running, and a flat-start session with `IVF_BUILDS=2` leaves the volume IVF-attached (build2). The controller stopped `bench-tv` by hand.
+- **The p99-during-delete probe ran on gn100**, 11:00:07Z–11:14:15Z: 3 reps per arm, alternating pre and post, with no failed request, OOM or server error. Results are in section 4.11. Plan C halved the stall that a delete puts on other collections: the delete-window p99 went from 200.4 to 91.8 ms. Searches on a collection while another collection ingests stall just as long in both arms (p99 305–309 ms, p50 69–83 ms, against 7.4–7.9 ms when quiet). That stall is what plan D1 moves off the event loop, so the probe will run again on D1's image.
+- **The malloc lead.** Plan C put `ENV MALLOC_TRIM_THRESHOLD_=134217728` in the image (D13). glibc treats setting the trim threshold (like the top pad, the mmap threshold or the mmap maximum) as a request to stop adjusting the mmap threshold dynamically. So every allocation of 128 KiB or more then stays a fresh `mmap`, with its page faults, and is returned by `munmap` when freed. Without the knob, glibc raises the threshold after the first such block is freed, up to 32 MiB on 64-bit, and later blocks come from the already-faulted heap.
+  - That could explain why only restarted containers were slow. glibc takes a block from the arena's free space first and asks the kernel only when there is none. A container that has just built the index has a large free heap left over, while a restarted one does not.
+  - A scratch A/B on gn100 (`mtt-ab.sh`: one image, cd3cbf2, and three arms of fresh 4 GiB containers) tests it:
+    - `knob` is the image as shipped;
+    - `noknob` unsets the variable (`--unsetenv`);
+    - `mmap32` keeps the knob and fixes the mmap threshold at 32 MiB, the dynamic threshold's own ceiling.
+  - Each engine gets a discarded warm-up and then 3 rounds in rotated order.
+  - The first launch (`mtt1`, 11:16:56Z) died at its first `mmap32` run. `echo -e VAR=...` treats `-e` as echo's own flag, so podman read the variable as an image name. Fixed to `--env=` and `--unsetenv=`, and relaunched as `mtt2` at 11:23:08Z.
+  - `mtt1`'s only complete pair already pointed at the knob: filtered p50 48.1 ms with it and 36.0 ms without, the latter close to a-ref's 35.7 ms. Hybrid p50 did not follow (76.0 and 77.5 ms), so the hybrid regression may have another cause.
+  - Default glibc cannot simply come back. Section 5.6: without the knob, a swapless 4 GiB IVF build is OOM-killed, with or without `malloc_trim`. A fix has to keep C7's headroom, so any threshold change needs a swapless attach → detach → attach check.
+- **Plan D1's pre-flight (10:50Z–10:59Z).** Five Sonnet scanners ran in one workflow, with 0 errors:
+  - a replay of Tasks 1–5 on a scratch copy of cd3cbf2;
+  - two drift scans, one for Tasks 1–3 and one for Tasks 4–6;
+  - a DGX scan of Task 6;
+  - a consistency scan against the spec, the B and C hand-offs, and plans D2, E, F and G.
+  - The replay found all 17 quoted anchors exactly once, and every Step 2 failed as the plan says. No repair was needed. The totals were 269, 278, 283, 285 and 288, which is N0 + 8, 17, 22, 24 and 27 with N0 = 261. The total was 288 on CPython 3.12.14 and SQLite 3.53.1 too.
+- **Thirteen rulings (11:14Z)**, recorded in the SDD ledger. The ones that change what D1 ships:
+  - **`INSERT OR REPLACE` into `vecs`.** Task 3 adopts plan C's hand-off. With Task 3's rollback, `MAX(records.id)` never moves after a failed job. An orphan `vecs` row at `MAX(id) + 1` would then fail every later job of the collection, where today it fails one. Task 3's rollback test is extended to pin the self-heal. No new test is added.
+  - **The attach log's `backfill=` count** reports the rows actually written, as a separate commit in Task 3. This is plan C's other residual.
+  - **"Before 2026-09" is wrong.** B and C are 2026-09 releases that still journal TEXT payloads, so the plan's comments, `docs/storage.md` and the ADR say "before the binary job journal" instead.
+  - **A crashed binary job is re-claimed.** The legacy-replay test also leaves a binary job `processing`.
+  - **Mixed supplied and embedded vectors** get covered in an existing test (Task 3), since nothing in the plan feeds that mix through the worker.
+  - **`docs/storage.md`'s upgrade note** follows the vacuum policy.
+  - **Task 6's gn100 run** gets plan C's runbook rules:
+    - LF archives;
+    - deploying through `deploy.sh`;
+    - a uv-managed host interpreter whose SQLite must match the image's;
+    - `podman stop` before `rm -f`, on `bench-tv` only;
+    - scrubbed output;
+    - a guard against any running probe.
+  - The rest: the counts, the trailer, line endings, notes for reviewers, and two hand-offs to D2's pre-flight.
+- **Task 1** (the codec and the `job_payloads` table) was dispatched at 11:18:12Z. It came back DONE at f7918ff in 93 s: 269 passed, `ruff --select F` clean. The review approved it with 0 Critical and 0 Important findings. Two minors were deferred to the final review:
+  - the little-endian test cannot fail on a little-endian host;
+  - several documented `ValueError` branches of the decoder are untested.
+- Task 2 (wiring the binary journal) was dispatched right after.
+
 ## 3. Decision register
 
 ID prefixes:
@@ -1485,6 +1528,72 @@ Reading it:
 - The probe's detaches at 8 GiB took 23–27 s, timed from the DELETE. The sessions and detach.sh took 34–35 s. The difference was not investigated.
 - The maintainer accepted the build cost (R-A5).
 
+### 4.10 Plan C on the bench: a-ref against a-ref2
+
+Two sessions on gn100 with the same regime: 4 GiB, host-warm, c=8, `FLAT_RUNS=3`, `IVF_BUILDS=2`, PBS CPython 3.12.14, SQLite 3.53.1 and one BLAS thread. a-ref is 21e272d (plan A, 2026-09-29). a-ref2 is cd3cbf2 (plan C merged, plus the 4 GiB detach), 2026-09-30 10:39Z–10:56Z, on the volume plan C's acceptance run had migrated. a-ref2 is the baseline plans D–G compare against.
+
+Each cell is the median of the counted runs, with the band (max − min) in brackets. The build row uses run0 and build2.
+
+| Engine | Metric | a-ref | a-ref2 | Verdict |
+|---|---|---|---|---|
+| raggio | Memory after ingest (MB) | 1,546 (22) | 1,503 (1) | better |
+| raggio | Search p50 (ms) | 18.2 (0.6) | 18.3 (0.4) | within band |
+| raggio | Filtered p50 (ms) | 24.3 (9.3) | 26.4 (2.7) | within band |
+| raggio | Hybrid p50 (ms) | 77.9 (1.3) | 80.6 (1.1) | **worse** |
+| raggio | Hybrid p95 (ms) | 116.1 (1.8) | 119.8 (2.3) | **worse** |
+| raggio | Hybrid QPS serial | 11.6 (0.1) | 11.2 (0.1) | **worse** |
+| raggio | Hybrid p99 under concurrency (ms) | 1,203 (250) | 1,107 (186) | within band |
+| raggio | Hybrid CPU per query under concurrency (ms) | 282.3 (31.2) | 265.9 (7.6) | within band |
+| raggio-ivf | IVF build at 4 GiB (s) | 52.84 (0.11) | 41.13 (0.25) | better |
+| raggio-ivf | Search p99 (ms) | 14.9 (5.9) | 9.7 (0.6) | within band |
+| raggio-ivf | QPS concurrent | 223 (20) | 208 (4) | within band |
+| raggio-ivf | Filtered p50 (ms) | 35.7 (1.1) | 49.4 (1.1) | **worse** |
+| raggio-ivf | Filtered p95 (ms) | 37.0 (1.2) | 51.0 (1.8) | **worse** |
+| raggio-ivf | Recall@10 | 0.994 | 0.993 | worse (see below) |
+| raggio-ivf | Hybrid p50 (ms) | 74.1 (0.3) | 77.5 (0.8) | **worse** |
+| raggio-ivf | Hybrid p99 (ms) | 468.6 (9.2) | 487.9 (6.2) | **worse** |
+| raggio-ivf | Hybrid QPS serial | 12.1 (0.1) | 11.6 (0.0) | **worse** |
+| both | Disk footprint (MB) | 16,470 / 16,758 | 16,479 / 16,768 | worse (+9 MB) |
+
+Cold start to first query went from 3.9 to 2.1 s (flat) and 2.5 s (IVF), but compare.py marks it not claimable in a host-warm regime. Flat memory under load improved with memory after ingest (1,549 → 1,505 MB). Flat QPS, text-hit@10 and hybrid under concurrency were within the band.
+
+raggio-ivf filtered p50 per run (ms). run0 and build2 ran in the container that had just built the index; run1–run3 each ran in a restarted container that loaded it from disk:
+
+| Session | run0 (built) | run1 | run2 | run3 | build2 (built) |
+|---|---|---|---|---|---|
+| a-ref | 37.2 | 35.5 | 36.6 | 35.7 | 37.3 |
+| a-ref2 | 36.6 | 48.3 | 49.4 | 49.4 | 37.1 |
+
+Reading it:
+- **The build is 11.7 s faster (−22 %).** Plan C draws the training sample by rowid instead of `ORDER BY RANDOM()` (section 5.5), the build's main pre-work; how the saving splits was not measured. The in-session detach at 4 GiB took 32 s, against 34–35 s at 8 GiB in a-ref.
+- **The filtered regression belongs to restarted containers only**, as the table shows. Section 2 (10:46Z) has the malloc lead and the A/B that tests it.
+- **Hybrid is 3–4 % slower on both engines and in every run**: flat 79.8–81.1 ms against 77.4–78.7 ms, IVF 76.7–78.1 ms against 73.9–75.9 ms. The ranges do not overlap. Hybrid under concurrency did not get worse.
+- **The recall row compares k-means builds, not code.** The counted runs reuse run0's index. The four builds on record gave 0.9938 and 0.9928 (a-ref) and 0.9926 and 0.9952 (a-ref2).
+- **Disk +9 MB** is the migration's covering index `idx_records_doc_type (doc_id, type, indexed)`, which replaced `idx_records_doc (doc_id)`.
+
+### 4.11 Search latency while another collection is deleted mid-ingest
+
+The probe from section 2 (10:05Z), run on gn100 on 2026-09-30, 11:00Z–11:14Z.
+- Arms: pre = 21e272d (plan B without C), post = cd3cbf2.
+- Each arm and rep got a fresh bind-mounted data dir in a 4 GiB container. The arms alternated, 3 reps each.
+- The reader was open-loop at 40 searches/s on `steady`, with latency counted from the scheduled start.
+- Classes: `quiet` (nothing else runs), `ingest` (`victim` ingests) and `delete` (the window around each `DELETE` of `victim` mid-ingest).
+
+Median across reps (ms):
+
+| Arm | quiet p99 | ingest p50 | ingest p99 | delete p99 | slowest request per delete window, median / max |
+|---|---|---|---|---|---|
+| pre (21e272d) | 10.5 | 72.3 | 304.7 | 200.4 | 121.9 / 223.1 |
+| post (cd3cbf2) | 10.4 | 82.4 | 309.1 | 91.8 | 83.4 / 104.8 |
+
+All 27,533 searches returned 200. The DELETE itself took 144 ms (pre) and 159 ms (post) at the median, and at most 214 and 210 ms.
+
+Reading it:
+- **Plan C halved the delete stall.** In pre, readers queue on `_load_lock` for as long as the delete holds it. The worst window reached 223 ms, about the DELETE's own duration. In post, a resident collection's requests no longer take that lock, and the worst window was 105 ms.
+- **What is left of the delete stall is the ingest stall.** The post delete windows (p99 92 ms) sit inside the ingest class's range, because the victim is ingesting until it is deleted.
+- **The ingest stall did not move, and it is large:** p50 69–83 ms and p99 about 305 ms, against a quiet p50 of 7.4–7.9 ms. The worker's payload decoding, flattening and matrix building run on the event loop and stall every collection's requests. Plan D1 moves them into threads. The probe runs again on D1's image, against cd3cbf2.
+- Caveat: the victim ingests 50-document batches of 10 records. Larger batches would stall longer.
+
 ## 5. Negative results and surprises
 
 ### 5.1 Audience batching lost on NEON
@@ -1760,6 +1869,7 @@ State as of 2026-09-28, about 19:30Z.
 - Dated note, 2026-09-30 09:25Z: plan C is complete on its branch (adf8ac1, 260 passed), after one fix wave and a clean scoped re-review (section 2, 09:17Z). The merge decision is the maintainer's.
 - Dated note, 2026-09-30 10:05Z: plan C is merged into main locally (bb907ac), followed by the probe-path fix (d7f4b01); 260 passed; not pushed (section 2, 09:25Z). Next: the a-ref2 re-baseline on gn100, the `DETACH_MEMORY=8g` removal and the p99-during-delete probe, then plan D1.
 - Dated note, 2026-09-30 10:46Z: `main` is pushed (d7f4b01, then cd3cbf2: the detach at 4 GiB, 261 passed). a-ref2 is running on gn100 (10:39Z), and the p99-during-delete probe is built and smoke-tested locally (section 2, 10:05Z). Next: a-ref2's comparison with a-ref, the probe on gn100, then plan D1.
+- Dated note, 2026-09-30 11:25Z: a-ref2 and the p99 probe are done (sections 4.10 and 4.11). a-ref2 shows plan C's build and memory wins, a 3–4 % hybrid regression, and a filtered regression in restarted IVF containers. A malloc A/B (`mtt2`) runs on gn100 to test the lead (section 2, 10:46Z). Plan D1 is pre-flighted and ruled; Task 1 is approved (f7918ff, 269 passed), and Task 2 is running.
 
 ### 9.2 Open questions in the plans
 
@@ -1798,7 +1908,7 @@ State as of 2026-09-28, about 19:30Z.
 - **Plan code checked only against stand-ins** (dated 22:45Z). Plan G's decision code and scenarios ran against a stand-in `compare.py`; the real one comes with plan A, and its first real run is G's Task 10 Step 4. Plan A's Task 5 was run from the plan text in a scratch copy, but its suite totals (161 to 171) are sums, not runs.
 - **CI.** At critic time `.github/workflows` held only `docs.yml`; plan A adds `tests.yml`.
 - **Re-creating a collection while its delete is still running** (found in B's pre-flight, 2026-09-29): a same-name create that lands between the delete's catalog DELETE and its `rmtree` loses its directory. The next request answers 500. This exists at 19a8a2e too, and B leaves it alone. A likely fix: rename the directory to a tombstone under `_load_lock`, then remove the tombstone outside the lock.
-- **A DELETE mid-ingest briefly stalls every collection** (B's pre-flight, 2026-09-29): accepted in B, see 09:14Z. Plan C, which moves collection construction off the event loop, is the place to move `stop()` out of `_load_lock`. (Dated note, 10:45Z: the stall is longer than one write section; see the 09:14Z note and 10:33Z. Plan C's acceptance should measure it as p99 on other collections while one is deleted mid-ingest. Dated note, 2026-09-30 08:06Z: plan C's pre-flight reversed this. Task 4 pins, by test, that a resident collection's requests no longer wait on another collection's delete. `stop()` stays under `_load_lock`, so loads of non-resident collections still queue behind it. The p99 is not part of plan C's acceptance; it is a non-gating gn100 follow-up probe (section 2, 00:27Z).)
+- **A DELETE mid-ingest briefly stalls every collection** (B's pre-flight, 2026-09-29): accepted in B, see 09:14Z. Plan C, which moves collection construction off the event loop, is the place to move `stop()` out of `_load_lock`. (Dated note, 10:45Z: the stall is longer than one write section; see the 09:14Z note and 10:33Z. Plan C's acceptance should measure it as p99 on other collections while one is deleted mid-ingest. Dated note, 2026-09-30 08:06Z: plan C's pre-flight reversed this. Task 4 pins, by test, that a resident collection's requests no longer wait on another collection's delete. `stop()` stays under `_load_lock`, so loads of non-resident collections still queue behind it. The p99 is not part of plan C's acceptance; it is a non-gating gn100 follow-up probe (section 2, 00:27Z). Dated note, 2026-09-30 11:14Z: measured on gn100 (section 4.11). The delete-window p99 went from 200.4 ms before plan C to 91.8 ms after it. What remains is the ingest stall, which plan D1 targets.)
 - **Issue candidates from B's final review** (2026-09-29; drafted, not filed. Dated note, 11:10Z: the maintainer chose to file all five; they wait for a GitHub CLI login. Dated note, 21:10Z: filed as #1–#5, in the order below):
   - the same-name create that races a delete (the item above);
   - a subprocess test for closing a connection under a running statement: `close()` blocked in the Windows probes, and a connection with no earlier statement segfaulted;
