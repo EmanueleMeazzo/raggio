@@ -1127,27 +1127,34 @@ class Collection:
                 f"{no_text} records have neither a retained vector nor text;"
                 " re-ingest them before attaching an index"
             )
+        written = 0
         for s in range(0, len(rows), 64):
             batch = rows[s : s + 64]
             vecs = await self.embedder.embed([t for _, t in batch])
             vecs16 = _normalize(np.array(vecs, dtype=np.float32)).astype(np.float16)
 
             def write():
+                # A DELETE can land while the batch is embedded; an orphan vecs row would
+                # collide with the next ingest's MAX(id)+1, so write only live records.
                 with self.db_lock:
+                    n = 0
                     for (rid, _), v in zip(batch, vecs16):
-                        self.db.execute(
-                            "INSERT OR REPLACE INTO vecs(id, vec) VALUES (?,?)", (rid, v.tobytes())
-                        )
+                        n += self.db.execute(
+                            "INSERT OR REPLACE INTO vecs(id, vec) SELECT ?, ?"
+                            " WHERE EXISTS (SELECT 1 FROM records WHERE id=? AND indexed=1)",
+                            (rid, v.tobytes(), rid),
+                        ).rowcount
                     self.db.commit()
+                    return n
 
-            await asyncio.to_thread(write)
+            written += await asyncio.to_thread(write)
             if add is not None:
                 await asyncio.to_thread(
                     add,
                     np.array([rid for rid, _ in batch], dtype=np.uint64),
                     vecs16.astype(np.float32),  # the fp16 round trip a stream would read
                 )
-        return len(rows)
+        return written
 
     async def _attach_index(self, payload: dict) -> None:
         """Build IVF shards from retained vectors and swap them in. The build runs

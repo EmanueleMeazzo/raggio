@@ -310,7 +310,7 @@ def test_reconcile_reads_live_ids_once_through_the_helper(tmp_path, monkeypatch)
 
 
 def test_reconcile_keeps_live_ids_above_2_32(tmp_path):
-    big = [2**40 + 1, 2**40 + 2, 2**40 + 3]  # a int64/uint64 mix would promote to float64
+    big = [2**40 + 1, 2**40 + 2, 2**40 + 3]  # an int64/uint64 mix would promote to float64
     seed(tmp_path, big[:2], big)
     col = make_collection(tmp_path)
     assert len(col.index) == 2
@@ -852,13 +852,38 @@ def test_attach_backfills_rows_the_stream_missed(tmp_path, monkeypatch):
     assert not any("LEFT JOIN" in s for s, _ in log)  # found from the stream, no pre-scan
 
 
-def test_attach_backfills_a_legacy_collection_before_training(tmp_path):
+def test_attach_backfills_a_legacy_collection_before_training(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger=LOG)
     col = make_collection(tmp_path)
     ingest(col, 300)
     delete_vecs(col, range(1, 301))  # every row predates vector retention
     asyncio.run(col._process_job({"op": "attach_index", "nlist": 8}))
     assert isinstance(col.index, _IvfIndex) and len(col.index) == 300
     assert col.db.execute("SELECT COUNT(*) FROM vecs").fetchone()[0] == 300
+    assert "legacy_backfill=300" in caplog.text  # the pre-train backfill really ran
+
+
+def test_backfill_skips_a_record_deleted_mid_embed(tmp_path):
+    class DeletesOnce(FakeEmbedder):
+        async def embed(self, texts):
+            if not self.fired:
+                self.fired = True
+                col._delete_doc_rows("d9")  # a DELETE lands while the batch is embedded
+            return await super().embed(texts)
+
+        fired = False
+
+    col = make_collection(tmp_path, DeletesOnce())
+    ingest(col, 10)  # d9 holds the highest id, 10
+    delete_vecs(col, [9, 10])
+    n = asyncio.run(col._backfill_vecs(np.array([9, 10], dtype=np.uint64)))
+    assert col.db.execute(
+        "SELECT COUNT(*) FROM vecs WHERE id NOT IN (SELECT id FROM records)"
+    ).fetchone()[0] == 0  # no orphan to collide with the next MAX(id)+1
+    assert n == 1  # the deleted row is neither written nor counted
+    ingest(col, 1, start=100)
+    live = col.db.execute("SELECT COUNT(*) FROM records WHERE indexed=1").fetchone()[0]
+    assert sum(col.indexed_counts.values()) == live
 
 
 def test_attach_fails_after_the_stream_for_textless_rows(tmp_path, monkeypatch):
