@@ -625,3 +625,65 @@ def test_request_paths_that_scan_records_run_off_the_loop(tmp_path, monkeypatch)
 
     assert asyncio.run(run()) == [200, 200, 200]
     assert len(where) >= 3 and all(where), where
+
+
+# ---- Task 6: rowid sampling ----
+
+
+def vec_ids(col, mat) -> list:
+    """Map sampled f32 rows back to record ids via their stored fp16 bytes
+    (fp16 -> f32 -> fp16 round-trips exactly)."""
+    by_blob = {bytes(b): i for i, b in col.db.execute("SELECT id, vec FROM vecs")}
+    return [by_blob[row.astype(np.float16).tobytes()] for row in mat]
+
+
+def test_vec_sample_dense_ids_point_read_without_random(tmp_path):
+    col = make_collection(tmp_path)
+    ingest(col, 2000)
+    log = record_sql(col)
+    mat = col._vec_sample(256)
+    assert mat.shape == (256, DIM) and mat.dtype == np.float32
+    assert len(set(vec_ids(col, mat))) == 256
+    assert not any("RANDOM()" in s for s, _ in log)  # p1: 152 s cold at 2.55M rows
+
+
+def test_vec_sample_sparse_ids_fall_back(tmp_path):
+    col = make_collection(tmp_path)
+    ingest(col, 2000)
+    with col.db_lock:  # mass delete: 200 of 2000 ids left, density 0.1
+        col.db.execute("DELETE FROM records WHERE id % 10 != 0")
+        col.db.commit()
+    col.indexed_counts = {"chunk": 200}  # what _delete_doc_rows keeps in step
+    log = record_sql(col)
+    mat = col._vec_sample(50)
+    assert len(mat) == 50
+    assert all(i % 10 == 0 for i in vec_ids(col, mat))
+    assert any("RANDOM()" in s for s, _ in log)
+
+
+def test_vec_sample_k_at_least_half_returns_all_rows(tmp_path):
+    col = make_collection(tmp_path)
+    ingest(col, 300)
+    assert sorted(vec_ids(col, col._vec_sample(65_536))) == list(range(1, 301))
+    assert len(set(vec_ids(col, col._vec_sample(150)))) == 150  # k == n/2: rowid path
+    assert len(set(vec_ids(col, col._vec_sample(151)))) == 151  # k > n/2: full scan
+
+
+def test_vec_sample_never_returns_rows_without_vectors(tmp_path):
+    col = make_collection(tmp_path)
+    ingest(col, 2000)
+    with col.db_lock:  # legacy rows: indexed, but no retained fp16 original
+        col.db.execute("DELETE FROM vecs WHERE id <= 1000")
+        col.db.commit()
+    for k in (100, 900):
+        ids = vec_ids(col, col._vec_sample(k))
+        assert len(ids) == k and len(set(ids)) == k and min(ids) > 1000
+
+
+def test_vec_sample_is_uniform_over_ids(tmp_path):
+    # k-means trains on this sample: a bias toward low (old) ids would skew the shards.
+    # One draw's mean has sd ~34; the mean of 20 draws has sd ~8, so 60 is ~8 sd
+    col = make_collection(tmp_path)
+    ingest(col, 2000)
+    means = [np.mean(vec_ids(col, col._vec_sample(250))) for _ in range(20)]
+    assert abs(np.mean(means) - 1000.5) < 60

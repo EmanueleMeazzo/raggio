@@ -84,6 +84,12 @@ IVF_BUILD_BLOCK = 16_384  # rows per streamed rebuild block (~100 MB f32 at 1536
 MIGRATION_LOG_EVERY_S = 10.0
 MIGRATION_PROGRESS_OPS = 1_000_000
 
+# _vec_sample (k-means training / calibration sample): ids are MAX+1-allocated, so
+# random rowids hit live rows at rate n/max_id. Point-read those while that rate is at
+# least VEC_SAMPLE_MIN_DENSITY; mass deletes below it fall back to ORDER BY RANDOM()
+VEC_SAMPLE_MIN_DENSITY = 0.2
+VEC_SAMPLE_ROUNDS = 8
+
 # uvicorn configures this logger with its stderr handler, so these lines reach
 # `podman logs`; under pytest the records propagate to the root logger (caplog)
 _log = logging.getLogger("uvicorn.error")
@@ -1014,7 +1020,35 @@ class Collection:
             )
 
     def _vec_sample(self, k: int) -> np.ndarray:
-        rows = self._rdb().execute(
+        """Up to k distinct, uniformly random retained vectors of indexed records.
+        ORDER BY RANDOM() reads and sorts every vecs page (p1: 152 s cold at 2.55M rows),
+        so while ids are dense, draw random rowids and point-read only those. Every
+        live id is equally likely to be drawn, so the pick stays uniform. Too sparse,
+        k above n/2, or too few hits after VEC_SAMPLE_ROUNDS falls back to the scan."""
+        db = self._rdb()
+        n = sum(self.indexed_counts.values())
+        max_id = db.execute("SELECT MAX(id) FROM records").fetchone()[0] or 0
+        if n and max_id and n / max_id >= VEC_SAMPLE_MIN_DENSITY and 2 * k <= n:
+            rng = np.random.default_rng()
+            got: dict[int, bytes] = {}
+            tried = np.empty(0, dtype=np.int64)
+            for _ in range(VEC_SAMPLE_ROUNDS):
+                draws = rng.integers(1, max_id + 1, size=int((k - len(got)) * max_id / n * 1.3) + 64)
+                cand = np.setdiff1d(draws, tried)
+                tried = np.union1d(tried, cand)
+                got.update(_rows_by_id(
+                    db,
+                    "SELECT v.id, v.vec FROM vecs v JOIN records r ON r.id=v.id"
+                    " WHERE r.indexed=1 AND v.id IN ({})",
+                    cand.tolist(),
+                ))
+                if len(got) >= k:
+                    keys = list(got)
+                    pick = rng.choice(len(keys), k, replace=False)
+                    blob = b"".join(got[keys[i]] for i in pick)
+                    mat = np.frombuffer(blob, dtype=np.float16)
+                    return mat.reshape(k, self.cfg.dim).astype(np.float32)
+        rows = db.execute(
             "SELECT v.vec FROM vecs v JOIN records r ON r.id=v.id WHERE r.indexed=1"
             " ORDER BY RANDOM() LIMIT ?", (k,),
         ).fetchall()
