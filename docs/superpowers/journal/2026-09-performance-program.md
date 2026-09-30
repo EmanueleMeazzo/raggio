@@ -851,6 +851,173 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
   - `git branch -d` refused, because the main checkout is on the docs branch, not on `main`. The branch was deleted with `-D` after `git merge-base --is-ancestor` confirmed that `main` contains it.
 - **Where things stand.** `main` is 17 commits ahead of `origin/main`, and nothing is pushed. The next plan in the merge order is C.
 
+**00:19Z–00:28Z. `main` is pushed, the first GitHub Actions run confirms CPython 3.12.14, and plan C starts.**
+- **Push first (W-12).** Asked whether to start plan C, the maintainer chose "Push first, then plan C" over "Start plan C now" (recommended) and "Pause here".
+  - Before the confirmation, the unpublished range (19a8a2e..00c70a1: 17 commits, 30 files, +3,303/−119) was scanned, patches and messages both. It holds no ssh or key path, no IP besides 127.0.0.1 and 0.0.0.0, and no home path. The scripts read `$SSH_CONFIG`. The host alias `gn100` appears in `deploy.sh` and the ADR.
+  - The maintainer confirmed with "Push main now". It was pushed at 00:22:18Z, a fast-forward from 19a8a2e to 00c70a1 with no force. It publishes plan A's PR 1, plan B and plan A's PR 2.
+  - The docs branches and `bench-hardening` stay local, because their older commits carry the ssh path.
+- **The first Actions run.** The tests workflow's job took 27 s.
+  - `uv lock --check` downloaded `cpython-3.12.14-linux-x86_64-gnu`, and every later step reported "Using CPython 3.12.14". The suite: 193 passed, 1 warning.
+  - This closes PR 2's last open test-plan item (section 5.17): `UV_PYTHON_PREFERENCE: only-managed` works on a runner that has a system 3.12.
+  - The docs workflow passed too. One annotation: `ubuntu-latest` moves to Ubuntu 26 from 2026-10-19.
+- **Plan C starts** in `.worktrees/cold-start-loop-hygiene`, on branch `cold-start-loop-hygiene` from `main` at 00c70a1.
+  - The suite there: 193 passed, 1 warning, so N0 = 193. The plan expected 188, but PR 2 added 5 tests, and the plan counts relative to N0.
+  - The pre-flight scan runs as a workflow, `planC-preflight`. Four Sonnet scanners each cover one area: the code drift since 19a8a2e for Tasks 1–5, and again for Tasks 6–10; the DGX Tasks 11–12 against plan A's scripts and image; cross-task and spec consistency. An adversarial Sonnet verifier checks each scanner's findings.
+
+**00:27Z–08:06Z. Plan C's pre-flight scan, and twenty rulings before Task 1.**
+- **The scan.** The `planC-preflight` workflow started at 00:27Z with four Sonnet scanners, each followed by an adversarial Sonnet verifier.
+  - Code drift since 19a8a2e, Tasks 1–5: 42 rows, table at 00:31Z. Every one of the 14 quoted old-text blocks exists verbatim, once; only line numbers moved. Plan B did not touch `touch()`, so Task 4 applies as written. The `EXPLAIN` expectations reproduce on the workstation's SQLite 3.47.1.
+  - Code drift, Tasks 6–10: 26 rows, all notes, table at 00:30Z. The worktree is CRLF on disk, and Task 9's old text depends on Task 3's output, so the order holds.
+  - DGX Tasks 11–12 against plan A's scripts and image: 32 rows, table at 00:37Z.
+  - Cross-task and spec consistency: 116 rows. This scanner failed on an API connection error (`ENOTFOUND`). The workflow was resumed from its run ID, the finished agents replayed from cache, and its table landed at 07:59Z.
+- **B's promise, reversed.** Plan B's ADR Deferred row and B's final-review ruling (section 2, 2026-09-29) said plan C's acceptance "gets a number: p99 on other collections while one is deleted mid-ingest". Plan C carries no such measurement, and spec §7 C has no such threshold.
+  - Ruling: spec §7 C stays the only gate. Task 4 gains one test: a resident collection's `touch()` returns within 1 s while another collection's `DELETE` is held inside a slow `stop()`. It fails on `main`, where `touch()` always takes `_load_lock`, and passes with Task 4's resident fast path.
+  - Task 10's addendum says plainly that `stop()` stays under `_load_lock` (the tombstone-first redesign stays rejected, for the reasons B's review gave), that resident requests no longer wait on it, and that loads of collections not yet resident still do. It amends B's Deferred sentence to match.
+  - The p99 number is not added to Tasks 11–12. It needs a concurrent ingest-plus-delete load generator that no plan script has, inside the largest task. It becomes a non-gating gn100 follow-up probe, to be offered to the maintainer when plan C finishes.
+  - The reasoning: the test pins the structural fix (resident requests are off the lock) deterministically, which a p99 on one host would not. The residual cost, a first request to a non-resident collection waiting for `stop()`, is bounded by `stop()`.
+- **Other rulings.**
+  - The docs wording is corrected where the plan overstated. A collection with unfinished jobs is loaded, and migrated, at start-up, before the server answers anything, `/healthz` included. Loads and migrations of different collections run one at a time. The legacy-row failure can come before the stream as well as after it. "Every row is pinned by a test" becomes "every Accepted row".
+  - `GET /collections/{name}` joins the reads that can answer 500 during a racing delete, now that `stats()` runs in a thread. This is the class B's Deferred row already lists.
+  - Task 11's session dies early unless the image reads `MALLOC_TRIM_THRESHOLD_=134217728`, and `c_verdict.py --adr` refuses to write a block that contains a home path.
+  - The pre-C image for the legacy follow-up is named: `localhost/raggio:21e272d`.
+  - A new follow-up: the volume Task 12 leaves behind carries the covering index, so plans D–G need a maintainer decision to re-baseline or accept the drift from a-ref.
+  - Counts: N0 is 193, and every count from Task 4 on is the plan's number plus one.
+- **Found outside plan C.** Two bench probe scripts hard-code a home directory path, and have since the initial release (2026-08-24). So it was public before W-12, and W-12's push added none. Nothing is changed yet: the maintainer decides on a forward fix, and on whether history should be rewritten.
+
+**08:06Z–08:24Z. Plan C's Tasks 1–6: six commits, each approved on its first review.**
+- **The loop.** Each task ran as a Sonnet implementer, then a Sonnet reviewer that read only the task's diff package. From Task 3 on, both read a standing-instructions file that carries the pre-flight rulings, so each dispatch names only the brief, the base commit and the expected count. A task took 2–4 minutes from dispatch to approval. There were no fix rounds.
+- **Commits and counts** (N0 = 193):
+  - Task 1, 93afa5c: the covering index `idx_records_doc_type(doc_id, type, indexed)`, the partial index `idx_jobs_open`, and a one-time migration that logs on `uvicorn.error`. 198 passed.
+  - Task 2, db7ba7e: the sorted-listing page query reads `records NOT INDEXED`, and `EXPLAIN` plan tests pin it and every other records scan. 217 passed.
+  - Task 3, 80d9311: the ghost-id diff uses numpy `setdiff1d`. 229 passed.
+  - Task 4, a3d1171: `Collection(...)` is built off the loop and cancel-safe, and a resident collection's `touch()` skips `_load_lock`. 235 passed. The pre-flight's extra test failed first, as ruled: on the pre-change code a resident `touch()` waits for another collection's `DELETE`.
+  - Task 5, 77a571c: `stats()` runs in a thread. 237 passed.
+  - Task 6, 1208c82: the IVF training sample draws random rowids instead of `ORDER BY RANDOM()`, with a fallback for sparse ids or a large k. 242 passed. In the test where half the ids have no vector, k=100 takes the rowid path and k=900 the fallback. Both are correct, as the pre-flight predicted.
+- **What the reviews found.** Nothing Important. The minor findings are ledgered for the final review:
+  - log assertions that could be tighter;
+  - boundary comments that no test asserts;
+  - untested branches of the cancel path (a double cancel, a failed build);
+  - a test that detects only gross bias in sampling uniformity.
+- **One pre-existing race, widened.** `shutdown()` does not take `_load_lock`. So a collection built off the loop could register after shutdown's evict loop, and leak until the process exits. This was possible before, within one eviction await. Task 4 widens the window to a build's duration. The Task 4 reviewer confirmed it is reachable only if a request outlives graceful shutdown. It goes to the final review, not to a Task 4 change.
+
+**08:24Z–08:35Z. Plan C's Tasks 7–10: the rest of the code and the docs, again with no fix rounds.**
+- **Commits and counts** (N0 = 193):
+  - Task 7, f65177b: `malloc_trim(0)` in a worker thread, in a `finally` after every attach and detach job, and `ENV MALLOC_TRIM_THRESHOLD_=134217728` in the image, after `EXPOSE 8000` so plan G's later edit of the lines above it still applies. There is no `MALLOC_ARENA_MAX`. 247 passed.
+  - Task 8, 3d3b221: the headroom guard runs before any SQL in attach and detach, sized at 1.25× the measured need. For the gn100 collection (2,549,119 × 1024, 4-bit, nlist 256) that is 2,195 MiB; the reviewer recomputed it by hand. The nprobe-only retune still skips the guard. 251 passed.
+  - Task 9, 5445c8e: rows without a retained vector are found from the build stream (live ids minus streamed ids), not from a `records` × `vecs` anti-join before it. The old pre-scan runs only when the training sample comes back short, which only happens on a collection ingested before vector retention. Each attach logs one line of phase timings, which Task 11's verdict parses. 258 passed.
+  - Task 10, 022674c: the ADR addendum and the storage and indexing docs, with the pre-flight's wording rulings and the addendum dated 2026-09-30. Docs only, so still 258.
+- **Review method.** From Task 7 on, each reviewer dispatch named the task's specific risks, one focused check each. For example: where the Dockerfile lines go, whether the trim can hide a job's error, and whether the attach log matches the verdict's regex field for field. Every risk checked out.
+- **One more race for the final review.** If a record is deleted while its batch is being re-embedded, the backfill's `INSERT OR REPLACE` can re-create a `vecs` row for it. The index side is safe, because the swap diff removes the id. The orphan row is harmless, because every reader joins `records`. The race existed before, but Task 9 widens its window from the pre-work to the whole build.
+- **Task 11** (the gn100 scripts) was dispatched at 08:35Z. It writes five scripts outside the repo, checks them on the workstation, makes no commit and does not contact gn100.
+
+**08:35Z–08:43Z. Plan C's Task 11 (the gn100 scripts) and the launch of the acceptance run.**
+- **Task 11.** A Sonnet implementer wrote the five scripts outside the repo, in the workstation's scratch folder:
+  - `c_check.py`, the workstation check;
+  - `c_evict.py`, the true-cold eviction;
+  - `c_probe.py`, the in-image probes;
+  - `c_session.sh`, the gn100 session;
+  - `c_verdict.py`, the verdict and the ADR insert.
+
+  The controller re-ran the check from the repo root. It passed, including the pre-flight's two additions: the session dies unless the image sets `MALLOC_TRIM_THRESHOLD_=134217728`, and the verdict refuses to write an ADR block that holds a home path.
+- **The review looked at safety on a shared host first.** gn100 runs other people's containers and volumes. The Sonnet reviewer checked that the session:
+  - stops or removes only `bench-tv`;
+  - stops it only if it started it;
+  - cleans up on every exit path;
+  - evicts the page cache read-only;
+  - never logs the volume's mount path.
+
+  It also checked that the verdict's thresholds match spec §7 C exactly. It approved the scripts with four minor points, and three were fixed in one round before the run:
+  - An unexpected file error in the eviction would have printed a traceback with the volume's absolute path, which contains the home directory. Errors now name files relative to the volume root and fail the step.
+  - An unreadable directory would have been skipped silently, so the 16 MB residency gate could pass without covering it. It now fails the step.
+  - The session's facts file captured every container's command line, other people's included. It now records only names, states and images.
+- **Task 12, up to the launch.** The controller runs the gn100 steps itself.
+  - The maintainer's standing go-ahead covers the run window. The session is capped at 60 minutes by `timeout`.
+  - The preflight was read-only. No session was running, `bench-tv` had been stopped for 9 hours, and `bench-wv` was left alone. gn100 had been rebooted about an hour earlier, so the volume's page cache was fully cold: 0 MB resident across 15,981.5 MB in 259 files.
+  - `deploy.sh` built `localhost/raggio:022674c`. The session `c1` started at 08:43:23Z. Its first row records Python 3.12.14, SQLite 3.53.1, turbovec 1.0.0, `OPENBLAS_NUM_THREADS=1` and `MALLOC_TRIM_THRESHOLD_=134217728`. The volume was unmigrated, as expected: `meta.db` 14,431.6 MB, the IVF index 1,549.9 MB, no open jobs.
+
+**08:43Z–08:58Z. Plan C's acceptance run on gn100: ten checks, ten PASS, first try.**
+- **The run.** Session `c1` ran on `localhost/raggio:022674c` from 08:43:23Z to 08:53:08Z. It took about 10 minutes, where the plan budgeted about 25 and capped it at 60. It started from an unmigrated volume: 2,549,119 chunks × 1024 dims, IVF with nlist 256. Every container had `--memory 4g`, and the memory run also had `--memory-swap 4g`. "True-cold" means every file of the volume was dropped from the page cache and `mincore` confirmed at most 16 MB still cached. "Host-warm" means each file was read once just before.
+- **The checks** (spec §7 C):
+
+  | Check | Measured | Threshold |
+  |---|---|---|
+  | C1 start → first GET, true-cold, median of 3 | IVF 4.82 s, flat 4.18 s | ≤ 6 s, ≤ 5 s |
+  | C2 slowest `/healthz` while a load ran | 0.003 s (99 probes over 6 starts) | ≤ 0.1 s |
+  | C3 later GETs (median of each start's slowest of 3) | IVF 0.45 s, flat 0.48 s | ≤ 1.0 s |
+  | C4 bytes read by `Collection()` true-cold | IVF 1,650 MB (index files 1,550 MB); flat 1,374 MB (1,275 MB) | index files + 150 MB |
+  | C5 migration `CREATE INDEX` | 49.6 s true-cold, 1.5 s host-warm; `meta.db` +91.5 MB | ≤ 60 s, ≤ 3 s; ≤ 120 MB |
+  | C6 `_vec_sample(65536)` | 11.12 s true-cold, 0.42 s host-warm | ≤ 15 s, ≤ 1 s |
+  | C7 swapless attach → detach → attach | done ×3, no swap, no OOM kill; VmHWM 3,527 MiB; RSS 15 s after each job +235 / +54 / +294 MiB | ≤ 3,891 MiB; ≤ +512 MiB |
+  | C8 host-warm sorted list page, median | IVF 0.92 s, flat 0.94 s | ≤ 1.0 s |
+  | C9 true-cold attach pre-work | 1.63 s (guard 0.00 + live-id diff 1.63 + backfill of 0 rows) | ≤ 10 s |
+  | labels | 31 rows; SQLite 3.53.1; `OPENBLAS_NUM_THREADS=1`; each row states its regime and cap | — |
+
+- **Where the time goes in a cold attach.** The first attach took 185.5 s: the sample 10.88 s, the build 170.68 s, the live-id diff 1.63 s and the swap 2.30 s. The pre-work that plan C removed (a full `records` scan and an anti-join before training) is now under 2 s. The build itself is untouched by plan C. The detach took 15.5 s and a host-warm re-attach 42.8 s.
+- **Margins.** C8 is the thinnest, at 0.92–0.94 s against 1.0 s: the host-warm sorted list page. C1 on IVF (4.82 of 6 s), C5 (49.6 of 60 s) and C6 (11.12 of 15 s) have room, but not much. C7's peak of 3,527 MiB against a 4 GiB swapless cap backs the plan's follow-up: Plan A's `DETACH_MEMORY=8g` override, kept "until Plan C lands", can go (a change for plan A's runbook, not this branch).
+- **State left behind.** No `bench-tv` container, `bench-wv` untouched, no session running. The volume is migrated (`idx_jobs_open` and `idx_records_doc_type`), with its IVF index. The deploy kept the previous bench files in a `pre-deploy-…` folder. No fetched file holds a home path.
+- **Recorded.** A Sonnet implementer appended the ADR test, saw it fail on the missing heading, recorded the block with `c_verdict.py --adr`, and committed b64713e: 259 passed. The ADR kept its CRLF endings.
+
+**08:58Z–09:01Z. Plan C's Task 12 review, then the final review of the whole branch.**
+- **Task 12's review.** A Sonnet reviewer re-ran the verdict script on the fetched session files. Its output was identical to the block in the ADR, once line endings were normalised, so no figure was typed by hand. The reviewer approved the block. It sits at the end of the plan C addendum, leaks no host details, and its test fails if any check line goes missing or turns to FAIL.
+- **What that review noticed.** Three figures quoted earlier in the addendum come from the pre-flight probe p1, and they differ from the acceptance run's. The sample was 8.05 s true-cold in p1 against 10.39–11.12 s in the run. The malloc_trim peak was 3,631–3,646 MiB in p1 against 3,515–3,527 MiB. And p1 ran on SQLite 3.40.1, where the acceptance image ships 3.53.1. None of these contradicts a threshold. Nothing in the addendum says which figure is which, so this went to the final review as a minor point.
+- **The final review.** All twelve tasks are approved. The whole branch, 11 commits from main (7 files, +1,352/−72), went to one reviewer on Opus. It had the plan, the spec, the standing rulings, and every minor point the per-task reviews deferred. It was asked to rule on each point, fix before merge or accept, and to look first at how the tasks interact. The two parked races are on that list:
+  - `shutdown()` can miss a collection that is still being built off the loop;
+  - a record deleted mid-backfill can leave an orphan `vecs` row.
+
+  It was also asked to check what the Task 8 reviewer could not: that every delete path keeps `indexed_counts` current, since both the headroom guard and the sample's density check read it.
+
+**09:01Z–09:17Z. The final review on Opus: ready to merge with one fix, the race a per-task review had called harmless.**
+- **The verdict.** It took about 14 minutes, found nothing Critical and one Important issue, and gave a verdict of "with fixes". The reviewer re-ran the suite (259 passed) and read the whole range. It confirmed the concurrency work:
+  - the off-loop build is cancel-safe;
+  - the lock-free fast path in `touch()` is sound, because every removal from `resident` happens before its first `await`;
+  - every id set stays `uint64`.
+- **The Important finding: the orphan `vecs` row was not harmless.** The Task 9 reviewer had parked this race as harmless, because every reader joins `records`. The final reviewer followed the writers instead:
+  - An ingest allocates new ids as `MAX(id)+1` over `records`, then plain-INSERTs their vectors.
+  - Delete the document that holds the highest ids while the backfill embeds its batch, and the backfill re-creates that id's `vecs` row.
+  - The next ingest reuses the id and fails with `UNIQUE constraint failed: vecs.id`.
+
+  Its transaction is still open, so the next commit publishes a record the index does not have. `indexed_counts` is then one lower than the table, and the headroom guard, the sample's density check and the search allowlist all read that count. The reviewer reproduced all of this in a scratch directory. The race predates plan C, but Task 9 rewrote the function and widened the window from the pre-work to the whole build.
+- **The fix.** The backfill now writes a vector only while its record still exists. That check runs in the same statement and under the same lock that deletes use. One test deletes a document mid-embed, then checks that no orphan remains and that the next ingest succeeds.
+- **Four documentation corrections**, folded into the same fix wave:
+  - **Migration time.** The operator doc gave the prototype's migration time, about 16 s per 1M rows on SQLite 3.40.1. The shipped image measured 49.6 s at 2.55M, about 20 s per 1M.
+  - **Free pages.** The doc said the dropped index's free pages stay until a `VACUUM`. That is only true for files created before incremental auto-vacuum. On the gn100 volume they were gone by the end of the session, returned by `_finish_job`'s `incremental_vacuum`.
+  - **Two sets of numbers.** The ADR now says its rows carry the prototype's numbers, and that the acceptance run is the authoritative measurement.
+  - **Sample fallbacks.** The `_vec_sample` row now names its third fallback.
+- **The rest of the triage.** Every other deferred point was accepted, with a reason for each. The reviewer verified that every delete path keeps `indexed_counts` current: there are two `DELETE FROM records` sites, and nothing sets `indexed=0`.
+
+  It also accepted the shutdown race. The shipped command does not set `--timeout-graceful-shutdown`, so uvicorn waits for in-flight requests, and their builds register before `shutdown()` runs. A fix is only needed if someone adds that timeout.
+
+  One item goes to plan D: `_upsert_rows` should roll back on any error, which closes the whole class of drift from a failed upsert.
+- **Process note for the article.** Twelve per-task Sonnet reviews each approved their slice. The one real defect sat between two of them: Task 9's backfill and plan B's id allocation. The per-task reviewer checked the readers of `vecs`; the final reviewer, with the whole branch and the ledger of deferred points, checked the writers. Following the skill's rule, there is exactly one fix wave and one scoped re-review.
+
+**09:17Z–09:25Z. Plan C's fix wave, the scoped re-review, and a branch ready to merge.**
+- **The fix wave.** A Sonnet implementer made two commits in about 2.5 minutes, 260 passed after each:
+  - 364fa06 guards the backfill write. The new test failed on the old code with one orphan `vecs` row, as the review predicted.
+  - adf8ac1 brings the operator doc and the ADR to the acceptance run's figures.
+- **The re-review ran on Opus, not the standing Sonnet tier.** It is the final review's own follow-through. The finding it verified is the one a per-task Sonnet review had judged harmless, and the diff was about 50 lines, so the cost was small. It marked every finding addressed and checked the fix in memory: the guarded statement counts 1 for an insert, 1 for a replace and 0 for a missing record. It confirmed that the new return value only feeds a log field, and that the test is deterministic, because an ingest that supplies vectors never calls the embedder. It raised two log-only residuals:
+  - a docstring says `add()` receives each written batch, but it also receives the skipped rows, which the swap removes;
+  - the attach log's `backfill=` count reports the rows it tried, not the rows it wrote.
+
+  Both were accepted. The skill allows exactly one fix wave, and behaviour is correct and pinned.
+- **Plan C by the numbers.**
+  - 12 tasks, 13 commits over main.
+  - Tests: 193 → 260.
+  - Per-task reviews: 12 approved, with one fix round, on Task 11's scratch scripts.
+  - Final review: one Important finding and one fix wave.
+  - Acceptance on gn100: ten of ten checks passed on the first session.
+  - End to end, from the pre-flight rulings at 08:06Z to a green branch at 09:25Z, took about 1 hour 20 minutes of wall-clock time. That includes a 10-minute acceptance run.
+
+**09:25Z–10:05Z. Plan C is merged, a public-repo leak is fixed, and the follow-ups are chosen.**
+- **Merge.** The maintainer chose a local merge. It is a merge commit, bb907ac "Merge plan C: cold start and loop hygiene", and keeps all 13 commits, as for plans A and B. The suite passed on the merged tree: 260 passed. The worktree and the branch were removed. Nothing has been pushed yet.
+- **A leak found along the way, fixed forward.** Two bench probes committed for ADR 0003, `bench/rescore_probe.py` and `bench/text_probe.py`, hard-coded absolute paths on gn100 that included the maintainer's home directory. They had been public since that commit. The maintainer chose a forward fix: d7f4b01 makes the paths default to `~`-relative ones, expanded at run time, with `BENCH_DIR` and `BENCH_DB` overrides. No tracked file in main now holds a home path. The old commits still do. Rewriting public history is a separate decision, and it stays with the maintainer.
+- **Plans D–G get a fresh baseline.** Task 12 left the bench volume migrated, so it no longer matches the volume a-ref was measured on. The maintainer chose to re-baseline, as a-ref2, before plan D. D–G's deltas will then measure only their own changes, not plan C's.
+- **Follow-ups queued:**
+  - Drop plan A's `DETACH_MEMORY=8g` override. The acceptance run's swapless peak was 3,527 MiB under a 4 GiB cap.
+  - Run the p99-during-delete probe on gn100. This is the number plan B's ADR promised, and the F1 ruling made it a non-gating probe.
+
+  The maintainer declined a pre-C comparison on the old image, so the article's before/after for plan C rests on the p1 prototype and baseline3.
+- **The ledger is kept.** The skill deletes the plan's working folder after the merge. At the maintainer's choice, it was archived outside the repo instead, next to plan B's, so the article can quote the rulings and reviews.
+
 ## 3. Decision register
 
 ID prefixes:
@@ -921,8 +1088,9 @@ ID prefixes:
 | R-A4 | 2026-09-29, by 08:27Z | PR 1's equivalence gate closes as passed. The one row outside the band against the same-day control (IVF hybrid p95, +1.0 ms, 0.6%) is recorded as a run-order effect, not a bench effect. a-equiv2 plus control1 are PR 1's reference. | "Paired replication first" (about 45 min on gn100: the old bench, then the new one, IVF first after a restart, in the same order; it would have removed the order confound). | control1 vs a-equiv2: 1 row outside the band, in code identical in both benches; control1's build1 read 158.0 ms right after a build. baseline3 vs control1: 8 rows "better" with the same bench, so the host. IVF build: 50.3 s with the old bench, 49.0 s with the new. | Maintainer (chose "Accept equivalence", recommended) | Transcript | PR 1 moves to finishing |
 | W-11 | 2026-09-29, asked 11:19Z, answered 20:57Z | Tool versions: always the latest release. The workstation's uv went from 0.5.24 to 0.12.20, and PR 2's exact uv pins (the Dockerfile's `ARG UV_VERSION`, the CI setup-uv `version`) take the latest release at execution time in place of the plan's 0.12.19. Floors such as `required-version = ">=0.12"` stay floors. | "Update to 0.12.19" (the plan's pin, recommended); "Side-by-side copy only"; "Don't touch uv yet". | uv 0.12.20 was the latest release on 2026-09-29. | Maintainer (free text: "Update, always use the latest version") | Transcript | Applied to the workstation; the pins land with PR 2 |
 | R-A5 | 2026-09-30, answered about 00:02Z | Gate 1 (R-A1) failed and is overridden. PR 2 ships `OPENBLAS_NUM_THREADS=1` (D16) as it is, and a-ref becomes the reference baseline. D16's fallback (threadpoolctl for the build) is not needed. | "Accept now, fallback later" (the same acceptance, with the fallback left as an open follow-up). "Plan the fallback first" (PR 2 waits for a threadpoolctl change and an a-ref2 session; the OpenBLAS thread count is process-wide, so searches during a build would get the spinning threads back). Earlier, before the probe: "Accept, override Gate 1" and "Plan D16's fallback now", when the maintainer chose "Find the cause first". | Gate 1: IVF build median 50.52 → 52.84 s (+2.32 s), band 1.1 s. probe-ob1, a 2×2 with 3 builds per cell: main unset 49.88, main OB1 54.62, PR 2 unset 49.42, PR 2 OB1 53.06 s. One BLAS thread costs 3.64–4.74 s; the image change is −0.46 to −1.56 s. What OB1 buys: raggio-ivf CPU per query under concurrency 37.0 → 4.9 ms. The hybrid gains (p99 under concurrency 3,823 → 1,230 ms) come partly from the interpreter and SQLite (p4). | Maintainer (chose "Accept, override Gate 1", recommended) | Transcript; section 4.9 | PR 2 moves to finishing |
+| W-12 | 2026-09-30, asked 00:19Z, confirmed 00:21Z | `main` is pushed to the public `origin` before plan C starts: a fast-forward from 19a8a2e to 00c70a1 (17 commits: plan A's PR 1, plan B, plan A's PR 2), no force. The docs branches and `bench-hardening` stay local. | "Start plan C now" (recommended; nothing pushed). "Pause here". At the confirmation: "Don't push; start plan C" and "Don't push; pause". | The pre-push scan of patches and messages found no ssh or key path, no IP besides 127.0.0.1 and 0.0.0.0, and no home path. The scripts read `$SSH_CONFIG`. Pushed 00:22:18Z. First Actions run: tests green (193 passed), with uv downloading CPython 3.12.14; docs green. | Maintainer (chose "Push first, then plan C", then "Push main now", recommended) | Transcript; section 2 | Done |
 
-Register total: 57 entries (P 3, D 16, R 22, X 5, W 11). (Dated note, 2026-09-30 00:08Z: R-A5 added. Dated note, 2026-09-29 21:05Z: W-11 added. Dated note, 08:30Z: R-A4 added. Dated note, 08:05Z: R-A3 and W-10 added; W-8 superseded. Dated note, 23:00Z: W-9 added. Dated note, 22:45Z: R-G8, R-G9 and W-8 added. Dated note, 21:20Z: R-G7 added. Dated note, 21:23Z: X4 added. Dated note, 21:45Z: X5 added. Dated note, 22:30Z: W-7 added.) (Dated note, 20:40Z: R-B1, R-B2, R-G5, R-G6, W-6 and X3 were added after p4; before them the total was 38 (P 3, D 16, R 12, X 2, W 5).) R-D3, R-G3 and R-G4 were added at 20:05Z, and R-D4 at about 20:15Z; the backfill written at about 19:30Z had 34.
+Register total: 58 entries (P 3, D 16, R 22, X 5, W 12). (Dated note, 2026-09-30 00:28Z: W-12 added. Dated note, 2026-09-30 00:08Z: R-A5 added. Dated note, 2026-09-29 21:05Z: W-11 added. Dated note, 08:30Z: R-A4 added. Dated note, 08:05Z: R-A3 and W-10 added; W-8 superseded. Dated note, 23:00Z: W-9 added. Dated note, 22:45Z: R-G8, R-G9 and W-8 added. Dated note, 21:20Z: R-G7 added. Dated note, 21:23Z: X4 added. Dated note, 21:45Z: X5 added. Dated note, 22:30Z: W-7 added.) (Dated note, 20:40Z: R-B1, R-B2, R-G5, R-G6, W-6 and X3 were added after p4; before them the total was 38 (P 3, D 16, R 12, X 2, W 5).) R-D3, R-G3 and R-G4 were added at 20:05Z, and R-D4 at about 20:15Z; the backfill written at about 19:30Z had 34.
 
 Three recommended options were overridden: the review scope at 18:46:59Z (R-EX, "Go through the key ones" instead of "Accept all defaults"), and R-A1 and W-5 at 18:51:48Z. At 18:46:59Z the commit question's recommended "I commit in my terminal" was also answered with free text instead: "I already committed, let's debug the shell, I can also reboot if necessary". Separately, spec §3.1 says two of its rows override a plan's default: A1 and the fallback in G2.
 
@@ -1386,6 +1554,8 @@ PR 2's `tests.yml` asked setup-uv for `python-version: "3.12"`, and its tests ch
 
 The controller's Linux proof could not have caught it. G1 runs in a `uv:0.12.20-trixie-slim` container, which has no system Python, so uv downloaded the managed build there. The gap shows only on a runner that has a system 3.12. One workflow-level line fixes it (`UV_PYTHON_PREFERENCE: only-managed`), and a test pins that line. The first GitHub run should show CPython 3.12.14 being downloaded.
 
+Dated note, 2026-09-30 00:28Z: confirmed. The first Actions run on `main` (00c70a1, pushed at 00:22:18Z) downloaded `cpython-3.12.14-linux-x86_64-gnu` and passed 193 tests.
+
 ## 6. Method: how we measured
 
 Spec §6 sets one protocol for every plan. Each rule below gives the reason the sources record, or says "reason not recorded".
@@ -1548,6 +1718,16 @@ State as of 2026-09-28, about 19:30Z.
 - Dated note, 2026-09-29 21:57Z: PR 2's final review passed after one fix wave, and the head is 21e272d (section 2, 21:32Z–21:57Z). Plans E and G carry errata for the uv 0.12.20 and checkout pins. Task 10, the gn100 re-baseline, is running: session a-main is under way, and a-ref follows on 21e272d.
 - Dated note, 2026-09-30 00:08Z: Task 10 is done (section 2, 21:57Z–00:08Z). Gate 2 passed. Gate 1 failed by 2.3 s; a probe traced the loss to OB1, and the maintainer overrode the gate (R-A5). `~/raggio-bench/a-ref` is the reference baseline for plans C–G. PR 2 (21e272d) waits for the maintainer's finish choice.
 - Dated note, 2026-09-30 00:19Z: PR 2 is merged into `main` locally as 00c70a1 (section 2, 00:08Z–00:19Z), so plan A is complete. Nothing is pushed: `main` is 17 commits ahead of `origin/main`. Next in the merge order: plan C.
+- Dated note, 2026-09-30 00:28Z: `main` is pushed (W-12), so `origin/main` is 00c70a1, and its first Actions run is green on CPython 3.12.14. Plan C is in progress in `.worktrees/cold-start-loop-hygiene`, from `main` at 00c70a1. The pre-flight scan runs first.
+- Dated note, 2026-09-30 08:06Z: plan C's pre-flight is done and ruled (section 2, 00:27Z). Task 1 is next, on Sonnet.
+- Dated note, 2026-09-30 08:24Z: plan C's Tasks 1–6 are committed and approved (section 2, 08:06Z). Task 7, the memory release after index jobs, is running.
+- Dated note, 2026-09-30 08:35Z: plan C's Tasks 7–10 are committed and approved (section 2, 08:24Z); the branch is at 022674c, 258 passed. Task 11 (the gn100 scripts, no commit) is running; Task 12 is the gn100 acceptance run.
+- Dated note, 2026-09-30 08:43Z: Task 11 is done after one fix round (section 2, 08:35Z). Task 12's session `c1` is running on gn100 (08:43Z, 60-minute cap).
+- Dated note, 2026-09-30 08:58Z: plan C's acceptance run passed all ten checks on the first session (section 2, 08:43Z) and is recorded in ADR 0001 (b64713e, 259 passed). Next: Task 12's review, then the final whole-branch review on Opus.
+- Dated note, 2026-09-30 09:01Z: Task 12's review approved the recorded verdict (section 2, 08:58Z). All twelve tasks of plan C are complete; the final whole-branch review is running on Opus.
+- Dated note, 2026-09-30 09:17Z: the final review on Opus said "with fixes": one Important issue, the backfill's orphan `vecs` row, plus four doc corrections (section 2, 09:01Z). One fix wave is running on Sonnet, then one scoped re-review.
+- Dated note, 2026-09-30 09:25Z: plan C is complete on its branch (adf8ac1, 260 passed), after one fix wave and a clean scoped re-review (section 2, 09:17Z). The merge decision is the maintainer's.
+- Dated note, 2026-09-30 10:05Z: plan C is merged into main locally (bb907ac), followed by the probe-path fix (d7f4b01); 260 passed; not pushed (section 2, 09:25Z). Next: the a-ref2 re-baseline on gn100, the `DETACH_MEMORY=8g` removal and the p99-during-delete probe, then plan D1.
 
 ### 9.2 Open questions in the plans
 
@@ -1586,7 +1766,7 @@ State as of 2026-09-28, about 19:30Z.
 - **Plan code checked only against stand-ins** (dated 22:45Z). Plan G's decision code and scenarios ran against a stand-in `compare.py`; the real one comes with plan A, and its first real run is G's Task 10 Step 4. Plan A's Task 5 was run from the plan text in a scratch copy, but its suite totals (161 to 171) are sums, not runs.
 - **CI.** At critic time `.github/workflows` held only `docs.yml`; plan A adds `tests.yml`.
 - **Re-creating a collection while its delete is still running** (found in B's pre-flight, 2026-09-29): a same-name create that lands between the delete's catalog DELETE and its `rmtree` loses its directory. The next request answers 500. This exists at 19a8a2e too, and B leaves it alone. A likely fix: rename the directory to a tombstone under `_load_lock`, then remove the tombstone outside the lock.
-- **A DELETE mid-ingest briefly stalls every collection** (B's pre-flight, 2026-09-29): accepted in B, see 09:14Z. Plan C, which moves collection construction off the event loop, is the place to move `stop()` out of `_load_lock`. (Dated note, 10:45Z: the stall is longer than one write section; see the 09:14Z note and 10:33Z. Plan C's acceptance should measure it as p99 on other collections while one is deleted mid-ingest.)
+- **A DELETE mid-ingest briefly stalls every collection** (B's pre-flight, 2026-09-29): accepted in B, see 09:14Z. Plan C, which moves collection construction off the event loop, is the place to move `stop()` out of `_load_lock`. (Dated note, 10:45Z: the stall is longer than one write section; see the 09:14Z note and 10:33Z. Plan C's acceptance should measure it as p99 on other collections while one is deleted mid-ingest. Dated note, 2026-09-30 08:06Z: plan C's pre-flight reversed this. Task 4 pins, by test, that a resident collection's requests no longer wait on another collection's delete. `stop()` stays under `_load_lock`, so loads of non-resident collections still queue behind it. The p99 is not part of plan C's acceptance; it is a non-gating gn100 follow-up probe (section 2, 00:27Z).)
 - **Issue candidates from B's final review** (2026-09-29; drafted, not filed. Dated note, 11:10Z: the maintainer chose to file all five; they wait for a GitHub CLI login. Dated note, 21:10Z: filed as #1–#5, in the order below):
   - the same-name create that races a delete (the item above);
   - a subprocess test for closing a connection under a running statement: `close()` blocked in the Windows probes, and a connection with no earlier statement segfaulted;
