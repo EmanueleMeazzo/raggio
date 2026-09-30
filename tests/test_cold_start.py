@@ -265,3 +265,106 @@ def test_records_scans_use_the_covering_index(tmp_path):
     )
     # ADR 0003: records_fts must stay the outer loop (never a rowid-restricted MATCH)
     assert plan(db, fts, ['"chunk"', "d1", 5]).startswith("SCAN records_fts VIRTUAL TABLE")
+
+
+# ---- Task 3: numpy id-set diffs ----
+
+
+def seed(tmp_path, record_ids, index_ids):
+    """A collection dir whose meta.db holds `record_ids` and whose synced flat index
+    holds `index_ids`: the state a crash between a db commit and index.sync leaves."""
+    db = open_meta_db(tmp_path / "meta.db")
+    db.executemany(
+        "INSERT INTO records(id, external_id, doc_id, type, position, text, metadata, indexed)"
+        " VALUES (?,?,'d1','chunk',0,'hello','{}',1)",
+        [(i, f"c{i}") for i in record_ids],
+    )
+    db.commit()
+    db.close()
+    idx = IdMapIndex(dim=DIM, bit_width=4)
+    if index_ids:
+        idx.add_with_ids(
+            np.random.default_rng(0).standard_normal((len(index_ids), DIM)).astype(np.float32),
+            np.array(index_ids, dtype=np.uint64),
+        )
+    idx.sync(str(tmp_path / "index.tvim"))
+
+
+def test_live_ids_is_uint64_and_handles_empty(tmp_path):
+    col = make_collection(tmp_path)
+    empty = store._live_ids(col.db)
+    assert empty.dtype == np.uint64 and len(empty) == 0
+    ingest(col, 5)
+    live = store._live_ids(col.db)
+    assert live.dtype == np.uint64
+    assert sorted(live.tolist()) == [1, 2, 3, 4, 5]
+
+
+def test_reconcile_reads_live_ids_once_through_the_helper(tmp_path, monkeypatch):
+    seed(tmp_path, [1, 2], [1, 2, 3])
+    calls, real = [], store._live_ids
+    monkeypatch.setattr(store, "_live_ids", lambda db: calls.append(1) or real(db))
+    col = make_collection(tmp_path)
+    assert calls == [1]
+    assert len(col.index) == 2 and not col.index.contains(3)
+
+
+def test_reconcile_keeps_live_ids_above_2_32(tmp_path):
+    big = [2**40 + 1, 2**40 + 2, 2**40 + 3]  # a int64/uint64 mix would promote to float64
+    seed(tmp_path, big[:2], big)
+    col = make_collection(tmp_path)
+    assert len(col.index) == 2
+    assert col.index.contains(big[0]) and col.index.contains(big[1])
+    assert not col.index.contains(big[2])
+
+
+def test_reconcile_without_ghosts_does_not_sync(tmp_path, monkeypatch):
+    seed(tmp_path, [1, 2, 3], [1, 2, 3])
+    synced = []
+    monkeypatch.setattr(Collection, "_sync_index", lambda self: synced.append(1))
+    col = make_collection(tmp_path)
+    assert len(col.index) == 3 and synced == []
+
+
+def test_reconcile_all_ghosts_empties_the_index(tmp_path):
+    seed(tmp_path, [], [5, 6, 7])  # empty records, non-empty index
+    col = make_collection(tmp_path)
+    assert len(col.index) == 0
+
+
+def test_reconcile_never_re_adds(tmp_path):
+    seed(tmp_path, [1, 2, 3, 4], [1, 2])  # records the index lacks stay out (§4.3)
+    col = make_collection(tmp_path)
+    assert len(col.index) == 2
+    assert not col.index.contains(3) and not col.index.contains(4)
+
+
+@pytest.mark.parametrize("seed_", range(5))
+def test_reconcile_matches_the_set_semantics(tmp_path, seed_):
+    rng = np.random.default_rng(seed_)
+    records = sorted(rng.choice(np.arange(1, 200), size=int(rng.integers(0, 150)), replace=False).tolist())
+    in_index = sorted(rng.choice(np.arange(1, 200), size=int(rng.integers(1, 150)), replace=False).tolist())
+    seed(tmp_path, records, in_index)
+    col = make_collection(tmp_path)
+    expect = set(in_index) & set(records)  # the pre-plan-C set logic
+    assert len(col.index) == len(expect)
+    assert all(col.index.contains(i) == (i in expect) for i in in_index)
+
+
+def test_rows_deleted_during_a_build_are_diffed_out(tmp_path):
+    col = make_collection(tmp_path)
+    ingest(col, 300)
+    real = col._iter_vec_blocks
+    victims = iter(["c7", "c8"])
+
+    def stream_then_delete():
+        yield from real()
+        with col.db_lock:  # a delete that commits while the build streams
+            col.db.execute("DELETE FROM records WHERE external_id=?", (next(victims),))
+            col.db.commit()
+
+    col._iter_vec_blocks = stream_then_delete
+    asyncio.run(col._process_job({"op": "attach_index", "nlist": 8}))
+    assert isinstance(col.index, _IvfIndex) and len(col.index) == 299
+    asyncio.run(col._process_job({"op": "detach_index"}))
+    assert isinstance(col.index, IdMapIndex) and len(col.index) == 298

@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import itertools
 import json
 import logging
 import math
@@ -180,6 +181,18 @@ def _rows_by_id(db, sql: str, ids: list[int]):
     for s in range(0, len(ids), 512):
         chunk = ids[s : s + 512]
         yield from db.execute(sql.format(",".join("?" * len(chunk))), chunk)
+
+
+def _live_ids(db) -> np.ndarray:
+    """Every indexed record id as a uint64 array. The planner answers this from the
+    covering idx_records_doc_type (pinned in tests), never the text-heavy records
+    pages. The order is the index's (doc_id, type, id), not id order;
+    np.setdiff1d(assume_unique=True) needs no sort, and both sides must be uint64 (an
+    int64/uint64 mix promotes to float64 and loses ids above 2**53)."""
+    return np.fromiter(
+        itertools.chain.from_iterable(db.execute("SELECT id FROM records WHERE indexed=1")),
+        dtype=np.uint64,
+    )
 
 
 def _fold(token: str) -> str:
@@ -712,11 +725,14 @@ class Collection:
             probe = np.zeros((1, self.cfg.dim), dtype=np.float32)
             probe[0, 0] = 1.0
             all_ids = self.index.search(probe, k=len(self.index))[1][0]  # every id
-        live = {r[0] for r in self.db.execute("SELECT id FROM records WHERE indexed=1")}
-        ghosts = [int(i) for i in all_ids if int(i) not in live]
-        for g in ghosts:
-            self.index.remove(g)
-        if ghosts:
+        # numpy set difference: a 2.55M-entry Python set plus a per-id membership loop
+        # cost seconds on every cold start (brief 2b; the SQL scan is covering, Task 1)
+        ghosts = np.setdiff1d(
+            np.asarray(all_ids, dtype=np.uint64), _live_ids(self.db), assume_unique=True
+        )
+        for g in ghosts:  # evict only: a record the index lacks is never re-added (§4.3)
+            self.index.remove(int(g))
+        if len(ghosts):
             self._sync_index()
 
     # ---- worker / ingest queue ----
@@ -1070,20 +1086,20 @@ class Collection:
                 self._vec_sample(IVF_TRAIN_SAMPLE), nlist, self.cfg.dim, self.cfg.bit_width,
                 int(nprobe_req or IVF_DEFAULT_NPROBE),
             )
-            seen = []
+            seen = [np.empty(0, dtype=np.uint64)]
             for ids, mat in self._iter_vec_blocks():
                 ivf.add_with_ids(mat, ids)
                 seen.append(ids)
-            return ivf, set(map(int, np.concatenate(seen)))
+            return ivf, np.concatenate(seen)
 
         ivf, seen = await asyncio.to_thread(build)
         tmp = self.dir / "ivf.tmp"
         async with self.lock.write():
 
             def swap():
-                live = {r[0] for r in self._rdb().execute("SELECT id FROM records WHERE indexed=1")}
-                for gone in seen - live:  # deleted while the build streamed
-                    ivf.remove(gone)
+                # deleted while the build streamed
+                for gone in np.setdiff1d(seen, _live_ids(self._rdb()), assume_unique=True):
+                    ivf.remove(int(gone))
                 if tmp.exists():
                     shutil.rmtree(tmp)
                 ivf.sync(tmp)
@@ -1127,20 +1143,19 @@ class Collection:
             sample = self._vec_sample(CAL_SAMPLE)
             if len(sample) >= 64:
                 flat.calibrate(sample)  # calibrate-early holds for rebuilds too
-            seen = []
+            seen = [np.empty(0, dtype=np.uint64)]
             for ids, mat in self._iter_vec_blocks():
                 flat.add_with_ids(mat, ids)
                 seen.append(ids)
-            return flat, set(map(int, np.concatenate(seen))) if seen else set()
+            return flat, np.concatenate(seen)
 
         flat, seen = await asyncio.to_thread(build)
         tmp = self.dir / "index.tvim.tmp"
         async with self.lock.write():
 
             def swap():
-                live = {r[0] for r in self._rdb().execute("SELECT id FROM records WHERE indexed=1")}
-                for gone in seen - live:
-                    flat.remove(gone)
+                for gone in np.setdiff1d(seen, _live_ids(self._rdb()), assume_unique=True):
+                    flat.remove(int(gone))
                 tmp.unlink(missing_ok=True)
                 flat.sync(str(tmp))
                 _retry_fs(lambda: os.replace(tmp, self.index_path))
