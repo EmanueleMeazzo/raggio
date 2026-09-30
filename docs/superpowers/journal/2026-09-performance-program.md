@@ -1214,6 +1214,20 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
   - A local image build took 38 s. It has CPython 3.12.14 and SQLite 3.53.1, as before, but it is a different CPython build: built 29 September, where 0.12.20's is from 24 September. turbovec is 1.0.0.
   - It lands on `main` after D1's merge, so that every Task 11 arm of plan E shares one uv and one CPython build.
 
+**14:04Z–15:22Z. D1's A/B finishes. Flat ingest and the reingest double and the event-loop stall goes to zero, but the IVF probe's gain falls inside its noise band, so D1 stops at Step 11.**
+- **The reingests** ran in the order base, candidate, base, candidate: 30.8, 16.7, 30.5 and 16.6 minutes (13:31:07Z–15:05:43Z). Every run finished its 10,197 jobs as `done`, and the script stopped `bench-tv` at the end.
+- **The preview** (`planD-summary.py`) printed "a gate failed; the ADR is unchanged". Six gates passed and `D1-ivf256` failed (section 4.15):
+  - flat probe: 2,342.4 → 4,982.0 vec/s, a gain of 2,639.6 against a band of 417.3;
+  - IVF probe (nlist 256): 533.5 → 612.0 vec/s, a gain of 78.5 against a band of 98.7, so within band;
+  - the reingest (`bench.py`, flat, 2.55M vectors): 1,530.9 → 3,035.4 vec/s, with a band of 17.4.
+- **Every candidate IVF run beat every base run**, by at least 76.5 vec/s. The band is the wider of the two arms' ranges. The candidate's range is wide because its third run drained in 70.4 s, against 81.7 s for the other two (section 5.20).
+- **Plan A's `compare.py` on the reingest sessions** found 8 rows better beyond the band and 2 worse:
+  - better: ingest time 1,665 → 840 s, search p50/p95/p99, serial QPS 40 → 44, hybrid p99 580.9 → 532.7 ms, and disk;
+  - worse: memory after ingest, 460 → 1,620 MB, and memory under load, 1,603 → 1,628 MB.
+- **The memory-after-ingest row reads backwards.** The candidate's 1,617–1,623 MB is the usual resident state: every adopt session so far measured 1,502–1,551 MB there. The outlier is the base right after its reingest, at 388 and 533 MB. Under load both arms reach about 1.6 GB, 26 MB apart (section 9.4).
+- **The plan's rule is to stop:** "If any line reads `- FAIL:`, stop here. Show the block to the user and do not go on to Step 12 … Never loosen a gate or rerun selectively to get a pass." No gate test was appended, the ADR keeps its `Pending:` line, and the decision went to the maintainer.
+- **The p99-during-delete probe ran again, on D1's image against cd3cbf2** (15:09:45Z–15:21:25Z; section 4.11). D1 cut the search p99 during ingest from 306.8 to 120.8 ms, and in the delete windows from 87.4 to 8.3 ms. The quiet p99 did not move (10.5 against 10.3 ms).
+
 ## 3. Decision register
 
 ID prefixes:
@@ -1721,6 +1735,23 @@ Reading it:
 - **The ingest stall did not move, and it is large:** p50 69–83 ms and p99 about 305 ms, against a quiet p50 of 7.4–7.9 ms. The worker's payload decoding, flattening and matrix building run on the event loop and stall every collection's requests. Plan D1 moves them into threads. The probe runs again on D1's image, against cd3cbf2.
 - Caveat: the victim ingests 50-document batches of 10 records. Larger batches would stall longer.
 
+**The re-run on D1's image** (2026-09-30, 15:09:45Z–15:21:25Z) used the same probe, parameters and 4 GiB containers. Arms: c = cd3cbf2 (the `post` image above) and d1 = 2274a6a0d60d (D1's A/B candidate), alternating, 3 reps each.
+
+Median across reps (ms):
+
+| Arm | quiet p99 | ingest p50 | ingest p99 | delete p99 | slowest request per delete window, median / max |
+|---|---|---|---|---|---|
+| c (cd3cbf2) | 10.5 | 79.4 | 306.8 | 87.4 | 61.1 / 91.4 |
+| d1 (2274a6a) | 10.3 | 42.7 | 120.8 | 8.3 | 6.6 / 8.7 |
+
+All 22,708 classified searches returned 200, and no server logged an error. The DELETE took 132.6 ms (c) and 56.2 ms (d1) at the median, and at most 205.5 and 87.5 ms.
+
+Reading it:
+- **The c arm repeats the `post` arm** of the first run: ingest p99 306.8 against 309.1 ms, and delete p99 87.4 against 91.8 ms.
+- **D1 cuts the ingest stall by more than half:** p99 306.8 → 120.8 ms and p50 79.4 → 42.7 ms. What remains is still about 5.5× the quiet p50 (7.5–8.0 ms). Where the rest comes from was not traced.
+- **The victim also ingests about 2.6× faster.** At 40 searches/s, the ingest class holds 1,009–1,021 searches (about 25 s) against 2,627–2,661 (about 66 s).
+- **The delete windows no longer stall:** the slowest request per window was 6.6 ms at the median and 8.7 ms at most, against 61.1 and 91.4 ms. Every one of the 48 DELETEs still overlapped a victim job in `processing`. The d1 windows hold fewer requests (0–4 against 2–9), because the DELETE itself is faster, so the class's p99 is close to its max.
+
 ### 4.12 The malloc knob: mtt2
 
 A scratch A/B on gn100 (`mtt-ab.sh`), 2026-09-30, 11:23Z–11:58Z. It used one image (cd3cbf2), fresh 4 GiB containers, host-warm, and the bench's reuse mode (no ingest). Each engine got a discarded warm-up, then 3 rounds with the arm order rotated. The arms:
@@ -1812,6 +1843,54 @@ Reading it:
 - **`mmap4m` failed only the peak.** Every job finished, and RSS 15 s after each job stayed under its cap. Its faster second attach and detach are single runs.
 - **The 16 MiB kill** looks like mem1's: exit 137 at 13:01:25Z, and a server log that ends at "collection bench loaded", with no traceback. A knob server replayed the killed attach and then detached (157.1 s), so the volume ended flat.
 - **No threshold wins both ways.** The one that passes C7 recovers 8.3 of the 12.7–13.8 ms that the larger thresholds recover. Plan F's Task 2 binary-searches the smaller side into the larger, so the arrays become shard-sized (about 64 KB), under the knob's 128 KiB threshold. Hence X6: nothing ships, and plan F's A/B carries the recovery.
+
+### 4.15 D1's A/B on gn100: ingest off the event loop, with batched syncs
+
+Plan D1's Task 6, run on gn100 on 2026-09-30, 13:13:08Z–15:05:43Z (cap 330 minutes).
+- Arms: base = cd3cbf2266ab (plan C, the image a-ref2 measured), candidate = 2274a6a0d60d (D1 after the final review's fix wave).
+- Both images run CPython 3.12.14 with SQLite 3.53.1 and turbovec 1.0.0. The probe's host venv was re-synced to the same pair.
+- The probes (`bench/ingest_probe.py`, host-warm, uncapped host process) ran flat, then IVF with nlist 256: a discarded base warm-up, then base and candidate alternating, three runs each.
+- The reingests (`bench.py --reingest`, host-warm, `bench-tv` capped at 4 GiB) ran base, candidate, base, candidate.
+
+The gated rows (Plan A's rule: gain = candidate median − base median; band = the wider of the two ranges, at least 1 vec/s; `better` needs gain > band):
+
+| Row (vec/s) | Base runs | Candidate runs | Base median | Candidate median | Gain | Band | Verdict |
+|---|---|---|---|---|---|---|---|
+| Probe, flat | 2,274.9 / 2,355.5 / 2,342.4 | 5,020.8 / 4,982.0 / 4,603.5 | 2,342.4 | 4,982.0 | 2,639.6 | 417.3 | better |
+| Probe, IVF 256 | 505.0 / 533.5 / 535.2 | 611.7 / 612.0 / 710.4 | 533.5 | 612.0 | 78.5 | 98.7 | within band |
+| Reingest, flat | 1,531.1 / 1,530.7 | 3,026.7 / 3,044.1 | 1,530.9 | 3,035.4 | 1,504.5 | 17.4 | better |
+
+Gates: `D1-run`, `D1-flat`, `D1-fingerprints`, `D1-jobs`, `D1-bench` and `D1-labels` PASS; `D1-ivf256` FAIL.
+
+Where the time goes, per probe run (base → candidate, ranges over runs 1–3):
+
+| Probe | Loop stall (s) | Enqueue (s) | Drain (s) |
+|---|---|---|---|
+| Flat | 5.5–6.4 → 0 | 9.8–9.9 → 2.9–3.2 | 21.2–22.0 → 10.0–10.9 |
+| IVF 256 | 7.8–8.3 → 0–0.19 | 7.6–7.8 → 1.9–2.3 | 93.4–99.0 → 70.4–81.7 |
+
+`compare.py` on the reingest sessions (two runs per side, so its bands are two-run ranges):
+
+| Row | Base | Candidate | Verdict |
+|---|---|---|---|
+| Ingest wall time (s) | 1,665 | 840 | better |
+| Search p50 / p95 / p99 (ms) | 23.4 / 27.1 / 29.2 | 22.6 / 25.6 / 27.5 | better |
+| QPS serial | 40 | 44 | better |
+| Hybrid p99 (ms) | 580.9 | 532.7 | better |
+| Disk footprint (MB) | 16,522 | 16,496 | better |
+| Memory after ingest (MB) | 460 | 1,620 | worse |
+| Memory under load (MB) | 1,603 | 1,628 | worse |
+| Every other row (concurrent QPS and p95, filtered, recall, hybrid p50/p95/QPS, text-hit@10) | | | within band |
+
+Cold start (3.5 → 2.5 s) is "not claimable": one reading per run.
+
+Reading it:
+- **D1 does what it was built for.** The event loop no longer stalls during ingest: 5.5–8.3 s of stall per probe run became 0 on flat and at most 0.19 s on IVF. Enqueueing, which the loop serves, went 3–4× faster on both.
+- **Flat ingest more than doubled**, both in the probe (2.1×) and in the full 2.55M-vector reingest (2.0×, 1,665 → 840 s). D1 moves the payload work off the loop and writes the index file once per batch of jobs, not once per job.
+- **IVF gained less: +15 % at the medians**, against +113 % on flat. Its drain fell from 93–99 s to 70–82 s. Where the rest of IVF's drain goes was not profiled.
+- **The IVF gate failed on its band, not on its runs** (section 5.20). Every candidate run beat every base run.
+- **The search rows moved a little**, beyond their bands: p50 −0.8 ms and hybrid p99 −48 ms. D1 is an ingest change, and why search moved was not checked.
+- **Memory:** section 9.4.
 
 ## 5. Negative results and surprises
 
@@ -1921,6 +2000,10 @@ Plan C set `MALLOC_TRIM_THRESHOLD_` (D13) so that glibc gives freed heap back an
 ### 5.19 The plan's reason for the prune key pointed the wrong way
 
 Plan E's Task 1 keyed the prune's df cache by each stage-2 token as it is, because `_fold` is not idempotent: math bold A folds to A, and A folds again to a. The fact is right, but it argues for the second fold. FTS5 lowercases the query's terms, so for `𝐀𝐁` it matches `ab`. A df looked up for `AB` is 0, so the prune keeps the token whatever the df of `ab`. That is the failure D14 was written to remove (section 5.4), brought back by the fix. The pre-flight's drift scan caught it by reading the code against FTS5's behaviour. The controller reproduced it in a sandbox before ruling: `AB` at df 0 against 40, and a ranked OR over 41 rows against a budget of 10 (section 2, 13:20Z; ruling E-R1). Every step of the plan had been replayed green before that, because none of its tests used a character whose fold changes twice.
+
+### 5.20 Every candidate run won, and the gate still failed
+
+Plan A's rule sets the band to the wider of the two arms' ranges (max − min over the runs), and a claim needs the median gain to exceed it. With three runs per arm, one run sets each range. D1's IVF candidate drained its third run in 70.4 s, 11 s faster than its other two, so its range became 98.7 vec/s. The gain at the medians was 78.5. By the rule the result is "within band", yet the two samples do not overlap: the slowest candidate run (611.7) beat the fastest base run (535.2) by 76.5. If the two arms were exchangeable, all three candidate runs would rank above all three base runs with probability 1/20. The rule is conservative on purpose. It was fixed before any data, and it cannot tell a favourable outlier from noise, so an unusually good run can sink a claim that the runs support. The plan forbids loosening the gate afterwards and rerunning selectively, and neither was done: the result went to the maintainer as a FAIL.
 
 ## 6. Method: how we measured
 
@@ -2101,6 +2184,7 @@ State as of 2026-09-28, about 19:30Z.
 - Dated note, 2026-09-30 12:20Z: the final review's I1 (a cancelled delete could hand its ids to the next upsert) is fixed at e6e1e44, the wording fixes are at 2274a6a, and the re-review approved both (289 passed). The A/B's scripts are at revision 2. D1's candidate is 2274a6a0d60d. mem1 ruled out a 32 MiB mmap threshold, which is OOM-killed in the swapless build (section 4.13). `sweep1`, then `mem2` (C7 for 1, 4 and 16 MiB), then the D1 A/B run on gn100.
 - Dated note, 2026-09-30 13:20Z: sweep1 and mem2 are done (section 4.14). No mmap threshold ships; plan F's `_intersect` rewrite carries the filtered-search recovery (X6). D1's gn100 A/B is running (13:13:08Z, cap 330 minutes): candidate 2274a6a0d60d against base cd3cbf2266ab, with the reingests.
 - Dated note, 2026-09-30 14:04Z: plan E's pre-flight is done and ruled (section 2, 13:20Z), including a fix to the plan's prune key (E-R1, section 5.19). uv 0.12.21 is committed on `uv-0.12.21` and lands on `main` after D1's merge (X7). D1's A/B is in its reingests on gn100.
+- Dated note, 2026-09-30 15:22Z: D1's A/B is done (section 4.15). Six gates passed and `D1-ivf256` failed within its band (section 5.20). By the plan, D1 stops at Step 11: no gate test, no results in the ADR, and the decision is the maintainer's. The p99-during-delete probe ran again on D1's image (section 4.11). Plan E waits for D1's merge.
 
 ### 9.2 Open questions in the plans
 
@@ -2131,6 +2215,8 @@ State as of 2026-09-28, about 19:30Z.
 - **a-equiv's flat memory** (2026-09-29): 1528–1529 MB in runs 2 and 3, against 1547–1551 MB in baseline3, control1 and a-equiv2. It is not the run order, because control1 ran in the same order, and not the bench, because a-equiv2 ran the same bench.
 - **From p4 (20:40Z):** the two states of the flat concurrent row (section 5.8); the multi-second hybrid p99 tails on every arm at c=8 and c=16; why R1 fails 12–15× less often on 3.14t (section 5.15).
 - p3 attributes the server gap (203–408 QPS against an in-process ceiling of 610–662) to "serial drain plus event-loop pipeline", inferred from per-thread CPU sampling, not a per-stage trace.
+- **Memory right after a reingest** (D1's A/B, 2026-09-30). The base measured 388 and 533 MB after its reingests, against 1,617–1,623 MB for D1's candidate and 1,502–1,551 MB in every adopt session. Under load both arms reach about 1.6 GB. `bench.py` reads `podman stats`, which leaves inactive file pages out. Why the base's index looks non-resident right after its reingest was not investigated.
+- **D1's third IVF candidate run** drained in 70.4 s, against 81.7 s for the other two and 93–99 s for the base. It was the last probe run. Nothing in the log explains it.
 
 ### 9.5 Disputed, unaddressed, and limits
 
