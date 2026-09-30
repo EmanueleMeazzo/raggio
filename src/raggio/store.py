@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import sqlite3
+import struct
 import sys
 import threading
 import time
@@ -182,6 +183,100 @@ def _normalize(mat: np.ndarray) -> np.ndarray:
     if (norms == 0).any():
         raise ValueError("zero vector cannot be normalized")
     return (mat / norms).astype(np.float32)
+
+
+# Binary job journal row (job_payloads.data): _JOB_HEADER (magic, JSON byte length,
+# vector count, dim; little-endian, so aarch64 and x86 read the same bytes), then the
+# payload as UTF-8 JSON with each supplied vector replaced by its row index, then the
+# vectors as little-endian float32. float32 is what the worker indexes anyway, so no
+# precision is lost, and the vectors skip a JSON round trip that costs ~100 ms per
+# 250x1024 job. Stdlib + numpy only: runtime JSON stays stdlib.
+_JOB_MAGIC = b"RGJ\x01"
+_JOB_HEADER = struct.Struct("<4sIII")
+
+
+def _encode_payload(payload: dict) -> bytes:
+    """Encode a job payload for job_payloads. A summary's or chunk's non-None `vector`
+    becomes an int row index into the float32 block; None stays None ("embed this").
+    Index-op payloads carry no vectors (n_vecs = dim = 0). Copies whatever it rewrites,
+    so the caller's dict is never mutated. Raises ValueError unless the vectors form one
+    rectangular float matrix (the route checks dims, so only direct callers hit that)."""
+    vectors: list = []
+
+    def take(rec: dict) -> dict:
+        if rec.get("vector") is None:
+            return rec
+        vectors.append(rec["vector"])
+        return {**rec, "vector": len(vectors) - 1}
+
+    docs = payload.get("documents")
+    if docs is not None:
+        out = []
+        for d in docs:
+            d = dict(d)
+            if d.get("summary"):
+                d["summary"] = take(d["summary"])
+            if d.get("chunks"):
+                d["chunks"] = [take(c) for c in d["chunks"]]
+            out.append(d)
+        payload = {**payload, "documents": out}
+    try:
+        mat = np.asarray(vectors, dtype="<f4") if vectors else np.empty((0, 0), dtype="<f4")
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"job payload vectors are not one rectangular float matrix: {e}"
+        ) from None
+    if mat.ndim != 2:
+        raise ValueError(
+            f"job payload vectors are not one rectangular float matrix: shape {mat.shape}"
+        )
+    meta = json.dumps(payload).encode("utf-8")
+    n, dim = mat.shape
+    return _JOB_HEADER.pack(_JOB_MAGIC, len(meta), n, dim) + meta + mat.tobytes()
+
+
+def _decode_payload(data: bytes) -> dict:
+    """Inverse of _encode_payload. Each vector comes back as a row of one read-only
+    little-endian float32 matrix (views into `data`, no copy). Anything malformed
+    raises ValueError: short or overlong data, bad magic, bad UTF-8 or JSON, a non-dict
+    top level, a malformed document list, or a vector index out of range."""
+    size = _JOB_HEADER.size
+    if len(data) < size:
+        raise ValueError(f"job payload truncated: {len(data)} bytes, the header alone is {size}")
+    magic, json_len, n, dim = _JOB_HEADER.unpack_from(data)
+    if magic != _JOB_MAGIC:
+        raise ValueError(f"job payload has bad magic {bytes(magic)!r}")
+    end = size + json_len
+    if len(data) != end + 4 * n * dim:
+        raise ValueError(
+            f"job payload is {len(data)} bytes but its header says {end + 4 * n * dim}"
+            " (truncated or corrupt)"
+        )
+    payload = json.loads(bytes(data[size:end]).decode("utf-8"))  # both errors are ValueErrors
+    if not isinstance(payload, dict):
+        raise ValueError(f"job payload is a JSON {type(payload).__name__}, not an object")
+    if n * dim:
+        mat = np.frombuffer(data, dtype="<f4", count=n * dim, offset=end).reshape(n, dim)
+    else:
+        mat = np.empty((n, dim), dtype="<f4")
+    mat.flags.writeable = False  # also for bytearray input: rows are shared views
+
+    def row(i) -> np.ndarray:
+        if type(i) is not int or not 0 <= i < n:
+            raise ValueError(f"job payload vector index {i!r} is outside 0..{n - 1}")
+        return mat[i]
+
+    try:
+        for d in payload.get("documents") or ():
+            s = d.get("summary")
+            if s and s.get("vector") is not None:
+                s["vector"] = row(s["vector"])
+            for c in d.get("chunks") or ():
+                if c.get("vector") is not None:
+                    c["vector"] = row(c["vector"])
+    except (AttributeError, TypeError) as e:
+        raise ValueError(f"job payload has a malformed document list: {e}") from None
+    return payload
 
 
 def _filter_sql(scope: str, filt: dict | None) -> tuple[str, list]:
@@ -372,6 +467,14 @@ def open_meta_db(path: Path, tokenizer: str = "unicode61") -> sqlite3.Connection
             error TEXT,
             created_at TEXT,
             updated_at TEXT
+        );
+        -- binary job payloads (_encode_payload), one row per open or failed job. A side
+        -- table, NOT jobs.payload: the claim's status UPDATE would otherwise rewrite the
+        -- payload's whole overflow chain (MBs per job). jobs.payload stays TEXT: journals
+        -- written before the binary job journal keep their JSON there and still replay.
+        CREATE TABLE IF NOT EXISTS job_payloads(
+            job_id INTEGER PRIMARY KEY,
+            data BLOB
         );
         """
     )
