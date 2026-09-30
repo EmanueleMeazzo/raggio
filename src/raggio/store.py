@@ -279,6 +279,14 @@ def _decode_payload(data: bytes) -> dict:
     return payload
 
 
+# the worker's claim: the lowest open job. 'processing' is included so jobs interrupted
+# by a crash replay on boot. Keep the literal predicate byte for byte: it is what Plan
+# C's partial index idx_jobs_open matches (spec 4.1), and C's plan test pins this text
+_CLAIM_SQL = (
+    "SELECT id, payload FROM jobs WHERE status IN ('pending','processing') ORDER BY id LIMIT 1"
+)
+
+
 def _filter_sql(scope: str, filt: dict | None) -> tuple[str, list]:
     """Build WHERE clause for records: type scope + metadata filters, all ANDed.
     Per key: scalar = equality; list = `in`; object = range ops / `in` / `contains`."""
@@ -917,22 +925,36 @@ class Collection:
             self.db.close()
 
     async def enqueue(self, payload: dict) -> int:
-        # journaling a bulky payload is real I/O: run the transaction in a thread and
-        # only touch the (non-thread-safe) wake event back on the loop
-        job_id = await asyncio.to_thread(self._enqueue_row, json.dumps(payload))
+        # encoding a bulky payload is real CPU and journaling it real I/O: both run in
+        # a thread, and only the (non-thread-safe) wake event is touched on the loop
+        job_id = await asyncio.to_thread(self._enqueue_row, payload)
         self._wake.set()
         return job_id
 
-    def _enqueue_row(self, payload_json: str) -> int:
+    def _enqueue_row(self, payload: dict) -> int:
+        # encode BEFORE taking db_lock: the lock serializes every write on self.db, so
+        # CPU work under it would stall the worker's claim/finish and other enqueues
+        data = _encode_payload(payload)
         with self.db_lock:
-            # explicit id, not lastrowid: MAX+1 is race-free under db_lock
-            job_id = self.db.execute("SELECT COALESCE(MAX(id),0)+1 FROM jobs").fetchone()[0]
-            self.db.execute(
-                "INSERT INTO jobs(id, payload, status, created_at, updated_at)"
-                " VALUES (?, ?, 'pending', ?, ?)",
-                (job_id, payload_json, _now(), _now()),
-            )
-            self.db.commit()
+            try:
+                # explicit id, not lastrowid: MAX+1 is race-free under db_lock
+                job_id = self.db.execute("SELECT COALESCE(MAX(id),0)+1 FROM jobs").fetchone()[0]
+                # jobs.payload stays NULL: the payload lives in job_payloads, so the
+                # claim's status UPDATE rewrites a small row, not an MB overflow chain
+                self.db.execute(
+                    "INSERT INTO jobs(id, payload, status, created_at, updated_at)"
+                    " VALUES (?, NULL, 'pending', ?, ?)",
+                    (job_id, _now(), _now()),
+                )
+                self.db.execute(
+                    "INSERT INTO job_payloads(job_id, data) VALUES (?, ?)", (job_id, data)
+                )
+                self.db.commit()
+            except BaseException:
+                # one transaction: a jobs row without its payload would replay as an
+                # error job, and a half-written txn would ride on the next commit
+                self.db.rollback()
+                raise
         return job_id
 
     def pending_jobs(self) -> int:
@@ -940,28 +962,52 @@ class Collection:
             "SELECT COUNT(*) FROM jobs WHERE status IN ('pending','processing')"
         ).fetchone()[0]
 
-    def _claim_next(self) -> tuple | None:
-        # 'processing' included so jobs interrupted by a crash are replayed on boot
+    def _claim_next(self) -> tuple[int, dict | None, str | None] | None:
+        """Claim the lowest open job. Returns (job_id, payload, None), or
+        (job_id, None, "bad job payload: ...") when its payload cannot be decoded, or
+        None when no job is open. The claim is one short transaction under db_lock;
+        the decode runs after the lock is released, still in this worker thread, so
+        neither the loop nor the other writers wait for it."""
         with self.db_lock:
-            row = self.db.execute(
-                "SELECT id, payload FROM jobs WHERE status IN ('pending','processing') ORDER BY id LIMIT 1"
+            row = self.db.execute(_CLAIM_SQL).fetchone()
+            if row is None:
+                return None
+            job_id, text = row
+            blob = self.db.execute(
+                "SELECT data FROM job_payloads WHERE job_id=?", (job_id,)
             ).fetchone()
-            if row is not None:
-                self.db.execute(
-                    "UPDATE jobs SET status='processing', updated_at=? WHERE id=?", (_now(), row[0])
+            self.db.execute(
+                "UPDATE jobs SET status='processing', updated_at=? WHERE id=?", (_now(), job_id)
+            )
+            self.db.commit()
+        try:
+            if blob is not None and blob[0] is not None:
+                return job_id, _decode_payload(blob[0]), None
+            if text is None:
+                raise ValueError(
+                    f"job {job_id} has no payload (neither jobs.payload nor job_payloads)"
                 )
-                self.db.commit()
-            return row
+            payload = json.loads(text)  # a journal row written before the binary job journal
+            if not isinstance(payload, dict):
+                raise ValueError(f"payload is a JSON {type(payload).__name__}, not an object")
+            return job_id, payload, None
+        except Exception as e:
+            # as when json.loads ran inside the worker's try: an undecodable row ends
+            # as an 'error' job with its payload row kept, and the worker lives on
+            return job_id, None, f"bad job payload: {e}"
 
     def _finish_job(self, job_id: int, status: str, error: str | None) -> None:
         with self.db_lock:
             # payload cleared on success so vector-heavy jobs don't accumulate on disk;
-            # kept on error for diagnosis
+            # kept on error for diagnosis. The CASE clears a legacy TEXT payload; a
+            # binary one is its job_payloads row, deleted in the same commit
             self.db.execute(
                 "UPDATE jobs SET status=?, error=?, updated_at=?,"
                 " payload=CASE WHEN ?='done' THEN NULL ELSE payload END WHERE id=?",
                 (status, error, _now(), status, job_id),
             )
+            if status == "done":
+                self.db.execute("DELETE FROM job_payloads WHERE job_id=?", (job_id,))
             self.db.commit()
             # return the cleared payload's pages to the OS between jobs. fetchall() is
             # load-bearing: the pragma frees pages per STEP, and pysqlite's execute()
@@ -977,9 +1023,13 @@ class Collection:
             if row is None:
                 await self._wake.wait()
                 continue
-            job_id, payload = row
+            # decoded in the claim's thread; an undecodable row comes back as
+            # (job_id, None, reason) and finishes as 'error' like any failed job
+            job_id, payload, bad = row
             try:
-                await self._process_job(json.loads(payload))
+                if bad is not None:
+                    raise ValueError(bad)
+                await self._process_job(payload)
                 status, error = "done", None
             except asyncio.CancelledError:
                 raise
