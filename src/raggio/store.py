@@ -1421,6 +1421,7 @@ class Collection:
 
         ivf, seen, missing, build_s, live_s = await asyncio.to_thread(build)
         t3 = time.monotonic()
+        wrote = 0
         if len(missing):
             parts = [seen]
 
@@ -1428,7 +1429,7 @@ class Collection:
                 ivf.add_with_ids(mat, ids)
                 parts.append(ids)
 
-            await self._backfill_vecs(missing, add)
+            wrote = await self._backfill_vecs(missing, add)
             seen = np.concatenate(parts)  # the swap diff covers them too
         t4 = time.monotonic()
         tmp = self.dir / "ivf.tmp"
@@ -1460,7 +1461,7 @@ class Collection:
             "attach_index %s: n=%d nlist=%d prework=%.2fs sample=%.2fs legacy_backfill=%d"
             " build=%.2fs live_scan=%.2fs backfill=%d rows %.2fs swap=%.2fs total=%.2fs",
             self.cfg.name, n, nlist, t1 - t0, t2 - t1, legacy, build_s, live_s,
-            len(missing), t4 - t3, t5 - t4, t5 - t0,
+            wrote, t4 - t3, t5 - t4, t5 - t0,
         )
 
     async def _detach_index(self) -> None:
