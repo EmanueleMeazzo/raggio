@@ -727,3 +727,90 @@ def test_freelist_bounded_during_backlog(tmp_path, monkeypatch):
         assert idle <= 1  # the finish that empties the queue vacuums in full
     finally:
         asyncio.run(col.stop())
+
+
+# ---- bench/ingest_probe.py
+
+PROBE = Path(__file__).resolve().parents[1] / "bench" / "ingest_probe.py"
+
+
+def load_probe(monkeypatch):
+    """Import bench/ingest_probe.py as a module. The probe puts its tree's src/ first
+    on sys.path at import; patching in a copy of sys.path undoes that after the test."""
+    import importlib.util
+
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    spec = importlib.util.spec_from_file_location("ingest_probe", PROBE)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def probe_args(tmp_path, **over):
+    """argv for a tiny probe run: dim 16, 200 prefill rows, 4 jobs x 20 rows, job 0
+    re-upserting prefill rows 0-19. Keywords override a flag ('_' for '-')."""
+    opts = {"dim": 16, "prefill": 200, "jobs": 4, "job_rows": 20, "reupsert_every": 5,
+            "enqueuers": 2, "seed": 1, "tmp": tmp_path, **over}
+    argv = []
+    for name, value in opts.items():
+        argv += ["--" + name.replace("_", "-"), str(value)]
+    return argv
+
+
+def test_ingest_probe_runs_flat_and_reports(tmp_path, monkeypatch):
+    probe = load_probe(monkeypatch)
+    assert sys.path[0] == str(PROBE.parents[1] / "src")  # measures its own tree's code
+    out_file = tmp_path / "probe.json"
+    out = probe.main(probe_args(tmp_path, out=out_file))
+    assert {
+        "ingest_vps", "drain_s", "enqueue_s", "loop_stall_s", "loop_lag_max_ms", "rows",
+        "jobs", "freelist", "fingerprint", "store_file", "sqlite_version", "turbovec", "args",
+    } <= set(out)
+    assert out["jobs"] == {"done": 4}
+    assert out["rows"] == 80  # 4 jobs x 20 rows, the re-upsert included
+    assert out["index"] == {"type": "flat"}
+    # 200 prefill rows + 3 fresh jobs x 20; job 0 replaced 20 prefill rows in place
+    assert out["fingerprint"]["counts"] == {"chunk": 260}
+    assert out["fingerprint"]["n_index"] == 260
+    assert out["freelist"] <= 1  # the queue went idle, so the last finish vacuumed in full
+    assert out["payload_rows"] == 0  # a done job's job_payloads row is deleted
+    assert out["ingest_vps"] == pytest.approx(80 / out["drain_s"])
+    assert 0 < out["enqueue_s"] <= out["drain_s"]
+    assert out["loop_stall_s"] >= 0 and out["loop_lag_max_ms"] >= 0
+    assert out["store_file"] == store.__file__
+    assert out["sqlite_version"] == sqlite3.sqlite_version
+    assert out["regime"] == "host-warm, uncapped host process"
+    assert (out["args"]["seed"], out["args"]["ivf"], out["args"]["job_rows"]) == (1, 0, 20)
+    assert json.loads(out_file.read_text(encoding="utf-8")) == out
+
+
+def test_ingest_probe_runs_ivf(tmp_path, monkeypatch):
+    # bench.py never ingests into an IVF collection; the probe attaches one (nlist 4)
+    # before the clock starts, so every timed job syncs the IVF shards
+    monkeypatch.setattr(store, "IVF_MIN_ROWS", 100)
+    probe = load_probe(monkeypatch)
+    out = probe.main(probe_args(tmp_path, prefill=400, ivf=4, seed=3))
+    assert out["index"]["type"] == "ivf" and out["index"]["nlist"] == 4
+    assert out["jobs"] == {"done": 4}
+    assert out["rows"] == 80
+    assert out["fingerprint"]["counts"] == {"chunk": 460}  # 400 + 3 fresh jobs x 20
+    assert out["fingerprint"]["n_index"] == 460
+    assert out["payload_rows"] == 0
+    assert out["ingest_vps"] > 0
+
+
+def test_ingest_probe_fingerprint_is_deterministic(tmp_path, monkeypatch):
+    # three enqueuers race to land six jobs (jobs 0 and 3 re-upsert disjoint prefill
+    # blocks), so the journal order differs between runs; the final state must not
+    probe = load_probe(monkeypatch)
+    shape = {"prefill": 100, "jobs": 6, "job_rows": 10, "reupsert_every": 3, "enqueuers": 3}
+    a = probe.main(probe_args(tmp_path, seed=7, **shape))
+    b = probe.main(probe_args(tmp_path, seed=7, **shape))
+    c = probe.main(probe_args(tmp_path, seed=8, **shape))
+    assert a["jobs"] == b["jobs"] == c["jobs"] == {"done": 6}
+    assert a["fingerprint"] == b["fingerprint"]
+    assert a["fingerprint"]["counts"] == {"chunk": 140}  # 100 + 4 fresh jobs x 10
+    assert a["fingerprint"]["n_index"] == 140
+    # the fingerprint does see the data: another seed gives other texts and vectors
+    assert c["fingerprint"]["records"] != a["fingerprint"]["records"]
+    assert c["fingerprint"]["vecs"] != a["fingerprint"]["vecs"]
