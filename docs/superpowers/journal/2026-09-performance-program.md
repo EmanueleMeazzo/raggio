@@ -1117,6 +1117,38 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
   - `sweep1` then sweeps the mmap threshold on IVF only (1, 4, 16 and 32 MiB, against the knob), to find the smallest threshold that recovers filtered search.
   - The D1 A/B waits for both. Its two arms share the knob, so the malloc question does not bias it.
 
+**12:05Z–12:20Z. The final review finds a cancellation race, the fix wave lands, and a 32 MiB mmap threshold is OOM-killed.**
+- **The final review** (Opus, cd3cbf2..24bcc90, done at 12:07:41Z) returned "Ready with fixes": one Important finding and two Minor ones. It also ruled on the nine minors the task reviews had deferred.
+  - **I1, a race between a cancelled delete and the next upsert.** Task 3 moved `_delete_doc_rows`' index removal (`_unindex`) after the commit, as the plan says, but also out of `db_lock`. The plan relied on `delete_document` holding `lock.write()` around the thread. A cancelled `delete_document` releases `lock.write()` at its `await`, but its `to_thread` body runs on. Plan B's `stop()` is built around exactly that orphaned-thread model. In the window between the commit and the removal:
+    - the worker can take `lock.write()`;
+    - its upsert reads `MAX(records.id)`, which no longer counts the deleted rows;
+    - so it hands the deleted document's ids to new rows. The job then fails with "already present in index", and a committed record stays out of the index for good.
+  - The reviewer reproduced it in a scratch script and confirmed the fix at runtime. The race is latent in the shipped server, because no handler cancels a delete, but it is a regression against base, which removed the ids under `db_lock`.
+  - **M1:** `docs/benchmark.md` quoted 1,105 vec/s as if measured under the new vacuum policy. It was measured when the journal's pages went back after every job.
+  - **M2:** the ADR's downgrade row said a drained queue leaves no payload row. Failed jobs keep theirs.
+  - The nine deferred minors were all accepted, for the reasons the reviewer gave. The D2 anchors were checked verbatim, and no hot-path hazard was found.
+- **The ruling:** fix I1, M1 and M2 in one wave of two commits. `_unindex` itself stays byte-identical, because D2 quotes it verbatim. The suite count moves from 288 to 289, so the A/B's gate test makes 290.
+- **The fix wave** (Sonnet, 12:07Z–12:11Z):
+  - e6e1e44 moves the `_unindex` call inside `db_lock`, still after the commit and after the `indexed_counts` rebind. It adds a spy test that records `db_lock.locked()` inside `_unindex`. Revert check: with the call moved back out, the test fails (`False != True`); restored, it passes.
+  - 2274a6a corrects the two sentences.
+  - 289 passed. `ruff --select F` flags 5 errors in 4 files that the branch never touched; all 5 are already there at cd3cbf2.
+  - A scoped Sonnet re-review approved the wave with two minors, both accepted:
+    - `_unindex`'s docstring ("db_lock is not needed") now reads oddly on the delete path, but it stays verbatim for D2;
+    - a delete now holds `db_lock` for one `index.remove` per record. Search takes `db_lock` only when a thread first opens its connection.
+- **The A/B scripts' review** (Sonnet, about 12:05Z) returned "Ready with fixes". The controller's revision 2 (12:10Z):
+  - Important 1: `fail()` could stop a `bench-tv` that the run had not started. The flag that allows it is now set only inside `start_ctr`, right after `podman run`.
+  - Important 2: the self-check did not pin the arm order, trees or images. Sixteen `sed` mutations of the driver all passed the old check. Twelve literal lines are now pinned: the tree and image mapping, the probe flags, the orders, the 180-minute threshold and the deadline.
+  - Two minors fixed:
+    - a failing `podman ps` passed the guard; now it fails the run;
+    - an unparsable 200 from the pending-jobs poll could spin for two hours; now three in a row fail it.
+  - Accepted and noted: there is no TERM trap, because the runbook stops `bench-tv` by hand after a cap kill.
+- **The A/B's SHAs are pinned** (12:16Z): base cd3cbf2266ab (plan C's merge), candidate 2274a6a0d60d, with the reingests, and a 330-minute cap.
+- **mem1** (11:57:59Z–12:12:37Z; section 4.13) put a hard limit on the malloc fix. The knob passed C7. The knob plus a fixed 32 MiB mmap threshold was SIGKILLed 147 s into the first swapless attach, which is the 4 GiB OOM that plan C's knob exists to prevent (section 5.6). So mtt2's 32 MiB fix is ruled out. The threshold has to sit above the query's temporaries and below the build's large blocks.
+- **Next on gn100, chained:**
+  - `sweep1` (from 12:12:52Z) measures IVF search with the mmap threshold at 1, 4, 16 and 32 MiB;
+  - `mem2`, queued behind it, runs C7 for 1, 4 and 16 MiB;
+  - the D1 A/B follows.
+
 ## 3. Decision register
 
 ID prefixes:
@@ -1651,6 +1683,32 @@ Reading it:
 - **Hybrid is not the knob.** Hybrid p50 moved by less than 1 ms in every arm, inside the bands. a-ref2's 3–4 % hybrid regression is still unexplained.
 - **What is left:** whether `mmap32` keeps C7's headroom in a swapless attach → detach cycle (`mem1`), and whether a smaller threshold recovers filtered search for less memory (`sweep1`).
 
+### 4.13 The malloc knob: mem1, plan C's C7 per arm
+
+A scratch run on gn100 (`mem-arm.sh`), 2026-09-30, 11:58Z–12:13Z, with image cd3cbf2. It repeats plan C's C7 cycle for each arm in a fresh swapless container (`--memory 4g --memory-swap 4g`), starting from a flat index:
+- attach, true-cold;
+- detach;
+- attach, host-warm;
+- detach.
+
+C7 passes when every job is done, with no swap and no OOM kill, a peak VmHWM of at most 3,891 MiB, and VmRSS 15 s after each job at most 512 MiB above the loaded RSS.
+
+| Arm | Loaded RSS (MiB) | Attach 1 | Detach | Attach 2 | Detach 2 | Max VmHWM (MiB) | Max RSS 15 s after a job (MiB) | C7 |
+|---|---|---|---|---|---|---|---|---|
+| `knob` | 1,461 | 187.6 s | 20.4 s | 45.7 s | 20.3 s | 3,556 | 1,791 (cap 1,973) | PASS |
+| `mmap32m` | 1,577 | killed at 146.9 s | not run | not run | not run | not sampled | not sampled | FAIL |
+
+Reading it:
+- **The kill was an OOM kill.**
+  - The container exited with code 137 (SIGKILL) at 12:06:25Z. The server's log ends at "collection bench loaded", with no traceback.
+  - podman's `OOMKilled` flag read false. Rootless podman does not always see the cgroup's OOM event, and nothing else stops `bench-tv` in the middle of a job.
+- **Why.**
+  - glibc's own dynamic mmap threshold tops out at 32 MiB on 64-bit, so a fixed 32 MiB threshold behaves like `noknob` during the build.
+  - The build's freed large blocks stay in the heap instead of going back to the kernel. The peak then crosses the swapless cap, as in section 5.6.
+  - At rest, the arm already held 116 MiB more than `knob`.
+- **The knob's pass** reproduces plan C's C7 at the merged image (max VmHWM 3,556 MiB against 3,891).
+- **Afterwards.** A knob server replayed the killed attach and then detached (162.3 s), so the volume ended flat for the next run.
+
 ## 5. Negative results and surprises
 
 ### 5.1 Audience batching lost on NEON
@@ -1754,7 +1812,7 @@ Dated note, 2026-09-30 00:28Z: confirmed. The first Actions run on `main` (00c70
 
 ### 5.18 The knob that saved the 4 GiB build slowed filtered IVF search by a third
 
-Plan C set `MALLOC_TRIM_THRESHOLD_` (D13) so that glibc gives freed heap back and a swapless 4 GiB IVF build is not OOM-killed (section 5.6). glibc treats that variable as a request to stop adjusting the mmap threshold, which stays at 128 KiB. A container that loaded its index from disk then got each filtered query's large temporaries as fresh `mmap`s. Filtered p50 went from 36 to 49 ms, but only in restarted containers, which is why a-ref2's built-index runs looked normal (sections 4.10 and 4.12). No gate caught it at merge time, because plan C's acceptance run measured memory, not search. A fixed mmap threshold brings the latency back and keeps the knob, at a cost of about 110 MB of RSS at 32 MiB.
+Plan C set `MALLOC_TRIM_THRESHOLD_` (D13) so that glibc gives freed heap back and a swapless 4 GiB IVF build is not OOM-killed (section 5.6). glibc treats that variable as a request to stop adjusting the mmap threshold, which stays at 128 KiB. A container that loaded its index from disk then got each filtered query's large temporaries as fresh `mmap`s. Filtered p50 went from 36 to 49 ms, but only in restarted containers, which is why a-ref2's built-index runs looked normal (sections 4.10 and 4.12). No gate caught it at merge time, because plan C's acceptance run measured memory, not search. A fixed mmap threshold brings the latency back and keeps the knob, at a cost of about 110 MB of RSS at 32 MiB. But at 32 MiB, the swapless 4 GiB build is OOM-killed again (section 4.13), so the fix is not that simple. The threshold has to clear the query's temporaries without keeping the build's large blocks in the heap.
 
 ## 6. Method: how we measured
 
@@ -1932,6 +1990,7 @@ State as of 2026-09-28, about 19:30Z.
 - Dated note, 2026-09-30 10:46Z: `main` is pushed (d7f4b01, then cd3cbf2: the detach at 4 GiB, 261 passed). a-ref2 is running on gn100 (10:39Z), and the p99-during-delete probe is built and smoke-tested locally (section 2, 10:05Z). Next: a-ref2's comparison with a-ref, the probe on gn100, then plan D1.
 - Dated note, 2026-09-30 11:25Z: a-ref2 and the p99 probe are done (sections 4.10 and 4.11). a-ref2 shows plan C's build and memory wins, a 3–4 % hybrid regression, and a filtered regression in restarted IVF containers. A malloc A/B (`mtt2`) runs on gn100 to test the lead (section 2, 10:46Z). Plan D1 is pre-flighted and ruled; Task 1 is approved (f7918ff, 269 passed), and Task 2 is running.
 - Dated note, 2026-09-30 12:10Z: plan D1's Tasks 1–5 are approved, and ADR 0001 has its D1 addendum (24bcc90, 288 passed; section 2, 11:25Z). The final whole-branch review on Opus runs before Task 6's gn100 A/B, so any fix lands before the A/B pins its candidate. mtt2 traced the IVF filtered regression to the malloc knob (section 4.12). `mem1` (C7 for a fixed 32 MiB mmap threshold) and `sweep1` (the threshold sweep) are running on gn100; the D1 A/B follows them.
+- Dated note, 2026-09-30 12:20Z: the final review's I1 (a cancelled delete could hand its ids to the next upsert) is fixed at e6e1e44, the wording fixes are at 2274a6a, and the re-review approved both (289 passed). The A/B's scripts are at revision 2. D1's candidate is 2274a6a0d60d. mem1 ruled out a 32 MiB mmap threshold, which is OOM-killed in the swapless build (section 4.13). `sweep1`, then `mem2` (C7 for 1, 4 and 16 MiB), then the D1 A/B run on gn100.
 
 ### 9.2 Open questions in the plans
 
