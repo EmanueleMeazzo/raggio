@@ -210,3 +210,58 @@ def test_open_job_queries_use_the_partial_index(tmp_path):
     assert "idx_jobs_open" in plan(db, claim), plan(db, claim)
     assert col.pending_jobs() == 2
     assert col._claim_next()[0] == 51  # lowest open id, 'processing' replays first
+
+
+# ---- Task 2: pinned query plans (D9) ----
+
+LIST_META = {i: {"year": 2000 + i % 5, "src": "wiki" if i % 2 else "arxiv"} for i in range(30)}
+
+
+@pytest.mark.parametrize("scope", ["chunks", "summaries", "both"])
+@pytest.mark.parametrize("sort", [None, "year", "-year"])
+@pytest.mark.parametrize("filt", [None, {"src": "wiki"}])
+def test_listing_page_query_never_uses_the_covering_index(tmp_path, scope, sort, filt):
+    # p1: with idx_records_doc_type the planner walks the index in doc_id order and
+    # fetches every row by rowid (0.91 -> 2.73 s warm at 2.55M rows); EXPLAIN the SQL
+    # list_records really runs, for every page shape
+    col = make_collection(tmp_path)
+    ingest(col, 30, meta=LIST_META)
+    log = record_sql(col)
+    col.list_records(scope, filt, sort, 20, 0)
+    page = [(s, p) for s, p in log if "LIMIT ? OFFSET ?" in s]
+    assert len(page) == 1
+    detail = plan(col.db, *page[0])
+    assert "idx_records_doc_type" not in detail, detail
+
+
+def test_records_scans_use_the_covering_index(tmp_path):
+    # regression pins (brief 2b §3, SQLite 3.47.1, no sqlite_stat1)
+    col = make_collection(tmp_path)
+    ingest(col, 30, meta=LIST_META)
+    db = col.db
+    for sql in (
+        "SELECT type, COUNT(*) FROM records WHERE indexed=1 GROUP BY type",  # Collection.__init__
+        "SELECT type, COUNT(*) FROM records GROUP BY type",  # stats()
+        "SELECT COUNT(DISTINCT doc_id) FROM records",  # stats()
+        "SELECT id FROM records WHERE indexed=1",  # the live-id scan (_live_ids, Task 3)
+        "SELECT COUNT(*) FROM records WHERE indexed = 1",  # unfiltered list count
+    ):
+        assert "COVERING INDEX idx_records_doc_type" in plan(db, sql), (sql, plan(db, sql))
+    for sql in (
+        "SELECT id FROM records WHERE doc_id=? AND type='chunk' AND indexed=1",  # siblings
+        "SELECT id FROM records WHERE doc_id=? AND type='summary'",  # summary expansion
+        "SELECT id FROM records WHERE doc_id=? ORDER BY type DESC, position, id",  # get_document
+        "SELECT id, indexed, type FROM records WHERE doc_id=?",  # _delete_doc_rows
+    ):
+        detail = plan(db, sql, ["d1"])
+        assert "idx_records_doc_type (doc_id=?" in detail, (sql, detail)
+    filtered = "SELECT COUNT(*) FROM records WHERE indexed = 1 AND json_extract(metadata, ?) = ?"
+    assert "idx_records_doc_type" not in plan(db, filtered, ["$.src", "wiki"])
+    fts = (
+        "SELECT r.id, -bm25(records_fts) FROM records_fts"
+        " JOIN records r ON r.id = records_fts.rowid"
+        " WHERE records_fts MATCH ? AND doc_id=? AND type='chunk' AND indexed=1"
+        " ORDER BY bm25(records_fts) LIMIT ?"
+    )
+    # ADR 0003: records_fts must stay the outer loop (never a rowid-restricted MATCH)
+    assert plan(db, fts, ['"chunk"', "d1", 5]).startswith("SCAN records_fts VIRTUAL TABLE")

@@ -1634,7 +1634,7 @@ class Collection:
             if not re.fullmatch(r"-?[\w.]+", sort):
                 raise ValueError("sort must be a metadata key, optionally prefixed with '-' for descending")
             # ponytail: ORDER BY json_extract scans the filtered set (no expression index);
-            # add one per hot sort key if listing large collections gets slow
+            # an expression index per hot sort key is the follow-up (spec §5.2), not C
             order = f"json_extract(metadata, ?) {'DESC' if sort[0] == '-' else 'ASC'}, id"
             oparams = ["$." + sort.lstrip("-")]
         db = self._rdb()
@@ -1642,7 +1642,12 @@ class Collection:
         ids = [
             r[0]
             for r in db.execute(
-                f"SELECT id FROM records WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
+                # NOT INDEXED (D9): with idx_records_doc_type present the planner walks
+                # the covering index in doc_id order and fetches each row by rowid (p1:
+                # 0.91 -> 2.73 s warm at 2.55M; ANALYZE does not fix it). NOT INDEXED
+                # keeps the rowid-order table scan and still allows rowid lookups, so
+                # the default ORDER BY id page still stops after LIMIT rows.
+                f"SELECT id FROM records NOT INDEXED WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
                 [*params, *oparams, limit, offset],
             )
         ]
