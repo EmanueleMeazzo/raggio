@@ -119,7 +119,7 @@ GOLDEN = [
     # spacing vowel signs (Mc, combining class 0) survive the fold but are not
     # alphanumeric, so they split words; the virama (combining class 9) is dropped
     ("ह\u093fन\u094dद\u0940", ["ह", "नद"]),  # "Hindi"
-    ("한국어 量子力学", ["한국어", "量子力学"]),  # Hangul -> jamo (NFKD)
+    ("한국어 量子力学", ["한국어", "量子力学"]),  # Hangul -> jamo
     ("a\u0301b", ["ab"]),
     ("x_1 naïve_bayes 42", ["x", "1", "naive", "bayes", "42"]),
     ("٣٤ ² ①", ["٣٤", "2", "1"]),
@@ -177,7 +177,7 @@ POOLS = [
     [chr(c) for c in range(0x300, 0x370)],  # combining diacritics
     [chr(c) for c in range(0x0900, 0x097F)] + [chr(c) for c in range(0x0E00, 0x0E7F)],
     [chr(c) for c in range(0xAC00, 0xAC00 + 500)] + [chr(c) for c in range(0x4E00, 0x4E00 + 500)],
-    list("ﬁﬂﬀﬃﬄ²³¹½¼¾ⅠⅡⅢⅣⅧⓐⒶ①⑴µÅK𝐀𝐚𝟏‐‑–—_'’.,;:!?/\\t\n ")
+    list("ﬁﬂﬀﬃﬄ²³¹½¼¾ⅠⅡⅢⅣⅧⓐⒶ①⑴µÅK𝐀𝐚𝟏‐‑–—_'’.,;:!?/\\\t\n ")
     + ["\u00ad", "\u200b", "\u200c", "\u200d", "\u2060", "\u0345"],  # SHY, ZW*, WJ, U+0345
 ]
 
