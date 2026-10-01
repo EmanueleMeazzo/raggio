@@ -7,6 +7,7 @@ missing extension into a collection error instead of skips.
 """
 
 import asyncio
+import math
 import os
 import random
 import unicodedata
@@ -188,3 +189,54 @@ def test_fold_tokens_matches_python_on_mixed_scripts():
     for _ in range(20_000):
         s = "".join(rng.choice(rng.choice(POOLS)) for _ in range(rng.randint(0, 40)))
         assert native.fold_tokens(s) == store._fold_tokens(s), ascii(s)
+
+
+# ---- stage-2 scorer: the Python reference ----------------------------------------------
+
+N_DOCS = 1000
+DF = {"alpha": 400, "beta": 30, "gamma": 999}  # gamma's IDF clamps to 1e-6
+CAND = [(10, "alpha beta gamma"), (11, "Beta alpha"), (12, "alpha alpha beta"),
+        (13, None), (14, ""), (15, "delta")]
+QUERY = "Alpha beta alpha gamma"
+# literal output of Collection._bm25_rescore before the native scorer existed: the
+# Python path (and NATIVE_BM25=0) stays bit-for-bit what raggio shipped
+PINNED = ([11, 12, 10, 13], [4.630506582919665, 4.082961455183432, 3.9300947468477836, 0.0])
+
+
+def _idf(qtoks):
+    return {t: max(math.log((N_DOCS - DF.get(t, 0) + 0.5) / (DF.get(t, 0) + 0.5)), 1e-6)
+            for t in dict.fromkeys(qtoks)}
+
+
+def _pinned_collection(tmp_path, monkeypatch, **kw):
+    col = Collection(CollectionConfig("t", 8, 4, None, None, None), Path(tmp_path),
+                     lambda: None, **kw)
+    col.indexed_counts = {"chunk": N_DOCS}
+    monkeypatch.setattr(col, "_df", lambda t: DF.get(t, 0))
+    monkeypatch.setattr(col, "_avgdl", lambda: 2.5)
+    return col
+
+
+def _topn_args(qtext, cand, n, avgdl=2.5):
+    qtoks = store._fold_tokens(qtext)[:100]
+    return (qtoks, _idf(qtoks), [r for r, _ in cand], [t for _, t in cand], avgdl, n,
+            store.BM25_K1, store.BM25_B, store.SDM_WEIGHT)
+
+
+def test_python_scorer_is_pinned(tmp_path, monkeypatch):
+    col = _pinned_collection(tmp_path, monkeypatch)
+    assert col._bm25_rescore(QUERY, CAND, 4) == PINNED
+    assert store._bm25_topn(*_topn_args(QUERY, CAND, 4)) == PINNED
+
+
+def test_python_scorer_edge_cases():
+    # sum() of nothing is int 0: a candidate without any query token, for a query
+    # without bigrams, scores int 0, and the API serializes it as 0, not 0.0
+    ids, scores = store._bm25_topn(["alpha"], {"alpha": 1.0}, [1, 2], ["alpha", "beta"],
+                                   1.0, 10, 1.2, 0.75, 0.2)
+    assert ids == [1, 2] and [type(s) for s in scores] == [float, int]
+    assert store._bm25_topn([], {}, [1], ["alpha"], 1.0, 10, 1.2, 0.75, 0.2) == ([], [])
+    assert store._bm25_topn(["alpha"], {"alpha": 1.0}, [], [], 0.0, 10, 1.2, 0.75, 0.2) == ([], [])
+    assert store._bm25_topn(*_topn_args(QUERY, CAND, 0)) == ([], [])
+    with pytest.raises(ZeroDivisionError):  # an all-punctuation avgdl sample
+        store._bm25_topn(*_topn_args(QUERY, CAND, 4, avgdl=0.0))

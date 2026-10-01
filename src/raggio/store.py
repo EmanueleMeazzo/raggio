@@ -390,6 +390,49 @@ def _fold_tokens(text: str) -> list[str]:
     return _TOKEN_RE.findall(_fold(text))
 
 
+def _bm25_topn(
+    qtoks: list[str],
+    idf: dict[str, float],
+    rids: list[int],
+    texts: list[str | None],
+    avgdl: float,
+    n: int,
+    k1: float,
+    b: float,
+    sdm_weight: float,
+) -> tuple[list[int], list[float]]:
+    """Top-n (ids, scores) of the full-query BM25 + SDM-lite score over the candidates
+    (rids[i], texts[i]), ordered by (-score, rid). idf maps each distinct query token.
+    The pure-Python reference: raggio_native.bm25_topn returns the same ids and the
+    bit-identical scores (ADR 0004)."""
+    if not qtoks or not texts:
+        return [], []
+    pairs = {(x, y) for x, y in zip(qtoks, qtoks[1:]) if x != y}
+    scored = []
+    for rid, text in zip(rids, texts):
+        toks = _fold_tokens(text or "")
+        dl = len(toks) or 1
+        norm = k1 * (1 - b + b * dl / avgdl)
+        tf: dict[str, int] = {}
+        for t in toks:
+            if t in idf:
+                tf[t] = tf.get(t, 0) + 1
+        s = sum(idf[t] * f * (k1 + 1) / (f + norm) for t, f in tf.items())
+        if pairs:
+            tf2: dict[tuple, int] = {}
+            for pr in zip(toks, toks[1:]):
+                if pr in pairs:
+                    tf2[pr] = tf2.get(pr, 0) + 1
+            s += sdm_weight * sum(
+                (idf[x] + idf[y]) / 2 * f * (k1 + 1) / (f + norm)
+                for (x, y), f in tf2.items()
+            )
+        scored.append((s, rid))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    top = scored[:n]
+    return [rid for _, rid in top], [s for s, _ in top]
+
+
 def _or_query(tokens: list[str]) -> str:
     """Quoted tokens OR'd into FTS5 MATCH syntax (any term qualifies; ranking elsewhere)."""
     return " OR ".join(f'"{t}"' for t in tokens)
@@ -1801,10 +1844,10 @@ class Collection:
     def _bm25_rescore(
         self, qtext: str, cand: list[tuple[int, str | None]], n: int
     ) -> tuple[list[int], list[float]]:
-        """Full-query BM25 over a candidate set, in Python. Reproduces FTS5's bm25()
-        (k1/b, ln((N-df+0.5)/(df+0.5)) IDF with the 1e-6 clamp) plus a small SDM-lite
-        ordered-bigram proximity term. df comes from the shared df cache; df-0 tokens
-        (typos) get the clamp floor, never full weight."""
+        """Full-query BM25 over a candidate set. Reproduces FTS5's bm25() (k1/b,
+        ln((N-df+0.5)/(df+0.5)) IDF with the 1e-6 clamp) plus a small SDM-lite
+        ordered-bigram proximity term (_bm25_topn). df comes from the shared df cache;
+        df-0 tokens (typos) get the clamp floor, never full weight."""
         qtoks = _fold_tokens(qtext)[:100]
         if not qtoks or not cand:
             return [], []
@@ -1813,31 +1856,11 @@ class Collection:
         for t in dict.fromkeys(qtoks):
             df = self._df(t)
             idf[t] = max(math.log((total - df + 0.5) / (df + 0.5)), 1e-6)
-        pairs = {(a, b) for a, b in zip(qtoks, qtoks[1:]) if a != b}
-        avgdl = self._avgdl()
-        scored = []
-        for rid, text in cand:
-            toks = _fold_tokens(text or "")
-            dl = len(toks) or 1
-            norm = BM25_K1 * (1 - BM25_B + BM25_B * dl / avgdl)
-            tf: dict[str, int] = {}
-            for t in toks:
-                if t in idf:
-                    tf[t] = tf.get(t, 0) + 1
-            s = sum(idf[t] * f * (BM25_K1 + 1) / (f + norm) for t, f in tf.items())
-            if pairs:
-                tf2: dict[tuple, int] = {}
-                for pr in zip(toks, toks[1:]):
-                    if pr in pairs:
-                        tf2[pr] = tf2.get(pr, 0) + 1
-                s += SDM_WEIGHT * sum(
-                    (idf[a] + idf[b]) / 2 * f * (BM25_K1 + 1) / (f + norm)
-                    for (a, b), f in tf2.items()
-                )
-            scored.append((s, rid))
-        scored.sort(key=lambda x: (-x[0], x[1]))
-        top = scored[:n]
-        return [rid for _, rid in top], [s for s, _ in top]
+        rids = [rid for rid, _ in cand]
+        texts = [text for _, text in cand]
+        return _bm25_topn(
+            qtoks, idf, rids, texts, self._avgdl(), n, BM25_K1, BM25_B, SDM_WEIGHT
+        )
 
     def _text_ids(
         self, qtext: str, n: int, scope: str, filt: dict | None
