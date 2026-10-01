@@ -473,3 +473,16 @@ def test_image_builds_the_extension_in_a_rust_builder_stage():
     assert "cargo" not in runtime and "rust" not in runtime
     code = "\n".join(ln for ln in runtime.splitlines() if not ln.lstrip().startswith("#"))
     assert "OPENBLAS_NUM_THREADS=1" in code and "MALLOC_TRIM_THRESHOLD_=134217728" in code
+
+
+def test_ci_builds_the_extension_and_requires_it():
+    ci = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
+    assert "\n  native:\n" in ci
+    job = re.split(r"\n  (?=\S)", ci.split("\n  native:\n", 1)[1], 1)[0]
+    # x86_64 and the DGX's aarch64, with the image's toolchain
+    assert "runner: [ubuntu-latest, ubuntu-24.04-arm]" in job
+    rust = re.search(r"^ARG RUST_VERSION=(\S+)$", _dockerfile(), re.M).group(1)
+    assert f"rustup toolchain install {rust} --profile minimal" in job
+    assert "run: uv sync --frozen --group bench --extra native" in job
+    # REQUIRE_NATIVE=1: a missing extension fails the job instead of skipping the parity tests
+    assert re.search(r'run: uv run --no-sync pytest -q\n\s+env:\n\s+REQUIRE_NATIVE: "1"\n', job)
