@@ -117,3 +117,13 @@ Honest readings that follow:
   before/after in `bench/results-arxiv.md`.
 - The pre-existing hybrid p99 tail (a near-universal guarantee token forcing a large stage-1a
   rank pass) is unchanged — known future latency item, deliberately not coupled to this change.
+
+## Addendum 2026-09 — native stage 2
+
+Stage 2 now runs in the `raggio_native` extension when it is installed (the image always
+builds it), with the Python scorer kept as its bit-identical reference and as the fallback
+(`NATIVE_BM25=0`): see [ADR 0004](0004-native-bm25.md). The stage-2 cost above describes the
+Python scorer, measured since on the DGX at 31.5 ms p50 per query against 1.5 ms native.
+Records, order and scores are unchanged by the scorer. The candidate prune now tokenizes
+like stage 2 (ADR 0004, spec D14), which changes the candidates of queries holding `_` or
+compatibility characters (ligatures, superscripts, math alphanumerics). The pre-existing hybrid p99 tail that ADR 0003's Consequences list as unchanged was the `\w+` prune keeping df-0 underscore tokens, not a guarantee token; the prune tokenizer change (D14, ADR 0004) addresses it.

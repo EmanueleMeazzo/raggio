@@ -35,6 +35,7 @@ All configuration is via environment variables:
 | `DATA_DIR` | `/data` | Storage root (mount a volume here) |
 | `MAX_RESIDENT_COLLECTIONS` | `4` | LRU cap on in-memory collections |
 | `COLLECTION_IDLE_TTL` | `900` | Seconds before an idle collection is offloaded to disk |
+| `NATIVE_BM25` | `auto` | Stage-2 BM25 scorer: `auto` runs the native `raggio_native` extension when it is installed (the container image builds it), `0` forces the pure-Python scorer. Both return the same results; `GET /healthz` reports which one runs |
 
 ## Authentication
 
@@ -117,6 +118,16 @@ uv run pytest
 The project needs uv 0.12 or newer (`required-version` in `pyproject.toml`). The
 `bench` group adds orjson, which the benchmark harness in `bench/` (and its
 tests) imports; the server itself never needs it.
+
+With a Rust toolchain, also build the native stage-2 BM25 scorer
+([ADR 0004](adr/0004-native-bm25.md)). `REQUIRE_NATIVE=1` makes its parity tests fail,
+instead of skip, when the extension is missing. `uv sync` is exact: a later sync without
+`--extra native` uninstalls it.
+
+```bash
+uv sync --group bench --extra native
+REQUIRE_NATIVE=1 uv run pytest
+```
 
 Build these docs locally:
 

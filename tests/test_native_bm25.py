@@ -623,3 +623,37 @@ def test_probe_passes_measures_warm_passes_apart_from_the_first(tmp_path, monkey
     assert all(p["text_hit"] == 19 / 20 for p in res["passes"])
     assert res["top10"] == [["r0"]] + [[f"r{r}"] for r in rows[1:]]
     assert set(res["concurrent"]) == {"qps", "p50", "p99"} and res["concurrent"]["qps"] == 2.5
+
+
+# ---- docs: the knob, the native build, the healthz key, ADR 0004 --------------------------
+
+def _doc(rel):
+    return (ROOT / rel).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("doc", ["README.md", "docs/getting-started.md"])
+def test_docs_cover_the_knob_and_the_native_build(doc):
+    lines = _doc(doc).splitlines()
+    (row,) = [ln for ln in lines if ln.startswith("| `NATIVE_BM25` | `auto` |")]
+    assert "`0`" in row
+    # a line of its own: test_packaging still wants `uv sync --group bench` verbatim
+    assert "uv sync --group bench --extra native" in lines
+    assert "REQUIRE_NATIVE=1 uv run pytest" in lines
+
+
+def test_api_docs_show_the_healthz_scorer_key():
+    health = _doc("docs/api.md").split("## Health", 1)[1]
+    assert '"bm25": "native"' in health and "`python`" in health and "`NATIVE_BM25=0`" in health
+
+
+def test_adr_0004_records_the_decision_and_the_docs_point_to_it():
+    adr = _doc("docs/adr/0004-native-bm25.md")
+    assert adr.startswith("# ADR 0004")
+    for fact in ("0001-performance-optimization-decisions.md", "NATIVE_BM25", "REQUIRE_NATIVE",
+                 "UNIDATA_VERSION", "bench/bm25_probe.py", "_prune_common", "sqlite3.sqlite_version"):
+        assert fact in adr
+    assert "json_group_array" not in adr  # p2 falsified the JSON-aggregate follow-up
+    assert "(0004-native-bm25.md)" in _doc("docs/adr/0003-recall-rescoring.md")
+    concepts = _doc("docs/concepts.md")
+    assert "(adr/0004-native-bm25.md)" in concepts
+    assert "recomputed in Python" not in concepts and "The Python rescorer" not in concepts
