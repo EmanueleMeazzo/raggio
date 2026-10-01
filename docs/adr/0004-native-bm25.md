@@ -77,3 +77,277 @@ index, warm page cache; `docs/superpowers/research/2026-09-28-dgx-probe-p2-hybri
 - FTS5's `unicode61` tokenizer (stage 1, Unicode 6.1 tables) still differs from the
   stage-2 tokenizer on scripts newer than Unicode 6.1. That predates this decision and is
   unchanged by it (spec D10).
+
+## Results — DGX A/B
+
+Measured on gn100 on 2026-10-01, in one window, following spec §6. Every arm is a fresh `bench-tv` container on the same volume and flat index, with a 4 GiB cap and podman's default swap. All arms are host-warm: a discarded warm-up arm ran first, and no cold-start claim is made (spec D12). Each arm sends bench.py's hybrid queries (500, `--limit 2549619`, seed 42) through `bench/bm25_probe.py passes`: three serial passes, then one at concurrency 8. Pass 1 is the first after the load and is reported apart; the gates compare the warm passes 2 and 3. e-prune and e-python run the same scorer on two servers. The band is their gap, or any compared arm's pass-2 vs pass-3 spread if that is wider.
+
+### Arms
+
+| Arm | What it runs | Image | `bm25` in `/healthz` | Python | turbovec | `NATIVE_BM25` | `/healthz` after start | first GET after start | Regime |
+|---|---|---|---|---|---|---|---|---|---|
+| e-base | `main` at the merge base: the `\w+` prune, Python stage 2 | `localhost/raggio:49c09f2` | absent | 3.12.14 | 1.0.0 | unset | 320 ms | 2608 ms | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+| e-prune | Task 1's commit: the D14 prune, Python stage 2 | `localhost/raggio:be2f37c` | absent | 3.12.14 | 1.0.0 | unset | 851 ms | 3171 ms | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+| e-native | the branch head: the D14 prune, native stage 2 | `localhost/raggio:f95b3b8` | native | 3.12.14 | 1.0.0 | unset | 845 ms | 3153 ms | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+| e-python | the branch head with `ENV NATIVE_BM25=0`: the D14 prune, Python stage 2 | `localhost/raggio:f95b3b8-py` | python | 3.12.14 | 1.0.0 | 0 | 842 ms | 3144 ms | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+
+### Hybrid passes
+
+Latencies in ms. "First 10 max" is the slowest of the pass's first 10 queries. Text-hit is bench's hybrid text-hit@10.
+
+| Arm | Pass | p50 | p95 | p99 | First 10 max | q/s | Text-hit@10 | Regime |
+|---|---|---|---|---|---|---|---|---|
+| e-base | 1 (first after the load) | 79.209 | 119.883 | 489.455 | 447.286 | 11.4 | 0.984 | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+| e-base | 2 (warm) | 76.994 | 110.649 | 482.868 | 439.196 | 11.8 | 0.984 | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+| e-base | 3 (warm) | 77.573 | 108.365 | 489.26 | 407.524 | 11.8 | 0.984 | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+| e-prune | 1 (first after the load) | 79.19 | 113.598 | 145.116 | 145.985 | 12.5 | 0.984 | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+| e-prune | 2 (warm) | 77.718 | 98.687 | 119.862 | 120.695 | 13.0 | 0.984 | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+| e-prune | 3 (warm) | 76.973 | 97.702 | 115.94 | 118.476 | 13.1 | 0.984 | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+| e-native | 1 (first after the load) | 49.421 | 74.685 | 96.751 | 125.592 | 20.0 | 0.984 | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+| e-native | 2 (warm) | 46.552 | 66.763 | 84.839 | 84.858 | 21.5 | 0.984 | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+| e-native | 3 (warm) | 45.906 | 64.687 | 80.409 | 80.409 | 22.0 | 0.984 | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+| e-python | 1 (first after the load) | 79.506 | 106.761 | 138.081 | 141.725 | 12.6 | 0.984 | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+| e-python | 2 (warm) | 76.887 | 97.947 | 116.64 | 119.792 | 13.1 | 0.984 | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+| e-python | 3 (warm) | 76.931 | 97.923 | 116.398 | 121.033 | 13.2 | 0.984 | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+
+### Prune tokenizer (D14): e-prune vs e-base
+
+| Metric (warm mean, ms) | Candidate | Reference | Ratio | Band | Verdict | Regime |
+|---|---|---|---|---|---|---|
+| Hybrid p99 (gate) | 117.9 (e-prune) | 486.1 (e-base) | 0.24× | ±6.4 (1.3%) | better | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+| Hybrid p95 (reported) | 98.2 (e-prune) | 109.5 (e-base) | 0.90× | ±2.3 (2.1%) | better | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+| Hybrid p50 (reported) | 77.3 (e-prune) | 77.3 (e-base) | 1.00× | ±0.7 (1.0%) | within band | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+
+Gate: warm p99 better beyond the band. Text-hit@10 over every pass of every arm: [0.984]. Hybrid top-10s changed by the prune: 5 of 500 (1.0%). p2 measured 5 of 500 hybrid top-10s, and 1.8% of the text leg's. The ranked OR, counted by the probe with the D14 prune: 24 underscore queries, the largest matching 48760 rows against a budget of 50982; 2 of 500 queries over the budget.
+
+### Native scorer: e-native vs e-prune and e-python
+
+| Metric (warm mean, ms) | Candidate | Reference | Ratio | Band | Verdict | Regime |
+|---|---|---|---|---|---|---|
+| Hybrid p50 (gate) | 46.2 (e-native) | 77.1 (e-prune + e-python) | 0.60× | ±0.7 (1.0%) | better | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+| Hybrid p95 (reported) | 65.7 (e-native) | 98.1 (e-prune + e-python) | 0.67× | ±2.1 (2.1%) | better | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+| Hybrid p99 (reported) | 82.6 (e-native) | 117.2 (e-prune + e-python) | 0.70× | ±4.4 (3.8%) | better | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+
+Gate: warm flat hybrid p50 better beyond the band; p2 expects 0.71–0.79×. Hybrid top-10s changed: e-native vs e-python 0, and e-python vs e-prune 0, so `NATIVE_BM25=0` gives the prune arm's rankings back. Parity by `repr` on the same query texts is in the probe below.
+
+### Concurrent (reported, not gated)
+
+Spec D15: SQLite's memstatus mutex caps concurrent hybrid, so concurrent QPS and p99 are reported, not gated. No expectation is declared for SQLite 3.53.1: p2 measured 0.99× on Debian's 3.40.1 and 2.1× on PBS's 3.50.4.
+
+| Arm | q/s | p50 (ms) | p99 (ms) | SQLite | Regime |
+|---|---|---|---|---|---|
+| e-base | 17.7 | 442.631 | 1047.152 | 3.53.1 | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+| e-prune | 17.5 | 459.336 | 795.416 | 3.53.1 | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+| e-native | 36.7 | 217.048 | 440.907 | 3.53.1 | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+| e-python | 17.7 | 445.904 | 804.444 | 3.53.1 | host-warm, 4g, swap host-default, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1 |
+
+e-native / e-python at concurrency 8: 2.07× the q/s, 0.55× the p99.
+
+### Measurements
+
+```json
+{
+ "queries": 500,
+ "arms": {
+  "e-base": {
+   "queries": 500,
+   "passes": [
+    {
+     "p50": 79.209,
+     "p95": 119.883,
+     "p99": 489.455,
+     "first10_max": 447.286,
+     "qps": 11.4,
+     "text_hit": 0.984
+    },
+    {
+     "p50": 76.994,
+     "p95": 110.649,
+     "p99": 482.868,
+     "first10_max": 439.196,
+     "qps": 11.8,
+     "text_hit": 0.984
+    },
+    {
+     "p50": 77.573,
+     "p95": 108.365,
+     "p99": 489.26,
+     "first10_max": 407.524,
+     "qps": 11.8,
+     "text_hit": 0.984
+    }
+   ],
+   "concurrent": {
+    "qps": 17.7,
+    "p50": 442.631,
+    "p99": 1047.152
+   },
+   "python": "3.12.14",
+   "sqlite_version": "3.53.1",
+   "turbovec": "1.0.0",
+   "openblas_num_threads": "1",
+   "native_bm25": "unset",
+   "page_cache": "host-warm",
+   "memory": "4g",
+   "memory_swap": "host-default",
+   "bm25": "absent",
+   "image": "localhost/raggio:49c09f2"
+  },
+  "e-prune": {
+   "queries": 500,
+   "passes": [
+    {
+     "p50": 79.19,
+     "p95": 113.598,
+     "p99": 145.116,
+     "first10_max": 145.985,
+     "qps": 12.5,
+     "text_hit": 0.984
+    },
+    {
+     "p50": 77.718,
+     "p95": 98.687,
+     "p99": 119.862,
+     "first10_max": 120.695,
+     "qps": 13.0,
+     "text_hit": 0.984
+    },
+    {
+     "p50": 76.973,
+     "p95": 97.702,
+     "p99": 115.94,
+     "first10_max": 118.476,
+     "qps": 13.1,
+     "text_hit": 0.984
+    }
+   ],
+   "concurrent": {
+    "qps": 17.5,
+    "p50": 459.336,
+    "p99": 795.416
+   },
+   "python": "3.12.14",
+   "sqlite_version": "3.53.1",
+   "turbovec": "1.0.0",
+   "openblas_num_threads": "1",
+   "native_bm25": "unset",
+   "page_cache": "host-warm",
+   "memory": "4g",
+   "memory_swap": "host-default",
+   "bm25": "absent",
+   "image": "localhost/raggio:be2f37c"
+  },
+  "e-native": {
+   "queries": 500,
+   "passes": [
+    {
+     "p50": 49.421,
+     "p95": 74.685,
+     "p99": 96.751,
+     "first10_max": 125.592,
+     "qps": 20.0,
+     "text_hit": 0.984
+    },
+    {
+     "p50": 46.552,
+     "p95": 66.763,
+     "p99": 84.839,
+     "first10_max": 84.858,
+     "qps": 21.5,
+     "text_hit": 0.984
+    },
+    {
+     "p50": 45.906,
+     "p95": 64.687,
+     "p99": 80.409,
+     "first10_max": 80.409,
+     "qps": 22.0,
+     "text_hit": 0.984
+    }
+   ],
+   "concurrent": {
+    "qps": 36.7,
+    "p50": 217.048,
+    "p99": 440.907
+   },
+   "python": "3.12.14",
+   "sqlite_version": "3.53.1",
+   "turbovec": "1.0.0",
+   "openblas_num_threads": "1",
+   "native_bm25": "unset",
+   "page_cache": "host-warm",
+   "memory": "4g",
+   "memory_swap": "host-default",
+   "bm25": "native",
+   "image": "localhost/raggio:f95b3b8"
+  },
+  "e-python": {
+   "queries": 500,
+   "passes": [
+    {
+     "p50": 79.506,
+     "p95": 106.761,
+     "p99": 138.081,
+     "first10_max": 141.725,
+     "qps": 12.6,
+     "text_hit": 0.984
+    },
+    {
+     "p50": 76.887,
+     "p95": 97.947,
+     "p99": 116.64,
+     "first10_max": 119.792,
+     "qps": 13.1,
+     "text_hit": 0.984
+    },
+    {
+     "p50": 76.931,
+     "p95": 97.923,
+     "p99": 116.398,
+     "first10_max": 121.033,
+     "qps": 13.2,
+     "text_hit": 0.984
+    }
+   ],
+   "concurrent": {
+    "qps": 17.7,
+    "p50": 445.904,
+    "p99": 804.444
+   },
+   "python": "3.12.14",
+   "sqlite_version": "3.53.1",
+   "turbovec": "1.0.0",
+   "openblas_num_threads": "1",
+   "native_bm25": "0",
+   "page_cache": "host-warm",
+   "memory": "4g",
+   "memory_swap": "host-default",
+   "bm25": "python",
+   "image": "localhost/raggio:f95b3b8-py"
+  }
+ },
+ "top10_changed": {
+  "e-prune vs e-base": 5,
+  "e-python vs e-prune": 0,
+  "e-native vs e-python": 0
+ }
+}
+```
+
+### Probe
+
+`bench/bm25_probe.py parity` in `localhost/raggio:f95b3b8`, over the bench collection's `meta.db` with `bench-tv` stopped, on the same query texts:
+
+```text
+parity: 500 queries (494 two-stage): id-order mismatches 0, score bit-mismatches 0, max relative diff 0
+avgdl: native 158.41015625 python 158.41015625
+stage 2 p50/p99 ms: native [1.646, 2.676] python [31.117, 46.776]
+text leg p50/p99 ms: native [36.212, 71.686] python [65.878, 103.783]
+text leg q/s by threads: native {'1': 27.4, '2': 45.7, '4': 45.6, '8': 42.8} python {'1': 15.1, '2': 23.0, '4': 27.1, '8': 23.0}
+ranked OR: budget 50982 rows, queries over it 2, underscore queries' matches [28195, 44742, 24329, 45409, 38181, 48760, 37670, 35882, 22435, 24650, 38989, 34856, 46550, 42322, 12017, 22696, 44445, 40444, 27214, 35765, 27070, 32746, 42145, 35019]
+PASS
+```
+
+```json
+{"queries": 500, "avgdl_native": 158.41015625, "avgdl_python": 158.41015625, "two_stage": 494, "id_mismatches": 0, "score_bit_mismatches": 0, "max_rel_diff": 0.0, "stage2_ms_native": [1.646, 2.676], "text_leg_ms_native": [36.212, 71.686], "stage2_ms_python": [31.117, 46.776], "text_leg_ms_python": [65.878, 103.783], "text_leg_qps_native": {"1": 27.4, "2": 45.7, "4": 45.6, "8": 42.8}, "text_leg_qps_python": {"1": 15.1, "2": 23.0, "4": 27.1, "8": 23.0}, "or_budget": 50982, "or_over_budget": 2, "or_matches_underscore": [28195, 44742, 24329, 45409, 38181, 48760, 37670, 35882, 22435, 24650, 38989, 34856, 46550, 42322, 12017, 22696, 44445, 40444, 27214, 35765, 27070, 32746, 42145, 35019]}
+```

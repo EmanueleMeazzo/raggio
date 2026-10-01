@@ -659,3 +659,60 @@ def test_adr_0004_records_the_decision_and_the_docs_point_to_it():
     concepts = _doc("docs/concepts.md")
     assert "(adr/0004-native-bm25.md)" in concepts
     assert "recomputed in Python" not in concepts and "The Python rescorer" not in concepts
+
+
+# ---- ADR 0004: the DGX A/B (Task 11) ------------------------------------------------------
+
+def _subsection(text, title):
+    return text.split(f"\n### {title}\n", 1)[1].split("\n### ", 1)[0]
+
+
+def _json_block(section):
+    return json.loads(section.split("```json\n", 1)[1].split("\n```", 1)[0])
+
+
+def _warm(arm, key):  # passes 2 and 3; pass 1 follows the load and is reported apart (spec §6)
+    return [p[key] for p in arm["passes"][1:]]
+
+
+def _mean(xs):
+    return sum(xs) / len(xs)
+
+
+def _better_beyond_band(arms, key, cand, base):
+    """The candidate's warm mean is below the base arms' by more than the band: the wider of
+    the between-server gap (e-prune and e-python score alike on two servers) and any compared
+    arm's pass-2 vs pass-3 spread."""
+    ref = _mean([_mean(_warm(arms[b], key)) for b in base])
+    gap = abs(_mean(_warm(arms["e-prune"], key)) - _mean(_warm(arms["e-python"], key)))
+    spread = max(max(_warm(arms[a], key)) - min(_warm(arms[a], key)) for a in (cand, *base))
+    return ref - _mean(_warm(arms[cand], key)) > max(gap, spread)
+
+
+def test_adr_0004_records_a_passing_dgx_ab():
+    adr = _doc("docs/adr/0004-native-bm25.md")
+    assert "\n## Results — DGX A/B\n" in adr, "Task 11 appends the DGX A/B"
+    results = adr.split("\n## Results — DGX A/B\n", 1)[1]
+    ab = _json_block(_subsection(results, "Measurements"))
+    arms, changed = ab["arms"], ab["top10_changed"]
+    assert set(arms) == {"e-base", "e-prune", "e-native", "e-python"}
+    assert all(a["queries"] == 500 and len(a["passes"]) == 3 for a in arms.values())
+    # spec §6: one regime for every arm, and every row states it
+    regimes = {tuple(a[k] for k in ("page_cache", "memory", "memory_swap", "python",
+                                    "sqlite_version", "turbovec", "openblas_num_threads"))
+               for a in arms.values()}
+    assert len(regimes) == 1 and "unset" not in next(iter(regimes))
+    assert [arms[a]["bm25"] for a in ("e-native", "e-python")] == ["native", "python"]
+    # text-hit@10 unchanged in every pass of every arm (spec §7, both arms)
+    assert len({p["text_hit"] for a in arms.values() for p in a["passes"]}) == 1
+    # prune arm: warm p99; native arm: warm flat p50 (spec §7)
+    assert _better_beyond_band(arms, "p99", "e-prune", ["e-base"])
+    assert _better_beyond_band(arms, "p50", "e-native", ["e-prune", "e-python"])
+    # the scorer changes no ranking, and NATIVE_BM25=0 gives the prune arm's rankings back
+    assert changed["e-native vs e-python"] == changed["e-python vs e-prune"] == 0
+    probe = _json_block(_subsection(results, "Probe"))
+    assert probe["queries"] == 500
+    assert probe["id_mismatches"] == probe["score_bit_mismatches"] == 0
+    assert probe["max_rel_diff"] == 0 and probe["avgdl_native"] == probe["avgdl_python"]
+    under = probe["or_matches_underscore"]  # the underscore titles' ranked OR (D14)
+    assert under and max(under) <= probe["or_budget"]
