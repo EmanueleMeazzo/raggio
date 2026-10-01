@@ -1,0 +1,21 @@
+[package]
+name = "raggio-native"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+publish = false
+build = "build.rs"
+
+[lib]
+name = "raggio_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+# no "extension-module" feature: deprecated since maturin 1.9.4 (pyproject pins >= 1.9.4);
+# no "abi3": the image builds for its exact interpreter, and abi3 cannot load on 3.14t
+pyo3 = "0.29.3"
+rustc-hash = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1

@@ -7,13 +7,26 @@ missing extension into a collection error instead of skips.
 """
 
 import asyncio
+import os
 import random
+import unicodedata
 from pathlib import Path
 
 import pytest
 
 from raggio import store
 from raggio.store import Collection, CollectionConfig
+
+try:
+    import raggio_native as native
+except ImportError:
+    if os.environ.get("REQUIRE_NATIVE") == "1":
+        raise
+    native = None
+
+needs_native = pytest.mark.skipif(
+    native is None, reason="raggio_native is not built (uv sync --extra native)"
+)
 
 # ---- prune tokenizer (D14): the ranked OR sees the tokens FTS5 indexed ------------------
 
@@ -87,3 +100,91 @@ def test_trigram_prune_keeps_word_tokens(tmp_path):
     col = _prune_collection(tmp_path, {"c1": "get_user_id café"}, tokenizer="trigram")
     assert col._prune_common("get_user_id café") == (
         ["get_user_id", "café"], ["get_user_id", "café"])
+
+
+# ---- tokenizer: native fold_tokens against the reference --------------------------------
+
+GOLDEN = [
+    ("Café_Bar x²", ["cafe", "bar", "x2"]),  # '_' separates, NFKD folds compatibility forms
+    ("İstanbul", ["istanbul"]),  # lower() gives i + U+0307; the combining dot is dropped
+    ("ﬁnite ﬂow", ["finite", "flow"]),
+    ("Ⅷ ½ µm Å K", ["viii", "1", "2", "μm", "a", "k"]),
+    # Final_Sigma: a word-final capital sigma lowers to ς, also across the case-ignorable
+    # U+0345; a lone Σ has no cased letter before it and stays σ
+    ("ΣΟΦΙΑΣ σοφίας ΑΣ. ΑΣ\u0345 Σ", ["σοφιας", "σοφιας", "ας", "ας", "σ"]),
+    ("ΑΣ'Β ΑΣ'", ["ασ", "β", "ας"]),  # the apostrophe is case-ignorable: Β after it is cased
+    ("Ἀθῆναι ὈΔΥΣΣΕΥΣ", ["αθηναι", "οδυσσευς"]),
+    ("Straße", ["straße"]),  # lower() keeps ß (casefold would not)
+    ("𝐀𝐁𝟏", ["AB1"]),  # NFKD runs after lower(): math bold folds to UPPERCASE ASCII
+    # spacing vowel signs (Mc, combining class 0) survive the fold but are not
+    # alphanumeric, so they split words; the virama (combining class 9) is dropped
+    ("ह\u093fन\u094dद\u0940", ["ह", "नद"]),  # "Hindi"
+    ("한국어 量子力学", ["한국어", "量子力学"]),  # Hangul -> jamo (NFKD)
+    ("a\u0301b", ["ab"]),
+    ("x_1 naïve_bayes 42", ["x", "1", "naive", "bayes", "42"]),
+    ("٣٤ ² ①", ["٣٤", "2", "1"]),
+    ("ǅungla ﬀ", ["dzungla", "ff"]),
+    ("\u00a0\u200d\t\n", []),
+    ("", []),
+]
+
+
+@pytest.mark.parametrize(("text", "tokens"), GOLDEN)
+def test_python_fold_tokens_goldens(text, tokens):
+    assert store._fold_tokens(text) == tokens  # the reference the native tokenizer copies
+
+
+@needs_native
+@pytest.mark.parametrize(("text", "tokens"), GOLDEN)
+def test_native_fold_tokens_goldens(text, tokens):
+    assert native.fold_tokens(text) == tokens
+
+
+@needs_native
+def test_unicode_data_matches_the_interpreter():
+    # the tables are generated at build time from the build interpreter's unicodedata;
+    # store refuses the extension when they disagree with the running interpreter's
+    assert native.UNIDATA_VERSION == unicodedata.unidata_version
+
+
+def _first_divergence(chars, make):
+    for c in chars:
+        s = make(c)
+        if native.fold_tokens(s) != store._fold_tokens(s):
+            return f"U+{ord(c):04X} {unicodedata.name(c, '?')}: {s!r}"
+    return None
+
+
+@needs_native
+def test_fold_tokens_matches_python_on_every_code_point():
+    # every code point alone and in the four Final_Sigma positions: after a space
+    # (Cased lookup), between a cased letter and Σ (Case_Ignorable, backward scan),
+    # between Σ and a cased letter (Case_Ignorable, forward scan), before a space
+    def make(c):
+        return f"{c} {c}Σ a{c}Σ aΣ{c}b aΣ{c} "
+
+    chars = [chr(cp) for cp in range(0x110000) if not 0xD800 <= cp <= 0xDFFF]
+    for i in range(0, len(chars), 2048):
+        chunk = chars[i : i + 2048]
+        text = "".join(make(c) for c in chunk)
+        if native.fold_tokens(text) != store._fold_tokens(text):
+            pytest.fail(_first_divergence(chunk, make) or f"divergence in chunk {i}")
+
+
+POOLS = [
+    [chr(c) for c in range(0x20, 0x7F)],
+    list("àáâãäåçèéêëìíîïñòóôõöùúûüýÿœæßøłđħıĳŀŉſǅǈǋǲΣσςΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΤΥΦΧΨΩάέήίόύώΐΰϊϋ"),
+    [chr(c) for c in range(0x300, 0x370)],  # combining diacritics
+    [chr(c) for c in range(0x0900, 0x097F)] + [chr(c) for c in range(0x0E00, 0x0E7F)],
+    [chr(c) for c in range(0xAC00, 0xAC00 + 500)] + [chr(c) for c in range(0x4E00, 0x4E00 + 500)],
+    list("ﬁﬂﬀﬃﬄ²³¹½¼¾ⅠⅡⅢⅣⅧⓐⒶ①⑴µÅK𝐀𝐚𝟏‐‑–—_'’.,;:!?/\\t\n ")
+    + ["\u00ad", "\u200b", "\u200c", "\u200d", "\u2060", "\u0345"],  # SHY, ZW*, WJ, U+0345
+]
+
+
+@needs_native
+def test_fold_tokens_matches_python_on_mixed_scripts():
+    rng = random.Random(1)
+    for _ in range(20_000):
+        s = "".join(rng.choice(rng.choice(POOLS)) for _ in range(rng.randint(0, 40)))
+        assert native.fold_tokens(s) == store._fold_tokens(s), ascii(s)

@@ -8,4 +8,5 @@ bench/snapshot/
 bench/fingerprint-*.json
 bench/results-partial.json
 site/
+native/target/
 NUL
