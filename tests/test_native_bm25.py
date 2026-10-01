@@ -17,9 +17,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
 from raggio import store
-from raggio.store import Collection, CollectionConfig
+from raggio.app import create_app
+from raggio.config import Settings
+from raggio.store import Collection, CollectionConfig, CollectionManager
 
 try:
     import raggio_native as native
@@ -373,3 +376,54 @@ def test_avgdl_tokenizes_natively_with_the_same_result(tmp_path, monkeypatch):
     assert calls
     col._avgdl_cache, col._native_bm25 = None, False
     assert col._avgdl() == fast
+
+
+# ---- NATIVE_BM25 knob and /healthz ------------------------------------------------------
+
+
+def test_native_bm25_setting(monkeypatch):
+    monkeypatch.delenv("NATIVE_BM25", raising=False)
+    assert Settings().native_bm25 == "auto"
+    monkeypatch.setenv("NATIVE_BM25", "0")
+    assert Settings().native_bm25 == "0"
+    monkeypatch.setenv("NATIVE_BM25", "off")  # a typo must not silently pick a scorer
+    with pytest.raises(ValueError, match="NATIVE_BM25"):
+        Settings()
+
+
+@pytest.mark.parametrize(("knob", "enabled"), [("auto", True), ("0", False)])
+def test_manager_hands_the_knob_to_collections(tmp_path, monkeypatch, knob, enabled):
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("NATIVE_BM25", knob)
+    manager = CollectionManager(Settings())
+
+    async def load():
+        await manager.create_collection("c", 8, 4, None, None, None)
+        col = await manager.touch("c")
+        await manager.shutdown()
+        return col
+
+    assert asyncio.run(load())._native_bm25 is enabled
+
+
+def _healthz(tmp_path, monkeypatch, knob):
+    monkeypatch.setenv("ROOT_API_KEY", "root-key")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("NATIVE_BM25", knob)
+    with TestClient(create_app(embedder_factory=lambda cfg: None)) as c:
+        return c.get("/healthz").json()
+
+
+def test_healthz_reports_python_when_disabled(tmp_path, monkeypatch):
+    assert _healthz(tmp_path, monkeypatch, "0")["bm25"] == "python"
+
+
+def test_healthz_reports_python_without_the_extension(tmp_path, monkeypatch):
+    monkeypatch.setattr(store, "_native", None)
+    assert _healthz(tmp_path, monkeypatch, "auto")["bm25"] == "python"
+
+
+@needs_native
+def test_healthz_reports_native(tmp_path, monkeypatch):
+    body = _healthz(tmp_path, monkeypatch, "auto")
+    assert body["bm25"] == "native" and body["status"] == "ok"

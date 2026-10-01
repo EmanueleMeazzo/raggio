@@ -2206,6 +2206,12 @@ class CollectionManager:
     def _dir(self, name: str) -> Path:
         return self.data_dir / "collections" / name
 
+    def bm25_backend(self) -> str:
+        """The stage-2 scorer collections run, as GET /healthz reports it."""
+        if _native is not None and self.settings.native_bm25 == "auto":
+            return "native"
+        return "python"
+
     def get_config(self, name: str) -> CollectionConfig | None:
         with self._catalog_lock:
             row = self.catalog.execute(
@@ -2309,6 +2315,7 @@ class CollectionManager:
         build = asyncio.ensure_future(asyncio.to_thread(
             Collection, cfg, self._dir(name), lambda: self.embedder_factory(cfg),
             lambda ic, name=name: self.set_index_config(name, ic),
+            native_bm25=self.settings.native_bm25 == "auto",
         ))
         try:
             c = await asyncio.shield(build)
