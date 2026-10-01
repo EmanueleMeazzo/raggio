@@ -7,6 +7,7 @@ missing extension into a collection error instead of skips.
 """
 
 import asyncio
+import json
 import math
 import os
 import random
@@ -17,6 +18,7 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
@@ -486,3 +488,138 @@ def test_ci_builds_the_extension_and_requires_it():
     assert "run: uv sync --frozen --group bench --extra native" in job
     # REQUIRE_NATIVE=1: a missing extension fails the job instead of skipping the parity tests
     assert re.search(r'run: uv run --no-sync pytest -q\n\s+env:\n\s+REQUIRE_NATIVE: "1"\n', job)
+
+
+# ---- bench/bm25_probe.py: the DGX parity and speed probe --------------------------------
+
+PROBE_QUERIES = ["alpha beta gamma", "Epsilon naïve the of", "ΣΟΦΙΑΣ σοφίας x_1 the",
+                 "k-means O(n log n) of", "the of alpha", "zzz", ""]
+
+
+@pytest.fixture
+def probe(monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT / "bench"))
+    import bm25_probe
+
+    return bm25_probe
+
+
+def _probe_collection(path, monkeypatch):
+    # a 120-doc corpus: a zero budget floor makes the pruner drop tokens, so stage 2 runs
+    monkeypatch.setattr(store, "FTS_SCAN_BUDGET_MIN_ROWS", 0)
+    col = _collection(path)
+    rng = random.Random(3)
+    docs = [{"doc_id": f"d{i}", "chunks": [{"id": f"c{i}", "vector": [float(i % 7 + 1)] * 8,
+                                            "text": " ".join(rng.choices(WORDS, k=rng.randint(1, 30)))}]}
+            for i in range(120)]
+    asyncio.run(col._process_job({"documents": docs}))
+    return col
+
+
+def test_probe_text_leg_is_the_collections_text_leg(tmp_path, monkeypatch, probe):
+    col = _probe_collection(tmp_path, monkeypatch)
+    assert sum(probe.is_two_stage(col, q) for q in PROBE_QUERIES) >= 3  # stage 2 runs
+    for enabled in (False, True) if native else (False,):
+        col._native_bm25 = enabled
+        leg = probe.TextLeg(tmp_path / "meta.db", enabled)
+        assert leg.cfg.tokenizer == "unicode61"
+        for q in PROBE_QUERIES:
+            assert leg._prune_common(q) == col._prune_common(q)
+            _same(leg._text_ids(q, probe.N, "chunks", None), col._text_ids(q, probe.N, "chunks", None))
+    # the tokenizer comes from the collection's FTS schema: Task 1's prune branches on it
+    (tmp_path / "tri").mkdir()
+    _prune_collection(tmp_path / "tri", {"c1": "get_user_id café"}, tokenizer="trigram")
+    assert probe.TextLeg(tmp_path / "tri" / "meta.db", False).cfg.tokenizer == "trigram"
+
+
+@needs_native
+def test_probe_parity_passes_and_catches_a_one_ulp_drift(tmp_path, monkeypatch, probe, capsys):
+    col = _probe_collection(tmp_path, monkeypatch)
+    # "ΣΟΦΙΑΣ σοφίας x_1 the" is the one underscore query: its ranked OR, counted directly
+    kept, _ = col._prune_common(PROBE_QUERIES[2])
+    under = col._rdb().execute("SELECT COUNT(*) FROM records_fts WHERE records_fts MATCH ?",
+                               (store._or_query(kept),)).fetchone()[0]
+    asyncio.run(col.stop())  # like bench-tv, stopped before the probe opens its meta.db
+    queries = tmp_path / "q.json"
+    queries.write_text(json.dumps(PROBE_QUERIES * 3), encoding="utf-8")
+    argv = ["parity", str(tmp_path / "meta.db"), str(queries), "--threads", "1,2"]
+    assert probe.main(argv) == 0
+    res = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert res["id_mismatches"] == res["score_bit_mismatches"] == 0 and res["max_rel_diff"] == 0
+    assert res["two_stage"] >= 9 and set(res["text_leg_qps_native"]) == {"1", "2"}
+    assert res["or_budget"] == 2  # max(FTS_SCAN_BUDGET_MIN_ROWS = 0, int(0.02 * 120 chunks))
+    assert res["or_matches_underscore"] == [under] * 3 and under > 0
+    assert res["or_over_budget"] > 0  # the rarest real token survives even a 2-row budget
+    real = native.bm25_topn
+
+    def drifted(*args):
+        ids, scores = real(*args)
+        return ids, [math.nextafter(s, math.inf) for s in scores]
+
+    monkeypatch.setattr(native, "bm25_topn", drifted)
+    assert probe.main(argv) == 1
+    res = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert res["score_bit_mismatches"] > 0 and 0 < res["max_rel_diff"] < 1e-15
+
+
+def test_probe_queries_are_the_bench_hybrid_queries(tmp_path, monkeypatch, probe):
+    pytest.importorskip("orjson", reason="bench.py needs the bench dependency group")
+    src = (ROOT / "bench" / "bench.py").read_text(encoding="utf-8")
+    for line in (  # the derivation bm25_probe.bench_queries repeats
+        "hrng = np.random.default_rng(args.seed)",
+        "hybrid_rows = hrng.choice(ingest_rows, size=len(queries), replace=False)",
+        "hybrid_texts = [TITLES[r] if TITLES is not None else path_tokens(paths[r]) for r in hybrid_rows]",
+    ):
+        assert line in src
+    import bench
+
+    def load_corpus(limit, n_queries, seed):
+        bench.TITLES = [f"title {i}" for i in range(limit)]
+        paths = [f"p/{i}.md" for i in range(limit)]
+        return None, paths, [], np.arange(n_queries, limit), None, np.zeros((n_queries, 4))
+
+    monkeypatch.setattr(bench, "TITLES", None)
+    monkeypatch.setattr(bench, "load_corpus", load_corpus)
+    out = tmp_path / "q.json"
+    assert probe.main(["queries", str(out), "--limit", "50", "--queries", "5", "--seed", "42"]) == 0
+    rows = np.random.default_rng(42).choice(np.arange(5, 50), size=5, replace=False)
+    assert json.loads(out.read_text(encoding="utf-8")) == [f"title {r}" for r in rows]
+
+
+def test_probe_passes_measures_warm_passes_apart_from_the_first(tmp_path, monkeypatch, probe):
+    pytest.importorskip("orjson", reason="bench.py needs the bench dependency group")
+    import bench
+
+    def load_corpus(limit, n_queries, seed):
+        bench.TITLES = [f"title {i}" for i in range(limit)]
+        paths = [f"p/{i}.md" for i in range(limit)]
+        return None, paths, [], np.arange(n_queries, limit), None, np.zeros((n_queries, 4))
+
+    calls = []
+
+    async def run_queries(engine, queries, concurrency, headers, filt=None, k=10, texts=None):
+        calls.append((engine, concurrency, headers, list(texts)))
+        n = len(calls)
+        # pass 1 is the first after a load: its first queries are slow (spec §6)
+        lat = [10.0 * n + i % 7 + (500.0 if n == 1 and i < 10 else 0.0) for i in range(len(queries))]
+        # every query finds the doc its title came from, except query 0
+        hits = [[f"r{t.split()[1]}"] if i else ["r0"] for i, t in enumerate(texts)]
+        return lat, 2.0 * n, hits
+
+    monkeypatch.setattr(bench, "TITLES", None)
+    monkeypatch.setattr(bench, "load_corpus", load_corpus)
+    monkeypatch.setattr(bench, "run_queries", run_queries)
+    out = tmp_path / "passes.json"
+    assert probe.main(["passes", str(out), "--limit", "100", "--queries", "20", "--seed", "42",
+                       "--passes", "3", "--concurrency", "8"]) == 0
+    res = json.loads(out.read_text(encoding="utf-8"))
+    rows = np.random.default_rng(42).choice(np.arange(20, 100), size=20, replace=False)
+    assert [c[:3] for c in calls] == [("raggio", 1, bench.TR_HDRS)] * 3 + [("raggio", 8, bench.TR_HDRS)]
+    assert all(c[3] == [f"title {r}" for r in rows] for c in calls)  # bench.py's hybrid texts
+    first, *warm = res["passes"]
+    assert res["queries"] == 20 and len(warm) == 2
+    assert first["first10_max"] > 500 > max(p["first10_max"] for p in warm)
+    assert [p["qps"] for p in res["passes"]] == [10.0, 5.0, 3.3]  # 20 queries / wall
+    assert all(p["text_hit"] == 19 / 20 for p in res["passes"])
+    assert res["top10"] == [["r0"]] + [[f"r{r}"] for r in rows[1:]]
+    assert set(res["concurrent"]) == {"qps", "p50", "p99"} and res["concurrent"]["qps"] == 2.5
