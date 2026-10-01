@@ -11,6 +11,7 @@ import math
 import os
 import random
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -240,3 +241,73 @@ def test_python_scorer_edge_cases():
     assert store._bm25_topn(*_topn_args(QUERY, CAND, 0)) == ([], [])
     with pytest.raises(ZeroDivisionError):  # an all-punctuation avgdl sample
         store._bm25_topn(*_topn_args(QUERY, CAND, 4, avgdl=0.0))
+
+
+# ---- stage-2 scorer: native against the reference --------------------------------------
+
+WORDS = ["alpha", "beta", "gamma", "delta", "Epsilon", "naïve", "Schrödinger", "ΣΟΦΙΑΣ",
+         "σοφίας", "ﬁnite", "x_1", "量子力学", "ह\u093fन\u094dद\u0940", "Gauß", "İstanbul", "O(n log n)",
+         "k-means", r"$\alpha$", "the", "of"]
+
+
+def _scenario(seed):
+    rng = random.Random(seed)
+    texts = [" ".join(rng.choices(WORDS, k=rng.randint(0, 60))) for _ in range(300)]
+    texts[3], texts[4], texts[7] = None, "", texts[8]  # missing, empty, an exact tie
+    rids = rng.sample(range(1, 10**7), len(texts))
+    qtoks = store._fold_tokens(" ".join(rng.choices(WORDS, k=rng.randint(1, 12))))
+    idf = {t: rng.choice([1e-6, rng.uniform(0.01, 12.0)]) for t in dict.fromkeys(qtoks)}
+    return (qtoks, idf, rids, texts, rng.uniform(5.0, 60.0), rng.choice([1, 10, 100, 1000]),
+            store.BM25_K1, store.BM25_B, rng.choice([0.0, store.SDM_WEIGHT, 1.0]))
+
+
+def _same(got, ref):
+    assert got[0] == ref[0]  # the same ids in the same (-score, rid) order
+    assert list(map(repr, got[1])) == list(map(repr, ref[1]))  # bit-identical, same types
+
+
+@needs_native
+@pytest.mark.parametrize("seed", range(40))
+def test_native_scorer_matches_reference(seed):
+    args = _scenario(seed)
+    _same(native.bm25_topn(*args), store._bm25_topn(*args))
+
+
+@needs_native
+def test_native_scorer_ignores_candidate_order():
+    qtoks, idf, rids, texts, *rest = _scenario(99)
+    pairs = list(zip(rids, texts))
+    random.Random(5).shuffle(pairs)
+    shuffled = native.bm25_topn(qtoks, idf, [r for r, _ in pairs], [t for _, t in pairs], *rest)
+    _same(shuffled, native.bm25_topn(qtoks, idf, rids, texts, *rest))
+
+
+@needs_native
+def test_native_scorer_edge_cases():
+    _same(native.bm25_topn(*_topn_args(QUERY, CAND, 4)), PINNED)
+    int_zero = (["alpha"], {"alpha": 1.0}, [1, 2], ["alpha", "beta"], 1.0, 10, 1.2, 0.75, 0.2)
+    _same(native.bm25_topn(*int_zero), store._bm25_topn(*int_zero))
+    assert native.bm25_topn([], {}, [1], ["alpha"], 1.0, 10, 1.2, 0.75, 0.2) == ([], [])
+    assert native.bm25_topn(["alpha"], {"alpha": 1.0}, [], [], 0.0, 10, 1.2, 0.75, 0.2) == ([], [])
+    assert native.bm25_topn(*_topn_args(QUERY, CAND, 0)) == ([], [])
+    with pytest.raises(ZeroDivisionError):
+        native.bm25_topn(*_topn_args(QUERY, CAND, 4, avgdl=0.0))
+    # misuse the reference would silently absorb (zip truncates) is an error here
+    with pytest.raises(ValueError, match="length"):
+        native.bm25_topn(["alpha"], {"alpha": 1.0}, [1, 2], ["alpha"], 1.0, 10, 1.2, 0.75, 0.2)
+    with pytest.raises(ValueError, match="idf"):
+        native.bm25_topn(["alpha", "beta"], {"alpha": 1.0}, [1], ["alpha"], 1.0, 10, 1.2, 0.75, 0.2)
+    with pytest.raises(ValueError, match="idf"):
+        native.bm25_topn(["alpha"], {"alpha": 1.0, "beta": 1.0}, [1], ["alpha"], 1.0, 10, 1.2, 0.75, 0.2)
+
+
+@needs_native
+def test_native_scorer_is_thread_safe():
+    # gil_used = false, and scoring runs detached from the interpreter: threads running
+    # at once must each get exactly the single-threaded answer
+    scenarios = [_scenario(seed) for seed in range(16)]
+    expected = [store._bm25_topn(*a) for a in scenarios]
+    with ThreadPoolExecutor(8) as pool:
+        for _ in range(4):
+            for got, ref in zip(pool.map(lambda a: native.bm25_topn(*a), scenarios), expected):
+                _same(got, ref)
