@@ -886,6 +886,11 @@ dependencies = [
     { name = "uvicorn", extra = ["standard"] },
 ]
 
+[package.optional-dependencies]
+native = [
+    { name = "raggio-native" },
+]
+
 [package.dev-dependencies]
 bench = [
     { name = "orjson" },
@@ -902,14 +907,21 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.141.1" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "numpy", specifier = ">=2.5.2" },
+    { name = "raggio-native", marker = "extra == 'native'", directory = "native" },
     { name = "turbovec", specifier = ">=1.0.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.52.4" },
 ]
+provides-extras = ["native"]
 
 [package.metadata.requires-dev]
 bench = [{ name = "orjson", specifier = ">=3.12.0" }]
 dev = [{ name = "pytest", specifier = ">=8" }]
 docs = [{ name = "mkdocs-material", specifier = ">=9" }]
+
+[[package]]
+name = "raggio-native"
+version = "0.1.0"
+source = { directory = "native" }
 
 [[package]]
 name = "requests"

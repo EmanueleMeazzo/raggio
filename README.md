@@ -71,6 +71,7 @@ podman run -p 8000:8000 -v raggio-data:/data \
 | `DATA_DIR` | `/data` | storage root |
 | `MAX_RESIDENT_COLLECTIONS` | `4` | LRU cap on in-memory collections |
 | `COLLECTION_IDLE_TTL` | `900` | seconds before an idle collection is offloaded to disk |
+| `NATIVE_BM25` | `auto` | stage-2 BM25 scorer: `auto` runs the native extension when installed (the image builds it), `0` the pure-Python one; same results |
 
 ## API
 
@@ -188,6 +189,14 @@ Needs uv 0.12 or newer (`required-version` in `pyproject.toml`).
 ```bash
 uv sync --group bench
 uv run pytest
+```
+
+With a Rust toolchain, build the native BM25 scorer too ([ADR 0004](docs/adr/0004-native-bm25.md));
+its parity tests then run instead of skipping. A later sync without `--extra native` removes it.
+
+```bash
+uv sync --group bench --extra native
+REQUIRE_NATIVE=1 uv run pytest
 ```
 
 ## License

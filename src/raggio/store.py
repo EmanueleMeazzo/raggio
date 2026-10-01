@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import unicodedata
+import warnings
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,6 +25,28 @@ from turbovec import IdMapIndex
 
 from .config import Settings
 from .embeddings import Embedder
+
+
+def _load_native():
+    """The optional Rust stage-2 scorer (native/, ADR 0004; `uv sync --extra native`), or
+    None. Its Unicode tables come from the interpreter it was built for: built against
+    other Unicode data it would tokenize differently, so it is refused, not trusted."""
+    try:
+        import raggio_native
+    except ImportError:
+        return None
+    if raggio_native.UNIDATA_VERSION != unicodedata.unidata_version:
+        warnings.warn(
+            f"raggio_native was built for Unicode {raggio_native.UNIDATA_VERSION}, this"
+            f" interpreter has {unicodedata.unidata_version}: using the Python BM25 scorer",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
+    return raggio_native
+
+
+_native = _load_native()
 
 RANGE_OPS = {"gte": ">=", "lte": "<=", "gt": ">", "lt": "<"}
 
@@ -388,6 +411,49 @@ _TOKEN_RE = re.compile(r"[^\W_]+")
 def _fold_tokens(text: str) -> list[str]:
     """Fold + tokenize a whole string: one _fold pass over the text, then split."""
     return _TOKEN_RE.findall(_fold(text))
+
+
+def _bm25_topn(
+    qtoks: list[str],
+    idf: dict[str, float],
+    rids: list[int],
+    texts: list[str | None],
+    avgdl: float,
+    n: int,
+    k1: float,
+    b: float,
+    sdm_weight: float,
+) -> tuple[list[int], list[float]]:
+    """Top-n (ids, scores) of the full-query BM25 + SDM-lite score over the candidates
+    (rids[i], texts[i]), ordered by (-score, rid). idf maps each distinct query token.
+    The pure-Python reference: raggio_native.bm25_topn returns the same ids and the
+    bit-identical scores (ADR 0004)."""
+    if not qtoks or not texts:
+        return [], []
+    pairs = {(x, y) for x, y in zip(qtoks, qtoks[1:]) if x != y}
+    scored = []
+    for rid, text in zip(rids, texts):
+        toks = _fold_tokens(text or "")
+        dl = len(toks) or 1
+        norm = k1 * (1 - b + b * dl / avgdl)
+        tf: dict[str, int] = {}
+        for t in toks:
+            if t in idf:
+                tf[t] = tf.get(t, 0) + 1
+        s = sum(idf[t] * f * (k1 + 1) / (f + norm) for t, f in tf.items())
+        if pairs:
+            tf2: dict[tuple, int] = {}
+            for pr in zip(toks, toks[1:]):
+                if pr in pairs:
+                    tf2[pr] = tf2.get(pr, 0) + 1
+            s += sdm_weight * sum(
+                (idf[x] + idf[y]) / 2 * f * (k1 + 1) / (f + norm)
+                for (x, y), f in tf2.items()
+            )
+        scored.append((s, rid))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    top = scored[:n]
+    return [rid for _, rid in top], [s for s, _ in top]
 
 
 def _or_query(tokens: list[str]) -> str:
@@ -800,7 +866,12 @@ class Collection:
     """A resident collection: turbovec index + sqlite metadata + ingest worker."""
 
     def __init__(
-        self, cfg: CollectionConfig, directory: Path, embedder_factory, set_index_config=None
+        self,
+        cfg: CollectionConfig,
+        directory: Path,
+        embedder_factory,
+        set_index_config=None,
+        native_bm25: bool = True,
     ) -> None:
         self.cfg = cfg
         self.dir = directory
@@ -851,6 +922,8 @@ class Collection:
         # mean folded-token doc length for Python BM25; GIL-atomic swap, no lock —
         # concurrent recomputes land on the same value. Invalidated with the df cache.
         self._avgdl_cache: float | None = None
+        # stage 2 runs raggio_native when it is importable, unless NATIVE_BM25=0
+        self._native_bm25 = native_bm25
         # search-path reads use one connection per thread: concurrent readers on the
         # shared self.db raise SQLITE_MISUSE (pysqlite connections aren't concurrency-
         # safe), and WAL makes independent read connections cheap and non-blocking
@@ -1734,8 +1807,20 @@ class Collection:
         doc-frequency fits the FTS_SCAN_BUDGET, the rest dropped. The rarest token
         always survives, so a query of only-common words still matches. Unknown terms
         (df lookup misses, e.g. trigram tokenizer) cost nothing and are always kept.
-        kept < all signals _text_ids to restore full-query ranking in stage 2."""
-        toks = re.findall(r"\w+", qtext)[:100]
+        kept < all signals _text_ids to restore full-query ranking in stage 2.
+        Tokens are stage 2's (_fold_tokens), which split on '_' as FTS5 unicode61 does:
+        the old word regex kept '_2' with df 0, FTS5 read it as '2', and the ranked OR
+        matched most of the corpus. Trigram matches substrings, where '_' and diacritics
+        count, so it keeps the raw word tokens."""
+        if self.cfg.tokenizer == "trigram":
+            toks = re.findall(r"\w+", qtext)[:100]
+        else:
+            toks = _fold_tokens(qtext)[:100]
+        # the df key is the term FTS5 matches: FTS5 lowercases the query's terms, and
+        # _fold_tokens leaves the capitals NFKD makes from compatibility characters (math
+        # alphanumerics, double-struck letters, the numero and trade mark signs, modifier
+        # letters: bold A -> A), so fold again (A -> a)
+        keys = [_fold(t) for t in toks]
         if not toks:
             return [], []
         total = sum(self.indexed_counts.values())
@@ -1749,8 +1834,7 @@ class Collection:
             self._avgdl_cache = None
             self._df_cache_churn = 0
         dfs = {}
-        for t in toks:
-            key = _fold(t)
+        for key in keys:
             if key not in dfs:
                 dfs[key] = self._df(key)
         # df-0 tokens (typos, trigram tokenizer) cost nothing and are always kept, but
@@ -1763,7 +1847,7 @@ class Collection:
             spent += df
             kept.add(key)
             have_real = have_real or df > 0
-        return [t for t in toks if _fold(t) in kept], toks
+        return [t for t, key in zip(toks, keys) if key in kept], toks
 
     def _avgdl(self) -> float:
         """Mean folded-token doc length from a ~256-doc sample (random id probes — a
@@ -1773,6 +1857,8 @@ class Collection:
         if cached is not None:
             return cached
         db = self._rdb()
+        nat = self._scorer()
+        fold_tokens = nat.fold_tokens if nat else _fold_tokens
         maxid = db.execute("SELECT MAX(id) FROM records").fetchone()[0] or 0
         dls = []
         if maxid:
@@ -1783,18 +1869,23 @@ class Collection:
                     (int(g),),
                 ).fetchone()
                 if row:
-                    dls.append(len(_fold_tokens(row[0])))
+                    dls.append(len(fold_tokens(row[0])))
         avgdl = (sum(dls) / len(dls)) if dls else 1.0
         self._avgdl_cache = avgdl
         return avgdl
 
+    def _scorer(self):
+        """raggio_native when it is loaded and NATIVE_BM25 allows it, else None (the
+        Python reference). Read per call, so tests can swap the module global."""
+        return _native if self._native_bm25 else None
+
     def _bm25_rescore(
         self, qtext: str, cand: list[tuple[int, str | None]], n: int
     ) -> tuple[list[int], list[float]]:
-        """Full-query BM25 over a candidate set, in Python. Reproduces FTS5's bm25()
-        (k1/b, ln((N-df+0.5)/(df+0.5)) IDF with the 1e-6 clamp) plus a small SDM-lite
-        ordered-bigram proximity term. df comes from the shared df cache; df-0 tokens
-        (typos) get the clamp floor, never full weight."""
+        """Full-query BM25 over a candidate set. Reproduces FTS5's bm25() (k1/b,
+        ln((N-df+0.5)/(df+0.5)) IDF with the 1e-6 clamp) plus a small SDM-lite
+        ordered-bigram proximity term (_bm25_topn). df comes from the shared df cache;
+        df-0 tokens (typos) get the clamp floor, never full weight."""
         qtoks = _fold_tokens(qtext)[:100]
         if not qtoks or not cand:
             return [], []
@@ -1803,31 +1894,11 @@ class Collection:
         for t in dict.fromkeys(qtoks):
             df = self._df(t)
             idf[t] = max(math.log((total - df + 0.5) / (df + 0.5)), 1e-6)
-        pairs = {(a, b) for a, b in zip(qtoks, qtoks[1:]) if a != b}
-        avgdl = self._avgdl()
-        scored = []
-        for rid, text in cand:
-            toks = _fold_tokens(text or "")
-            dl = len(toks) or 1
-            norm = BM25_K1 * (1 - BM25_B + BM25_B * dl / avgdl)
-            tf: dict[str, int] = {}
-            for t in toks:
-                if t in idf:
-                    tf[t] = tf.get(t, 0) + 1
-            s = sum(idf[t] * f * (BM25_K1 + 1) / (f + norm) for t, f in tf.items())
-            if pairs:
-                tf2: dict[tuple, int] = {}
-                for pr in zip(toks, toks[1:]):
-                    if pr in pairs:
-                        tf2[pr] = tf2.get(pr, 0) + 1
-                s += SDM_WEIGHT * sum(
-                    (idf[a] + idf[b]) / 2 * f * (BM25_K1 + 1) / (f + norm)
-                    for (a, b), f in tf2.items()
-                )
-            scored.append((s, rid))
-        scored.sort(key=lambda x: (-x[0], x[1]))
-        top = scored[:n]
-        return [rid for _, rid in top], [s for s, _ in top]
+        rids = [rid for rid, _ in cand]
+        texts = [text for _, text in cand]
+        nat = self._scorer()
+        topn = nat.bm25_topn if nat else _bm25_topn
+        return topn(qtoks, idf, rids, texts, self._avgdl(), n, BM25_K1, BM25_B, SDM_WEIGHT)
 
     def _text_ids(
         self, qtext: str, n: int, scope: str, filt: dict | None
@@ -2136,6 +2207,12 @@ class CollectionManager:
     def _dir(self, name: str) -> Path:
         return self.data_dir / "collections" / name
 
+    def bm25_backend(self) -> str:
+        """The stage-2 scorer collections run, as GET /healthz reports it."""
+        if _native is not None and self.settings.native_bm25 == "auto":
+            return "native"
+        return "python"
+
     def get_config(self, name: str) -> CollectionConfig | None:
         with self._catalog_lock:
             row = self.catalog.execute(
@@ -2239,6 +2316,7 @@ class CollectionManager:
         build = asyncio.ensure_future(asyncio.to_thread(
             Collection, cfg, self._dir(name), lambda: self.embedder_factory(cfg),
             lambda ic, name=name: self.set_index_config(name, ic),
+            native_bm25=self.settings.native_bm25 == "auto",
         ))
         try:
             c = await asyncio.shield(build)

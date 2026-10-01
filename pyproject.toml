@@ -11,6 +11,13 @@ dependencies = [
     "uvicorn[standard]>=0.52.4",
 ]
 
+[project.optional-dependencies]
+# the Rust stage-2 BM25 scorer and tokenizer (native/, ADR 0004); building it needs a Rust
+# toolchain. Without it raggio runs the pure-Python scorer, with identical results.
+native = [
+    "raggio-native",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8",
@@ -28,6 +35,9 @@ docs = [
 # floor for every uv that touches uv.lock; the exact pin lives in the Dockerfile
 # (ARG UV_VERSION) and .github/workflows/tests.yml (setup-uv version)
 required-version = ">=0.12"
+
+[tool.uv.sources]
+raggio-native = { path = "native" }
 
 [build-system]
 requires = ["hatchling"]

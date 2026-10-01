@@ -5,4 +5,5 @@ docs
 bench
 **/__pycache__
 *.md
+native/target
 NUL

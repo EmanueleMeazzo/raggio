@@ -216,7 +216,7 @@ tf in records longer than the collection's average length (*avgdl*) — a match
 in a two-line record means more than the same match in a ten-page one. Scores
 are positive, unbounded, and only comparable within one query. raggio uses
 FTS5's `bm25()` directly on small collections and reproduces it exactly
-(same k1, b, IDF) in Python on large ones — see
+(same k1, b, IDF) in its own stage-2 scorer on large ones — see
 [two-stage retrieval](#two-stage-retrieval-candidate-generation-rescoring).
 
 ### Stopwords
@@ -246,13 +246,18 @@ then rank them properly. **Stage 1 — candidate generation** at bounded cost:
 FTS5 ranks only the pruned rarest tokens (top 500), unioned with an unranked
 AND-of-all-tokens query (top 1000 — intersections are cheap because their
 cost tracks the rarest term). **Stage 2 — rescoring**: full-query BM25 is
-recomputed in Python over just those candidates (FTS5-parity k1/b/IDF), plus
+recomputed over just those candidates (FTS5-parity k1/b/IDF), plus
 the proximity bonus below, so a record matching the whole query beats one
 that merely repeats its rarest word. Small collections skip stage 2 — the
 single FTS5 query already ranks the full query there. This lifted the arXiv
 known-item hit rate from 0.732 to 0.983
 ([ADR 0003](adr/0003-recall-rescoring.md),
 [Search](search.md#text-query-handling)).
+
+Stage 2 runs in the `raggio_native` extension (Rust, GIL released) when it is
+installed, which the container image always does, and in pure Python
+otherwise. Both return the same records with bit-identical scores
+([ADR 0004](adr/0004-native-bm25.md)).
 
 ## Proximity & term dependence
 
@@ -271,7 +276,7 @@ bag-of-words baselines.
 
 ### raggio's SDM-lite bonus
 
-The Python rescorer implements just the ordered half: each query **bigram**
+The stage-2 rescorer implements just the ordered half: each query **bigram**
 (adjacent word pair) found adjacent and in order in a record adds a
 BM25-saturated bonus at weight 0.2, using the mean of the two words' IDFs in
 place of true bigram statistics. It exists to recover title-as-phrase queries

@@ -293,6 +293,10 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
 
     @app.get("/healthz")
     async def healthz():
-        return {"status": "ok", "resident_collections": list(manager.resident)}
+        return {
+            "status": "ok",
+            "resident_collections": list(manager.resident),
+            "bm25": manager.bm25_backend(),
+        }
 
     return app
