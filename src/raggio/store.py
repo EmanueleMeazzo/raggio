@@ -1734,8 +1734,19 @@ class Collection:
         doc-frequency fits the FTS_SCAN_BUDGET, the rest dropped. The rarest token
         always survives, so a query of only-common words still matches. Unknown terms
         (df lookup misses, e.g. trigram tokenizer) cost nothing and are always kept.
-        kept < all signals _text_ids to restore full-query ranking in stage 2."""
-        toks = re.findall(r"\w+", qtext)[:100]
+        kept < all signals _text_ids to restore full-query ranking in stage 2.
+        Tokens are stage 2's (_fold_tokens), which split on '_' as FTS5 unicode61 does:
+        the old word regex kept '_2' with df 0, FTS5 read it as '2', and the ranked OR
+        matched most of the corpus. Trigram matches substrings, where '_' and diacritics
+        count, so it keeps the raw word tokens."""
+        if self.cfg.tokenizer == "trigram":
+            toks = re.findall(r"\w+", qtext)[:100]
+        else:
+            toks = _fold_tokens(qtext)[:100]
+        # the df key is the term FTS5 matches: FTS5 lowercases the query's terms, and
+        # _fold_tokens leaves math alphanumerics as ASCII capitals (bold A -> A), so fold
+        # again (A -> a); for every other token a second _fold changes nothing
+        keys = [_fold(t) for t in toks]
         if not toks:
             return [], []
         total = sum(self.indexed_counts.values())
@@ -1749,8 +1760,7 @@ class Collection:
             self._avgdl_cache = None
             self._df_cache_churn = 0
         dfs = {}
-        for t in toks:
-            key = _fold(t)
+        for key in keys:
             if key not in dfs:
                 dfs[key] = self._df(key)
         # df-0 tokens (typos, trigram tokenizer) cost nothing and are always kept, but
@@ -1763,7 +1773,7 @@ class Collection:
             spent += df
             kept.add(key)
             have_real = have_real or df > 0
-        return [t for t in toks if _fold(t) in kept], toks
+        return [t for t, key in zip(toks, keys) if key in kept], toks
 
     def _avgdl(self) -> float:
         """Mean folded-token doc length from a ~256-doc sample (random id probes — a
