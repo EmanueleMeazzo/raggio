@@ -10,6 +10,7 @@ import asyncio
 import math
 import os
 import random
+import re
 import sys
 import types
 import unicodedata
@@ -427,3 +428,48 @@ def test_healthz_reports_python_without_the_extension(tmp_path, monkeypatch):
 def test_healthz_reports_native(tmp_path, monkeypatch):
     body = _healthz(tmp_path, monkeypatch, "auto")
     assert body["bm25"] == "native" and body["status"] == "ok"
+
+
+# ---- packaging: the image and CI build the extension ------------------------------------
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def _dockerfile():
+    return (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+
+def test_image_builds_the_extension_in_a_rust_builder_stage():
+    d = _dockerfile()
+    assert re.search(r"^ARG RUST_VERSION=\d+\.\d+\.\d+$", d, re.M)  # pinned, like UV_VERSION
+    stages = re.split(r"^FROM ", d, flags=re.M)[1:]
+    (builder,) = [s for s in stages if s.split("\n", 1)[0].endswith(" AS builder")]
+    runtime = stages[-1]
+    # the wheel is not manylinux-audited: the builder runs the runtime's Debian release
+    assert builder.startswith("docker.io/library/rust:${RUST_VERSION}-slim-trixie AS builder")
+    assert runtime.startswith("docker.io/library/debian:trixie-slim\n")
+    # rust:*-slim has no python3: PyO3 and build.rs (gen_unicode.py) must run uv's /python,
+    # the interpreter the runtime copies, or the Unicode tables are some other interpreter's
+    install = builder.index("RUN uv python install ${PYTHON}\n")
+    link = re.search(r"^RUN bash -c 'set -euo pipefail; .*uv python find .*/usr/local/bin/python3.*'$",
+                     builder, re.M)
+    pyo3 = builder.index("ENV PYO3_PYTHON=/usr/local/bin/python3\n")
+    assert link and install < link.start() < pyo3
+    # podman's OCI format ignores SHELL: a RUN with a pipe sets pipefail itself
+    for run in re.findall(r"^RUN .*$", d, re.M):
+        assert not re.search(r"(?<!\|)\|(?!\|)", run) or "set -euo pipefail" in run, run
+    # the crate is copied before the dependency-only sync: its build layer caches apart from src/
+    assert pyo3 < builder.index("COPY native ./native") < builder.index(
+        "RUN uv sync --frozen --no-install-project")
+    syncs = re.findall(r"^RUN uv sync (.*)$", d, re.M)
+    assert len(syncs) == 2 and all("--extra native" in s for s in syncs)
+    # maturin builds --locked against the committed lock: the image compiles these crates only
+    native_cfg = (ROOT / "native" / "pyproject.toml").read_text(encoding="utf-8")
+    assert "locked = true" in native_cfg.splitlines() and (ROOT / "native" / "Cargo.lock").is_file()
+    # cargo's build tree stays out of /app, which the runtime stage copies whole
+    assert re.search(r"CARGO_TARGET_DIR=/tmp/\S+", builder)
+    assert "native/target" in (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    # the runtime stage: no toolchain, and A's (D16) and C's (D13) ENV lines still there
+    assert "cargo" not in runtime and "rust" not in runtime
+    code = "\n".join(ln for ln in runtime.splitlines() if not ln.lstrip().startswith("#"))
+    assert "OPENBLAS_NUM_THREADS=1" in code and "MALLOC_TRIM_THRESHOLD_=134217728" in code
