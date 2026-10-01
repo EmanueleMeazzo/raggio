@@ -1271,6 +1271,14 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
 - **Detach took 1 s**, because the volume was already flat.
 - **The arms started at 22:56:08Z** with a 110-minute cap: a warm-up, then base, prune, native and Python, then the parity probe. The arms script gained a start guard against any other bench work and stops `bench-tv` on exit (T11-R5). Task 11's results test is in the worktree, failing as it should until the results are appended.
 
+**About 22:56Z–23:22Z. Plan E's A/B on gn100 passes every gate (section 4.16), and plan E lands on `main`.**
+- **The run.** The arms ran from 22:56:08Z to 23:07:15Z: a discarded warm-up, then base, prune, native and Python, each a fresh `bench-tv` on the same flat volume. The parity probe ran from 23:07Z to 23:11:28Z and printed PASS. The whole run took 15 minutes of its 110-minute cap.
+- **The gates.** The prune cut warm hybrid p99 to 0.24× (486.1 → 117.9 ms, band 1.3 %). The native scorer cut warm hybrid p50 to 0.60× (77.1 → 46.2 ms, band 1.0 %). Text-hit@10 was 0.984 on every pass of every arm. The probe compared 500 queries, 494 of them two-stage, and found no id-order or score-bit mismatch. The largest underscore query matched 48,760 rows against a budget of 50,982. The native and Python scorers on the same image changed no top-10, and `NATIVE_BM25=0` gave back the prune arm's rankings exactly.
+- **The record (91d316b).** The rendered section went into ADR 0004 as it came off gn100, with the test from Task 11's Step 2 (its regime tuple widened by T11-R4). 398 passed, and `mkdocs build --strict` passed. The review (Sonnet) approved it with no Critical or Important issues: it recomputed every table figure from the section's JSON with the render's formulas and found them exact, and the test equals the plan's apart from the ruled tuple. Two of its minors are about the prose: the section quotes p2's 0.71–0.79× beside 0.60× with no comment (section 5.22 explains it), and "2 of 500 queries over the budget" can read as underscore queries, which none of the 24 is. The ADR keeps the section as rendered.
+- **The merge.** Plan E was merged into `main` with `--no-ff` (fa0fa9f, 398 passed with the extension and `REQUIRE_NATIVE=1`; without it, 330 passed and 68 skipped, the same 398). `main` was pushed as a fast-forward from 49c09f2 to fa0fa9f (14 commits), with no force. Both Actions workflows passed. `tests` ran three jobs: `test` without the extension (330 passed, 68 skipped), and `native` on x86_64 and on aarch64 (`ubuntu-24.04-arm`), 398 passed each. It was the first CI run of the aarch64 job.
+- **Cleanup.** E's worktree was removed and its branch deleted, after `git merge-base --is-ancestor` showed it in `origin/main`. The deploy worktree was removed after the append. gn100 is idle: `bench-tv` is stopped and no probe container is left. E's ledger is archived, and its hand-offs to F, D2 and G are in a scratch file for their pre-flights.
+- **Still open.** The image and CI pin Rust 1.98.1, because `rust:1.99.0-slim-trixie` still returned 404 at 23:15Z (X8). The two issue drafts from the final review are for the maintainer to post or drop (X9). Plan F is next.
+
 ## 3. Decision register
 
 ID prefixes:
@@ -1331,6 +1339,7 @@ ID prefixes:
 | X6 | 2026-09-30, about 13:10Z | No mmap threshold ships. Plan C's `MALLOC_TRIM_THRESHOLD_` (D13) stays as it is. The IVF filtered-search regression it causes in restarted containers (section 5.18) is left to plan F's Task 2. Its `_intersect` binary-searches the smaller side into the larger, so the per-shard temporaries shrink from about 2 MB to shard size (about 64 KB), under glibc's 128 KiB threshold. Plan F's A/B shows the recovery; its F3 gate (filtered p50 ≤ 10 ms) is absolute. | Ship `MALLOC_MMAP_THRESHOLD_=1048576` now: it passes C7 at +3 MB, but wins back only 8.3 of about 13 ms, and E's and F's A/Bs would carry it as one more variable, to drop or re-measure after F. Ship 4 MiB: full recovery at +13 MB, but 49 MiB over C7's VmHWM cap. 16 or 32 MiB: killed in the swapless build. Measure 2 MiB: more gn100 time for a value between a partial fix and a failing one, which plan F makes moot. | Sections 4.12–4.14. | Controller (W-14: the recommended option) | Section 2, 12:20Z | In force |
 | X7 | 2026-09-30, about 13:58Z | uv 0.12.21 (released 2026-09-29) lands on `main` as its own commit, after D1's merge and before plan E's branch: the Dockerfile's `ARG UV_VERSION` and the CI's setup-uv `version`. E's Task 7 and Task 8 then carry 0.12.21. Plan G's nine 0.12.20 anchors are fixed at G's pre-flight. | Bump inside E (its Task 11 arms would straddle two uv versions and possibly two CPython builds, and Task 11 needs Task 1 to be E's first commit). Keep 0.12.20 until a later plan (W-11 asks for the latest). | E's version scan. The 0.12.21 image has the same CPython 3.12.14 and SQLite 3.53.1 as 0.12.20's, but a CPython built 29 September, not 24 September. Suite 261 passed on the bump branch. | Controller (W-11, W-14) | Section 2, 13:20Z | Committed on `uv-0.12.21` (56e8e6b); lands after D1 |
 | X8 | 2026-10-01, about 21:30Z | Plan E takes the two releases that came out after its version scan (W-11; ruling E-R14). PyO3 0.29.3: Task 2's `native/Cargo.toml` pins it, and cargo generates `native/Cargo.lock` instead of it being copied from the plan. Rust 1.99.0: the workstation's toolchain is updated. The image and CI pins move to 1.99.0 at Task 7 if `rust:1.99.0-slim-trixie` is on Docker Hub. If it is not, they stay at 1.98.1 and are checked again before the final review. Tasks 7 and 8 always carry the same version. | Keep the plan's PyO3 0.29.2 and Rust 1.98.1 (W-11 asks for the latest). Pin 1.99.0 in the image before its tag exists. | PyO3 0.29.3 (2026-09-30) is a patch release; among its fixes is the Windows `raw-dylib` opt-out. Rust 1.99.0 became stable on 2026-10-01, and `rust:1.99.0-slim-trixie` returned 404 at 21:28Z and 21:44Z. The generated lock differs from the plan's only in the five pyo3 crates. Task 2 built and passed on 1.99.0 with 0.29.3. | Controller (W-11, W-14) | Section 2, 2026-10-01 | PyO3 in Task 2 (d1def25); the image's Rust pin is open until Task 7. (Dated note, 2026-10-01 22:16Z: Tasks 7 and 8 kept 1.98.1, because the 1.99.0 image tag was still missing at 22:10Z; rechecked before the final review.) |
+| X9 | 2026-10-01, about 22:50Z | Plan E ships the D14 prune with a known loss, documented (ruling E-R15, under W-14). D14 folds a query's compatibility forms, so `CO₂`, `m²` or `ℝ³` ask FTS5 for `co2`, `m2` or `r3`, which FTS5's `unicode61` does not index for a document that holds the original form. ADR 0004's D14 row and ADR 0003's addendum say so. Two issue drafts, not posted: this loss with three fixes, and stage 2's df lookup by the unfolded token (pre-existing). | Revert D14's MATCH terms to the raw tokens (gives up D14's gain, and needs a new A/B arm). Match both forms (a more complex query; a ranking change that needs its own hit@10 check). | The final review's I-1, reproduced end to end: a one-term query `CO₂` returned nothing. The bench's queries are ASCII, so the A/B is unaffected. | Assistant (W-14); the maintainer may overrule | Final review; ledger `preflight-rulings.md` | Shipped with plan E |
 | W-1 | 2026-09-27 23:27Z | "Answer, don't act": a question such as "is it OK to X?" gets an answer and an offer, never an unrequested action. | None. | The gn100 restart incident (section 7). | Maintainer (correction) | Transcript | Standing rule |
 | W-2 | 2026-09-27 23:09Z to 2026-09-28 01:11Z | Offload work to gn100 "when it makes sense". First baseline: "not more than 65m". Later: "no limits" for this program while the PC stays on. The spec keeps a rule that DGX runs over about 5 minutes need a go-ahead with a time cap. | None. | None. | Maintainer | Transcript; spec §6 | Standing |
 | W-3 | 2026-09-28 18:45Z | Every question to the maintainer goes through the structured question tool. | None. | None. | Maintainer | Transcript | Standing |
@@ -1938,6 +1947,36 @@ Reading it:
 - **Memory:** section 9.4.
 - **The outcome** (2026-10-01): the maintainer overrode `D1-ivf256` (R-D5). ADR 0001 records all seven gate lines, the FAIL included, and a dated override line under them (68d1083). D1 is merged into `main` (0901ec0).
 
+### 4.16 Plan E's A/B on gn100: the prune tokenizer and the native scorer
+
+Plan E's Task 11, run on gn100 on 2026-10-01, 22:56:08Z–23:11:28Z (cap 110 minutes). The full section is ADR 0004's "Results — DGX A/B".
+- Arms: e-base = 49c09f2 (`main`: the `\w+` prune, Python stage 2), e-prune = be2f37c (D14 alone), e-native = f95b3b8 (the branch head), e-python = f95b3b8 with `ENV NATIVE_BM25=0`.
+- Every arm ran CPython 3.12.14, SQLite 3.53.1, turbovec 1.0.0 and `OPENBLAS_NUM_THREADS=1`, host-warm, in a 4 GiB container with the host's default swap. The probe's host venv ran the same Python and SQLite.
+- Each arm sent bench.py's 500 hybrid queries (seed 42) in three serial passes and one pass at concurrency 8. The gates use the mean of passes 2 and 3.
+
+Warm hybrid latency (ms, mean of passes 2 and 3):
+
+| Arm | p50 | p95 | p99 | q/s (pass 3) |
+|---|---|---|---|---|
+| e-base | 77.3 | 109.5 | 486.1 | 11.8 |
+| e-prune | 77.3 | 98.2 | 117.9 | 13.1 |
+| e-python | 76.9 | 97.9 | 116.5 | 13.2 |
+| e-native | 46.2 | 65.7 | 82.6 | 22.0 |
+
+The gates:
+
+| Gate | Candidate | Reference | Ratio | Band | Verdict |
+|---|---|---|---|---|---|
+| Prune, warm p99 | 117.9 (e-prune) | 486.1 (e-base) | 0.24× | 1.3 % | better |
+| Native, warm p50 | 46.2 (e-native) | 77.1 (e-prune + e-python) | 0.60× | 1.0 % | better |
+
+- **Rankings.** Text-hit@10 was 0.984 on all twelve passes. The prune changed 5 of 500 hybrid top-10s, the same count as probe p2. e-native vs e-python changed 0, and e-python vs e-prune changed 0.
+- **Parity (probe, on the bench collection's `meta.db`).** 500 queries, 494 two-stage: 0 id-order mismatches, 0 score bit-mismatches, max relative difference 0, and the same avgdl (158.41015625) from both scorers.
+- **Where the time went.** Stage 2 p50/p99: native 1.646/2.676 ms, Python 31.117/46.776 ms (19× at p50). Text leg p50/p99: native 36.2/71.7 ms, Python 65.9/103.8 ms. Text-leg q/s by threads (1, 2, 4, 8): native 27.4, 45.7, 45.6, 42.8; Python 15.1, 23.0, 27.1, 23.0.
+- **The ranked OR.** 24 underscore queries, the largest matching 48,760 rows against a budget of 50,982. 2 of 500 queries went over the budget, and neither is an underscore query.
+- **Concurrent, at 8 (reported, not gated).** q/s: e-base 17.7, e-prune 17.5, e-python 17.7, e-native 36.7. p99: 1,047, 795, 804 and 441 ms. Native is 2.07× Python's q/s at 0.55× its p99.
+- **Pass 1 (first after the load).** First-10 max: e-base 447 ms, e-prune 146 ms, e-native 126 ms, e-python 142 ms. The discarded warm-up arm's was 491 ms.
+
 ## 5. Negative results and surprises
 
 ### 5.1 Audience batching lost on NEON
@@ -2054,6 +2093,10 @@ Plan A's rule sets the band to the wider of the two arms' ranges (max − min ov
 ### 5.21 An editing tool changed two test literals, and the plan got the blame
 
 Task 2's tests hold Unicode goldens and a pool of characters for a seeded fuzz. The implementer reported that one golden was wrong in the plan: Korean `한국어` should fold to decomposed jamo, and the plan "carried precomposed syllables". It did not. The plan and the brief both hold the jamo (U+1112 U+1161 U+11AB …). The characters were composed (NFC) somewhere between the brief and the file on disk, most likely by the agent's file-writing tool, and the test failed until the implementer wrote the value again. The result was the plan's own value, reported as a correction. The controller compared every added line with the brief, code point by code point, and found a second change that no test could catch. One backslash had been dropped from the pool's punctuation literal, so where the plan has a backslash and a TAB, the pool held a backslash and the letter `t`. The fuzz still passed, because it compares the Rust tokenizer with the Python reference on whatever input it gets. It had stopped testing the tab, and it had no way to show that. The controller restored both lines (d1def25, section 2, 2026-10-01). The review could not have caught either one: a diff cannot show composed text against decomposed text, and the reviewer said so.
+
+### 5.22 The native scorer beat its own forecast, and SQLite 3.53.1 did not cap it
+
+Probe p2 forecast the native scorer's gain at 0.71–0.79× of hybrid p50. gn100 measured 0.60×. The saving itself is what p2 predicted: Python stage 2 took 31.1 ms at p50 and native 1.6 ms, about 29.5 ms, and warm hybrid p50 fell by 30.9 ms. What changed is the total it divides into. p2's estimate implies a hybrid p50 of about 89 ms (63–70 ms after the gain); the reference arms here measured 77.1 ms, on a newer `main` (plans B to D1) and SQLite 3.53.1 instead of Debian's 3.40.1. Which change removed the other 12 ms was not measured. At concurrency 8, native served 2.07× Python's q/s. That matches p2's 2.1× on PBS's SQLite 3.50.4, not its 0.99× on Debian's 3.40.1, so the memstatus mutex did not cap SQLite 3.53.1 either. The prune alone left concurrent q/s where it was (17.5 vs 17.7): it removes a tail, and the tail is a few queries.
 
 ## 6. Method: how we measured
 
@@ -2241,6 +2284,7 @@ State as of 2026-09-28, about 19:30Z.
 - Dated note, 2026-10-01 21:45Z: plan E is under way in `.worktrees/native-bm25` from 49c09f2 (section 2, 2026-10-01). Tasks 1 and 2 are approved (d1def25, 331 passed), and Task 3 is running. PyO3 0.29.3 is in; the image's Rust pin is decided at Task 7 (X8).
 - Dated note, 2026-10-01 22:16Z: plan E Tasks 3 to 8 are approved (dae62d1, 389 passed), and the pure-Python fallback passes the whole suite without the extension. The image and CI pin Rust 1.98.1 until `rust:1.99.0-slim-trixie` exists (X8). Tasks 9 and 10 are next, then the final review and the A/B on gn100 (DGX Spark).
 - Dated note, 2026-10-01 22:59Z: plan E's ten tasks, the final review and one fix wave are approved (f95b3b8, 397 passed). I-1, D14's compatibility-form loss, is documented under E-R15, with two issue drafts not posted. Task 11's A/B is running on gn100 (22:56Z, cap 110 minutes).
+- Dated note, 2026-10-01 23:22Z: plan E is done. Its A/B passed every gate (section 4.16), and it is merged into `main` and pushed (fa0fa9f). Next: plan F, `ivf-fanout-and-upstream`, after its pre-flight. G's uv quotes need re-anchoring to 0.12.21 at G's pre-flight.
 
 ### 9.2 Open questions in the plans
 
