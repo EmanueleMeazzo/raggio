@@ -246,4 +246,5 @@ configured.
 
 `bm25` is the stage-2 BM25 scorer this instance runs: `native` (the `raggio_native`
 extension, [ADR 0004](adr/0004-native-bm25.md)) or `python` (the extension is not
-installed, or `NATIVE_BM25=0`). Both return the same results.
+installed, was built for another Unicode version, or `NATIVE_BM25=0`). Both return the
+same results.

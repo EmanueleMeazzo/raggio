@@ -126,4 +126,4 @@ builds it), with the Python scorer kept as its bit-identical reference and as th
 Python scorer, measured since on the DGX at 31.5 ms p50 per query against 1.5 ms native.
 Records, order and scores are unchanged by the scorer. The candidate prune now tokenizes
 like stage 2 (ADR 0004, spec D14), which changes the candidates of queries holding `_` or
-compatibility characters (ligatures, superscripts, math alphanumerics). The pre-existing hybrid p99 tail that ADR 0003's Consequences list as unchanged was the `\w+` prune keeping df-0 underscore tokens, not a guarantee token; the prune tokenizer change (D14, ADR 0004) addresses it.
+compatibility characters (ligatures, superscripts, math alphanumerics). A query term in such a form no longer matches the same form in a document, because FTS5 indexes it as written (ADR 0004). The pre-existing hybrid p99 tail that ADR 0003's Consequences list as unchanged was the `\w+` prune keeping df-0 underscore tokens, not a guarantee token; the prune tokenizer change (D14, ADR 0004) addresses it.

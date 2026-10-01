@@ -175,9 +175,9 @@ def parity(meta_db, queries: list[str], threads=(1, 2, 4, 8)) -> dict:
     return res
 
 
-def passed(res: dict) -> bool:
+def passed(res: dict) -> bool:  # a probe that compared no two-stage query proves nothing
     return (res["id_mismatches"] == res["score_bit_mismatches"] == 0
-            and res["avgdl_native"] == res["avgdl_python"])
+            and res["avgdl_native"] == res["avgdl_python"] and res["two_stage"] > 0)
 
 
 def report(res: dict) -> str:

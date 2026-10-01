@@ -1817,8 +1817,9 @@ class Collection:
         else:
             toks = _fold_tokens(qtext)[:100]
         # the df key is the term FTS5 matches: FTS5 lowercases the query's terms, and
-        # _fold_tokens leaves math alphanumerics as ASCII capitals (bold A -> A), so fold
-        # again (A -> a); for every other token a second _fold changes nothing
+        # _fold_tokens leaves the capitals NFKD makes from compatibility characters (math
+        # alphanumerics, double-struck letters, the numero and trade mark signs, modifier
+        # letters: bold A -> A), so fold again (A -> a)
         keys = [_fold(t) for t in toks]
         if not toks:
             return [], []

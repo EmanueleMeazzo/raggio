@@ -480,11 +480,12 @@ def test_image_builds_the_extension_in_a_rust_builder_stage():
 def test_ci_builds_the_extension_and_requires_it():
     ci = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
     assert "\n  native:\n" in ci
-    job = re.split(r"\n  (?=\S)", ci.split("\n  native:\n", 1)[1], 1)[0]
+    job = re.split(r"\n  (?=\S)", ci.split("\n  native:\n", 1)[1], maxsplit=1)[0]
     # x86_64 and the DGX's aarch64, with the image's toolchain
     assert "runner: [ubuntu-latest, ubuntu-24.04-arm]" in job
     rust = re.search(r"^ARG RUST_VERSION=(\S+)$", _dockerfile(), re.M).group(1)
     assert f"rustup toolchain install {rust} --profile minimal" in job
+    assert f"rustup default {rust}" in job
     assert "run: uv sync --frozen --group bench --extra native" in job
     # REQUIRE_NATIVE=1: a missing extension fails the job instead of skipping the parity tests
     assert re.search(r'run: uv run --no-sync pytest -q\n\s+env:\n\s+REQUIRE_NATIVE: "1"\n', job)
@@ -550,6 +551,7 @@ def test_probe_parity_passes_and_catches_a_one_ulp_drift(tmp_path, monkeypatch, 
     assert res["or_budget"] == 2  # max(FTS_SCAN_BUDGET_MIN_ROWS = 0, int(0.02 * 120 chunks))
     assert res["or_matches_underscore"] == [under] * 3 and under > 0
     assert res["or_over_budget"] > 0  # the rarest real token survives even a 2-row budget
+    assert not probe.passed({**res, "two_stage": 0})  # comparing nothing is not a pass
     real = native.bm25_topn
 
     def drifted(*args):
