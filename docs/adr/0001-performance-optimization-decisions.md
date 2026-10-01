@@ -154,4 +154,247 @@ Date: 2026-09-30 · Plan D, phase D1, of the 2026-09-28 performance program (`do
 
 ### Results — DGX A/B (D1)
 
-Pending: the gn100 A/B of Plan D Task 6 has not run yet.
+#### Measurements (D1)
+
+Run 2026-09-30 on gn100 (NVIDIA DGX Spark, GB10 Grace, 20 aarch64 cores), base `cd3cbf2266ab` (main before D1) against cand `2274a6a0d60d` (D1). Probe rows: `bench/ingest_probe.py --seed 42 --prefill 100000 --jobs 200 --job-rows 250` with `--ivf 0` and `--ivf 256`, each arm running its own tree, one discarded base run0 and then 3 interleaved rounds per mode. Bench row: `bench.py --limit 2549619 --engine raggio --reingest` (2,549,119 x 1024) in the order base, cand, base, cand, each in a fresh 4 GiB container. Values are ingest vec/s. Band = max(base max - min, cand max - min, 1 vec/s); a claim needs gain > band.
+
+| Row | Regime | Cap | sqlite_version | OPENBLAS_NUM_THREADS | base median | cand median | gain | band | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| probe flat | host-warm, uncapped host process | none (uncapped host process) | 3.53.1 | 1 | 2342.4 | 4982.0 | 2639.6 | 417.3 | better |
+| probe ivf256 | host-warm, uncapped host process | none (uncapped host process) | 3.53.1 | 1 | 533.5 | 612.0 | 78.5 | 98.7 | within band |
+| bench reingest | host-warm | 4g | base 3.53.1, cand 3.53.1 | 1 | 1530.9 | 3035.4 | 1504.5 | 17.4 | better |
+
+- PASS: D1-run
+- PASS: D1-flat
+- FAIL: D1-ivf256
+- PASS: D1-fingerprints
+- PASS: D1-jobs
+- PASS: D1-bench
+- PASS: D1-labels
+- OVERRIDE: D1-ivf256, by the maintainer on 2026-10-01. The gate fails as written: the gain (78.5 vec/s) is within the band (98.7). Every cand run beat every base run (611.7, 612.0, 710.4 against 505.0, 533.5, 535.2), and the fast third cand run alone sets the band. D1 ships on that evidence; the gate is not loosened, and the session was not rerun.
+
+```json
+{
+  "date": "2026-09-30",
+  "base_sha": "cd3cbf2266ab",
+  "cand_sha": "2274a6a0d60d",
+  "probe": {
+    "flat": {
+      "base": [
+        2274.9,
+        2355.4,
+        2342.4
+      ],
+      "cand": [
+        5020.8,
+        4982.0,
+        4603.5
+      ],
+      "base_median": 2342.4,
+      "cand_median": 4982.0,
+      "gain": 2639.6,
+      "band": 417.3,
+      "verdict": "better",
+      "drain_s": {
+        "base": [
+          21.98,
+          21.23,
+          21.35
+        ],
+        "cand": [
+          9.96,
+          10.04,
+          10.86
+        ]
+      },
+      "loop_stall_s": {
+        "base": [
+          6.38,
+          5.475,
+          5.498
+        ],
+        "cand": [
+          0,
+          0,
+          0
+        ]
+      },
+      "payload_rows": {
+        "base": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "cand": [
+          0,
+          0,
+          0
+        ]
+      },
+      "complete": true,
+      "fingerprints_equal": true,
+      "jobs_all_done": true
+    },
+    "ivf256": {
+      "base": [
+        505.0,
+        533.5,
+        535.2
+      ],
+      "cand": [
+        611.7,
+        612.0,
+        710.4
+      ],
+      "base_median": 533.5,
+      "cand_median": 612.0,
+      "gain": 78.5,
+      "band": 98.7,
+      "verdict": "within band",
+      "drain_s": {
+        "base": [
+          99.01,
+          93.73,
+          93.42
+        ],
+        "cand": [
+          81.74,
+          81.7,
+          70.39
+        ]
+      },
+      "loop_stall_s": {
+        "base": [
+          8.326,
+          8.187,
+          7.828
+        ],
+        "cand": [
+          0,
+          0.19,
+          0
+        ]
+      },
+      "payload_rows": {
+        "base": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "cand": [
+          0,
+          0,
+          0
+        ]
+      },
+      "complete": true,
+      "fingerprints_equal": true,
+      "jobs_all_done": true
+    }
+  },
+  "bench": {
+    "base": [
+      1531.1,
+      1530.7
+    ],
+    "cand": [
+      3026.7,
+      3044.1
+    ],
+    "base_median": 1530.9,
+    "cand_median": 3035.4,
+    "gain": 1504.5,
+    "band": 17.4,
+    "verdict": "better",
+    "runs": {
+      "base-run1": {
+        "ingest_s": 1664.9,
+        "jobs": {
+          "done": 10197
+        },
+        "payload_rows": null,
+        "freelist": 0
+      },
+      "base-run2": {
+        "ingest_s": 1665.3,
+        "jobs": {
+          "done": 10197
+        },
+        "payload_rows": null,
+        "freelist": 0
+      },
+      "cand-run1": {
+        "ingest_s": 842.2,
+        "jobs": {
+          "done": 10197
+        },
+        "payload_rows": 0,
+        "freelist": 0
+      },
+      "cand-run2": {
+        "ingest_s": 837.4,
+        "jobs": {
+          "done": 10197
+        },
+        "payload_rows": 0,
+        "freelist": 0
+      }
+    }
+  },
+  "labels": {
+    "probe": {
+      "regime": [
+        "host-warm, uncapped host process"
+      ],
+      "sqlite_version": [
+        "3.53.1"
+      ],
+      "openblas_num_threads": [
+        "1"
+      ],
+      "turbovec": [
+        "1.0.0"
+      ],
+      "python": [
+        "3.12.14"
+      ],
+      "cap": [
+        "none (uncapped host process)"
+      ]
+    },
+    "bench": {
+      "regime": [
+        "host-warm"
+      ],
+      "cap": [
+        "4g"
+      ],
+      "openblas_num_threads": [
+        "1"
+      ],
+      "sqlite_version": {
+        "base": [
+          "3.53.1"
+        ],
+        "cand": [
+          "3.53.1"
+        ]
+      }
+    }
+  },
+  "gates": {
+    "D1-run": "PASS",
+    "D1-flat": "PASS",
+    "D1-ivf256": "FAIL",
+    "D1-fingerprints": "PASS",
+    "D1-jobs": "PASS",
+    "D1-bench": "PASS",
+    "D1-labels": "PASS"
+  },
+  "overrides": {
+    "D1-ivf256": "by the maintainer on 2026-10-01. The gate fails as written: the gain (78.5 vec/s) is within the band (98.7). Every cand run beat every base run (611.7, 612.0, 710.4 against 505.0, 533.5, 535.2), and the fast third cand run alone sets the band. D1 ships on that evidence; the gate is not loosened, and the session was not rerun."
+  }
+}
+```

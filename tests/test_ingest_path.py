@@ -840,3 +840,78 @@ def test_ingest_probe_fingerprint_is_deterministic(tmp_path, monkeypatch):
     # the fingerprint does see the data: another seed gives other texts and vectors
     assert c["fingerprint"]["records"] != a["fingerprint"]["records"]
     assert c["fingerprint"]["vecs"] != a["fingerprint"]["vecs"]
+
+
+# ---- ADR 0001 addendum: D1 DGX results
+
+ADR = Path(__file__).resolve().parents[1] / "docs" / "adr" / "0001-performance-optimization-decisions.md"
+D1_RESULTS = "### Results " + chr(0x2014) + " DGX A/B (D1)"
+
+
+def adr_d1_results():
+    """(the D1 results subsection with \\r\\n normalized, its Measurements JSON or {}).
+    The subsection ends at the next ### or ## heading: Task 10 appends D2's after it."""
+    text = ADR.read_text(encoding="utf-8").replace("\r\n", "\n")
+    start = text.index(D1_RESULTS)
+    ends = [i for i in (text.find("\n### ", start + 1), text.find("\n## ", start + 1)) if i != -1]
+    section = text[start:min(ends, default=len(text))]
+    fence = "`" * 3
+    if "#### Measurements (D1)" not in section or fence + "json\n" not in section:
+        return section, {}
+    raw = section.split(fence + "json\n", 1)[1].split("\n" + fence, 1)[0]
+    return section, json.loads(raw)
+
+
+def test_adr_ingest_path_d1_results_record_the_gates():
+    """Spec section 7 D on gn100: ingest vec/s beyond the noise band on the flat path,
+    every job done with no payload row left, and one final state across arms. The IVF
+    gain fell within its band: the record keeps that FAIL and the maintainer's override."""
+    import statistics
+
+    section, m = adr_d1_results()
+    assert "Pending:" not in section
+    assert "#### Measurements (D1)" in section and m, "no Measurements (D1) JSON block"
+    assert {"date", "base_sha", "cand_sha", "probe", "bench", "labels", "gates"} <= set(m)
+    assert m["base_sha"] != m["cand_sha"]
+
+    def beyond_band(base, cand, floor=1.0):  # Plan A's rule: gain > max(bands, resolution)
+        band = max(max(base) - min(base), max(cand) - min(cand), floor)
+        return statistics.median(cand) - statistics.median(base) > band
+
+    for mode in ("flat", "ivf256"):
+        p = m["probe"][mode]
+        assert len(p["base"]) == 3 and len(p["cand"]) == 3, mode
+        assert p["fingerprints_equal"] and p["jobs_all_done"], mode
+        assert set(p["payload_rows"]["base"]) == {None}, mode  # the base has no side table
+        assert set(p["payload_rows"]["cand"]) == {0}, mode  # D1 leaves no payload row
+    flat, ivf = m["probe"]["flat"], m["probe"]["ivf256"]
+    assert beyond_band(flat["base"], flat["cand"]), "probe flat: the gain is within the band"
+    assert flat["verdict"] == "better" and "- PASS: D1-flat\n" in section
+    # D1-ivf256 failed as written (gain within the band) and the maintainer overrode it on
+    # 2026-10-01: every cand run beat every base run, and one fast cand run sets the band
+    assert not beyond_band(ivf["base"], ivf["cand"]) and ivf["verdict"] == "within band"
+    assert min(ivf["cand"]) > max(ivf["base"])
+    assert m["gates"]["D1-ivf256"] == "FAIL" and set(m.get("overrides", {})) == {"D1-ivf256"}
+    assert "- FAIL: D1-ivf256\n" in section
+    assert "- OVERRIDE: D1-ivf256, by the maintainer on 2026-10-01" in section
+    lp = m["labels"]["probe"]
+    assert lp["regime"] == ["host-warm, uncapped host process"] and lp["cap"]
+    assert lp["openblas_num_threads"] == ["1"] and len(lp["sqlite_version"]) == 1
+    b = m["bench"]
+    if b is None:  # probe-only window, or not enough time left for the reingests
+        assert "Not run: the bench reingest" in section and "- SKIP: D1-bench\n" in section
+    else:
+        assert len(b["base"]) == 2 and len(b["cand"]) == 2
+        assert beyond_band(b["base"], b["cand"]) and b["verdict"] == "better"
+        assert len(b["runs"]) == 4
+        for name, run in b["runs"].items():
+            assert set(run["jobs"]) == {"done"}, name  # no error, pending or processing job
+            assert run["payload_rows"] == (None if name.startswith("base") else 0), name
+        lb = m["labels"]["bench"]
+        assert lb["regime"] == ["host-warm"] and lb["cap"] == ["4g"]
+        assert lb["openblas_num_threads"] == ["1"]
+        assert all(len(v) == 1 for v in lb["sqlite_version"].values())
+        assert "- PASS: D1-bench\n" in section
+    for gate in ("D1-run", "D1-fingerprints", "D1-jobs", "D1-labels"):
+        assert f"- PASS: {gate}\n" in section, gate
+    assert [line for line in section.splitlines() if line.startswith("- FAIL:")] == ["- FAIL: D1-ivf256"]
