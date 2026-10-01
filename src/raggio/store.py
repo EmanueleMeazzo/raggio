@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import unicodedata
+import warnings
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,6 +25,28 @@ from turbovec import IdMapIndex
 
 from .config import Settings
 from .embeddings import Embedder
+
+
+def _load_native():
+    """The optional Rust stage-2 scorer (native/, ADR 0004; `uv sync --extra native`), or
+    None. Its Unicode tables come from the interpreter it was built for: built against
+    other Unicode data it would tokenize differently, so it is refused, not trusted."""
+    try:
+        import raggio_native
+    except ImportError:
+        return None
+    if raggio_native.UNIDATA_VERSION != unicodedata.unidata_version:
+        warnings.warn(
+            f"raggio_native was built for Unicode {raggio_native.UNIDATA_VERSION}, this"
+            f" interpreter has {unicodedata.unidata_version}: using the Python BM25 scorer",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
+    return raggio_native
+
+
+_native = _load_native()
 
 RANGE_OPS = {"gte": ">=", "lte": "<=", "gt": ">", "lt": "<"}
 
@@ -843,7 +866,12 @@ class Collection:
     """A resident collection: turbovec index + sqlite metadata + ingest worker."""
 
     def __init__(
-        self, cfg: CollectionConfig, directory: Path, embedder_factory, set_index_config=None
+        self,
+        cfg: CollectionConfig,
+        directory: Path,
+        embedder_factory,
+        set_index_config=None,
+        native_bm25: bool = True,
     ) -> None:
         self.cfg = cfg
         self.dir = directory
@@ -894,6 +922,8 @@ class Collection:
         # mean folded-token doc length for Python BM25; GIL-atomic swap, no lock —
         # concurrent recomputes land on the same value. Invalidated with the df cache.
         self._avgdl_cache: float | None = None
+        # stage 2 runs raggio_native when it is importable, unless NATIVE_BM25=0
+        self._native_bm25 = native_bm25
         # search-path reads use one connection per thread: concurrent readers on the
         # shared self.db raise SQLITE_MISUSE (pysqlite connections aren't concurrency-
         # safe), and WAL makes independent read connections cheap and non-blocking
@@ -1826,6 +1856,8 @@ class Collection:
         if cached is not None:
             return cached
         db = self._rdb()
+        nat = self._scorer()
+        fold_tokens = nat.fold_tokens if nat else _fold_tokens
         maxid = db.execute("SELECT MAX(id) FROM records").fetchone()[0] or 0
         dls = []
         if maxid:
@@ -1836,10 +1868,15 @@ class Collection:
                     (int(g),),
                 ).fetchone()
                 if row:
-                    dls.append(len(_fold_tokens(row[0])))
+                    dls.append(len(fold_tokens(row[0])))
         avgdl = (sum(dls) / len(dls)) if dls else 1.0
         self._avgdl_cache = avgdl
         return avgdl
+
+    def _scorer(self):
+        """raggio_native when it is loaded and NATIVE_BM25 allows it, else None (the
+        Python reference). Read per call, so tests can swap the module global."""
+        return _native if self._native_bm25 else None
 
     def _bm25_rescore(
         self, qtext: str, cand: list[tuple[int, str | None]], n: int
@@ -1858,9 +1895,9 @@ class Collection:
             idf[t] = max(math.log((total - df + 0.5) / (df + 0.5)), 1e-6)
         rids = [rid for rid, _ in cand]
         texts = [text for _, text in cand]
-        return _bm25_topn(
-            qtoks, idf, rids, texts, self._avgdl(), n, BM25_K1, BM25_B, SDM_WEIGHT
-        )
+        nat = self._scorer()
+        topn = nat.bm25_topn if nat else _bm25_topn
+        return topn(qtoks, idf, rids, texts, self._avgdl(), n, BM25_K1, BM25_B, SDM_WEIGHT)
 
     def _text_ids(
         self, qtext: str, n: int, scope: str, filt: dict | None

@@ -10,6 +10,8 @@ import asyncio
 import math
 import os
 import random
+import sys
+import types
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -209,9 +211,14 @@ def _idf(qtoks):
             for t in dict.fromkeys(qtoks)}
 
 
-def _pinned_collection(tmp_path, monkeypatch, **kw):
-    col = Collection(CollectionConfig("t", 8, 4, None, None, None), Path(tmp_path),
-                     lambda: None, **kw)
+def _collection(path, **kw):
+    Path(path).mkdir(parents=True, exist_ok=True)
+    return Collection(CollectionConfig("t", 8, 4, None, None, None), Path(path),
+                      lambda: None, **kw)
+
+
+def _pinned_collection(path, monkeypatch, **kw):
+    col = _collection(path, **kw)
     col.indexed_counts = {"chunk": N_DOCS}
     monkeypatch.setattr(col, "_df", lambda t: DF.get(t, 0))
     monkeypatch.setattr(col, "_avgdl", lambda: 2.5)
@@ -311,3 +318,58 @@ def test_native_scorer_is_thread_safe():
         for _ in range(4):
             for got, ref in zip(pool.map(lambda a: native.bm25_topn(*a), scenarios), expected):
                 _same(got, ref)
+
+
+# ---- store dispatch ---------------------------------------------------------------------
+
+
+@needs_native
+def test_collection_scores_natively_unless_disabled(tmp_path, monkeypatch):
+    real, calls = native.bm25_topn, []
+    monkeypatch.setattr(native, "bm25_topn", lambda *a: calls.append(a) or real(*a))
+    on = _pinned_collection(tmp_path / "on", monkeypatch)
+    assert on._scorer() is native
+    _same(on._bm25_rescore(QUERY, CAND, 4), PINNED)
+    assert len(calls) == 1
+    off = _pinned_collection(tmp_path / "off", monkeypatch, native_bm25=False)
+    assert off._scorer() is None
+    _same(off._bm25_rescore(QUERY, CAND, 4), PINNED)
+    assert len(calls) == 1  # NATIVE_BM25=0: the Python reference scored
+
+
+def test_collection_falls_back_to_python_without_the_extension(tmp_path, monkeypatch):
+    monkeypatch.setattr(store, "_native", None)
+    col = _pinned_collection(tmp_path, monkeypatch)
+    assert col._scorer() is None
+    _same(col._bm25_rescore(QUERY, CAND, 4), PINNED)
+
+
+def test_extension_is_optional_and_unicode_checked(monkeypatch):
+    monkeypatch.setitem(sys.modules, "raggio_native", None)  # makes the import fail
+    assert store._load_native() is None
+    stale = types.ModuleType("raggio_native")
+    stale.UNIDATA_VERSION = "1.1.0"  # built by an interpreter with other Unicode data
+    monkeypatch.setitem(sys.modules, "raggio_native", stale)
+    with pytest.warns(RuntimeWarning, match="Unicode 1.1.0"):
+        assert store._load_native() is None
+
+
+@needs_native
+def test_extension_loads_when_unicode_matches():
+    assert store._load_native() is native
+    assert store._native is native
+
+
+@needs_native
+def test_avgdl_tokenizes_natively_with_the_same_result(tmp_path, monkeypatch):
+    col = _collection(tmp_path)
+    docs = [{"doc_id": f"d{i}", "chunks": [{"id": f"c{i}", "text": text,
+                                            "vector": [float(i + 1)] * 8}]}
+            for i, text in enumerate(t for _, t in CAND if t)]
+    asyncio.run(col._process_job({"documents": docs}))
+    real, calls = native.fold_tokens, []
+    monkeypatch.setattr(native, "fold_tokens", lambda t: calls.append(t) or real(t))
+    fast = col._avgdl()
+    assert calls
+    col._avgdl_cache, col._native_bm25 = None, False
+    assert col._avgdl() == fast
