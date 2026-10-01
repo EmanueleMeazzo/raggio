@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import sqlite3
+import struct
 import sys
 import threading
 import time
@@ -70,6 +71,14 @@ FTS_SCAN_BUDGET_MIN_ROWS = 1000
 # a large already-ingested index both LOSE recall, so it's calibrate-early-or-never.
 CAL_THRESHOLD = 10_000
 CAL_SAMPLE = 1024  # ~1024 representative rows is enough per turbovec docs
+
+# meta.db vacuum policy after a job finishes (Collection._vacuum_after_finish): a full
+# incremental_vacuum only once no job is open; while a backlog drains, a freelist of
+# VACUUM_FREELIST_PAGES or more (64 MB at 4 KiB pages) is trimmed back to
+# VACUUM_FREELIST_PAGES - VACUUM_CHUNK_PAGES, so one trim returns about the pages freed
+# since the last trim plus 8 MB and never stalls enqueues on a whole-file vacuum
+VACUUM_FREELIST_PAGES = 16_384
+VACUUM_CHUNK_PAGES = 2_048
 
 # Optional ScaNN-style IVF index, attached/removed per collection via the index API.
 # Measured (bench/ivf_probe.py, ADR 0002): at ~550k rows every recall-preserving cell
@@ -182,6 +191,134 @@ def _normalize(mat: np.ndarray) -> np.ndarray:
     if (norms == 0).any():
         raise ValueError("zero vector cannot be normalized")
     return (mat / norms).astype(np.float32)
+
+
+# Binary job journal row (job_payloads.data): _JOB_HEADER (magic, JSON byte length,
+# vector count, dim; little-endian, so aarch64 and x86 read the same bytes), then the
+# payload as UTF-8 JSON with each supplied vector replaced by its row index, then the
+# vectors as little-endian float32. float32 is what the worker indexes anyway, so no
+# precision is lost, and the vectors skip a JSON round trip that costs ~100 ms per
+# 250x1024 job. Stdlib + numpy only: runtime JSON stays stdlib.
+_JOB_MAGIC = b"RGJ\x01"
+_JOB_HEADER = struct.Struct("<4sIII")
+
+
+def _encode_payload(payload: dict) -> bytes:
+    """Encode a job payload for job_payloads. A summary's or chunk's non-None `vector`
+    becomes an int row index into the float32 block; None stays None ("embed this").
+    Index-op payloads carry no vectors (n_vecs = dim = 0). Copies whatever it rewrites,
+    so the caller's dict is never mutated. Raises ValueError unless the vectors form one
+    rectangular float matrix (the route checks dims, so only direct callers hit that)."""
+    vectors: list = []
+
+    def take(rec: dict) -> dict:
+        if rec.get("vector") is None:
+            return rec
+        vectors.append(rec["vector"])
+        return {**rec, "vector": len(vectors) - 1}
+
+    docs = payload.get("documents")
+    if docs is not None:
+        out = []
+        for d in docs:
+            d = dict(d)
+            if d.get("summary"):
+                d["summary"] = take(d["summary"])
+            if d.get("chunks"):
+                d["chunks"] = [take(c) for c in d["chunks"]]
+            out.append(d)
+        payload = {**payload, "documents": out}
+    try:
+        mat = np.asarray(vectors, dtype="<f4") if vectors else np.empty((0, 0), dtype="<f4")
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"job payload vectors are not one rectangular float matrix: {e}"
+        ) from None
+    if mat.ndim != 2:
+        raise ValueError(
+            f"job payload vectors are not one rectangular float matrix: shape {mat.shape}"
+        )
+    meta = json.dumps(payload).encode("utf-8")
+    n, dim = mat.shape
+    return _JOB_HEADER.pack(_JOB_MAGIC, len(meta), n, dim) + meta + mat.tobytes()
+
+
+def _decode_payload(data: bytes) -> dict:
+    """Inverse of _encode_payload. Each vector comes back as a row of one read-only
+    little-endian float32 matrix (views into `data`, no copy). Anything malformed
+    raises ValueError: short or overlong data, bad magic, bad UTF-8 or JSON, a non-dict
+    top level, a malformed document list, or a vector index out of range."""
+    size = _JOB_HEADER.size
+    if len(data) < size:
+        raise ValueError(f"job payload truncated: {len(data)} bytes, the header alone is {size}")
+    magic, json_len, n, dim = _JOB_HEADER.unpack_from(data)
+    if magic != _JOB_MAGIC:
+        raise ValueError(f"job payload has bad magic {bytes(magic)!r}")
+    end = size + json_len
+    if len(data) != end + 4 * n * dim:
+        raise ValueError(
+            f"job payload is {len(data)} bytes but its header says {end + 4 * n * dim}"
+            " (truncated or corrupt)"
+        )
+    payload = json.loads(bytes(data[size:end]).decode("utf-8"))  # both errors are ValueErrors
+    if not isinstance(payload, dict):
+        raise ValueError(f"job payload is a JSON {type(payload).__name__}, not an object")
+    if n * dim:
+        mat = np.frombuffer(data, dtype="<f4", count=n * dim, offset=end).reshape(n, dim)
+    else:
+        mat = np.empty((n, dim), dtype="<f4")
+    mat.flags.writeable = False  # also for bytearray input: rows are shared views
+
+    def row(i) -> np.ndarray:
+        if type(i) is not int or not 0 <= i < n:
+            raise ValueError(f"job payload vector index {i!r} is outside 0..{n - 1}")
+        return mat[i]
+
+    try:
+        for d in payload.get("documents") or ():
+            s = d.get("summary")
+            if s and s.get("vector") is not None:
+                s["vector"] = row(s["vector"])
+            for c in d.get("chunks") or ():
+                if c.get("vector") is not None:
+                    c["vector"] = row(c["vector"])
+    except (AttributeError, TypeError) as e:
+        raise ValueError(f"job payload has a malformed document list: {e}") from None
+    return payload
+
+
+# the worker's claim: the lowest open job. 'processing' is included so jobs interrupted
+# by a crash replay on boot. Keep the literal predicate byte for byte: it is what Plan
+# C's partial index idx_jobs_open matches (spec 4.1), and C's plan test pins this text
+_CLAIM_SQL = (
+    "SELECT id, payload FROM jobs WHERE status IN ('pending','processing') ORDER BY id LIMIT 1"
+)
+
+
+def _payload_rows(payload: dict) -> list[list]:
+    """Flatten an ingest payload's documents into record rows [external_id, doc_id,
+    type, position, text, metadata, vector]; vector None means "embed this". Rows are
+    lists because the worker fills in embedded vectors. Pure CPU: _process_job runs it
+    in a worker thread."""
+    rows = []
+    for d in payload["documents"]:
+        if d.get("summary"):
+            s = d["summary"]
+            rows.append([d["doc_id"], d["doc_id"], "summary", None, s.get("text"), s.get("metadata"), s.get("vector")])
+        for i, c in enumerate(d.get("chunks") or []):
+            pos = c.get("position") if c.get("position") is not None else i
+            rows.append([c["id"], d["doc_id"], "chunk", pos, c.get("text"), c.get("metadata"), c.get("vector")])
+    # last occurrence wins: _upsert_rows inserts a job's rows with one executemany, so
+    # a duplicate external_id within one payload would violate UNIQUE and fail the job
+    # (and the first copy would only have been replaced by the second anyway)
+    return list({r[0]: r for r in rows}.values())
+
+
+def _rows_matrix(rows: list[list]) -> np.ndarray:
+    """The rows' vectors as one unit-norm float32 matrix (ValueError on a zero vector).
+    np.array over nested float lists is ~13 ms per 250x1024 job: _process_job runs it
+    in a worker thread."""
+    return _normalize(np.array([r[6] for r in rows], dtype=np.float32))
 
 
 def _filter_sql(scope: str, filt: dict | None) -> tuple[str, list]:
@@ -372,6 +509,14 @@ def open_meta_db(path: Path, tokenizer: str = "unicode61") -> sqlite3.Connection
             error TEXT,
             created_at TEXT,
             updated_at TEXT
+        );
+        -- binary job payloads (_encode_payload), one row per open or failed job. A side
+        -- table, NOT jobs.payload: the claim's status UPDATE would otherwise rewrite the
+        -- payload's whole overflow chain (MBs per job). jobs.payload stays TEXT: journals
+        -- written before the binary job journal keep their JSON there and still replay.
+        CREATE TABLE IF NOT EXISTS job_payloads(
+            job_id INTEGER PRIMARY KEY,
+            data BLOB
         );
         """
     )
@@ -814,22 +959,36 @@ class Collection:
             self.db.close()
 
     async def enqueue(self, payload: dict) -> int:
-        # journaling a bulky payload is real I/O: run the transaction in a thread and
-        # only touch the (non-thread-safe) wake event back on the loop
-        job_id = await asyncio.to_thread(self._enqueue_row, json.dumps(payload))
+        # encoding a bulky payload is real CPU and journaling it real I/O: both run in
+        # a thread, and only the (non-thread-safe) wake event is touched on the loop
+        job_id = await asyncio.to_thread(self._enqueue_row, payload)
         self._wake.set()
         return job_id
 
-    def _enqueue_row(self, payload_json: str) -> int:
+    def _enqueue_row(self, payload: dict) -> int:
+        # encode BEFORE taking db_lock: the lock serializes every write on self.db, so
+        # CPU work under it would stall the worker's claim/finish and other enqueues
+        data = _encode_payload(payload)
         with self.db_lock:
-            # explicit id, not lastrowid: MAX+1 is race-free under db_lock
-            job_id = self.db.execute("SELECT COALESCE(MAX(id),0)+1 FROM jobs").fetchone()[0]
-            self.db.execute(
-                "INSERT INTO jobs(id, payload, status, created_at, updated_at)"
-                " VALUES (?, ?, 'pending', ?, ?)",
-                (job_id, payload_json, _now(), _now()),
-            )
-            self.db.commit()
+            try:
+                # explicit id, not lastrowid: MAX+1 is race-free under db_lock
+                job_id = self.db.execute("SELECT COALESCE(MAX(id),0)+1 FROM jobs").fetchone()[0]
+                # jobs.payload stays NULL: the payload lives in job_payloads, so the
+                # claim's status UPDATE rewrites a small row, not an MB overflow chain
+                self.db.execute(
+                    "INSERT INTO jobs(id, payload, status, created_at, updated_at)"
+                    " VALUES (?, NULL, 'pending', ?, ?)",
+                    (job_id, _now(), _now()),
+                )
+                self.db.execute(
+                    "INSERT INTO job_payloads(job_id, data) VALUES (?, ?)", (job_id, data)
+                )
+                self.db.commit()
+            except BaseException:
+                # one transaction: a jobs row without its payload would replay as an
+                # error job, and a half-written txn would ride on the next commit
+                self.db.rollback()
+                raise
         return job_id
 
     def pending_jobs(self) -> int:
@@ -837,33 +996,81 @@ class Collection:
             "SELECT COUNT(*) FROM jobs WHERE status IN ('pending','processing')"
         ).fetchone()[0]
 
-    def _claim_next(self) -> tuple | None:
-        # 'processing' included so jobs interrupted by a crash are replayed on boot
+    def _claim_next(self) -> tuple[int, dict | None, str | None] | None:
+        """Claim the lowest open job. Returns (job_id, payload, None), or
+        (job_id, None, "bad job payload: ...") when its payload cannot be decoded, or
+        None when no job is open. The claim is one short transaction under db_lock;
+        the decode runs after the lock is released, still in this worker thread, so
+        neither the loop nor the other writers wait for it."""
         with self.db_lock:
-            row = self.db.execute(
-                "SELECT id, payload FROM jobs WHERE status IN ('pending','processing') ORDER BY id LIMIT 1"
+            row = self.db.execute(_CLAIM_SQL).fetchone()
+            if row is None:
+                return None
+            job_id, text = row
+            blob = self.db.execute(
+                "SELECT data FROM job_payloads WHERE job_id=?", (job_id,)
             ).fetchone()
-            if row is not None:
-                self.db.execute(
-                    "UPDATE jobs SET status='processing', updated_at=? WHERE id=?", (_now(), row[0])
+            self.db.execute(
+                "UPDATE jobs SET status='processing', updated_at=? WHERE id=?", (_now(), job_id)
+            )
+            self.db.commit()
+        try:
+            if blob is not None and blob[0] is not None:
+                return job_id, _decode_payload(blob[0]), None
+            if text is None:
+                raise ValueError(
+                    f"job {job_id} has no payload (neither jobs.payload nor job_payloads)"
                 )
-                self.db.commit()
-            return row
+            payload = json.loads(text)  # a journal row written before the binary job journal
+            if not isinstance(payload, dict):
+                raise ValueError(f"payload is a JSON {type(payload).__name__}, not an object")
+            return job_id, payload, None
+        except Exception as e:
+            # as when json.loads ran inside the worker's try: an undecodable row ends
+            # as an 'error' job with its payload row kept, and the worker lives on
+            return job_id, None, f"bad job payload: {e}"
 
     def _finish_job(self, job_id: int, status: str, error: str | None) -> None:
         with self.db_lock:
             # payload cleared on success so vector-heavy jobs don't accumulate on disk;
-            # kept on error for diagnosis
+            # kept on error for diagnosis. The CASE clears a legacy TEXT payload; a
+            # binary one is its job_payloads row, deleted in the same commit
             self.db.execute(
                 "UPDATE jobs SET status=?, error=?, updated_at=?,"
                 " payload=CASE WHEN ?='done' THEN NULL ELSE payload END WHERE id=?",
                 (status, error, _now(), status, job_id),
             )
+            if status == "done":
+                self.db.execute("DELETE FROM job_payloads WHERE job_id=?", (job_id,))
             self.db.commit()
-            # return the cleared payload's pages to the OS between jobs. fetchall() is
-            # load-bearing: the pragma frees pages per STEP, and pysqlite's execute()
-            # steps once — without exhausting the cursor it frees a single page
+            # return freed pages to the OS: in full once the queue is empty, in bounded
+            # trims while a backlog drains
+            self._vacuum_after_finish()
+
+    def _vacuum_after_finish(self) -> None:
+        """Return freed meta.db pages to the OS after a job's finish commit (caller
+        holds db_lock; no transaction is open). A full incremental_vacuum after every
+        job cost 38-54 ms per job while a backlog drained, so it runs only once no job
+        is open. Until then a freelist of VACUUM_FREELIST_PAGES or more is trimmed
+        back to VACUUM_FREELIST_PAGES - VACUUM_CHUNK_PAGES: the file stays bounded
+        however many pages one job freed, and no trim is a whole-file vacuum that
+        holds enqueues behind db_lock."""
+        # the literal predicate, byte for byte pending_jobs' query: idx_jobs_open
+        # serves it, so counting open jobs never scans the journal
+        open_jobs = self.db.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status IN ('pending','processing')"
+        ).fetchone()[0]
+        # fetchall() is load-bearing on both vacuum pragmas: the pragma frees pages per
+        # STEP, and pysqlite's execute() steps once -- without exhausting the cursor it
+        # frees a single page
+        if open_jobs == 0:
             self.db.execute("PRAGMA incremental_vacuum").fetchall()
+            return
+        free = self.db.execute("PRAGMA freelist_count").fetchone()[0]
+        if free >= VACUUM_FREELIST_PAGES:
+            # a pragma argument cannot be a bound parameter; n is an int computed here
+            n = int(free - VACUUM_FREELIST_PAGES + VACUUM_CHUNK_PAGES)
+            self.db.execute(f"PRAGMA incremental_vacuum({n})").fetchall()
 
     async def _run_worker(self) -> None:
         while True:
@@ -874,9 +1081,13 @@ class Collection:
             if row is None:
                 await self._wake.wait()
                 continue
-            job_id, payload = row
+            # decoded in the claim's thread; an undecodable row comes back as
+            # (job_id, None, reason) and finishes as 'error' like any failed job
+            job_id, payload, bad = row
             try:
-                await self._process_job(json.loads(payload))
+                if bad is not None:
+                    raise ValueError(bad)
+                await self._process_job(payload)
                 status, error = "done", None
             except asyncio.CancelledError:
                 raise
@@ -895,34 +1106,29 @@ class Collection:
             finally:
                 await asyncio.to_thread(_malloc_trim)  # D13: failed builds free memory too
             return
-        # flatten documents into records: (external_id, doc_id, type, position, text, metadata, vector)
-        rows = []
-        for d in payload["documents"]:
-            if d.get("summary"):
-                s = d["summary"]
-                rows.append([d["doc_id"], d["doc_id"], "summary", None, s.get("text"), s.get("metadata"), s.get("vector")])
-            for i, c in enumerate(d.get("chunks") or []):
-                pos = c.get("position") if c.get("position") is not None else i
-                rows.append([c["id"], d["doc_id"], "chunk", pos, c.get("text"), c.get("metadata"), c.get("vector")])
+        # flatten documents into records (external_id, doc_id, type, position, text,
+        # metadata, vector) and build the matrix in worker threads: both are pure CPU
+        # the event loop should not carry
+        rows = await asyncio.to_thread(_payload_rows, payload)
         if not rows:
             return
-        # last occurrence wins: a duplicate external_id within one payload would
-        # otherwise leave the first copy's id in the vector index (the in-batch
-        # replace can't remove it — it isn't added until after the row loop)
-        rows = list({r[0]: r for r in rows}.values())
         need = [i for i, r in enumerate(rows) if r[6] is None]
         for start in range(0, len(need), 64):
             batch = need[start : start + 64]
             vecs = await self.embedder.embed([rows[i][4] for i in batch])
             for i, v in zip(batch, vecs):
                 rows[i][6] = v
-        mat = _normalize(np.array([r[6] for r in rows], dtype=np.float32))
+        mat = await asyncio.to_thread(_rows_matrix, rows)
 
         async with self.lock.write():
             # off the event loop: the FTS triggers tokenize every row (expensive with
-            # trigram). Batch atomicity relies on job replay + idempotent upserts, not
-            # on one transaction, so an interleaved commit (e.g. enqueue) is harmless.
-            ids, fresh = await asyncio.to_thread(self._upsert_rows, rows, mat)
+            # trigram). The upsert is one transaction that rolls back on any failure and
+            # touches neither the index nor indexed_counts before it commits, so a
+            # failed job leaves the collection as it was. The rows it replaced leave the
+            # index only after that commit.
+            ids, fresh, replaced = await asyncio.to_thread(self._upsert_rows, rows, mat)
+            if replaced:
+                await asyncio.to_thread(self._unindex, replaced)
             idarr = np.array(ids, dtype=np.uint64)
             # while the reservoir is armed, add in threshold-sized slices so even one
             # bulk job calibrates AT the threshold (calibrating after a large
@@ -967,43 +1173,79 @@ class Collection:
             return np.vstack(self._cal_reservoir)  # caller disarms after calibrate succeeds
         return None
 
-    def _upsert_rows(self, rows: list, mat: np.ndarray) -> tuple[list[int], list[bool]]:
+    def _upsert_rows(self, rows: list, mat: np.ndarray) -> tuple[list[int], list[bool], list[int]]:
+        """Insert `rows` (_payload_rows' shape) with `mat` as their vectors, replacing
+        any record with the same external_id: one transaction, rolled back on any
+        failure. Returns (ids, fresh, replaced): the new record ids in row order, per
+        row whether its external_id was new, and the replaced records' ids that are in
+        the vector index. The index is not touched here: the caller (holding
+        lock.write()) removes `replaced` with _unindex once this has committed, so a
+        failed upsert is a pure database rollback."""
         # fp16 originals retained on disk (half the f32 size, negligible loss vs the
         # 4-bit codes): the only way to rebuild the index representation later, since
         # turbovec can't enumerate or reconstruct vectors
         vecs16 = mat.astype(np.float16)
-        ids, fresh = [], []
+        # row CPU before db_lock: the lock serializes every write on self.db
+        blobs = [v.tobytes() for v in vecs16]
+        metas = [json.dumps(r[5] or {}) for r in rows]
         with self.db_lock:
-            counts = dict(self.indexed_counts)  # copy-on-write, published below
-            # explicit ids, not lastrowid: records are only inserted here, in the single worker
-            next_id = self.db.execute("SELECT COALESCE(MAX(id),0) FROM records").fetchone()[0] + 1
-            for n, (ext_id, doc_id, rtype, pos, text, meta, _) in enumerate(rows):
-                old = self.db.execute(
-                    "SELECT id, indexed, type FROM records WHERE external_id=?", (ext_id,)
-                ).fetchone()
-                fresh.append(old is None)
-                if old:  # upsert: replace record; makes crash-replay of a job idempotent
-                    if old[1]:
-                        self.index.remove(old[0])
-                        counts[old[2]] -= 1
-                    self.db.execute("DELETE FROM records WHERE id=?", (old[0],))
-                    self.db.execute("DELETE FROM vecs WHERE id=?", (old[0],))
-                self.db.execute(
+            try:
+                # one IN query per 512 rows instead of a point query per row
+                old = {
+                    ext_id: (rid, indexed, rtype)
+                    for ext_id, rid, indexed, rtype in _rows_by_id(
+                        self.db,
+                        "SELECT external_id, id, indexed, type FROM records WHERE external_id IN ({})",
+                        [r[0] for r in rows],
+                    )
+                }
+                # explicit ids, not lastrowid: records are only inserted here, in the single worker
+                first = self.db.execute("SELECT COALESCE(MAX(id),0) FROM records").fetchone()[0] + 1
+                ids = list(range(first, first + len(rows)))
+                # upsert = DELETE then INSERT in one transaction: external_id stays UNIQUE,
+                # and replaying a job after a crash is idempotent
+                gone = [(rid,) for rid, _, _ in old.values()]
+                self.db.executemany("DELETE FROM records WHERE id=?", gone)
+                self.db.executemany("DELETE FROM vecs WHERE id=?", gone)
+                self.db.executemany(
                     "INSERT INTO records(id, external_id, doc_id, type, position, text, metadata, indexed)"
                     " VALUES (?,?,?,?,?,?,?,1)",
-                    (next_id, ext_id, doc_id, rtype, pos, text, json.dumps(meta or {}), ),
+                    [(i, *r[:5], m) for i, r, m in zip(ids, rows, metas)],
                 )
-                self.db.execute(
-                    "INSERT INTO vecs(id, vec) VALUES (?,?)", (next_id, vecs16[n].tobytes())
+                # OR REPLACE: a vecs row already at a new id (past MAX(records.id)) is an
+                # orphan with no record; a plain INSERT would fail this job and, as the
+                # rollback leaves MAX(id) where it was, every later one
+                self.db.executemany(
+                    "INSERT OR REPLACE INTO vecs(id, vec) VALUES (?,?)", list(zip(ids, blobs))
                 )
-                counts[rtype] = counts.get(rtype, 0) + 1
-                ids.append(next_id)
-                next_id += 1
+                self.db.commit()
+            except BaseException:
+                # the transaction is still open after a failed statement: without this,
+                # the next commit on self.db (the worker's own _finish_job('error'))
+                # would persist the half-applied upsert
+                self.db.rollback()
+                raise
+            # published after the commit, still under db_lock: copy-on-write, one rebind
+            # per job, none when the transaction rolled back
+            counts = dict(self.indexed_counts)
+            for _, indexed, rtype in old.values():
+                if indexed:
+                    counts[rtype] -= 1
+            for r in rows:
+                counts[r[2]] = counts.get(r[2], 0) + 1
             self.indexed_counts = counts  # one reference store: readers see old or new
-            self.db.commit()
         self._allow_cache.clear()
         self._df_cache_churn += len(rows)
-        return ids, fresh
+        fresh = [r[0] not in old for r in rows]
+        replaced = [rid for rid, indexed, _ in old.values() if indexed]
+        return ids, fresh, replaced
+
+    def _unindex(self, rids: list[int]) -> None:
+        """Remove records whose rows a committed transaction replaced or deleted from
+        the vector index (the .tvim drops them at the next _sync_index). The caller
+        holds lock.write(), so no search runs meanwhile; db_lock is not needed."""
+        for rid in rids:
+            self.index.remove(rid)
 
     # ---- optional IVF index (attach / detach) ----
 
@@ -1211,6 +1453,7 @@ class Collection:
 
         ivf, seen, missing, build_s, live_s = await asyncio.to_thread(build)
         t3 = time.monotonic()
+        wrote = 0
         if len(missing):
             parts = [seen]
 
@@ -1218,7 +1461,7 @@ class Collection:
                 ivf.add_with_ids(mat, ids)
                 parts.append(ids)
 
-            await self._backfill_vecs(missing, add)
+            wrote = await self._backfill_vecs(missing, add)
             seen = np.concatenate(parts)  # the swap diff covers them too
         t4 = time.monotonic()
         tmp = self.dir / "ivf.tmp"
@@ -1250,7 +1493,7 @@ class Collection:
             "attach_index %s: n=%d nlist=%d prework=%.2fs sample=%.2fs legacy_backfill=%d"
             " build=%.2fs live_scan=%.2fs backfill=%d rows %.2fs swap=%.2fs total=%.2fs",
             self.cfg.name, n, nlist, t1 - t0, t2 - t1, legacy, build_s, live_s,
-            len(missing), t4 - t3, t5 - t4, t5 - t0,
+            wrote, t4 - t3, t5 - t4, t5 - t0,
         )
 
     async def _detach_index(self) -> None:
@@ -1754,20 +1997,28 @@ class Collection:
 
     def _delete_doc_rows(self, doc_id: str) -> int:
         with self.db_lock:
-            rows = self.db.execute(
-                "SELECT id, indexed, type FROM records WHERE doc_id=?", (doc_id,)
-            ).fetchall()
-            counts = dict(self.indexed_counts)  # copy-on-write, as in _upsert_rows
-            for rid, indexed, rtype in rows:
+            try:
+                rows = self.db.execute(
+                    "SELECT id, indexed, type FROM records WHERE doc_id=?", (doc_id,)
+                ).fetchall()
+                self.db.execute(
+                    "DELETE FROM vecs WHERE id IN (SELECT id FROM records WHERE doc_id=?)", (doc_id,)
+                )
+                self.db.execute("DELETE FROM records WHERE doc_id=?", (doc_id,))
+                self.db.commit()
+            except BaseException:
+                self.db.rollback()  # as in _upsert_rows: the next commit must not persist half a delete
+                raise
+            # published after the commit, still under db_lock: copy-on-write, one rebind
+            counts = dict(self.indexed_counts)
+            for _, indexed, rtype in rows:
                 if indexed:
-                    self.index.remove(rid)
                     counts[rtype] -= 1
-            self.db.execute(
-                "DELETE FROM vecs WHERE id IN (SELECT id FROM records WHERE doc_id=?)", (doc_id,)
-            )
-            self.db.execute("DELETE FROM records WHERE doc_id=?", (doc_id,))
             self.indexed_counts = counts
-            self.db.commit()
+            # the rows are gone for good, so only now do their ids leave the index; still
+            # under db_lock, as the next upsert reads MAX(id) there and would reuse them,
+            # even when a cancelled caller has already released lock.write()
+            self._unindex([rid for rid, indexed, _ in rows if indexed])
         self._allow_cache.clear()
         self._df_cache_churn += len(rows)
         return len(rows)

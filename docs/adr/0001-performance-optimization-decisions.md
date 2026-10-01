@@ -131,3 +131,270 @@ Checks (spec §7 C):
 - PASS: C8 — host-warm list page (`chunks`, sort `-year`, 20 rows), median: ivf 0.92 s over 3 pages; flat 0.94 s over 3 pages (≤ 1.0 s)
 - PASS: C9 — true-cold `POST /index` pre-work 1.63 s (≤ 10 s): guard 0.00 s + live-id diff 1.63 s + backfill of 0 rows 0.00 s
 - PASS: labels — 31 rows, SQLite 3.53.1, OPENBLAS_NUM_THREADS=1; every measurement row states its regime and memory cap
+
+## Addendum 2026-09 — ingest path
+
+Date: 2026-09-30 · Plan D, phase D1, of the 2026-09-28 performance program (`docs/superpowers/specs/2026-09-28-raggio-performance-design.md`). Direction-tested by the item2a prototype (`docs/superpowers/research/2026-09-28-item2a-ingest-path.md`) on a Windows x86-64 laptop: 250 × 1024 jobs, a 12k-row prefill, 2 enqueuers, every 5th job a re-upsert. Laptop numbers carry about ±30 % noise. The shipped code's gn100 A/B is under "Results — DGX A/B (D1)" below. Every accepted code change is pinned by `tests/test_ingest_path.py`.
+
+| Decision | Verdict | Evidence / rationale |
+|---|---|---|
+| Binary job journal in a side table `job_payloads(job_id INTEGER PRIMARY KEY, data BLOB)`, with `jobs.payload` NULL. Format: a `<4sIII` header (magic `RGJ\x01`, JSON length, vector count, dim), UTF-8 JSON in which each supplied vector is replaced by its row index, then little-endian float32 rows | **Accepted** | The claim `UPDATE` rewrote the 2.7 MB payload overflow chain, because `'pending'` and `'processing'` differ in length: 40–66 ms per job. With the side table: 3–10 ms. Enqueue SQL 71–94 → 41 ms. Bit-exact: the worker already stored float32 |
+| The binary payload inline in `jobs.payload` | **Rejected** | No schema change, but it keeps the 40–66 ms claim rewrite |
+| Legacy TEXT-JSON rows still replay, in id order, next to binary rows. A row with neither payload becomes an `error` job (`bad job payload: ...`) and never kills the worker | **Accepted (compatibility)** | A volume upgraded with open jobs holds both kinds. `error` jobs keep their payload row (`docs/storage.md`) |
+| Downgrade: drain the ingest queue (`pending_jobs == 0` on every collection) before starting an image from before the binary job journal | **Accepted (documented, not enforced)** | An older image reads `jobs.payload` only, so it would mark new-format open jobs `error`. A drained queue leaves no open job for the older image to claim. Failed jobs keep their payload rows, which it ignores |
+| Encode, decode, flattening and matrix building off the event loop, in the threads that already do the SQLite work. The encode runs before `db_lock` is taken, and the decode after it is released | **Accepted** | Base: `json.loads` of a 2.7 MB payload (41–68 ms per job) ran on the loop, and `json.dumps` (74–124 ms) was evaluated on the loop before `to_thread`. Loop stalls over 20 ms per 40-job run: 10.5–11.4 s → 0.4–0.5 s. Binary decode: 0.7–1 ms |
+| Set-based, failure-safe upsert: one transaction, an `IN` lookup per 512 ids, `executemany` DELETE then INSERT, rollback on any exception. The index removal (`_unindex`) and the one copy-on-write `indexed_counts` rebind (still under `db_lock`) run after the commit. Deletes follow the same order | **Accepted (bug fix)** | Base removed index ids and changed counts before the commit, with no rollback. A failure midway (SQLITE_FULL, I/O) left the implicit transaction open, and the worker's `_finish_job('error')` committed the half-applied upsert under a terminal job that never replays. Throughput: +0–12 % |
+| The upsert writes `vecs` with `INSERT OR REPLACE` | **Accepted (bug fix)** | A `vecs` row at a new id, past `MAX(records.id)`, is an orphan that no record owns. A plain `INSERT` fails that job, and since the rollback leaves `MAX(id)` where it was, every later job of the collection fails too. Replacing the orphan heals it and cannot overwrite a live vector |
+| `POST /index`'s log line counts the vectors the backfill wrote (`backfill=`), not the records it tried | **Accepted (log fix)** | A record deleted during the backfill's embed was counted but not written. D1 changes no other index-job logic |
+| Several jobs in one SQLite transaction | **Rejected** | Holds `db_lock` longer to save about one fsync per job |
+| A failure after the commit (`add_with_ids`, calibration) | **Unchanged (known gap)** | It still leaves an `error` job whose committed rows are missing from the index. `_reconcile_ghosts` only evicts; it never re-adds |
+| Vacuum policy: a full `incremental_vacuum` only when no job is open. While jobs are open, a finish that sees `VACUUM_FREELIST_PAGES` (16,384 pages, 64 MB at 4 KiB) or more trims the freelist back to `VACUUM_FREELIST_PAGES − VACUUM_CHUNK_PAGES` (`VACUUM_CHUNK_PAGES` = 2,048, so 14,336 pages). Both pragmas are drained with `.fetchall()` | **Accepted** | Per-job vacuum with the side table cost 38–54 ms; idle-only, 7–20 ms. A fixed-size chunk would let the freelist grow whenever a job frees more than one chunk |
+| `bench/ingest_probe.py`, an in-process drain benchmark (flat and IVF) that also runs in the base tree | **Accepted (tooling)** | `bench.py` never ingests into an IVF collection: `--engine raggio-ivf --reingest` only rebuilds the index. Probe rows are labelled host-warm, uncapped host process |
+| Batched index syncs (the lever in the standing constraints above) | **Deferred to D2** | D1 keeps one sync per job. Prototype, laptop: base 468–483 → + binary journal 810–849 → + set-based upsert 815–955 → + vacuum policy 995–1046 vec/s (flat); IVF nlist 64: 254 → 408 vec/s. Every variant's final state was identical to base |
+
+### Results — DGX A/B (D1)
+
+#### Measurements (D1)
+
+Run 2026-09-30 on gn100 (NVIDIA DGX Spark, GB10 Grace, 20 aarch64 cores), base `cd3cbf2266ab` (main before D1) against cand `2274a6a0d60d` (D1). Probe rows: `bench/ingest_probe.py --seed 42 --prefill 100000 --jobs 200 --job-rows 250` with `--ivf 0` and `--ivf 256`, each arm running its own tree, one discarded base run0 and then 3 interleaved rounds per mode. Bench row: `bench.py --limit 2549619 --engine raggio --reingest` (2,549,119 x 1024) in the order base, cand, base, cand, each in a fresh 4 GiB container. Values are ingest vec/s. Band = max(base max - min, cand max - min, 1 vec/s); a claim needs gain > band.
+
+| Row | Regime | Cap | sqlite_version | OPENBLAS_NUM_THREADS | base median | cand median | gain | band | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| probe flat | host-warm, uncapped host process | none (uncapped host process) | 3.53.1 | 1 | 2342.4 | 4982.0 | 2639.6 | 417.3 | better |
+| probe ivf256 | host-warm, uncapped host process | none (uncapped host process) | 3.53.1 | 1 | 533.5 | 612.0 | 78.5 | 98.7 | within band |
+| bench reingest | host-warm | 4g | base 3.53.1, cand 3.53.1 | 1 | 1530.9 | 3035.4 | 1504.5 | 17.4 | better |
+
+- PASS: D1-run
+- PASS: D1-flat
+- FAIL: D1-ivf256
+- PASS: D1-fingerprints
+- PASS: D1-jobs
+- PASS: D1-bench
+- PASS: D1-labels
+- OVERRIDE: D1-ivf256, by the maintainer on 2026-10-01. The gate fails as written: the gain (78.5 vec/s) is within the band (98.7). Every cand run beat every base run (611.7, 612.0, 710.4 against 505.0, 533.5, 535.2), and the fast third cand run alone sets the band. D1 ships on that evidence; the gate is not loosened, and the session was not rerun.
+
+```json
+{
+  "date": "2026-09-30",
+  "base_sha": "cd3cbf2266ab",
+  "cand_sha": "2274a6a0d60d",
+  "probe": {
+    "flat": {
+      "base": [
+        2274.9,
+        2355.4,
+        2342.4
+      ],
+      "cand": [
+        5020.8,
+        4982.0,
+        4603.5
+      ],
+      "base_median": 2342.4,
+      "cand_median": 4982.0,
+      "gain": 2639.6,
+      "band": 417.3,
+      "verdict": "better",
+      "drain_s": {
+        "base": [
+          21.98,
+          21.23,
+          21.35
+        ],
+        "cand": [
+          9.96,
+          10.04,
+          10.86
+        ]
+      },
+      "loop_stall_s": {
+        "base": [
+          6.38,
+          5.475,
+          5.498
+        ],
+        "cand": [
+          0,
+          0,
+          0
+        ]
+      },
+      "payload_rows": {
+        "base": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "cand": [
+          0,
+          0,
+          0
+        ]
+      },
+      "complete": true,
+      "fingerprints_equal": true,
+      "jobs_all_done": true
+    },
+    "ivf256": {
+      "base": [
+        505.0,
+        533.5,
+        535.2
+      ],
+      "cand": [
+        611.7,
+        612.0,
+        710.4
+      ],
+      "base_median": 533.5,
+      "cand_median": 612.0,
+      "gain": 78.5,
+      "band": 98.7,
+      "verdict": "within band",
+      "drain_s": {
+        "base": [
+          99.01,
+          93.73,
+          93.42
+        ],
+        "cand": [
+          81.74,
+          81.7,
+          70.39
+        ]
+      },
+      "loop_stall_s": {
+        "base": [
+          8.326,
+          8.187,
+          7.828
+        ],
+        "cand": [
+          0,
+          0.19,
+          0
+        ]
+      },
+      "payload_rows": {
+        "base": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "cand": [
+          0,
+          0,
+          0
+        ]
+      },
+      "complete": true,
+      "fingerprints_equal": true,
+      "jobs_all_done": true
+    }
+  },
+  "bench": {
+    "base": [
+      1531.1,
+      1530.7
+    ],
+    "cand": [
+      3026.7,
+      3044.1
+    ],
+    "base_median": 1530.9,
+    "cand_median": 3035.4,
+    "gain": 1504.5,
+    "band": 17.4,
+    "verdict": "better",
+    "runs": {
+      "base-run1": {
+        "ingest_s": 1664.9,
+        "jobs": {
+          "done": 10197
+        },
+        "payload_rows": null,
+        "freelist": 0
+      },
+      "base-run2": {
+        "ingest_s": 1665.3,
+        "jobs": {
+          "done": 10197
+        },
+        "payload_rows": null,
+        "freelist": 0
+      },
+      "cand-run1": {
+        "ingest_s": 842.2,
+        "jobs": {
+          "done": 10197
+        },
+        "payload_rows": 0,
+        "freelist": 0
+      },
+      "cand-run2": {
+        "ingest_s": 837.4,
+        "jobs": {
+          "done": 10197
+        },
+        "payload_rows": 0,
+        "freelist": 0
+      }
+    }
+  },
+  "labels": {
+    "probe": {
+      "regime": [
+        "host-warm, uncapped host process"
+      ],
+      "sqlite_version": [
+        "3.53.1"
+      ],
+      "openblas_num_threads": [
+        "1"
+      ],
+      "turbovec": [
+        "1.0.0"
+      ],
+      "python": [
+        "3.12.14"
+      ],
+      "cap": [
+        "none (uncapped host process)"
+      ]
+    },
+    "bench": {
+      "regime": [
+        "host-warm"
+      ],
+      "cap": [
+        "4g"
+      ],
+      "openblas_num_threads": [
+        "1"
+      ],
+      "sqlite_version": {
+        "base": [
+          "3.53.1"
+        ],
+        "cand": [
+          "3.53.1"
+        ]
+      }
+    }
+  },
+  "gates": {
+    "D1-run": "PASS",
+    "D1-flat": "PASS",
+    "D1-ivf256": "FAIL",
+    "D1-fingerprints": "PASS",
+    "D1-jobs": "PASS",
+    "D1-bench": "PASS",
+    "D1-labels": "PASS"
+  },
+  "overrides": {
+    "D1-ivf256": "by the maintainer on 2026-10-01. The gate fails as written: the gain (78.5 vec/s) is within the band (98.7). Every cand run beat every base run (611.7, 612.0, 710.4 against 505.0, 533.5, 535.2), and the fast third cand run alone sets the band. D1 ships on that evidence; the gate is not loosened, and the session was not rerun."
+  }
+}
+```

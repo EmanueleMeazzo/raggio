@@ -25,15 +25,26 @@ records which one is current).
 ## Ingest durability
 
 1. `POST /documents` journals the job to `meta.db` **before** the `202`
-   response is sent.
+   response is sent: a row in `jobs` (status and timestamps) and, in the
+   same transaction, the payload as one binary row in `job_payloads` (the
+   request's JSON fields, with the vectors stored as little-endian float32).
 2. A per-collection worker embeds missing vectors, writes records, and
    updates both indexes.
 3. The job is marked `done` only after the vector index is synced to disk.
-   Successful payloads are cleared so vector-heavy jobs don't accumulate;
-   failed jobs keep their payload for diagnosis.
+   A successful job's payload row is deleted so vector-heavy jobs don't
+   accumulate; a failed job keeps it for diagnosis. A payload that cannot
+   be read fails its job with a `bad job payload: ...` error. Freed pages
+   go back to the OS once the queue is empty; while a backlog drains,
+   `meta.db` keeps at most 16,384 free pages (64 MB at SQLite's default
+   4 KiB page size) and trims the excess as each job finishes.
 
 After a crash, any `pending` or `processing` job is replayed on boot.
-Replays are idempotent: records are upserted by id.
+Replays are idempotent: records are upserted by id. Jobs journaled by a
+release from before the binary job journal, whose JSON payload sits in
+`jobs.payload`, still replay after an upgrade. The reverse does not hold: an
+older release cannot read `job_payloads`, so drain the ingest queue
+(`pending_jobs` is 0 in `GET /collections/{name}` for every collection)
+before downgrading.
 
 ## Backup
 
@@ -60,8 +71,9 @@ drops the old `idx_records_doc`, and adds a small partial index over open jobs.
   already loaded keep answering. A collection with unfinished jobs is loaded, and
   migrated, at start-up, before the server begins answering.
 - **Disk:** `meta.db` grows by the new index (+92 MB at 2.55M records). About
-  82 MB of free pages from the dropped index stay in the file until the next
-  finished job returns them (`PRAGMA incremental_vacuum`); a `meta.db` created
+  82 MB of free pages from the dropped index stay in the file until a finished
+  job leaves the queue empty (`PRAGMA incremental_vacuum`; while a backlog
+  drains, each finished job trims them to at most 64 MB); a `meta.db` created
   before incremental auto-vacuum keeps them until a `VACUUM`. The WAL peaks
   around 105 MB during the build.
 - **Logs:** the start (`one-time migration`), a heartbeat every 10 s
