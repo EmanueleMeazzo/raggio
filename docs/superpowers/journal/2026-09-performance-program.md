@@ -1511,6 +1511,19 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
 - **Python parity** (X15). Images built from `cdfbcbc` run CPython 3.12.15, and gn100's host uv (0.12.5, left as it is) knows 3.12.14 at most. The probes run in the host venv in both arms (3.12.14, SQLite 3.53.1), and the reingests in the images (3.12.15, SQLite 3.53.1). Both arms share both versions, and both are labelled. Without `UV_PYTHON_PREFERENCE=only-managed UV_PYTHON=3.12`, the host sync picks the system's 3.13.3 with SQLite 3.47.1.
 - **Rulings, 04:25Z (W-14):** D2-R1 to D2-R23 in the ledger. Task 10's run-window question is answered by W-2 and W-14: one window, the tuning, then the publish with the reingests, under caps of 150 and 270 minutes. The override policy for a within-band IVF gate is set before the run (X14).
 
+**04:26Z–04:58Z. Plan D2's Tasks 7 and 8 pass review the first time, and so do the gn100 scripts.**
+- **The briefs** (04:26–04:33Z). A script builds each task's brief from three things: the plan's text for the task, byte for byte; the rulings that apply to it, quoted verbatim; and the exact counts on `cdfbcbc`, with the mutation checks the pre-flight asked for. The same script writes Task 9b's brief from D2-R14 and, later, a brief for Task 10's documentation step on its own. A second script lists every added line that does not appear verbatim in the brief, so the review sees each deviation.
+- **Task 7, `a2a9cfc`**: the plumbing (the two knobs, the claim cursor, the sync flag, the removal cap). 443 passed. Of 268 added lines, 8 are not verbatim, each one a ruled comment. The `>=` mutant now fails the new exact-cap pin. The Sonnet review approved it with two minor points, both accepted without change.
+- **Task 8, `4786777`**: the batched sync, with each job finished only after its sync. 455 passed, with one non-verbatim line, a ruled comment. The review approved it with three minor points, all accepted:
+  - the finish loop's pop before its await has no test, but Task 9 replaces that loop;
+  - a cancel mid-finish can leave the batch timer unset with jobs queued, which nothing reaches, because a stopped worker never restarts;
+  - the zero-delay test depends on the clock tick.
+- **The gn100 scripts** (prepared 04:33–04:39Z, reviewed by 04:55Z). A Sonnet agent applied the plan's Step 3 edits and the pre-flight's 17 script fixes to copies of D1's driver and summary, outside the repo.
+  - It restricted the override to the one case set before the run (X14): a `D2-ivf256` FAIL with complete runs and a within-band verdict. Any other override stops the summary. Ruling D2-R24 keeps that restriction.
+  - The review found nothing critical or important. Of 16 mutants run against the checker, 13 were caught. The three that survived (a tuning round dropped, a pair dropped, the shell's knob check removed) are now pinned, and all three fail the check.
+  - Two more fixes. The flat-index check after a reingest no longer pipes curl into `grep -q`, which under `pipefail` can fail a good run when grep exits before curl has finished writing. And an override now needs a non-empty reason.
+- **The host venv's versions are checked by hand.** The driver records the host's Python and SQLite but never asserts 3.12.14 and 3.53.1, so a venv that is wrong in both windows would pass every gate. The controller runs the version check after every sync on gn100 and stops unless it prints `3.12.14 3.53.1`.
+
 ## 3. Decision register
 
 ID prefixes:
@@ -2634,6 +2647,7 @@ State as of 2026-09-28, about 19:30Z.
 - Dated note, 2026-10-02 03:19Z: plan F is merged into `main` (`ce1a7e2`) and pushed; CI is green (section 2, 03:13–03:15Z). The merge order's next plan is D2 (its pre-flight first), then G.
 - Dated note, 2026-10-02 03:26Z: `main` is at `cdfbcbc` after three version bumps (uv 0.12.22, numpy 2.5.3, Rust 1.99.0; section 2, 03:20–03:25Z). The next image installs CPython 3.12.15. D2's base arm should be `cdfbcbc` or later, so that both arms run the same Python.
 - Dated note, 2026-10-02 04:25Z: plan D2's pre-flight is done and ruled (section 2, 03:27Z; D2-R1 to D2-R23 in the ledger). D2 runs in `.worktrees/ingest-path-d2` from `main` at `cdfbcbc` (432 passed). Task 9b, issue #3, is added (X13). Task 7 is next, on Sonnet; the gn100 scripts are prepared in parallel.
+- Dated note, 2026-10-02 04:58Z: D2's Tasks 7 and 8 are approved (`4786777`, 455 passed), and the gn100 scripts are reviewed and ready (section 2, 04:26Z). Task 9 is running; then Task 9b, Task 10's documentation step, and the tuning and A/B on gn100.
 
 ### 9.2 Open questions in the plans
 
