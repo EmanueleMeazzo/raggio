@@ -208,7 +208,7 @@ def test_no_threading_lock_is_held_across_an_await():
             continue
         locks = [i.context_expr.attr for i in node.items
                  if isinstance(i.context_expr, ast.Attribute)
-                 and i.context_expr.attr in ("_catalog_lock", "db_lock")]
+                 and i.context_expr.attr in ("_catalog_lock", "db_lock", "_allow_lock", "_id_lock")]
         if locks:
             sites.update(locks)
             awaits += [(locks[0], n.lineno) for stmt in node.body for n in ast.walk(stmt)

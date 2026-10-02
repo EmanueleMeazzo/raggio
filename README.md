@@ -72,6 +72,7 @@ podman run -p 8000:8000 -v raggio-data:/data \
 | `MAX_RESIDENT_COLLECTIONS` | `4` | LRU cap on in-memory collections |
 | `COLLECTION_IDLE_TTL` | `900` | seconds before an idle collection is offloaded to disk |
 | `NATIVE_BM25` | `auto` | stage-2 BM25 scorer: `auto` runs the native extension when installed (the image builds it), `0` the pure-Python one; same results |
+| `IVF_SEARCH_THREADS` | `min(12, CPUs)` | threads per indexed collection scanning IVF shards in parallel; `1` = serial |
 
 ## API
 

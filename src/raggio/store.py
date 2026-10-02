@@ -15,6 +15,7 @@ import threading
 import time
 import unicodedata
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -23,7 +24,7 @@ from pathlib import Path
 import numpy as np
 from turbovec import IdMapIndex
 
-from .config import Settings
+from .config import Settings, default_ivf_search_threads
 from .embeddings import Embedder
 
 
@@ -105,9 +106,10 @@ VACUUM_CHUNK_PAGES = 2_048
 
 # Optional ScaNN-style IVF index, attached/removed per collection via the index API.
 # Measured (bench/ivf_probe.py, ADR 0002): at ~550k rows every recall-preserving cell
-# is slower or barely faster than the flat scan (~0.4ms fixed cost per probed shard),
-# so it stays opt-in; at 2.2M rows it wins 3.5-6.8x. nprobe=16 keeps recall@10 >=0.95
-# on the real corpus. Fixed RAM cost is ~0.5-1 MB per shard (bench/shard_mem_probe.py).
+# is slower or barely faster than the flat scan (each probed shard is a single-core scan
+# of its bytes, ADR 0005), so it stays opt-in; at 2.2M rows it wins 3.5-6.8x.
+# nprobe=16 keeps recall@10 >=0.95 on the real corpus. Fixed RAM cost is ~0.5-1 MB per
+# shard (bench/shard_mem_probe.py).
 IVF_DEFAULT_NPROBE = 16
 IVF_MIN_ROWS = 1024  # k-means needs a training corpus; below this, attach is refused
 IVF_TRAIN_SAMPLE = 65_536
@@ -676,9 +678,69 @@ def _ensure_fts(db: sqlite3.Connection, tokenizer: str) -> None:
 
 
 def _ivf_auto_nlist(n: int) -> int:
-    # ~8k rows per shard, power of two: smaller shards pay more in per-shard fixed
-    # search cost (~0.4ms each) than they save in rows scanned
+    # ~8k rows per shard, power of two (ADR 0002's measured sweet spot); below 32,768
+    # rows turbovec scans a one-query search inline on the calling thread (ADR 0005)
     return int(np.clip(2 ** round(np.log2(max(n, 1) / 8192)), 16, 1024))
+
+
+def _sorted_ids(ids) -> np.ndarray:
+    """uint64, strictly increasing: the form _IvfIndex._intersect binary-searches.
+    Cached filter allowlists arrive sorted (an O(n) check, no copy); unsorted or
+    duplicated input (_expand's sibling lists) pays one np.unique."""
+    a = np.asarray(ids, dtype=np.uint64)
+    if len(a) > 1 and not bool((a[1:] > a[:-1]).all()):
+        a = np.unique(a)
+    return a
+
+
+class _ShardPool:
+    """Order-preserving map for _IvfIndex's per-(query, shard) searches, on threads
+    owned by one Collection and shut down by its stop() (ADR 0005). Never the asyncio
+    default executor: callers already run inside it (to_thread), so waiting on it
+    from there can deadlock. turbovec releases the GIL for a whole search (py.detach)
+    and runs nq=1 on shards under 32,768 rows inline on the calling thread, so these
+    threads scan in parallel.
+
+    The 32,768-row cliff (1,024 blocks, turbovec 1.0.0): from that size up, an nq=1
+    search takes turbovec's pooled path instead, where every thread of this pool shares
+    one rayon pool and the fan-out ceiling falls to about 2.45x (p3). The DGX corpus's
+    largest list (nlist 256, 2.55M rows) is 30,443 rows, 93 % of the cliff, and the DGX
+    run reports it (spec §7 F item 7). Never set RAYON_NUM_THREADS=1: it flattens the
+    pooled path to about 1,440 calls/s from T=2 (spec §4.2)."""
+
+    def __init__(self, threads: int, name: str = "") -> None:
+        self.threads = max(1, int(threads))
+        self._prefix = f"raggio-ivf-{name}" if name else "raggio-ivf"
+        self._ex: ThreadPoolExecutor | None = None  # built on the first fanned-out call
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def map(self, fn, tasks: list) -> list:
+        # 1 thread, 1 task, or closed: the plain loop on the calling thread (a pool of 1
+        # measured 0.89x of serial). IVF_SEARCH_THREADS=1 is the pre-0005 path bit-for-bit
+        # for distinct allowlists, which every caller passes (duplicate ids count once
+        # toward the 128-id tiny cut).
+        if self.threads <= 1 or len(tasks) <= 1 or self._closed:
+            return [fn(t) for t in tasks]
+        with self._lock:
+            if not self._closed and self._ex is None:
+                self._ex = ThreadPoolExecutor(self.threads, thread_name_prefix=self._prefix)
+            ex = self._ex
+        if ex is None:  # closed while we waited for the lock
+            return [fn(t) for t in tasks]
+        try:
+            futs = [ex.submit(fn, t) for t in tasks]
+        except RuntimeError:  # shut down between the check and submit (an orphaned search)
+            return [fn(t) for t in tasks]
+        return [f.result() for f in futs]
+
+    def close(self) -> None:
+        """Idempotent. Waits for running shard searches; later map() calls run serially."""
+        with self._lock:
+            self._closed = True
+            ex, self._ex = self._ex, None
+        if ex is not None:
+            ex.shutdown(wait=True)
 
 
 class _IvfIndex:
@@ -687,14 +749,24 @@ class _IvfIndex:
     recall (tunable per query) for skipping most of the corpus. Duck-types the slice
     of IdMapIndex that Collection uses, so the resident index is either kind."""
 
-    def __init__(self, centroids: np.ndarray, shards: list, nprobe: int) -> None:
+    def __init__(
+        self, centroids: np.ndarray, shards: list, nprobe: int, pool: _ShardPool | None = None
+    ) -> None:
         self.centroids = centroids  # (nlist, dim) f32, unit norm, static after train
         self.shards = shards
         self.nprobe = nprobe
+        self._pool = pool or _ShardPool(1)  # the owning Collection's; default: serial
         # per-shard id arrays for allowlist intersection (turbovec rejects allowlist
         # ids an index doesn't hold): built lazily via a full-k probe, dropped for any
         # shard a write touches. ~8 bytes/row when filtered queries occur, else nothing.
         self._id_cache: list = [None] * len(shards)
+        # per-shard write generation: an id probe that started before a write to its
+        # shard may not cache its (older) snapshot. Read lock-free, bumped under the lock.
+        self._id_gen = [0] * len(shards)
+        self._id_lock = threading.Lock()
+        # shards whose file lags memory: sync() writes only these (plus any shard file
+        # the target dir lacks). train() marks every shard, load() none.
+        self._dirty: set[int] = set()
 
     @property
     def nlist(self) -> int:
@@ -707,7 +779,10 @@ class _IvfIndex:
         )
 
     @classmethod
-    def train(cls, sample: np.ndarray, nlist: int, dim: int, bit_width: int, nprobe: int):
+    def train(
+        cls, sample: np.ndarray, nlist: int, dim: int, bit_width: int, nprobe: int,
+        pool: _ShardPool | None = None,
+    ):
         """k-means (8 Lloyd iterations, as measured in bench/ivf_probe.py) on a
         normalized sample. Every shard is calibrated from the sample BEFORE any row
         is added — the calibrate-early-or-never policy (see CAL_THRESHOLD) holds for
@@ -728,10 +803,15 @@ class _IvfIndex:
             sh = IdMapIndex(dim=dim, bit_width=bit_width)
             sh.calibrate(cal)
             shards.append(sh)
-        return cls(np.ascontiguousarray(C), shards, nprobe)
+        ivf = cls(np.ascontiguousarray(C), shards, nprobe, pool)
+        ivf._dirty.update(range(nlist))  # nothing on disk yet
+        return ivf
 
     @classmethod
-    def load(cls, directory: Path, dim: int, bit_width: int, nprobe: int):
+    def load(
+        cls, directory: Path, dim: int, bit_width: int, nprobe: int,
+        pool: _ShardPool | None = None,
+    ):
         C = np.load(directory / "centroids.npy")
         shards = []
         for j in range(len(C)):
@@ -739,16 +819,37 @@ class _IvfIndex:
             shards.append(
                 IdMapIndex.load(str(p)) if p.exists() else IdMapIndex(dim=dim, bit_width=bit_width)
             )
-        return cls(C, shards, nprobe)
+        return cls(C, shards, nprobe, pool)
 
-    def sync(self, directory) -> None:
+    @property
+    def dirty_shards(self) -> frozenset[int]:
+        """Shards with writes not yet synced to disk (empty: sync() is a no-op)."""
+        with self._id_lock:
+            return frozenset(self._dirty)
+
+    def sync(self, directory) -> int:
+        """Persist to `directory`: centroids once, then every dirty shard and every
+        shard whose file the directory lacks (a fresh attach tmp dir gets them all).
+        A shard's flag clears only after its own sync lands and no write raced it, so
+        a failure part-way leaves the rest dirty for the next call. Returns the number
+        of shard files written."""
         d = Path(directory)
         d.mkdir(exist_ok=True)
         cpath = d / "centroids.npy"
         if not cpath.exists():  # static after train; shard syncs are incremental
             np.save(cpath, self.centroids)
+        written = 0
         for j, sh in enumerate(self.shards):
-            sh.sync(str(d / f"shard-{j:04d}.tvim"))
+            path = d / f"shard-{j:04d}.tvim"
+            if j not in self._dirty and path.exists():
+                continue
+            gen = self._id_gen[j]
+            sh.sync(str(path))
+            written += 1
+            with self._id_lock:
+                if gen == self._id_gen[j]:
+                    self._dirty.discard(j)
+        return written
 
     # ---- the IdMapIndex surface Collection uses ----
 
@@ -767,24 +868,32 @@ class _IvfIndex:
     def calibration_state(self) -> str:
         return self.shards[0].calibration_state if self.shards else "uncalibrated"
 
+    def _shard_written(self, j: int) -> None:
+        """Every write to shard j calls this AFTER modifying the shard."""
+        with self._id_lock:
+            self._id_gen[j] += 1
+            self._id_cache[j] = None
+            self._dirty.add(j)
+
     def add_with_ids(self, mat: np.ndarray, ids: np.ndarray) -> None:
         asg = self._assign(mat, self.centroids)
         for j in np.unique(asg):
             m = asg == j
             self.shards[j].add_with_ids(np.ascontiguousarray(mat[m]), ids[m])
-            self._id_cache[j] = None
+            self._shard_written(int(j))
 
     def remove(self, rid: int) -> None:
         # ponytail: O(nlist) contains scan (~us each) beats maintaining an id->shard map
         for j, sh in enumerate(self.shards):
             if sh.contains(rid):
                 sh.remove(rid)
-                self._id_cache[j] = None
+                self._shard_written(j)
                 return
 
     def _shard_ids(self, j: int) -> np.ndarray:
         ids = self._id_cache[j]
         if ids is None:
+            gen = self._id_gen[j]  # read BEFORE the probe snapshots the shard
             sh = self.shards[j]
             if len(sh):
                 probe = np.zeros((1, self.centroids.shape[1]), dtype=np.float32)
@@ -793,51 +902,81 @@ class _IvfIndex:
                 # use searchsorted instead of a per-call re-sort
             else:
                 ids = np.empty(0, np.uint64)
-            self._id_cache[j] = ids  # racing readers compute the same array; last wins
+            with self._id_lock:
+                # a write since `gen` may postdate our snapshot (an orphaned search whose
+                # task was cancelled holds no read lock): use it once, never cache it
+                if gen == self._id_gen[j]:
+                    self._id_cache[j] = ids
         return ids
 
     def _intersect(self, allow: np.ndarray, j: int) -> np.ndarray:
-        """allow ∩ shard j's ids (both uint64; shard side pre-sorted)."""
+        """allow ∩ shard j's ids, sorted. Both sides are sorted and unique (allow via
+        _sorted_ids), so binary-search the smaller side into the larger: a 255k-id
+        filter against an 8k-row shard costs O(8k log 255k), not O(255k log 8k)
+        (laptop, 16 probed shards of 2.55M rows: 94 ms -> 5 ms per query; DGX p3:
+        29.8 -> 2.0 ms). search() calls this inside each pool task, so the pool's
+        threads may run it concurrently: it only reads allow and the shard-id cache."""
         sids = self._shard_ids(j)
-        if not len(sids):
-            return sids
-        pos = np.minimum(np.searchsorted(sids, allow), len(sids) - 1)
-        return allow[sids[pos] == allow]
+        if not len(sids) or not len(allow):
+            return sids[:0]
+        small, big = (allow, sids) if len(allow) <= len(sids) else (sids, allow)
+        pos = np.minimum(np.searchsorted(big, small), len(big) - 1)
+        return small[big[pos] == small]
 
     def search(self, queries: np.ndarray, k: int, allowlist=None, nprobe: int | None = None):
         """Merged top-k over probed shards. Mirrors IdMapIndex.search: single-query
         results are trimmed exactly; a batch is rectangular, short rows padded with
-        id 0 / -inf score (record ids start at 1, so padding never hydrates)."""
-        if allowlist is not None and len(allowlist) <= 128:
+        id 0 / -inf score (record ids start at 1, so padding never hydrates).
+        Every (query, shard) search is one pool task (ADR 0005); the merge consumes
+        them in the serial loop's order, so any pool size returns the serial result
+        bit-for-bit, tie order included. A filtered task cuts its own allowlist slice
+        on the pool thread (spec §2 row 6; p3: 3.7 ms against 6.4-7.0 ms cut up front
+        on the caller), so the intersections run in parallel too."""
+        if allowlist is not None:  # sorted, unique: the form _intersect binary-searches
+            allowlist = _sorted_ids(allowlist)
+        tiny = allowlist is not None and len(allowlist) <= 128
+        owned: dict[int, np.ndarray] = {}  # tiny allowlists only: shard j -> its slice
+        if tiny:
             # tiny allowlists (metadata filters, sibling expansion) must not lose
-            # rows to unprobed shards: probe exactly the shards that own them
-            owners = [
-                j for j in range(self.nlist)
-                if len(self.shards[j]) and len(self._intersect(allowlist, j))
-            ]
-            probes = [owners] * len(queries)
+            # rows to unprobed shards: probe exactly the shards that own them. The
+            # owners are needed for the probe list itself, so this cut stays here.
+            for j in range(self.nlist):
+                if len(self.shards[j]):
+                    a = self._intersect(allowlist, j)
+                    if len(a):
+                        owned[j] = a
+            probes = [list(owned)] * len(queries)
         else:
             npb = min(nprobe or self.nprobe, self.nlist)
             sims = queries @ self.centroids.T
             probes = [
                 np.argpartition(-sims[qi], npb - 1)[:npb] for qi in range(len(queries))
             ]
-        out = []
+        tasks = []  # (qi, query row, shard index, shard, k), serial-loop order
         for qi, probe in enumerate(probes):
             q = np.ascontiguousarray(queries[qi : qi + 1])
-            parts_s, parts_i = [], []
             for j in probe:
                 sh = self.shards[j]
-                if not len(sh):
-                    continue
-                allow = allowlist
-                if allow is not None:  # per-shard slice: turbovec rejects foreign ids
-                    allow = self._intersect(allowlist, j)
-                    if not len(allow):
-                        continue
-                s, i = sh.search(q, k=min(k, len(sh)), allowlist=allow)
-                parts_s.append(s[0])
-                parts_i.append(i[0])
+                if len(sh):
+                    tasks.append((qi, q, int(j), sh, min(k, len(sh))))
+
+        def run(task):
+            _, q, j, sh, kk = task
+            allow = None
+            if allowlist is not None:  # per-shard slice: turbovec rejects foreign ids
+                allow = owned[j] if tiny else self._intersect(allowlist, j)
+                if not len(allow):
+                    return None  # turbovec rejects an empty allowlist; adds nothing
+            s, i = sh.search(q, k=kk, allowlist=allow)
+            return s[0], i[0]
+
+        parts: list = [([], []) for _ in probes]
+        for task, res in zip(tasks, self._pool.map(run, tasks)):
+            if res is not None:
+                parts[task[0]][0].append(res[0])
+                parts[task[0]][1].append(res[1])
+        out = []
+        for parts_s, parts_i in parts:
             if parts_s:
                 s, i = np.concatenate(parts_s), np.concatenate(parts_i)
                 top = np.argsort(-s)[:k]
@@ -872,6 +1011,7 @@ class Collection:
         embedder_factory,
         set_index_config=None,
         native_bm25: bool = True,
+        ivf_search_threads: int | None = None,
     ) -> None:
         self.cfg = cfg
         self.dir = directory
@@ -889,12 +1029,15 @@ class Collection:
         # two independent write connections starved each other's busy handler under a
         # hot worker loop ("database is locked" past a 30s timeout).
         self.db = open_meta_db(directory / "meta.db", cfg.tokenizer)
+        # IVF shard fan-out (ADR 0005): threads start on the first multi-shard search and
+        # stop with the collection; flat collections never start any. 1 = serial loop.
+        self._shard_pool = _ShardPool(ivf_search_threads or default_ivf_search_threads(), cfg.name)
         # the catalog decides which representation is live; a stale sibling on disk
         # (crashed attach/detach) is ignored and rebuilt by the replayed job
         if cfg.index_config and (self.ivf_dir / "centroids.npy").exists():
             self.index = _IvfIndex.load(
                 self.ivf_dir, cfg.dim, cfg.bit_width,
-                cfg.index_config.get("nprobe", IVF_DEFAULT_NPROBE),
+                cfg.index_config.get("nprobe", IVF_DEFAULT_NPROBE), pool=self._shard_pool,
             )
         elif self.index_path.exists():
             self.index = IdMapIndex.load(str(self.index_path))
@@ -914,6 +1057,10 @@ class Collection:
         self._scan_queue: list = []  # (qvec, n, future) waiting for a batched scan
         self._scan_task: asyncio.Task | None = None
         self._allow_cache: dict[str, np.ndarray] = {}  # (scope, filter) -> allowlist ids
+        # bumped by every metadata/membership write; a filter scan that started before
+        # a write may not cache its (older) snapshot. Read lock-free, bumped under the lock.
+        self._allow_gen = 0
+        self._allow_lock = threading.Lock()
         # folded token -> doc frequency: a fts5vocab df lookup walks the term's whole
         # doclist (~15-30ms for near-universal tokens), and exactly those hot tokens
         # recur in every query — cached, pruning costs ~0 after warmup
@@ -1018,6 +1165,8 @@ class Collection:
             await asyncio.to_thread(self._close_conns)
         if self._embedder is not None:
             await self._embedder.aclose()
+        # after _closed: an orphaned search still running falls back to the serial loop
+        await asyncio.to_thread(self._shard_pool.close)
 
     def _close_conns(self) -> None:
         # under db_lock: a write transaction that already holds db_lock on self.db (a
@@ -1246,6 +1395,12 @@ class Collection:
             return np.vstack(self._cal_reservoir)  # caller disarms after calibrate succeeds
         return None
 
+    def _invalidate_allow(self) -> None:
+        """Every metadata/membership write calls this AFTER its commit."""
+        with self._allow_lock:
+            self._allow_gen += 1
+            self._allow_cache.clear()
+
     def _upsert_rows(self, rows: list, mat: np.ndarray) -> tuple[list[int], list[bool], list[int]]:
         """Insert `rows` (_payload_rows' shape) with `mat` as their vectors, replacing
         any record with the same external_id: one transaction, rolled back on any
@@ -1307,7 +1462,7 @@ class Collection:
             for r in rows:
                 counts[r[2]] = counts.get(r[2], 0) + 1
             self.indexed_counts = counts  # one reference store: readers see old or new
-        self._allow_cache.clear()
+        self._invalidate_allow()
         self._df_cache_churn += len(rows)
         fresh = [r[0] not in old for r in rows]
         replaced = [rid for rid, indexed, _ in old.values() if indexed]
@@ -1509,7 +1664,7 @@ class Collection:
             tb = time.monotonic()
             ivf = _IvfIndex.train(
                 sample, nlist, self.cfg.dim, self.cfg.bit_width,
-                int(nprobe_req or IVF_DEFAULT_NPROBE),
+                int(nprobe_req or IVF_DEFAULT_NPROBE), pool=self._shard_pool,
             )
             sample = None  # free the f32 sample before the stream, as before plan C
             seen = [np.empty(0, dtype=np.uint64)]
@@ -1739,16 +1894,19 @@ class Collection:
             key = f"{scope}|{json.dumps(filt, sort_keys=True)}"
             allow = self._allow_cache.get(key)
             if allow is None:
+                gen = self._allow_gen  # read BEFORE the SELECT takes its snapshot
                 where, params = _filter_sql(scope, filt)
                 ids = [r[0] for r in self._rdb().execute(f"SELECT id FROM records WHERE {where}", params)]
-                allow = np.array(ids, dtype=np.uint64)
-                try:  # ponytail: tiny FIFO; LRU if filters vary widely. Concurrent
-                    # searches race the eviction — losing the race is fine, crashing isn't.
-                    if len(self._allow_cache) >= 8:
-                        self._allow_cache.pop(next(iter(self._allow_cache)), None)
-                except (StopIteration, RuntimeError):  # emptied / resized mid-iteration
-                    pass
-                self._allow_cache[key] = allow
+                # sorted once per miss, whatever order the query plan returns: the IVF
+                # path intersects by binary search (flat turbovec ignores the order)
+                allow = np.sort(np.array(ids, dtype=np.uint64))
+                with self._allow_lock:
+                    # a write since `gen` may postdate our snapshot (an orphaned scan whose
+                    # task was cancelled holds no read lock): use it once, never cache it
+                    if gen == self._allow_gen:
+                        if len(self._allow_cache) >= 8:  # ponytail: tiny FIFO; LRU if filters vary widely
+                            self._allow_cache.pop(next(iter(self._allow_cache)))
+                        self._allow_cache[key] = allow
             if len(allow) == 0:
                 return [], []
             kw = {"nprobe": nprobe} if isinstance(self.index, _IvfIndex) else {}
@@ -2090,7 +2248,7 @@ class Collection:
             # under db_lock, as the next upsert reads MAX(id) there and would reuse them,
             # even when a cancelled caller has already released lock.write()
             self._unindex([rid for rid, indexed, _ in rows if indexed])
-        self._allow_cache.clear()
+        self._invalidate_allow()
         self._df_cache_churn += len(rows)
         return len(rows)
 
@@ -2150,7 +2308,7 @@ class Collection:
                 (json.dumps(patch), doc_id),
             )
             self.db.commit()
-        self._allow_cache.clear()  # cached allowlists were evaluated over the old metadata
+        self._invalidate_allow()  # cached allowlists were evaluated over the old metadata
         return cur.rowcount
 
     def stats(self) -> dict:
@@ -2317,6 +2475,7 @@ class CollectionManager:
             Collection, cfg, self._dir(name), lambda: self.embedder_factory(cfg),
             lambda ic, name=name: self.set_index_config(name, ic),
             native_bm25=self.settings.native_bm25 == "auto",
+            ivf_search_threads=self.settings.ivf_search_threads,
         ))
         try:
             c = await asyncio.shield(build)
