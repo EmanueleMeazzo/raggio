@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import struct
 import sys
+import sysconfig
 import threading
 import time
 import unicodedata
@@ -553,8 +554,17 @@ class CollectionConfig:
     index_config: dict | None = None  # {"nlist": N, "nprobe": M} when an IVF index is attached
 
 
+# meta.db connections are used from many threads and closed from yet another one. On a
+# free-threaded build (ADR 0006) a statement another thread cached is only freed when that
+# thread next runs Python (biased reference counting; CPython 3.14.8 merges a detached
+# thread's counts (gh-157838), 3.14.7t and older do not), so close() leaves a zombie that
+# keeps meta.db, -wal and -shm open: no statement cache there. 128 is sqlite3's own default.
+SQLITE_CACHED_STATEMENTS = 0 if sysconfig.get_config_var("Py_GIL_DISABLED") else 128
+
+
 def open_meta_db(path: Path, tokenizer: str = "unicode61") -> sqlite3.Connection:
-    db = sqlite3.connect(path, check_same_thread=False)
+    db = sqlite3.connect(path, check_same_thread=False,
+                         cached_statements=SQLITE_CACHED_STATEMENTS)
     # job payloads are bulky and transient: without this the file keeps every page the
     # ingest backlog ever occupied (a full-corpus ingest ballooned meta.db to 7+ GB).
     # MUST run before journal_mode=WAL — that pragma initializes the db file, and
@@ -1973,7 +1983,8 @@ class Collection:
             raise RuntimeError(f"collection '{self.cfg.name}' is closed")
         db = getattr(self._read_local, "db", None)
         if db is None:
-            db = sqlite3.connect(self.dir / "meta.db", check_same_thread=False)
+            db = sqlite3.connect(self.dir / "meta.db", check_same_thread=False,
+                                 cached_statements=SQLITE_CACHED_STATEMENTS)
             db.execute("PRAGMA query_only=1")
             with self.db_lock:
                 if self._closed:  # stop() swept the registry while this one opened

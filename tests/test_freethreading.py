@@ -203,3 +203,39 @@ def test_the_gil_is_still_disabled():
     # pytest imported every test module (raggio, raggio_native, turbovec, numpy, fastapi,
     # ...) before running any test, and the tests before this one ran on this interpreter
     assert sys._is_gil_enabled() is False
+
+
+# ---- meta.db connections close for real on a free-threaded build ----
+
+
+def test_stop_really_closes_meta_db_after_reads_on_many_threads(tmp_path, monkeypatch):
+    # every thread that served a read opened its own connection, and stop() closes them
+    # all from one other thread. On a free-threaded build a statement cached by its
+    # owning thread is only freed when that thread next runs Python (biased reference
+    # counting), so each cached statement kept its closed connection alive as a zombie:
+    # meta.db-wal/-shm stayed on disk and, on Windows, delete could not remove the dir
+    import asyncio
+
+    from raggio.config import Settings
+    from raggio.store import CollectionManager
+
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
+    m = CollectionManager(Settings(), lambda cfg: FakeEmbedder())
+    unit = np.ones(DIM) / np.sqrt(DIM)
+
+    async def run():
+        await m.create_collection("x", DIM, 4, None, None, None)
+        c = await m.touch("x")
+        await c.enqueue({"documents": [
+            {"doc_id": "d", "chunks": [{"id": "c", "text": "t", "vector": unit.tolist()}]}]})
+        while c.pending_jobs():
+            await asyncio.sleep(0.01)
+        # the default executor's threads stay alive and idle across shutdown
+        await asyncio.gather(*(asyncio.to_thread(c.list_records, "both", None, None, 10, 0)
+                               for _ in range(8)))
+        await asyncio.gather(*(asyncio.to_thread(c.get_document, "d") for _ in range(8)))
+        await m.shutdown()
+        return sorted(p.name for p in m._dir("x").glob("meta.db*"))
+
+    assert asyncio.run(run()) == ["meta.db"]
