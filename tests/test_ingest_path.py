@@ -16,7 +16,8 @@ import pytest
 
 sys.path.insert(0, "src")
 import raggio.store as store  # noqa: E402
-from raggio.store import Collection, CollectionConfig, open_meta_db  # noqa: E402
+from raggio.config import Settings  # noqa: E402
+from raggio.store import Collection, CollectionConfig, CollectionManager, open_meta_db  # noqa: E402
 
 
 def make_collection(tmp_path, dim=8, **kw):
@@ -915,3 +916,224 @@ def test_adr_ingest_path_d1_results_record_the_gates():
     for gate in ("D1-run", "D1-fingerprints", "D1-jobs", "D1-labels"):
         assert f"- PASS: {gate}\n" in section, gate
     assert [line for line in section.splitlines() if line.startswith("- FAIL:")] == ["- FAIL: D1-ivf256"]
+
+
+# ---- batched sync: plumbing
+
+
+def test_settings_sync_batch_knobs(monkeypatch):
+    monkeypatch.delenv("SYNC_BATCH_JOBS", raising=False)
+    monkeypatch.delenv("SYNC_BATCH_MS", raising=False)
+    s = Settings()
+    assert (s.sync_batch_jobs, s.sync_batch_ms) == (8, 1000.0)
+    assert type(s.sync_batch_jobs) is int and type(s.sync_batch_ms) is float
+    monkeypatch.setenv("SYNC_BATCH_JOBS", "3")
+    monkeypatch.setenv("SYNC_BATCH_MS", "250.5")
+    s = Settings()
+    assert (s.sync_batch_jobs, s.sync_batch_ms) == (3, 250.5)
+
+
+@pytest.mark.parametrize("name, value", [("SYNC_BATCH_JOBS", "0"), ("SYNC_BATCH_MS", "-1")])
+def test_settings_rejects_bad_sync_batch_knobs(monkeypatch, name, value):
+    # a batch of zero jobs could never close, and a negative wait is a typo: refuse to boot
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=name):
+        Settings()
+
+
+def test_manager_passes_sync_batch_knobs_to_collection(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("SYNC_BATCH_JOBS", "3")
+    monkeypatch.setenv("SYNC_BATCH_MS", "250")
+
+    async def go():
+        mgr = CollectionManager(Settings(), embedder_factory=lambda cfg: None)
+        try:
+            await mgr.create_collection("m", 8, 4, None, None, None)
+            col = await mgr.touch("m")
+            return col.sync_batch_jobs, col.sync_batch_ms
+        finally:
+            await mgr.shutdown()
+
+    assert asyncio.run(go()) == (3, 250.0)
+
+
+def test_claim_cursor_skips_already_claimed_jobs(tmp_path):
+    # the batched worker claims job k+1 while job k is still 'processing' (a job is
+    # finished only after its batch's sync), so the cursor, not the status, moves on
+    col = make_collection(tmp_path)
+    try:
+        assert [col._enqueue_row(docs_payload([i])) for i in (1, 2, 3)] == [1, 2, 3]
+        assert col._claim_next()[0] == 1  # no cursor: the lowest open job, as before
+        assert col._claim_next(1)[0] == 2
+        job_id, payload, error = col._claim_next(2)
+        assert (job_id, payload["documents"][0]["doc_id"], error) == (3, "d3", None)
+        assert col._claim_next(3) is None  # nothing open above the cursor
+        assert fetch(col, "SELECT id, status FROM jobs ORDER BY id") == [
+            (1, "processing"), (2, "processing"), (3, "processing")]
+        # cursor 0 (a worker's first claim, as on boot): 'processing' jobs replay first
+        assert col._claim_next()[0] == 1
+    finally:
+        asyncio.run(col.stop())
+
+
+def test_claim_query_never_scans_the_journal(tmp_path):
+    # the journal keeps every done job. The INDEXED BY hint is there so a planner change
+    # cannot silently turn the claim into a walk over all the done rows (cursor 0): the
+    # walk Plan C's partial index idx_jobs_open exists to avoid
+    col = make_collection(tmp_path)
+    try:
+        with col.db_lock:
+            col.db.executemany(LEGACY_JOB, [(i, "{}", "done") for i in range(1, 51)]
+                               + [(51, "{}", "processing"), (52, "{}", "pending")])
+            col.db.commit()
+        assert store._CLAIM_SQL.count("?") == 1  # the cursor
+        plan = " | ".join(r[3] for r in fetch(col, "EXPLAIN QUERY PLAN " + store._CLAIM_SQL, 0))
+        # one range search on the open-jobs index, in id order: no rowid range, no sort
+        assert plan.startswith("SEARCH") and "USING INDEX idx_jobs_open" in plan, plan
+        assert "PRIMARY KEY" not in plan and "TEMP B-TREE" not in plan, plan
+        assert col._claim_next(51)[0] == 52
+        assert col._claim_next()[0] == 51
+    finally:
+        asyncio.run(col.stop())
+
+
+def spy_sync(col):
+    """Wrap col._sync_index. Each call first appends the removal count it found (None
+    before Task 7 added the counter), then runs the real sync. Returns that list."""
+    seen, real = [], col._sync_index
+
+    def spy():
+        seen.append(getattr(col, "_removed_since_sync", None))
+        real()
+
+    col._sync_index = spy
+    return seen
+
+
+def test_process_job_sync_flag(tmp_path):
+    # sync=False is the batched worker's call: the job commits and updates the index in
+    # memory, and leaves writing the index file to its batch's one sync
+    col = make_collection(tmp_path)
+
+    async def run():
+        try:
+            seen = spy_sync(col)
+            await col._process_job(docs_payload([1, 2]))  # records 1, 2
+            calls = [len(seen)]
+            await col._process_job(docs_payload([3]), sync=False)  # record 3
+            calls.append(len(seen))
+            return calls, index_ids(col), fetch(col, "SELECT id FROM vecs ORDER BY id")
+        finally:
+            await col.stop()
+
+    calls, ids, vecs = asyncio.run(run())
+    assert calls == [1, 1]  # the default still syncs after every job; sync=False never
+    assert ids == [1, 2, 3]  # searchable at once: the in-memory index has record 3
+    assert vecs == [(1,), (2,), (3,)]  # and its rows are committed
+
+
+def test_removal_cap_syncs_before_crossing_the_cap(tmp_path, monkeypatch):
+    # turbovec keeps each removal as a redo op in the index file's header and rewrites
+    # the whole file past 1024 of them, so one sync must not carry more than
+    # SYNC_MAX_REMOVALS removals piled up across a batch's jobs. A lone job over the
+    # cap is not split: it syncs with everything it removed, as every job does today
+    monkeypatch.setattr(store, "SYNC_MAX_REMOVALS", 10)
+    col = make_collection(tmp_path)
+
+    async def run():
+        try:
+            await col._process_job(docs_payload(range(1, 13)))  # records 1-12, synced
+            seen = spy_sync(col)
+            for _ in range(3):  # each re-upsert replaces docs 1-6: 6 removals per job
+                await col._process_job(docs_payload(range(1, 7)), sync=False)
+            steps = [list(seen), col._removed_since_sync]
+            await asyncio.to_thread(col._sync_index)  # what the batch's flush will do
+            steps += [list(seen), col._removed_since_sync]
+            # one job replacing all 12 rows (docs 1-6's current rows, docs 7-12's first)
+            await col._process_job(docs_payload(range(1, 13)), sync=False)
+            steps += [list(seen), col._removed_since_sync]
+            await col._process_job(docs_payload([13]))  # the default sync=True
+            steps += [list(seen), col._removed_since_sync]
+            return steps, index_ids(col), fetch(col, "SELECT id FROM records ORDER BY id")
+        finally:
+            await col.stop()
+
+    steps, ids, records = asyncio.run(run())
+    assert steps == [
+        [6, 6], 6,  # jobs 2 and 3 each synced the 6 pending removals first: 6 + 6 > 10
+        [6, 6, 6], 0,  # the flush wrote job 3's 6 and reset the count
+        [6, 6, 6], 12,  # the count was 0, so no pre-sync: the lone job keeps all 12
+        [6, 6, 6, 12], 0,  # the next sync writes them in one go
+    ]
+    assert ids == [r[0] for r in records] and len(ids) == 13  # nothing lost, no ghost
+
+
+def test_removal_cap_lets_a_sync_carry_exactly_the_cap(tmp_path, monkeypatch):
+    # the check is "would pass the cap" (>): pending plus this job's removals may equal
+    # SYNC_MAX_REMOVALS, and that sync still carries them all in one go
+    monkeypatch.setattr(store, "SYNC_MAX_REMOVALS", 10)
+    col = make_collection(tmp_path)
+
+    async def run():
+        try:
+            await col._process_job(docs_payload(range(1, 11)))  # records 1-10, synced
+            seen = spy_sync(col)
+            await col._process_job(docs_payload(range(1, 5)), sync=False)  # 4 removals
+            await col._process_job(docs_payload(range(5, 11)), sync=False)  # 4 + 6 == 10
+            return list(seen), col._removed_since_sync
+        finally:
+            await col.stop()
+
+    assert asyncio.run(run()) == ([], 10)  # no pre-sync: the batch's sync takes all 10
+
+
+def test_sync_resets_the_removal_counter(tmp_path):
+    # every sync writes the pending removals, whoever runs it (the worker, the cap,
+    # delete_document, stop()), so every sync resets the count
+    col = make_collection(tmp_path)
+
+    async def run():
+        try:
+            await col._process_job(docs_payload([1, 2, 3]))  # records 1-3, synced
+            counts = [col._removed_since_sync]
+            await col._process_job(docs_payload([1, 2]), sync=False)  # replaces 2 rows
+            counts.append(col._removed_since_sync)
+            await asyncio.to_thread(col._sync_index)
+            counts.append(col._removed_since_sync)
+            seen = spy_sync(col)
+            await col.delete_document("d3")  # removes record 3's id, then syncs
+            counts.append(col._removed_since_sync)
+            return counts, list(seen)
+        finally:
+            await col.stop()
+
+    counts, seen = asyncio.run(run())
+    assert counts == [0, 2, 0, 0]
+    assert seen == [1]  # delete_document's _unindex counted its removal before the sync
+
+
+def test_ingest_probe_accepts_batch_flags(tmp_path, monkeypatch):
+    # Task 10 tunes N and T with the probe. Without the flags it builds the collection
+    # exactly as before, so the same file still runs on a tree without the knobs
+    probe = load_probe(monkeypatch)
+    made, real = [], probe.Collection
+
+    def spy(*args, **kw):
+        made.append(kw)
+        return real(*args, **kw)
+
+    monkeypatch.setattr(probe, "Collection", spy)
+    out = probe.main(probe_args(tmp_path, batch_jobs=3, batch_ms=250))
+    assert made == [{"sync_batch_jobs": 3, "sync_batch_ms": 250.0}]
+    assert (out["sync_batch_jobs"], out["sync_batch_ms"]) == (3, 250.0)
+    assert (out["args"]["batch_jobs"], out["args"]["batch_ms"]) == (3, 250.0)
+    assert out["jobs"] == {"done": 4}
+    made.clear()
+    out = probe.main(probe_args(tmp_path))
+    assert made == [{}]
+    assert (out["sync_batch_jobs"], out["sync_batch_ms"]) == (8, 1000.0)
+    assert out["args"]["batch_jobs"] is None and out["args"]["batch_ms"] is None
+    for bad in ({"batch_jobs": 0}, {"batch_ms": -1}):
+        with pytest.raises(SystemExit):
+            probe.main(probe_args(tmp_path, **bad))

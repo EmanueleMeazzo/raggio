@@ -26,3 +26,11 @@ class Settings:
         # per-collection pool for IVF shard searches; 1 = the serial loop, unset/0 = default
         threads = int(os.environ.get("IVF_SEARCH_THREADS", "0") or 0)
         self.ivf_search_threads = threads if threads > 0 else default_ivf_search_threads()
+        # the worker's batched index sync (spec 4.2, D8): one sync closes a batch of at
+        # most SYNC_BATCH_JOBS jobs or SYNC_BATCH_MS ms, whichever comes first; 1 = per job
+        self.sync_batch_jobs = int(os.environ.get("SYNC_BATCH_JOBS", "8"))
+        self.sync_batch_ms = float(os.environ.get("SYNC_BATCH_MS", "1000"))
+        if self.sync_batch_jobs < 1:
+            raise ValueError(f"SYNC_BATCH_JOBS must be >= 1, not {self.sync_batch_jobs}")
+        if not self.sync_batch_ms >= 0:  # also refuses nan
+            raise ValueError(f"SYNC_BATCH_MS must be >= 0, not {self.sync_batch_ms}")

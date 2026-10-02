@@ -103,6 +103,11 @@ CAL_SAMPLE = 1024  # ~1024 representative rows is enough per turbovec docs
 # since the last trim plus 8 MB and never stalls enqueues on a whole-file vacuum
 VACUUM_FREELIST_PAGES = 16_384
 VACUUM_CHUNK_PAGES = 2_048
+# removals one index sync may carry when a batch piles them up across jobs. turbovec
+# keeps each removal as a redo op in the index file's header and rewrites the whole
+# file past 1024 of them, so the worker syncs before a job would take the count over
+# this. A lone job over the cap is not split: it syncs with all its own removals
+SYNC_MAX_REMOVALS = 512
 
 # Optional ScaNN-style IVF index, attached/removed per collection via the index API.
 # Measured (bench/ivf_probe.py, ADR 0002): at ~550k rows every recall-preserving cell
@@ -312,11 +317,16 @@ def _decode_payload(data: bytes) -> dict:
     return payload
 
 
-# the worker's claim: the lowest open job. 'processing' is included so jobs interrupted
-# by a crash replay on boot. Keep the literal predicate byte for byte: it is what Plan
-# C's partial index idx_jobs_open matches (spec 4.1), and C's plan test pins this text
+# the worker's claim: the lowest open job above a cursor. 'processing' is included so
+# jobs interrupted by a crash replay on boot (cursor 0). The batched worker moves the
+# cursor past the jobs it claimed, which stay 'processing' until their batch's sync.
+# Keep the literal predicate byte for byte: Plan C's partial index idx_jobs_open
+# matches it (spec 4.1). INDEXED BY holds the plan on that index, so a planner change
+# cannot silently turn the claim into a journal walk over every done row (it fails
+# loudly, "no such index", and open_meta_db creates the index on every open)
 _CLAIM_SQL = (
-    "SELECT id, payload FROM jobs WHERE status IN ('pending','processing') ORDER BY id LIMIT 1"
+    "SELECT id, payload FROM jobs INDEXED BY idx_jobs_open"
+    " WHERE status IN ('pending','processing') AND id > ? ORDER BY id LIMIT 1"
 )
 
 
@@ -1012,6 +1022,8 @@ class Collection:
         set_index_config=None,
         native_bm25: bool = True,
         ivf_search_threads: int | None = None,
+        sync_batch_jobs: int = 8,
+        sync_batch_ms: float = 1000.0,
     ) -> None:
         self.cfg = cfg
         self.dir = directory
@@ -1032,6 +1044,12 @@ class Collection:
         # IVF shard fan-out (ADR 0005): threads start on the first multi-shard search and
         # stop with the collection; flat collections never start any. 1 = serial loop.
         self._shard_pool = _ShardPool(ivf_search_threads or default_ivf_search_threads(), cfg.name)
+        # the worker's batch bounds (Settings.sync_batch_jobs / sync_batch_ms) and the
+        # removals made since the last index sync: _unindex counts, _sync_index resets,
+        # and _process_job syncs first when a job would take the count over the cap
+        self.sync_batch_jobs = sync_batch_jobs
+        self.sync_batch_ms = sync_batch_ms
+        self._removed_since_sync = 0
         # the catalog decides which representation is live; a stale sibling on disk
         # (crashed attach/detach) is ignored and rebuilt by the replayed job
         if cfg.index_config and (self.ivf_dir / "centroids.npy").exists():
@@ -1218,14 +1236,16 @@ class Collection:
             "SELECT COUNT(*) FROM jobs WHERE status IN ('pending','processing')"
         ).fetchone()[0]
 
-    def _claim_next(self) -> tuple[int, dict | None, str | None] | None:
-        """Claim the lowest open job. Returns (job_id, payload, None), or
+    def _claim_next(self, after: int = 0) -> tuple[int, dict | None, str | None] | None:
+        """Claim the lowest open job with an id above `after` (0: the lowest open job,
+        as on boot; the batched worker passes the last id it claimed, because a claimed
+        job stays 'processing' until its batch syncs). Returns (job_id, payload, None), or
         (job_id, None, "bad job payload: ...") when its payload cannot be decoded, or
         None when no job is open. The claim is one short transaction under db_lock;
         the decode runs after the lock is released, still in this worker thread, so
         neither the loop nor the other writers wait for it."""
         with self.db_lock:
-            row = self.db.execute(_CLAIM_SQL).fetchone()
+            row = self.db.execute(_CLAIM_SQL, (after,)).fetchone()
             if row is None:
                 return None
             job_id, text = row
@@ -1317,7 +1337,11 @@ class Collection:
                 status, error = "error", str(e)
             await asyncio.to_thread(self._finish_job, job_id, status, error)
 
-    async def _process_job(self, payload: dict) -> None:
+    async def _process_job(self, payload: dict, *, sync: bool = True) -> None:
+        """Run one job. An ingest job ends by writing the index file (_sync_index) only
+        when sync is True, the default every direct caller keeps; the batched worker
+        passes False and syncs once per batch. Index jobs (attach/detach) ignore it:
+        their swap writes the new index in full."""
         op = payload.get("op")
         if op in ("attach_index", "detach_index"):
             try:
@@ -1350,6 +1374,11 @@ class Collection:
             # index only after that commit.
             ids, fresh, replaced = await asyncio.to_thread(self._upsert_rows, rows, mat)
             if replaced:
+                if (self._removed_since_sync
+                        and self._removed_since_sync + len(replaced) > SYNC_MAX_REMOVALS):
+                    # write earlier jobs' removals first, so no sync carries more than
+                    # the cap across jobs. A job alone over it is not split (count 0)
+                    await asyncio.to_thread(self._sync_index)
                 await asyncio.to_thread(self._unindex, replaced)
             idarr = np.array(ids, dtype=np.uint64)
             # while the reservoir is armed, add in threshold-sized slices so even one
@@ -1375,8 +1404,10 @@ class Collection:
                         # calibration must never fail the ingest job (an 'error' job is
                         # terminal and would leave committed rows behind)
                         pass
-            # ponytail: sync after every job; batch on an interval if write throughput matters
-            await asyncio.to_thread(self._sync_index)
+            # the batched worker passes sync=False and writes the index once per batch
+            # (Settings.sync_batch_jobs / sync_batch_ms); a direct call syncs here
+            if sync:
+                await asyncio.to_thread(self._sync_index)
 
     def _feed_calibration(self, mat: np.ndarray) -> np.ndarray | None:
         """Reservoir-sample ingested vectors (Algorithm R); once the one-shot
@@ -1471,7 +1502,14 @@ class Collection:
     def _unindex(self, rids: list[int]) -> None:
         """Remove records whose rows a committed transaction replaced or deleted from
         the vector index (the .tvim drops them at the next _sync_index). The caller
-        holds lock.write(), so no search runs meanwhile; db_lock is not needed."""
+        holds lock.write() (the delete path also holds db_lock); the index needs
+        neither db_lock nor any other lock here."""
+        # counted from the list, never from remove()'s return (None on _IvfIndex), and
+        # before the loop: a remove that raises midway leaves the count high, which
+        # only brings the next pre-sync early
+        # not atomic: an orphaned delete thread may race _sync_index's reset, and a
+        # lost count only mis-times a pre-sync
+        self._removed_since_sync += len(rids)
         for rid in rids:
             self.index.remove(rid)
 
@@ -1482,6 +1520,9 @@ class Collection:
             self.index.sync(self.ivf_dir)
         else:
             self.index.sync(str(self.index_path))
+        # the file now holds every pending removal. A sync that raises skips this, so
+        # the count stays, and the next attempt still sees what it carries
+        self._removed_since_sync = 0
 
     def _save_index_config(self, ic: dict | None) -> None:
         self._set_index_config_cb(ic)  # catalog first: it decides what load() trusts
@@ -2476,6 +2517,8 @@ class CollectionManager:
             lambda ic, name=name: self.set_index_config(name, ic),
             native_bm25=self.settings.native_bm25 == "auto",
             ivf_search_threads=self.settings.ivf_search_threads,
+            sync_batch_jobs=self.settings.sync_batch_jobs,
+            sync_batch_ms=self.settings.sync_batch_ms,
         ))
         try:
             c = await asyncio.shield(build)
