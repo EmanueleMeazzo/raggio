@@ -108,6 +108,11 @@ VACUUM_CHUNK_PAGES = 2_048
 # file past 1024 of them, so the worker syncs before a job would take the count over
 # this. A lone job over the cap is not split: it syncs with all its own removals
 SYNC_MAX_REMOVALS = 512
+# a failed index sync (a full disk, an I/O error) is retried after SYNC_RETRY_MIN_S s,
+# then twice as long after each failure, up to SYNC_RETRY_MAX_S s. The batch stays
+# 'processing' meanwhile, so if the process ends first the next open replays it
+SYNC_RETRY_MIN_S = 1.0
+SYNC_RETRY_MAX_S = 30.0
 
 # Optional ScaNN-style IVF index, attached/removed per collection via the index API.
 # Measured (bench/ivf_probe.py, ADR 0002): at ~550k rows every recall-preserving cell
@@ -1170,6 +1175,19 @@ class Collection:
         self._worker = asyncio.create_task(self._run_worker())
 
     async def stop(self) -> None:
+        async def close_step(what, step):
+            # spec 3.1 D4: a close step that raises an Exception is logged with its
+            # traceback and stop() goes on to the next one, so shutdown() still
+            # reaches every collection and the catalog. Only Exception: a cancel
+            # of stop(), a KeyboardInterrupt or a SystemExit propagates
+            try:
+                await step
+            except Exception:
+                _log.exception(
+                    "collection %s: closing %s failed in stop(); the shutdown goes on",
+                    self.cfg.name, what,
+                )
+
         async with self.lock.write():
             # cancel the worker only once write-locked: it is then outside its write
             # section (upsert -> index add -> sync), so no orphaned to_thread body is
@@ -1180,17 +1198,27 @@ class Collection:
                     await self._worker
                 except asyncio.CancelledError:
                     pass
-            await asyncio.to_thread(self._sync_index)
+                except Exception:
+                    # spec 3.1 D3: a worker that died of an exception (a finish or a
+                    # claim that raised) is logged, never re-raised, and stop() goes on
+                    # to flush and close. Any job the worker held stays 'processing'
+                    _log.exception(
+                        "collection %s: the ingest worker had died; stop() flushes its"
+                        " open batch of %d jobs, and any job it held stays 'processing'"
+                        " for the replay on the next open",
+                        self.cfg.name, len(self._unsynced),
+                    )
+            await asyncio.to_thread(self._sync_and_finish)
             self._closed = True
             # write-locked: no search holding the read lock is mid-query. Orphaned
             # to_thread bodies of cancelled searches, orphaned index builds and the
             # unlocked reads (list_records, get_document, job status) can still be
             # (ADR 0001, concurrency addendum, Deferred row)
-            await asyncio.to_thread(self._close_conns)
+            await close_step("the SQLite connections", asyncio.to_thread(self._close_conns))
         if self._embedder is not None:
-            await self._embedder.aclose()
+            await close_step("the embedder's HTTP client", self._embedder.aclose())
         # after _closed: an orphaned search still running falls back to the serial loop
-        await asyncio.to_thread(self._shard_pool.close)
+        await close_step("the IVF shard pool", asyncio.to_thread(self._shard_pool.close))
 
     def _close_conns(self) -> None:
         # under db_lock: a write transaction that already holds db_lock on self.db (a
@@ -1383,15 +1411,73 @@ class Collection:
         each job finishes, in claim order. None of them is 'done' before that sync
         returns (the job journal invariant), so a crash before it leaves them all
         'processing' and the replay redoes them. A crash between the sync and the last
-        finish replays the unfinished rest, which rewrites the same rows."""
-        async with self.lock.write():  # the per-job sync ran under it too
-            await asyncio.to_thread(self._sync_index)
+        finish replays the unfinished rest, which rewrites the same rows.
+
+        A sync that raises is logged and retried, after SYNC_RETRY_MIN_S and then twice
+        as long each time, up to SYNC_RETRY_MAX_S. Until one lands the batch stays
+        'processing' and the worker claims nothing new. The wait runs outside the write
+        lock, so searches, deletes and stop() go on; stop() cancels the wait and
+        finishes the batch itself (_sync_and_finish)."""
+        delay = SYNC_RETRY_MIN_S
+        while True:
+            try:
+                async with self.lock.write():  # the per-job sync ran under it too
+                    await asyncio.to_thread(self._sync_index)
+                break
+            except Exception:
+                # nothing is finished and the index keeps its in-memory rows; an IVF
+                # shard whose write failed stays dirty (Plan F), so the retry writes it
+                _log.exception(
+                    "collection %s: index sync failed, %d jobs stay 'processing';"
+                    " retrying in %.2f s",
+                    self.cfg.name, len(self._unsynced), delay,
+                )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, SYNC_RETRY_MAX_S)
         self._batch_t0 = None  # the batch closed at its sync
         while self._unsynced:
             # pop BEFORE the await: a stop() that cancels the worker mid-finish leaves
             # this job to the orphaned thread, and nothing finishes it twice
             job = self._unsynced.pop(0)
             await asyncio.to_thread(self._finish_job, *job)
+
+    def _sync_and_finish(self) -> None:
+        """stop()'s flush, run in a thread while stop() holds lock.write() and the
+        worker is already cancelled or dead: sync the index, then finish every job of
+        the open batch in claim order. A sync that raises an Exception is logged, and
+        nothing is finished: the jobs keep 'processing' and their payloads, and the next
+        open replays them. A finish that raises an Exception after the sync landed is
+        logged too, and no later job is tried; those jobs replay the same way. It then
+        returns normally, so stop() still closes the collection."""
+        try:
+            self._sync_index()
+        except Exception:
+            # never raised to stop()'s caller, so shutdown, eviction and delete complete
+            # (spec 3.1 D2). Only Exception: a KeyboardInterrupt or SystemExit propagates
+            _log.exception(
+                "collection %s: index sync failed in stop(), %d jobs stay 'processing'"
+                " for the replay on the next open",
+                self.cfg.name, len(self._unsynced),
+            )
+            return
+        self._batch_t0 = None
+        while self._unsynced:
+            try:
+                self._finish_job(*self._unsynced[0])
+            except Exception:
+                # spec 3.1 D3: the sync landed, but this job and the rest stay
+                # 'processing' with their payloads; the replay re-applies their rows,
+                # which rewrites the same rows. Only Exception, as above
+                _log.exception(
+                    "collection %s: finishing jobs failed in stop(), %d jobs stay"
+                    " 'processing' for the replay on the next open",
+                    self.cfg.name, len(self._unsynced),
+                )
+                return
+            # popped only once finished, so if a later finish fails, _unsynced holds
+            # that job and every job after it: the ones left for the replay. No worker
+            # runs now, so no other finish can take the same job
+            self._unsynced.pop(0)
 
     async def _process_job(self, payload: dict, *, sync: bool = True) -> None:
         """Run one job. An ingest job ends by writing the index file (_sync_index) only
@@ -1434,7 +1520,18 @@ class Collection:
                         and self._removed_since_sync + len(replaced) > SYNC_MAX_REMOVALS):
                     # write earlier jobs' removals first, so no sync carries more than
                     # the cap across jobs. A job alone over it is not split (count 0)
-                    await asyncio.to_thread(self._sync_index)
+                    try:
+                        await asyncio.to_thread(self._sync_index)
+                    except Exception:
+                        # this job's rows are already committed, so it must go on to
+                        # its removals and adds, or the index would lack them for good.
+                        # The counter keeps the pending removals, and the batch's sync
+                        # (retried until it lands) writes them all
+                        _log.exception(
+                            "collection %s: removal-cap index sync failed; the batch's"
+                            " sync will write these removals",
+                            self.cfg.name,
+                        )
                 await asyncio.to_thread(self._unindex, replaced)
             idarr = np.array(ids, dtype=np.uint64)
             # while the reservoir is armed, add in threshold-sized slices so even one
