@@ -627,12 +627,18 @@ async def _storm(col: Collection, seed: int, stop_after: float | None = None):
         ops["read"] += 1
 
     async def client():
-        while time.monotonic() < deadline:
+        # with stop_after, run past the deadline until one operation has started after
+        # stop() returned: under load stop() can get its write lock late, and a client
+        # that left first would leave nothing to run against the stopped collection
+        done = False
+        while time.monotonic() < deadline or (stop_after is not None and not done):
+            started_after_stop = bool(ops["stopped"])
             r = prng.random()
             try:
                 await (search() if r < 0.70 else write() if r < 0.85 else read())
             except Exception as e:
                 errors[f"{type(e).__name__}: {str(e)[:80]}"] += 1
+            done = started_after_stop
             await asyncio.sleep(0)
 
     async def stopper():
