@@ -1439,6 +1439,52 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
   - **F5, memory peak.** Both arms about 1.8–2.0 GB, read before bench's cold-start restart (F-R17).
   - **F7, largest list.** Run0 builds a new index (plan C's rowid sampling), so the largest list will differ from p3's 30,443 rows. A list at or above 32,768 rows is reported, and F7 still passes.
 
+**01:57Z–02:24Z. The A/B runs in 17 minutes. Six items pass; F6, the escape hatch, fails in both directions at once and is recorded as failed with an override.**
+- **The run.** Launched at 01:57:05Z under a 150-minute cap; `== PLANF AB DONE` at 02:14:31Z. The IVF rounds ran 01:57–02:12Z, then the in-process probes (stages, fan-out, exact) and the NEON repro, done by 02:14:29Z. The script stopped and removed bench-tv before the probes.
+- **Run0 at 02:04Z** confirmed F-R17: its peak before the restart was 4,096 MB, the cap, because run0 builds the IVF index; after the restart, 1,529 MB. Run0 built a new index (plan C's row sampling): recall@10 is 0.9946 on every run, against 0.993 on the old one, and the largest list is 24,123 rows instead of p3's 30,443.
+- **Fetched at 02:19Z** (40 files and the log; no home path in any). The summary script exited 1 (section 4.17):
+  - F1 (results), F2 (1.68× concurrent QPS), F3 (filtered p50 6.16 ms), F4 (serial p50), F5 (memory), F7 (largest list) and the row labels pass.
+  - **F6 fails.** With `IVF_SEARCH_THREADS=1` (T=1), serial p50 was 7.66 ms against base's 8.84 (1.19 ms faster, band 1.05) and concurrent QPS was 183.15 against 203.08 (19.94 slower, band 10.77).
+  - The grouped-call guard printed `REVISIT` at 12 threads, the chosen pool size and the default.
+- **F6 analysis, 02:20Z.** For unfiltered searches, base's `_IvfIndex.search` and F's T=1 path make the same per-(query, shard) turbovec calls in the same order. The T=1 path only adds a task list and a closure. A slower code path would not make serial latency better and concurrent QPS worse in the same runs. In the A/B the T=1 arm always ran straight after F's c=16 capture, and its serial runs were bimodal: 8.70, then 7.65 and 7.66 ms.
+- **Ruling, 02:20Z (W-14, R-D5's precedent; X11).** F6 is recorded as failed with an override line. Nothing is re-run to make it pass. A follow-up runs only to understand the gap and never counts as a gate. The guard's REVISIT goes to the maintainer as a reason to reopen spec D3; nothing ships on it.
+- **Override tooling, 02:22–02:24Z.** The summary script gains D1's `--override ITEM=REASON`: the item keeps its FAIL line, an `OVERRIDE` line follows, and the exit code is 0 only when every failed item is overridden. Overriding a passing item, or giving no reason, exits 1. The verify script records a FAIL only when an override names it. Five new cases in the scripts' self-check, and three mutations that each make it fail. The ADR test now pins the failed items to exactly `["F6"]` and requires the override line.
+
+**02:21Z–02:31Z. A follow-up in ABBA order does not reproduce F6's gap, and does not explain it either.**
+- Base fa0fa9f against F at T=1 only: a discarded T=1 run0, then four rounds in the order T=1 base, base T=1, T=1 base, base T=1, with no c=16 captures. 02:21:02Z–02:30:52Z.
+- Per run, T=1: serial p50 8.69, 8.34, 8.38, 11.72 ms; concurrent QPS 195.2, 199.8, 204.0, 163.4. Base: 8.60, 8.91, 8.64, 8.53 ms; 178.0, 181.5, 199.4, 195.0.
+- Medians: T=1 8.53 ms and 197.5 QPS, base 8.62 ms and 188.2 QPS. T=1 is level with base, slightly ahead on both.
+- But the A/B's two fast T=1 serial runs (7.65 and 7.66 ms) are faster than any follow-up run, and its slowest T=1 QPS run (175.3) is below every follow-up base run. The first override text said the follow-up "put them level"; a review later showed that this overstated what it settles (02:45Z entry).
+
+**02:30Z–02:47Z. The NEON repro disagrees with its own footer; pinning shows the tail costs nothing extra on one core. ADR 0005 gets the results, and the bench volume goes back to flat.**
+- The A/B's NEON repro printed 2.32, 2.14 and 1.66 per query at nq=2, 3 and 4 against nq=1, under a footer that still quoted p3's 2.05 and 4.89. nq=4 at 1.66 put the draft's ask (pad 2–3 queries into the 4-query tile) in doubt.
+- **Double-checked on gn100** (W-14; runs of about 2 s, no container touched). Pinned to one X925 core (`taskset -c 5` or `-c 15`, four runs): nq=2 1.01–1.02, nq=3 1.01, nq=4 0.65. Pinned to one A725 core: 1.01, 1.01, 0.49. Unpinned, five runs: nq=2 1.53–3.04, nq=3 1.35–2.38, nq=4 0.87–1.66.
+- So the 2–3-query tail shares no work, as the code says, and the excess appears only unpinned. Every multi-query search runs on turbovec's pool (`with_pool_if(nq > 1 || ...)`); a one-query search on a part under 32,768 rows runs on the caller. The 02:45Z entry isolates the cost.
+- **Ruling, 02:35Z (W-14): fix the drafts to match** (X12). The repro's docstring and footer, and the draft's title, Summary, Repro, Ask and Acceptance, now quote the pinned figures and the gn100 runs. On the workstation (x86 AVX2) the repro prints 0.67, 0.46 and 0.37.
+- The verify script wrote ADR 0005 and two drafts with CRLF line endings (Python's `write_text` on Windows), mixed with LF; all three were normalized to LF. The ADR gained a NEON note under the repro's output.
+- **02:43Z: `8eeb794` "Record Plan F's DGX A/B in ADR 0005".** 432 passed, the docs build strict, ruff's F rules report main's 5 findings only.
+- **F-R28, 02:44:40Z–02:46:16Z.** The bench volume is detached back to flat on F's image at 4 GiB: 95 s. bench-tv is Exited (0). gn100 is as plan F found it.
+
+**02:45Z–03:06Z. Two reviews narrow the record, and a placement experiment shows where the small-batch cost comes from.**
+- **Review 1 (Sonnet, 02:45–02:49Z)** of `8eeb794` and the drafts found no wrong data, and these points:
+  - The override's in-process "matches the serial loop" (29.49/29.58 against 28.82/29.75 ms) compares the T=1 code with itself: the probe's serial run is a one-thread pool, the same code.
+  - "Base's calls in base's order" holds for unfiltered searches only; filtered searches intersect and sort.
+  - "Rather than the code path" claims more than the follow-up shows.
+  - Base's memory-peak band (2,566 MB) is unexplained in the ADR.
+  - The handoff explanation was inferred, not isolated.
+  - The draft's Acceptance 1 (at most 0.6 per query, unpinned) could not be reached, and Acceptance 2 had already been met once.
+  - The scripts' self-check can no longer reach OK, because one of its cases needs a pending ADR. Accepted without change: it is a pre-A/B tool, and it passed at 02:24Z.
+  - The reviewer was itself partly wrong: it said the A/B's T=1 runs fell inside the follow-up's ranges. They do not (7.65 and 7.66 ms against a minimum of 8.34; 175.3 QPS against base's minimum of 178.0).
+- **Placement experiment, 02:47–02:55Z** (gn100 idle). The caller is pinned to X925 core 5 and turbovec's one pool worker to a chosen core; the worker inherits the affinity of the thread that creates the pool, and `/proc` confirmed every placement. Worker on the caller's core: 1.01–1.02 per query at nq=2. On another X925 in the same L3: 1.48–1.49. On an X925 in the other L3: 1.69–2.80. On an A725: 3.74–5.14 (section 4.17, section 5.25).
+- **Rulings 02:56Z, fixes 02:57–03:01Z, `5894d05`.** The override is rewritten: unfiltered searches only, no self-comparison, the follow-up's medians, and the A/B's runs that fall outside them. The ADR gains the memory-peak sentence and the placement figures, and a test that the verification record holds no `D:/` or `/home/` path, since the repo is public. The draft's Acceptance 1 becomes pinned (`taskset -c 5`; nq=2 and nq=3 each at most 0.9× of nq=1, median of three runs), and Acceptance 2 needs three runs out of three. 432 passed.
+- **Review 2 (Sonnet, 03:01–03:03Z)** recomputed every figure from the raw results: all match, and no path leaks. It found two overclaims and two minor points, all accepted at 03:04Z:
+  - "The handoff costs nothing measurable on one core": same-core runs give 1.00–1.02, up to about 4 µs per call, which this data cannot separate from the tail's own cost.
+  - The draft's "breaks even between 4 and 12 queries" holds for three of five unpinned runs. It now gives those three runs and the far-core cost at nq=8 (1.05–2.17).
+  - Acceptance 2 runs unpinned, so a kernel fix alone may not reach it; the draft says so.
+  - "We attribute the gap to variance between fresh containers" became "consistent with variance between fresh containers, which the follow-up did not test".
+  - ADR 0005's audience-batching row also stops quoting turbovec's own "~70 µs pool install" comment, which this data neither confirms nor isolates, and points to the placement note instead.
+- **03:06Z: `5e4a989` "Narrow ADR 0005's handoff and F6 claims to what the data show".** 432 passed. The drafts stay outside the repo, not posted.
+
 ## 3. Decision register
 
 ID prefixes:
@@ -1501,6 +1547,8 @@ ID prefixes:
 | X8 | 2026-10-01, about 21:30Z | Plan E takes the two releases that came out after its version scan (W-11; ruling E-R14). PyO3 0.29.3: Task 2's `native/Cargo.toml` pins it, and cargo generates `native/Cargo.lock` instead of it being copied from the plan. Rust 1.99.0: the workstation's toolchain is updated. The image and CI pins move to 1.99.0 at Task 7 if `rust:1.99.0-slim-trixie` is on Docker Hub. If it is not, they stay at 1.98.1 and are checked again before the final review. Tasks 7 and 8 always carry the same version. | Keep the plan's PyO3 0.29.2 and Rust 1.98.1 (W-11 asks for the latest). Pin 1.99.0 in the image before its tag exists. | PyO3 0.29.3 (2026-09-30) is a patch release; among its fixes is the Windows `raw-dylib` opt-out. Rust 1.99.0 became stable on 2026-10-01, and `rust:1.99.0-slim-trixie` returned 404 at 21:28Z and 21:44Z. The generated lock differs from the plan's only in the five pyo3 crates. Task 2 built and passed on 1.99.0 with 0.29.3. | Controller (W-11, W-14) | Section 2, 2026-10-01 | PyO3 in Task 2 (d1def25); the image's Rust pin is open until Task 7. (Dated note, 2026-10-01 22:16Z: Tasks 7 and 8 kept 1.98.1, because the 1.99.0 image tag was still missing at 22:10Z; rechecked before the final review.) |
 | X9 | 2026-10-01, about 22:50Z | Plan E ships the D14 prune with a known loss, documented (ruling E-R15, under W-14). D14 folds a query's compatibility forms, so `CO₂`, `m²` or `ℝ³` ask FTS5 for `co2`, `m2` or `r3`, which FTS5's `unicode61` does not index for a document that holds the original form. ADR 0004's D14 row and ADR 0003's addendum say so. Two issue drafts, not posted: this loss with three fixes, and stage 2's df lookup by the unfolded token (pre-existing). | Revert D14's MATCH terms to the raw tokens (gives up D14's gain, and needs a new A/B arm). Match both forms (a more complex query; a ranking change that needs its own hit@10 check). | The final review's I-1, reproduced end to end: a one-term query `CO₂` returned nothing. The bench's queries are ASCII, so the A/B is unaffected. | Assistant (W-14); the maintainer may overrule | Final review; ledger `preflight-rulings.md` | Shipped with plan E |
 | X10 | 2026-10-02, about 00:05Z | Plan F's memory gate (F5) reads the container's cgroup `memory.peak` before bench.py's cold-start restart (ruling F-R17). On gn100, an idempotent patch to the copy of bench.py records `memory_peak_mb` just before `cold_start()`. The script's later read is kept as `memory_peak_restart_mb`. Run0 checks that the restart resets the peak. | Keep the plan's read, which measures the restarted container. Read once more after the c=16 capture, which covers vector load only, not the filtered or hybrid phases. | `bench_engine` ends with `cold_start()`, which runs `podman restart`. The plan's `meta()` ran after it (DGX scan T9-H2, found by reading the code). | Controller (W-14) | Ledger `preflight-rulings.md`; section 5.23 | Ruled; checked on run0 |
+| X11 | 2026-10-02, about 02:20Z | Plan F's F6 (`IVF_SEARCH_THREADS=1` within the band) failed and is overridden. ADR 0005 records every item, the FAIL included, and an override line; the gate test pins the failed items to exactly F6 and requires the override. The summary script gains D1's `--override`. A follow-up on gn100 (ABBA order, no c=16 captures) runs only to understand the gap and is never a gate. | Re-run the A/B or the T=1 arm until F6 passes. Hold F until the gap is explained. | F6: serial p50 7.66 against 8.84 ms (band 1.05), concurrent QPS 183.15 against 203.08 (band 10.77), in opposite directions. For unfiltered searches the T=1 path makes base's calls in base's order. Follow-up medians: 8.53 against 8.62 ms, 197.5 against 188.2 QPS; it did not reach the A/B's fast T=1 runs. | Controller (W-14, under R-D5's precedent) | Section 5.24; section 4.17 | Recorded (`8eeb794`); wording narrowed after two reviews (`5894d05`, `5e4a989`) |
+| X12 | 2026-10-02, 02:35Z, 02:56Z and 03:04Z | The NEON upstream draft (not posted) changes its ask and its acceptance. Ask: a 2-query tile, and padding 3 queries into the 4-query tile; running small batches on the calling thread is a note, not an ask. Acceptance 1: pinned to one X925 core (`taskset -c 5`), nq=2 and nq=3 each at most 0.9× of nq=1, median of three runs. Acceptance 2: the probe's guard prints REVISIT at the chosen pool size in three runs out of three, with a note that a kernel fix alone may not get there. | Keep the earlier acceptance (at most 0.6 per query, unpinned): out of reach, since placement dominates. Ask turbovec to change how it routes small batches to its pool: we do not know its constraints. | Pinned: 1.00–1.02 per query at nq=2 and 3. By worker placement: 1.48–5.14 (section 5.25). Padding 2 queries into the 4-query tile would cost about 1.3× per query pinned (310.3 against 118.7 µs). | Controller (W-14) | Section 5.25; ledger | Drafted outside the repo; the maintainer posts it |
 | W-1 | 2026-09-27 23:27Z | "Answer, don't act": a question such as "is it OK to X?" gets an answer and an offer, never an unrequested action. | None. | The gn100 restart incident (section 7). | Maintainer (correction) | Transcript | Standing rule |
 | W-2 | 2026-09-27 23:09Z to 2026-09-28 01:11Z | Offload work to gn100 "when it makes sense". First baseline: "not more than 65m". Later: "no limits" for this program while the PC stays on. The spec keeps a rule that DGX runs over about 5 minutes need a go-ahead with a time cap. | None. | None. | Maintainer | Transcript; spec §6 | Standing |
 | W-3 | 2026-09-28 18:45Z | Every question to the maintainer goes through the structured question tool. | None. | None. | Maintainer | Transcript | Standing |
@@ -1519,7 +1567,7 @@ ID prefixes:
 | W-13 | 2026-09-30, asked 10:05Z, answered 10:24Z | `main` is pushed after plan C: a fast-forward from 00c70a1 to d7f4b01 (plan C's 13 commits, its merge bb907ac, and the probe-path fix), no force. The docs branches and `bench-hardening` stay local. | "Not yet" (keep `main` local and ask again later). | Pushed 10:24:36Z; Actions green (tests, docs). A scan of 00c70a1..cd3cbf2, run after the pushes, finds no added home path, IP or key path; the only home-path lines are the ones d7f4b01 removes. | Maintainer (chose "Push main now", recommended) | Transcript; section 2 | Done. cd3cbf2 (the 4 GiB detach) followed at 10:37:21Z under W-14. |
 | W-14 | 2026-09-30, about 10:24Z | Routine decisions no longer go to the maintainer: "just assume that the reply is the same and ask only really blocking questions. If something needs to be double checked, just do it, assume I'm not at the desk and you have time to do stuff". The controller takes the usual answer for a local merge commit, pushing `main`, committing the journal, the recommended option, archiving ledgers and starting the next plan in the agreed order. It still asks before a history rewrite, a force-push, anything posted outside the repo (issues, upstream), deleting data, or touching the maintainer's containers. | None offered: a free-text instruction. | "I have replied in the same way for the past 10 times you've asked the same stuff". | Maintainer (free text) | Transcript; section 2 | In force |
 
-Register total: 64 entries (P 3, D 16, R 23, X 8, W 14). (Dated note, 2026-10-01 21:45Z: X8 added. Dated note, 2026-10-01 21:26Z: R-D5 added; X7, added 2026-09-30 at 14:04Z, had not been counted here. Dated note, 2026-09-30 13:20Z: X6 added. Dated note, 2026-09-30 10:46Z: W-13 and W-14 added. Dated note, 2026-09-30 00:28Z: W-12 added. Dated note, 2026-09-30 00:08Z: R-A5 added. Dated note, 2026-09-29 21:05Z: W-11 added. Dated note, 08:30Z: R-A4 added. Dated note, 08:05Z: R-A3 and W-10 added; W-8 superseded. Dated note, 23:00Z: W-9 added. Dated note, 22:45Z: R-G8, R-G9 and W-8 added. Dated note, 21:20Z: R-G7 added. Dated note, 21:23Z: X4 added. Dated note, 21:45Z: X5 added. Dated note, 22:30Z: W-7 added.) (Dated note, 20:40Z: R-B1, R-B2, R-G5, R-G6, W-6 and X3 were added after p4; before them the total was 38 (P 3, D 16, R 12, X 2, W 5).) R-D3, R-G3 and R-G4 were added at 20:05Z, and R-D4 at about 20:15Z; the backfill written at about 19:30Z had 34.
+Register total: 68 entries (P 3, D 16, R 23, X 12, W 14). (Dated note, 2026-10-02 03:12Z: X11 and X12 added; X9 and X10, added on 2026-10-01 and 2026-10-02, had not been counted here. Dated note, 2026-10-01 21:45Z: X8 added. Dated note, 2026-10-01 21:26Z: R-D5 added; X7, added 2026-09-30 at 14:04Z, had not been counted here. Dated note, 2026-09-30 13:20Z: X6 added. Dated note, 2026-09-30 10:46Z: W-13 and W-14 added. Dated note, 2026-09-30 00:28Z: W-12 added. Dated note, 2026-09-30 00:08Z: R-A5 added. Dated note, 2026-09-29 21:05Z: W-11 added. Dated note, 08:30Z: R-A4 added. Dated note, 08:05Z: R-A3 and W-10 added; W-8 superseded. Dated note, 23:00Z: W-9 added. Dated note, 22:45Z: R-G8, R-G9 and W-8 added. Dated note, 21:20Z: R-G7 added. Dated note, 21:23Z: X4 added. Dated note, 21:45Z: X5 added. Dated note, 22:30Z: W-7 added.) (Dated note, 20:40Z: R-B1, R-B2, R-G5, R-G6, W-6 and X3 were added after p4; before them the total was 38 (P 3, D 16, R 12, X 2, W 5).) R-D3, R-G3 and R-G4 were added at 20:05Z, and R-D4 at about 20:15Z; the backfill written at about 19:30Z had 34.
 
 Three recommended options were overridden: the review scope at 18:46:59Z (R-EX, "Go through the key ones" instead of "Accept all defaults"), and R-A1 and W-5 at 18:51:48Z. At 18:46:59Z the commit question's recommended "I commit in my terminal" was also answered with free text instead: "I already committed, let's debug the shell, I can also reboot if necessary". Separately, spec §3.1 says two of its rows override a plan's default: A1 and the fallback in G2.
 
@@ -2138,13 +2186,85 @@ The gates:
 - **Concurrent, at 8 (reported, not gated).** q/s: e-base 17.7, e-prune 17.5, e-python 17.7, e-native 36.7. p99: 1,047, 795, 804 and 441 ms. Native is 2.07× Python's q/s at 0.55× its p99.
 - **Pass 1 (first after the load).** First-10 max: e-base 447 ms, e-prune 146 ms, e-native 126 ms, e-python 142 ms. The discarded warm-up arm's was 491 ms.
 
+### 4.17 Plan F's A/B on gn100: the IVF fan-out
+
+Plan F's Task 10, run on gn100 on 2026-10-02, 01:57:05Z–02:14:31Z (cap 150 minutes). The full record is ADR 0005's "Verification" section.
+- Arms: base = fa0fa9f (`main` after plans A–E), F = fd98580 (the branch head; pool of 12 threads, the default here), and F with `IVF_SEARCH_THREADS=1` (T=1, the escape hatch).
+- Seed 42, 2,549,119 × 1024, nlist 256, nprobe 16, c=8, host-warm, a 4 GiB container with the host's default swap, `OPENBLAS_NUM_THREADS=1`. Every arm ran CPython 3.12.14, SQLite 3.53.1 and turbovec 1.0.0.
+- A discarded base run0 built the IVF index, then three rounds ran base, F and T=1. After each base and F run, a c=16 capture recorded CPU (record only).
+
+Medians of 3 runs (band in brackets):
+
+| Metric | base | F | F, T=1 |
+|---|---|---|---|
+| QPS concurrent (c=8) | 203.1 (10.8) | 342.1 (27.7) | 183.1 (10.2) |
+| Search p50 (ms) | 8.8 (0.2) | 6.2 (0.2) | 7.7 (1.0) |
+| QPS serial | 112.1 (2.4) | 159.6 (6.3) | 127.7 (15.8) |
+| p95 under concurrency (ms) | 43.7 (5.2) | 28.6 (2.0) | 50.9 (8.3) |
+| Filtered p50 (ms) | 49.0 (1.5) | 6.2 (0.1) | 8.5 (1.7) |
+| Filtered p95 (ms) | 51.2 (2.1) | 7.4 (0.1) | 10.3 (1.7) |
+| Hybrid p50 (ms) | 46.2 (0.4) | 46.5 (1.3) | 45.9 (1.3) |
+| Recall@10 | 0.995 | 0.995 | 0.995 |
+| Memory peak before the restart (MB) | 1530 (2566) | 1529 (35) | 1530 (2) |
+| CPU per query at c=8 (ms) | 5.19 (0.32) | 10.09 (0.65) | 5.81 (0.57) |
+
+The items:
+- **F1 pass.** Recall@10 0.995 in every arm. In process, T=12 against T=1 on seed 42: 63 of 63 unfiltered batches, 500 of 500 filtered and 500 of 500 tiny-allowlist searches identical in ids, float32 score bits and tie order.
+- **F2 pass.** 342.1 [316.2..344.0] against 203.1 [198.3..209.1] QPS, 1.68×, and F's minimum is above base's maximum (p3: 324.7 against 189.2).
+- **F3 pass.** Filtered p50 6.16 ms against base's 48.98 (p3: 6.41 against 36.6; base about 49 in restarted containers, X6).
+- **F4 pass.** Serial p50 6.21 against 8.84 ms, band 0.18.
+- **F5 pass.** Memory peak 1,529 against 1,530 MB. Base's band is one run: base run 1, the first measured container after run0's index build, peaked at 4,096 MB, the cap, as run0 did. Every other measured run peaked at 1,527–1,562 MB.
+- **F6 fail, overridden (X11, section 5.24).** T=1 serial p50 7.66 against 8.84 ms (band 1.05), concurrent QPS 183.15 against 203.08 (band 10.77).
+- **F7 pass.** Largest list 24,123 rows, 74 % of the 32,768-row pooled-path cliff (p3's older index: 30,443).
+- **Labels pass.** Every measured run is host-warm, 4 GiB, default swap, OB1, the same index, SQLite 3.53.1 in every arm.
+
+At c=16 (record only; median [min..max] of 3):
+
+| Metric | base | F |
+|---|---|---|
+| QPS | 208.9 [192.6..217.5] | 408.0 [382.3..416.8] |
+| CPU per query, cgroup (ms) | 5.34 [5.12..5.77] | 10.23 [10.20..10.38] |
+| Cores busy, cgroup | 1.11 [1.11..1.12] | 4.18 [3.97..4.25] |
+| Event-loop thread (cores) | 0.19 [0.18..0.20] | 0.38 [0.35..0.42] |
+| Server threads above 0.05 cores | 3 | 15 |
+
+The F6 follow-up, 02:21–02:31Z (base against T=1 only, a discarded run0, four rounds in ABBA order, no c=16 captures):
+
+| Arm | Serial p50 per run (ms) | Median [min..max] | QPS at c=8 per run | Median [min..max] |
+|---|---|---|---|---|
+| base | 8.60, 8.91, 8.64, 8.53 | 8.62 [8.53..8.91] | 178.0, 181.5, 199.4, 195.0 | 188.2 [178.0..199.4] |
+| T=1 | 8.69, 8.34, 8.38, 11.72 | 8.53 [8.34..11.72] | 195.2, 199.8, 204.0, 163.4 | 197.5 [163.4..204.0] |
+| T=1 in the A/B | 8.70, 7.65, 7.66 | 7.66 | 183.1, 185.4, 175.3 | 183.1 |
+
+In process on the host (the probe, the same index):
+- **Stages, vector search at nq=8** (ms, median of 40; 128 turbovec calls per batch). At T=1: index stage 27.84, kernel time summed over calls 27.34, rescore 20.05, total 50.65. At T=12: 7.47, 63.46, 1.87 and 11.80.
+- **Pool sweep** (seed 7, plain fan-out, two runs, ms): T=1 29.49/29.58, 2 20.29/20.50, 4 12.05/16.91, 8 8.56/7.89, 12 7.42/7.57, 16 7.01/7.55, 20 7.49/7.68. The serial loop: 28.82/29.75. The probe chose 12, the default.
+- **Grouped calls.** On this index the mean audience is 2.39 queries per probed shard (p3: 1.40), so a batch needs 53.5 grouped calls instead of 128. Grouped won only at T=12 (6.74/7.12 against 7.42/7.57 ms), so the guard printed `REVISIT`. At every other pool size plain won, and grouped returned the same top-k (40 of 40).
+
+The NEON repro's tail, by where turbovec's pool worker runs (8,192 × 1024, 4-bit, k=50, median of 300; the caller pinned to X925 core 5; per-query cost against nq=1, two runs each):
+
+| Worker core | nq=2 | nq=3 | nq=4 | nq=8 |
+|---|---|---|---|---|
+| 5, the caller's own | 1.01–1.02 | 1.00–1.01 | 0.65–0.66 | 0.56 |
+| 6, X925 in the same L3 | 1.48–1.49 | 1.29–1.31 | 0.71–0.90 | 0.67–0.68 |
+| 15, X925 in the other L3 | 1.69–2.80 | 2.21–2.26 | 1.24–1.25 | 1.04–1.05 |
+| 0, A725 in the same L3 | 3.74–3.81 | 3.52–3.58 | 1.82–1.85 | 1.47–1.51 |
+| 10, A725 in the other L3 | 4.75–5.14 | 5.51–5.61 | 2.66–2.73 | 2.17 |
+
+The whole process pinned to one X925 core: 1.01–1.02, 1.01 and 0.65 at nq=2, 3 and 4 (four runs); to one A725 core: 1.01, 1.01, 0.49. Unpinned, as raggio runs (five runs): 1.53–3.04, 1.35–2.38, 0.87–1.66. The A/B's own repro run: 2.32, 2.14, 1.66, then 1.02 at nq=8 and 0.98 at nq=12. A one-query search runs on the caller in about 118 µs on an X925; an A725 takes about 3.2× as long (374.7 against 118.6 µs, pinned).
+
+Reading:
+- **F does what it was designed to do.** Concurrent QPS rises 1.68×, filtered p50 falls 8× (49.0 to 6.2 ms), serial p50 falls from 8.8 to 6.2 ms, with identical results and no memory cost. Hybrid p50 does not move: the text leg dominates it.
+- **It costs CPU.** CPU per query doubles: 5.19 to 10.09 ms at c=8, 5.34 to 10.23 at c=16. In process, the same 128 calls of an nq=8 batch take 63.46 ms of summed kernel time on 12 threads against 27.34 ms on one, while the index stage's wall time falls 3.7×. Each call costs more on the pool. The placement table gives one reason: a call on an A725 takes about 3.2× as long, and one on another core or the other L3 starts with cold caches. This was not profiled further.
+- **The server is not CPU-bound.** At c=16, F keeps 4.18 of 20 cores busy across 15 threads, with the event loop at 0.38 cores. Its 408 QPS at c=16 is above p3's 345–370 for the prototype at the same concurrency (section 4.5).
+
 ## 5. Negative results and surprises
 
 ### 5.1 Audience batching lost on NEON
 
 The laptop said to batch queries that probe the same shard. Brief 3b measured on AVX2: serial 76 q/s, pooled 298, audience-batched 159, both combined 490 (6.5×), with a mean audience of 2.67 ([3b](../research/2026-09-28-item3b-upstream-landscape.md)).
 
-gn100 said not to (p3; in process, seed 42, 8 concurrent, 5 reps). Grouping never beat plain per-(query, shard) calls beyond noise: best grouped 570.6 QPS against 610.4 for 12 workers. Grouped with one thread: 148.2 QPS against 241.5 serial (−39 %). Why: the mean audience at nq=8 was only 1.40 queries (brief 3b itself had predicted about 1.3 on the DGX, assuming an nlist of about 311; the index has 256). On NEON, nq=2–3 calls are not amortized: 1.95–4.89× the per-query cost of nq=1 (at 8,192 and 10k rows, 1,500 calls per point); they break even only at nq=8 (0.82–0.87×). AVX2 pads nq=1 to 4; the NEON nq=2–3 tail does not (turbovec `search.rs:3717-3760`, per brief 3a). The critic had flagged that brief 3b's result came from AVX2. Lesson: a kernel-shape optimisation measured on x86 did not transfer to aarch64. Decision D3.
+gn100 said not to (p3; in process, seed 42, 8 concurrent, 5 reps). Grouping never beat plain per-(query, shard) calls beyond noise: best grouped 570.6 QPS against 610.4 for 12 workers. Grouped with one thread: 148.2 QPS against 241.5 serial (−39 %). Why: the mean audience at nq=8 was only 1.40 queries (brief 3b itself had predicted about 1.3 on the DGX, assuming an nlist of about 311; the index has 256). On NEON, nq=2–3 calls are not amortized: 1.95–4.89× the per-query cost of nq=1 (at 8,192 and 10k rows, 1,500 calls per point); they break even only at nq=8 (0.82–0.87×). AVX2 pads nq=1 to 4; the NEON nq=2–3 tail does not (turbovec `search.rs:3717-3760`, per brief 3a). The critic had flagged that brief 3b's result came from AVX2. Lesson: a kernel-shape optimisation measured on x86 did not transfer to aarch64. Decision D3. (Dated note, 2026-10-02 03:12Z: those 1.95–4.89× were measured unpinned. Pinned to one core, 2–3-query calls cost 1.00–1.02× per query; most of the excess depends on which core runs turbovec's pool thread (section 5.25). In plan F's A/B, on a rebuilt index with 2.39 queries per probed shard, grouped calls won once, at 12 threads (section 4.17).)
 
 ### 5.2 The SQLite memstatus mutex, not the GIL, caps concurrent hybrid
 
@@ -2262,6 +2382,22 @@ Probe p2 forecast the native scorer's gain at 0.71–0.79× of hybrid p50. gn100
 ### 5.23 The memory gate would have read the peak after a restart
 
 Plan F's item 5 (F5) compares the container's cgroup `memory.peak` between base and F. It is one-sided: only a peak more than 50 MB above base fails (R-F1). The plan's script read the peak after each bench run. But bench.py's `bench_engine` ends with the cold-start measurement, and that measurement runs `podman restart`. A restart very likely starts the container in a fresh cgroup with a new peak. So the gate would have compared the two arms' restart footprints: the collection load and one search. It would have missed the concurrency-8, filtered and hybrid phases, which is where F's pool threads, sorted allowlists and per-thread arenas would show. Both arms would have read about the same, and F5 would have passed without measuring what it exists for. The DGX scan found this by reading the code; nothing had run. The ruling (F-R17, X10) records the peak inside the gn100 copy of bench.py, just before the restart. The later read is kept beside it, and run0 shows whether the restart reset the peak.
+
+### 5.24 The escape hatch failed its own gate, in both directions
+
+Plan F's item 6 (F6) asks that `IVF_SEARCH_THREADS=1` reproduce the old serial path within the noise band. By the code it should: for unfiltered searches it makes base's per-(query, shard) turbovec calls in base's order, plus a task list and a closure. The A/B said otherwise, two ways at once. Serial p50 was 1.19 ms better than base's (band 1.05), and concurrent QPS was 19.9 lower (band 10.8). A slower code path does not make one row better and another worse in the same runs. Two things set the T=1 arm apart: in every round it ran straight after F's c=16 capture, and its serial runs were bimodal (8.70, 7.65, 7.66 ms).
+
+A follow-up in ABBA order, without the captures, put T=1 level with base and slightly ahead on both medians (section 4.17). It did not close the question. The A/B's two fast T=1 runs are faster than any follow-up run, and its slowest QPS run is slower than every follow-up base run. So the follow-up neither reproduces the gap nor rules out a smaller real one. F6 is recorded as failed, with an override under W-14 and the D1 precedent (X11, R-D5).
+
+Two reviews then narrowed the override's text. One sentence quoted an in-process comparison that set the T=1 code against itself (the probe's "serial" run is a one-thread pool). Another said the gap came from container variance "rather than the code path", and later that it was "attributed" to that variance; the record now says it is consistent with variance between fresh containers, which the follow-up did not test. The first reviewer was also wrong in the other direction: it read the A/B's T=1 runs as inside the follow-up's ranges, and they are not. Lesson: on a host this noisy, an equivalence gate needs paired runs in balanced order from the start. Three runs in a fixed order cannot tell an arm effect from an order effect, and a follow-up after the fact can only fail to reproduce.
+
+### 5.25 The NEON small-batch penalty was mostly where the pool thread ran
+
+p3 measured 2–3-query calls on gn100 at 1.95–4.89× the per-query cost of one query (section 5.1). The upstream draft read that as turbovec's NEON tail, which shares no work between queries, and asked turbovec to pad 2–3-query batches into its 4-query tile. The A/B's run of the same repro gave 2.32, 2.14 and 1.66 at nq=2, 3 and 4: nq=4 should share work, so 1.66 did not fit.
+
+Pinned to one core, the tail costs 1.00–1.02 per query at nq=2 and 3, and nq=4 shares work (0.65). The rest is placement. turbovec runs every multi-query search on its thread pool, and a one-query search on a part under 32,768 rows on the calling thread. With the caller and the pool's one worker pinned separately, the worker on the caller's core costs 1.01–1.02; on another X925 sharing the L3, 1.48–1.49; on an X925 in the other L3, 1.69–2.80; on a Cortex-A725, 3.74–5.14. An A725 runs this kernel about 3.2× slower, and the scheduler may put the worker on either core class. Unpinned, five runs spread over 1.53–3.04.
+
+So the draft's ask changed: a 2-query tile, and padding only 3 queries into the 4-query tile, since padding 2 would cost about 1.3× per query pinned (310.3 against 118.7 µs). Its acceptance is measured pinned, and the placement cost is a note, not an ask (X12). On the same host the guard saw grouped calls win once, at 12 threads, with 2.39 queries per probed shard instead of p3's 1.40 (section 4.17). Lesson: on a host with two core classes and two L3 clusters, pin before reading a microbenchmark, and pin the pool's worker separately. Pinning the whole process hides placement, and leaving it unpinned mixes placement into every number.
 
 ## 6. Method: how we measured
 
@@ -2455,6 +2591,7 @@ State as of 2026-09-28, about 19:30Z.
 - Dated note, 2026-10-02 00:03Z: plan F's pre-flight is done and ruled (section 2, 2026-10-02; F-R1 to F-R39 in the ledger). F runs in `.worktrees/ivf-fanout-and-upstream` from `main` at fa0fa9f; Task 1 is next, on Sonnet.
 - Dated note, 2026-10-02 00:59Z: plan F's Tasks 1–5 are approved (8002a84, 427 passed; section 2, 2026-10-02). Task 6, the probe, is running. Still to come: Tasks 7–9, the final review on Opus, and Task 10's A/B on gn100 (DGX Spark).
 - Dated note, 2026-10-02 01:25Z: plan F's Tasks 1–9 are done and checked (ff7695c, 431 passed). The drafts and DGX scripts are outside the repo. The final review on Opus is running (section 2, 2026-10-02). Still to come: any fix wave, then Task 10's A/B on gn100, then the merge.
+- Dated note, 2026-10-02 03:12Z: plan F's A/B on gn100 is done (section 4.17). Six items pass; F6, the escape hatch, failed in both directions and is overridden (X11, section 5.24); the grouped-call guard printed REVISIT at 12 threads. ADR 0005 records it (`8eeb794`, narrowed after two reviews in `5894d05` and `5e4a989`; 432 passed). The NEON draft's ask and acceptance changed (X12, section 5.25); no draft is posted. The bench volume is flat again. Next: merge F into `main` and push, then plan D2.
 
 ### 9.2 Open questions in the plans
 
@@ -2469,7 +2606,7 @@ State as of 2026-09-28, about 19:30Z.
 
 - **OB1 side effects.** IVF train/attach (k-means matmuls), CREATE INDEX, ingest and text/hybrid search with `OPENBLAS_NUM_THREADS=1`. A's gn100 step checks the IVF build (R-A1). Fallback: restrict BLAS threads to the search path (threadpoolctl). (Dated note, 2026-09-30: the build is measured, at +3.6–4.7 s (section 4.9), and R-A5 recorded the fallback as not needed. CREATE INDEX and ingest under OB1 are still not measured.)
 - **Plan C:** a cold IVF build under C; migration plus load end to end in the server; CREATE INDEX RSS; `MALLOC_MMAP_THRESHOLD_`; anything above 2.55M rows. The cold `POST /index` bounds are targets, not measurements.
-- **Plan F's own filtered design** (intersect up front) was measured only in process; the server prototype intersected inside each task.
+- **Plan F's own filtered design** (intersect up front) was measured only in process; the server prototype intersected inside each task. (Dated note, 2026-10-02: F ships the cut inside each task, and its A/B measured it in the server: filtered p50 6.16 ms against base's 48.98 (section 4.17).)
 - **R2b** (IVF id cache) rests on reasoning only; no repro was built.
 - **Ingest on gn100.** The published 1,357 vec/s was not re-measured.
 - **Combined effects** (critic): native BM25 on 3.14t, the fan-out pool on 3.14t, and batched ingest together with fan-out under concurrent ingest plus search.
@@ -2487,6 +2624,10 @@ State as of 2026-09-28, about 19:30Z.
 - p3 attributes the server gap (203–408 QPS against an in-process ceiling of 610–662) to "serial drain plus event-loop pipeline", inferred from per-thread CPU sampling, not a per-stage trace.
 - **Memory right after a reingest** (D1's A/B, 2026-09-30). The base measured 388 and 533 MB after its reingests, against 1,617–1,623 MB for D1's candidate and 1,502–1,551 MB in every adopt session. Under load both arms reach about 1.6 GB. `bench.py` reads `podman stats`, which leaves inactive file pages out. Why the base's index looks non-resident right after its reingest was not investigated.
 - **D1's third IVF candidate run** drained in 70.4 s, against 81.7 s for the other two and 93–99 s for the base. It was the last probe run. Nothing in the log explains it.
+- **Base run 1's memory peak** (plan F's A/B, 2026-10-02): 4,096 MB before the restart, the cap, in the first measured container after run0's index build. Every other measured run peaked at 1,527–1,562 MB. Not investigated.
+- **F6's gap** (section 5.24): the A/B's T=1 serial runs read 8.70, 7.65 and 7.66 ms, and no follow-up run went below 8.34. What made two runs fast, and one QPS run slow, is not known.
+- **F doubles CPU per query** (5.19 to 10.09 ms at c=8) and the summed kernel time of a batch (27.34 to 63.46 ms in process). Pool-thread placement explains part of it (section 5.25); it was not profiled.
+- **The grouped-call guard's REVISIT** at 12 threads only, on one run, with 2.39 queries per probed shard on the rebuilt index against p3's 1.40. Whether it holds is a question for reopening spec D3.
 
 ### 9.5 Disputed, unaddressed, and limits
 
