@@ -182,6 +182,12 @@ run. It was not investigated.
 
 Batching guard: **REVISIT** at T=12: grouped beat plain beyond its run1/run2 band on seed 7. Nothing ships on it; it is reported to the maintainer as a reason to reopen spec D3. The default pool on gn100 (T=12) is the smallest within noise of the fastest on seed 7.
 
+Re-run, 2026-10-03: the maintainer reopened spec D3, so audience batching would ship if it won beyond noise. The index was rebuilt the same way, with mean audience 2.39 on seed 7 (as above) and 2.48 on seed 42. `fanout` then ran 5 times per seed, with the seeds interleaved, at T=8, 12 and 16. The criterion was fixed before the runs. At T=12, on both seeds, grouped's median had to be at most 0.95× plain's, and its slowest run had to be faster than plain's fastest. Neither seed passed:
+- grouped/plain medians were 1.016 on seed 7 (7.47 against 7.35 ms) and 0.955 on seed 42 (7.29 against 7.63 ms);
+- grouped's slowest run (7.64 and 7.55 ms) was slower than plain's fastest (6.85 and 6.86 ms).
+
+At T=16 grouped was 4–5 % slower on both seeds, and at T=8 the ratios were 1.002 and 0.990. Top-k was identical on every batch. The single-run REVISIT above did not reproduce, so spec D3 stands and audience batching stays unshipped.
+
 After F, the server limit is the HTTP/event-loop pipeline, about 3.1 ms per request, against
 an in-process ceiling of 610–662 QPS (spec §7 F, p3). The follow-ups (two `_drain_scans`
 batches in flight, `_hydrate` off the event loop, a cheaper parse of the vector body) are
