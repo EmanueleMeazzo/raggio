@@ -682,6 +682,16 @@ def _ivf_auto_nlist(n: int) -> int:
     return int(np.clip(2 ** round(np.log2(max(n, 1) / 8192)), 16, 1024))
 
 
+def _sorted_ids(ids) -> np.ndarray:
+    """uint64, strictly increasing: the form _IvfIndex._intersect binary-searches.
+    Cached filter allowlists arrive sorted (an O(n) check, no copy); unsorted or
+    duplicated input (_expand's sibling lists) pays one np.unique."""
+    a = np.asarray(ids, dtype=np.uint64)
+    if len(a) > 1 and not bool((a[1:] > a[:-1]).all()):
+        a = np.unique(a)
+    return a
+
+
 class _ShardPool:
     """Order-preserving map for _IvfIndex's per-(query, shard) searches, on threads
     owned by one Collection and shut down by its stop() (ADR 0005). Never the asyncio
@@ -855,12 +865,18 @@ class _IvfIndex:
         return ids
 
     def _intersect(self, allow: np.ndarray, j: int) -> np.ndarray:
-        """allow ∩ shard j's ids (both uint64; shard side pre-sorted)."""
+        """allow ∩ shard j's ids, sorted. Both sides are sorted and unique (allow via
+        _sorted_ids), so binary-search the smaller side into the larger: a 255k-id
+        filter against an 8k-row shard costs O(8k log 255k), not O(255k log 8k)
+        (laptop, 16 probed shards of 2.55M rows: 94 ms -> 5 ms per query; DGX p3:
+        29.8 -> 2.0 ms). search() calls this inside each pool task, so the pool's
+        threads may run it concurrently: it only reads allow and the shard-id cache."""
         sids = self._shard_ids(j)
-        if not len(sids):
-            return sids
-        pos = np.minimum(np.searchsorted(sids, allow), len(sids) - 1)
-        return allow[sids[pos] == allow]
+        if not len(sids) or not len(allow):
+            return sids[:0]
+        small, big = (allow, sids) if len(allow) <= len(sids) else (sids, allow)
+        pos = np.minimum(np.searchsorted(big, small), len(big) - 1)
+        return small[big[pos] == small]
 
     def search(self, queries: np.ndarray, k: int, allowlist=None, nprobe: int | None = None):
         """Merged top-k over probed shards. Mirrors IdMapIndex.search: single-query
@@ -871,7 +887,9 @@ class _IvfIndex:
         bit-for-bit, tie order included. A filtered task cuts its own allowlist slice
         on the pool thread (spec §2 row 6; p3: 3.7 ms against 6.4-7.0 ms cut up front
         on the caller), so the intersections run in parallel too."""
-        tiny = allowlist is not None and len(allowlist) <= 128
+        if allowlist is not None:  # sorted, unique: the form _intersect binary-searches
+            allowlist = _sorted_ids(allowlist)
+        tiny =allowlist is not None and len(allowlist) <= 128
         owned: dict[int, np.ndarray] = {}  # tiny allowlists only: shard j -> its slice
         if tiny:
             # tiny allowlists (metadata filters, sibling expansion) must not lose
@@ -1823,7 +1841,9 @@ class Collection:
             if allow is None:
                 where, params = _filter_sql(scope, filt)
                 ids = [r[0] for r in self._rdb().execute(f"SELECT id FROM records WHERE {where}", params)]
-                allow = np.array(ids, dtype=np.uint64)
+                # sorted once per miss, whatever order the query plan returns: the IVF
+                # path intersects by binary search (flat turbovec ignores the order)
+                allow = np.sort(np.array(ids, dtype=np.uint64))
                 try:  # ponytail: tiny FIFO; LRU if filters vary widely. Concurrent
                     # searches race the eviction — losing the race is fine, crashing isn't.
                     if len(self._allow_cache) >= 8:

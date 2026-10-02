@@ -425,3 +425,80 @@ def test_manager_passes_setting_to_collection(tmp_path, monkeypatch):
         return threads
 
     assert asyncio.run(go()) == 3
+
+
+# ---- shard-side allowlist intersection (sorted allowlists) ----
+
+
+def test_sorted_ids_normalizes():
+    out = store._sorted_ids([9, 3, 5, 3])
+    assert out.dtype == np.uint64 and out.tolist() == [3, 5, 9]
+    ready = np.array([1, 4, 7], dtype=np.uint64)
+    assert store._sorted_ids(ready) is ready  # already sorted: no copy, O(n) check only
+
+
+def test_intersect_both_directions_match_intersect1d():
+    ivf, _ = build_ivf()
+    rng = np.random.default_rng(11)
+    universe = np.arange(1, 3001, dtype=np.uint64)
+    foreign = np.arange(90_000, 90_050, dtype=np.uint64)
+    for size in (1, 5, 128, 129, 300, 2000, 3000):
+        raw = np.concatenate([rng.choice(universe, size, replace=False), foreign, universe[:3]])
+        allow = store._sorted_ids(rng.permutation(raw))
+        for j in range(ivf.nlist):
+            got = ivf._intersect(allow, j)
+            assert np.array_equal(got, np.intersect1d(raw, shard_ids(ivf.shards[j])))
+
+
+def test_unsorted_duplicate_large_allowlist_matches_reference():
+    # _expand passes sibling ids unsorted; the shard-side direction binary-searches
+    # the allowlist, so search() must normalize it first
+    ivf, X = build_ivf(threads=4)
+    rng = np.random.default_rng(12)
+    raw = rng.choice(np.arange(1, 3001, dtype=np.uint64), 700, replace=False)
+    raw = np.concatenate([raw, raw[:50], np.arange(80_000, 80_010, dtype=np.uint64)])
+    q = np.ascontiguousarray(X[:4])
+    for nprobe in (2, 8):
+        got = ivf.search(q, 25, allowlist=rng.permutation(raw), nprobe=nprobe)
+        assert_same(got, reference_search(ivf, q, 25, allowlist=np.unique(raw), nprobe=nprobe))
+
+
+def test_large_allowlist_inside_one_shard_skips_the_other_probed_shards():
+    # RF3: more than 128 ids (the nprobe path), all held by one shard: every other probed
+    # shard's slice is empty and must be skipped (turbovec rejects an empty allowlist)
+    ivf, X = build_ivf(threads=4)
+    j = max(range(ivf.nlist), key=lambda s: len(ivf.shards[s]))
+    allow = ivf._shard_ids(j)
+    assert len(allow) > 128
+    q = np.ascontiguousarray(X[:6])
+    for nprobe in (1, 3, 8):
+        got = ivf.search(q, 15, allowlist=allow, nprobe=nprobe)
+        assert_same(got, reference_search(ivf, q, 15, allowlist=allow, nprobe=nprobe))
+        assert np.isin(got[1][got[0] > -np.inf], allow).all()
+    ivf._pool.close()
+
+
+def test_allow_cache_holds_sorted_arrays(tmp_path):
+    col = make_collection(tmp_path, threads=4)
+    ingest(col, 300)
+    attach(col, nlist=8, nprobe=8)
+    real_rdb = col._rdb
+
+    class Reversed:  # a query plan that returns ids out of rowid order
+        def __init__(self, db):
+            self.db = db
+
+        def execute(self, sql, *a):
+            cur = self.db.execute(sql, *a)
+            if sql.startswith("SELECT id FROM records WHERE"):
+                return iter(cur.fetchall()[::-1])
+            return cur
+
+    col._rdb = lambda: Reversed(real_rdb())
+    q = np.array([rowvec(1)], dtype=np.float32)
+    hits = asyncio.run(col.search("vector", q, None, 5, "chunks", {"g": 1}, None))
+    col._rdb = real_rdb
+    assert hits[0]["id"] == "c1"
+    (allow,) = col._allow_cache.values()
+    assert len(allow) == 150 and bool((allow[1:] > allow[:-1]).all())
+    asyncio.run(col.stop())
