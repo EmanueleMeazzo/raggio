@@ -2308,9 +2308,9 @@ def test_shutdown_stops_a_collection_whose_eviction_was_cancelled(tmp_path, monk
 
 
 def test_a_cancelled_eviction_keeps_the_load_lock_until_stop_ends(tmp_path, monkeypatch):
-    # the cancelled caller re-raises only once stop() ends, so its _load_lock covers
-    # the whole close: a touch() queued behind it cannot reopen the directory beside
-    # a collection still closing
+    # the cancelled caller re-raises only once stop() ends, even when cancelled twice,
+    # so its _load_lock covers the whole close: a touch() queued behind it cannot
+    # reopen the directory beside a collection still closing
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
 
     async def go():
@@ -2330,6 +2330,8 @@ def test_a_cancelled_eviction_keeps_the_load_lock_until_stop_ends(tmp_path, monk
                     assert time.monotonic() < deadline, "stop() never asked for the lock"
                     await asyncio.sleep(0.01)
                 ev.cancel()
+                await asyncio.sleep(0.01)  # into _evict's wait loop
+                ev.cancel()  # a second cancel must not end that wait either
                 again = asyncio.create_task(mgr.touch("m"))
                 await asyncio.sleep(0.05)
                 early = (ev.done(), again.done(), col._closed)
