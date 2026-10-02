@@ -816,3 +816,25 @@ def test_docs_drop_the_fixed_cost_claim_and_document_the_knob():
     for path in ("README.md", "docs/getting-started.md"):
         text = Path(path).read_text(encoding="utf-8")
         assert "| `IVF_SEARCH_THREADS` | `min(12, CPUs)` |" in text, path
+
+
+# ---- ADR 0005 records the DGX A/B (Plan F Task 10) ----
+
+
+def test_adr0005_records_the_dgx_verification():
+    adr = Path("docs/adr/0005-ivf-fanout-and-upstream-stance.md").read_text(encoding="utf-8")
+    ver = adr.split("## Verification", 1)[1]
+    assert "Pending:" not in ver
+    # spec §7 F items 1-7, the §6 row labels, the guard, the after-F note, and the
+    # record-only c=16 cores-busy table (p4)
+    for needle in ("IVF_SEARCH_THREADS=1", "QPS concurrent", "Filtered p50", "Recall@10",
+                   "Memory peak", "sqlite_version", "OPENBLAS_NUM_THREADS=1", "### §7 F acceptance",
+                   "- PASS: F1", "- PASS: F7", "EXACT seed 42", "LISTS largest",
+                   "GUARD grouped vs plain", "Batching guard:", "3.1 ms per request",
+                   "Cores busy at c=16", "taskset -c 5"):
+        assert needle in ver, needle
+    # item 6 failed on gn100 and is recorded as failed, with the maintainer's override;
+    # it is the only failed item
+    fails = [ln.split()[2] for ln in ver.splitlines() if ln.startswith("- FAIL: ")]
+    assert fails == ["F6"]
+    assert "- OVERRIDE: F6, " in ver

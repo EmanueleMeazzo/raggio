@@ -105,7 +105,144 @@ code. What changes:
 
 ## Verification
 
-Pending: Plan F's DGX A/B appends the results here (base vs F default vs
-`IVF_SEARCH_THREADS=1`, seed 42, spec §6 noise bands, spec §7 F items 1–7), the stage
-attribution from `bench/ivf_fanout_probe.py stages`, the seed-7 pool-size sweep with the
-grouped regression guard, the seed-42 exactness check, and the largest IVF list size.
+DGX A/B, 2026-10-02: gn100 (GB10, 20 aarch64 cores). Base `fa0fa9f` (the preceding main) vs
+Plan F `fd98580` at the default `IVF_SEARCH_THREADS` (12 on gn100) and at `IVF_SEARCH_THREADS=1`.
+arXiv 2,549,119 × 1024, seed 42, 500 queries, concurrency 8 (the concurrent phase repeats
+the same 500 queries, so its caches are warm). Host-warm, `--memory 4g`, and
+`OPENBLAS_NUM_THREADS=1` in every arm (spec §7 F, D16). Every run is a fresh container, so
+the bands include between-server variance: a discarded run0, then 3 interleaved rounds per
+arm (median, band = max − min; spec §6). The row-label table gives each arm's
+`sqlite3.sqlite_version` (D15). The raw results are kept outside the repo.
+
+### IVF A/B (seed 42, 2,549,119 x 1024, nlist 256, nprobe 16, c=8, host-warm, --memory 4g, OPENBLAS_NUM_THREADS=1 in every arm)
+
+| Metric | base (preceding main): median (band, n) | F, default threads: median (band, n) | F, IVF_SEARCH_THREADS=1: median (band, n) |
+|---|---|---|---|
+| QPS concurrent | 203.1 (10.8, 3) | 342.1 (27.7, 3) | 183.1 (10.2, 3) |
+| Filtered p50 (ms) | 49.0 (1.5, 3) | 6.2 (0.1, 3) | 8.5 (1.7, 3) |
+| Search p50 (ms) | 8.8 (0.2, 3) | 6.2 (0.2, 3) | 7.7 (1.0, 3) |
+| QPS serial | 112.1 (2.4, 3) | 159.6 (6.3, 3) | 127.7 (15.8, 3) |
+| p95 under concurrency (ms) | 43.7 (5.2, 3) | 28.6 (2.0, 3) | 50.9 (8.3, 3) |
+| Filtered p95 (ms) | 51.2 (2.1, 3) | 7.4 (0.1, 3) | 10.3 (1.7, 3) |
+| Recall@10 | 0.995 (0.000, 3) | 0.995 (0.000, 3) | 0.995 (0.000, 3) |
+| Hybrid p50 (ms) | 46.2 (0.4, 3) | 46.5 (1.3, 3) | 45.9 (1.3, 3) |
+| Memory under load, one sample (MB) | 1510 (1, 3) | 1512 (2, 3) | 1510 (2, 3) |
+| Memory peak before the restart, cgroup (MB) | 1530 (2566, 3) | 1529 (35, 3) | 1530 (2, 3) |
+| Memory peak after bench's restart, cgroup (MB) | 1529 (1, 3) | 1529 (1, 3) | 1528 (1, 3) |
+| CPU per query at c=8 (ms) | 5.19 (0.32, 3) | 10.09 (0.65, 3) | 5.81 (0.57, 3) |
+
+### Row labels (spec §6: regime, cap, memory_swap, sqlite3.sqlite_version, OPENBLAS_NUM_THREADS, index)
+
+| Row label | base (preceding main) | F, default threads | F, IVF_SEARCH_THREADS=1 |
+|---|---|---|---|
+| regime | host-warm | host-warm | host-warm |
+| cap | 4g | 4g | 4g |
+| memory_swap | host-default | host-default | host-default |
+| sqlite_version | 3.53.1 | 3.53.1 | 3.53.1 |
+| openblas_num_threads | 1 | 1 | 1 |
+| index | {"nlist": 256, "nprobe": 16, "type": "ivf"} | {"nlist": 256, "nprobe": 16, "type": "ivf"} | {"nlist": 256, "nprobe": 16, "type": "ivf"} |
+
+### Seed-7 pool-size sweep and grouped regression guard
+
+`bench/ivf_fanout_probe.py fanout` (seed 7): serial r1/r2 28.82/29.75 ms; chosen pool size 12 (default here 12); GUARD grouped vs plain at 12: REVISIT
+
+### Cores busy at c=16 (record-only, not a gate)
+
+`planF-cpu.py` after each measured base and F run: 1,500 vector searches at c=16 after a discarded 200, with CPU from the container cgroup's `cpu.stat` and from per-thread `/proc/<pid>/task/*/stat` deltas. The pre-F expectation is p4's: 1.1–1.25 cores busy at 19a8a2e, bound by the single `_drain_scans` pipeline.
+
+| Metric | base (preceding main): median [min..max], n | F, default threads: median [min..max], n |
+|---|---|---|
+| QPS at c=16 | 208.9 [192.6..217.5], 3 | 408.0 [382.3..416.8], 3 |
+| CPU per query, cgroup cpu.stat (ms) | 5.34 [5.12..5.77], 3 | 10.23 [10.20..10.38], 3 |
+| Cores busy, cgroup | 1.11 [1.11..1.12], 3 | 4.18 [3.97..4.25], 3 |
+| Cores busy, sum of server threads | 1.10 [1.10..1.10], 3 | 4.15 [3.93..4.22], 3 |
+| Main thread, event loop (cores) | 0.19 [0.18..0.20], 3 | 0.38 [0.35..0.42], 3 |
+| Server threads above 0.05 cores | 3 [3..3], 3 | 15 [15..15], 3 |
+| Driver (cores) | 0.14 [0.14..0.23], 3 | 0.40 [0.37..0.42], 3 |
+
+### §7 F acceptance
+
+- PASS: F1 recall@10 unchanged at the default nprobe: [0.995] [0.993]; EXACT seed 42 T=12 vs IVF_SEARCH_THREADS=1: unfiltered 63/63 batches, filtered 500/500, tiny 500/500 (year='2024', 212331 and 100 ids; ids, float32 score bits and tie order): PASS
+- PASS: F2 concurrent QPS (c=8, medians of 3 and 3 runs): F 342.1 [316.2..344.0] vs base 203.1 [198.3..209.1], 1.68x; needs >= 1.5x and F's min above base's max [p3: 324.7 [308.6..381.4] vs 189.2 [162.8..207.3]]
+- PASS: F3 filtered p50 6.16 ms, needs <= 10 (base 48.98) [p3: 6.41 vs 36.6; base expected about 49 in restarted containers (plan C's MALLOC_TRIM_THRESHOLD_)]
+- PASS: F4 serial p50 better beyond the band: 6.21 vs 8.84: gain +2.63, band 0.18 ms [p3: 6.50 vs 8.44]
+- PASS: F5 container memory peak (cgroup memory.peak, median) 1529 vs base 1530 MB, delta -1.0 MB; fails only above +50 MB (one-sided, spec §3.1 F1); F's peak is 1.0 MB lower, reported [p3: 1.82 GB in both]
+- FAIL: F6 IVF_SEARCH_THREADS=1 reproduces the serial path within the band: serial p50 7.66 vs 8.84: diff -1.19, band 1.05; concurrent QPS 183.15 vs 203.08: diff -19.94, band 10.77
+- PASS: F7 largest IVF list 24,123 rows, 74% of the 32,768-row pooled-path cliff [30,443]
+- PASS: labels: every measured IVF run is host-warm, cap 4g, swap host-default, OPENBLAS_NUM_THREADS=1, index {"nlist": 256, "nprobe": 16, "type": "ivf"}, one sqlite_version per arm (base 3.53.1; f 3.53.1; f1 3.53.1)
+- OVERRIDE: F6, recorded as failed under the maintainer's standing ruling on failed gates (first given for plan D1's ivf256 gate, 2026-10-01); nothing was re-run to replace it. The `IVF_SEARCH_THREADS=1` path makes base's per-(query, shard) calls in base's order, and in-process it matches the serial loop (seed 7, `fanout` T=1: 29.49/29.58 ms against serial 28.82/29.75 ms). In this A/B the T=1 arm always ran right after F's c=16 capture. A follow-up on gn100 the same day (base against T=1 only, a discarded run0, then 4 rounds in ABBA order, no c=16 captures) put T=1 level with base: serial p50 8.53 [8.34..11.72] against 8.62 [8.53..8.91] ms, concurrent QPS 197.5 [163.4..204.0] against 188.2 [178.0..199.4]. The gap tracks fresh-container variance on gn100, which three runs per arm did not capture, rather than the code path.
+
+Filtered p50: base measures 48.98 ms in restarted containers (plan C's
+`MALLOC_TRIM_THRESHOLD_`), and F brings it to 6.16 ms.
+
+Batching guard: **REVISIT** at T=12: grouped beat plain beyond its run1/run2 band on seed 7. Nothing ships on it; it is reported to the maintainer as a reason to reopen spec D3. The default pool on gn100 (T=12) is the smallest within noise of the fastest on seed 7.
+
+After F, the server limit is the HTTP/event-loop pipeline, about 3.1 ms per request, against
+an in-process ceiling of 610–662 QPS (spec §7 F, p3). The follow-ups (two `_drain_scans`
+batches in flight, `_hydrate` off the event loop, a cheaper parse of the vector body) are
+outside this ADR. Concurrent numbers also carry SQLite's global memstatus malloc mutex (p2,
+D15), so arms are compared only at the same `sqlite_version`.
+
+### Seed-42 exactness and the largest IVF list (`bench/ivf_fanout_probe.py exact`, in-process)
+
+```text
+# rows: host-warm, uncapped (in-process on the host), sqlite_version 3.53.1, OPENBLAS_NUM_THREADS=1
+loaded bench: 2549119 rows, nlist 256, nprobe 16, dim 1024, 4-bit, 1.0s
+LISTS largest 24123 rows, 74% of the 32,768-row pooled-path cliff
+EXACT seed 42 T=12 vs IVF_SEARCH_THREADS=1: unfiltered 63/63 batches, filtered 500/500, tiny 500/500 (year='2024', 212331 and 100 ids; ids, float32 score bits and tie order): PASS
+```
+
+### Stage attribution (`bench/ivf_fanout_probe.py stages`, seed 7, in-process)
+
+```text
+# rows: host-warm, uncapped (in-process on the host), sqlite_version 3.53.1, OPENBLAS_NUM_THREADS=1
+loaded bench: 2549119 rows, nlist 256, nprobe 16, dim 1024, 4-bit, 1.1s
+LISTS largest 24123 rows, 74% of the 32,768-row pooled-path cliff
+filter year='2024': 212331 ids; allowlist SELECT+sort 828 ms, shard-id cache fill 184 ms (each once per cache miss, not in the rows below)
+path       nq   T    parse    route    index   kernel   unpack  rescore  hydrate   encode    total  calls    other   (ms, median of 40)
+vector      1   1     0.17     0.02     2.88     2.77     0.01     2.63     0.06     0.09     5.87     16     2.99
+vector      1  12     0.19     0.04     2.14     5.11     0.02     0.32     0.07     0.10     2.78     16     0.63
+vector      8   1     1.29     0.12    27.84    27.34     0.06    20.05     0.43     0.65    50.65    128    22.81
+vector      8  12     1.30     0.12     7.47    63.46     0.07     1.87     0.44     0.65    11.80    128     4.32
+filtered    1   1     0.17     0.02     2.70     1.05     0.01     1.86     0.05     0.09     4.82     16     2.12
+filtered    1  12     0.18     0.03     2.05     2.56     0.01     0.23     0.06     0.10     2.64     16     0.59
+```
+
+### Pool-size sweep and grouped regression guard (`bench/ivf_fanout_probe.py fanout`, seed 7)
+
+```text
+# rows: host-warm, uncapped (in-process on the host), sqlite_version 3.53.1, OPENBLAS_NUM_THREADS=1
+loaded bench: 2549119 rows, nlist 256, nprobe 16, dim 1024, 4-bit, 1.0s
+LISTS largest 24123 rows, 74% of the 32,768-row pooled-path cliff
+nq=8 nprobe=16 k=50: 128 plain calls/batch, 53.5 grouped calls/batch; audience mean 2.39, histogram (size 1..) [986, 424, 242, 179, 131, 91, 61, 27]
+  T    plain r1/r2 ms   grouped r1/r2 ms  plain x  grp x  verdict
+  1    29.49/   29.58    37.75/   45.03     0.98   0.71  plain  (plain==serial: True; grouped same top-k 40/40)
+  2    20.29/   20.50    25.20/   24.34     1.41   0.82  plain  (plain==serial: True; grouped same top-k 40/40)
+  4    12.05/   16.91    13.46/   13.99     1.99   1.05  plain  (plain==serial: True; grouped same top-k 40/40)
+  8     8.56/    7.89     7.81/    8.51     3.50   1.01  plain  (plain==serial: True; grouped same top-k 40/40)
+ 12     7.42/    7.57     6.74/    7.12     3.84   1.08  GROUPED WINS  (plain==serial: True; grouped same top-k 40/40)
+ 16     7.01/    7.55     7.28/    7.49     3.96   0.99  plain  (plain==serial: True; grouped same top-k 40/40)
+ 20     7.49/    7.68     7.17/    7.69     3.80   1.02  plain  (plain==serial: True; grouped same top-k 40/40)
+serial r1/r2 28.82/29.75 ms; chosen pool size 12 (default here 12); GUARD grouped vs plain at 12: REVISIT
+```
+
+### turbovec small-batch repro on GB10 (`neon_small_nq_repro.py`)
+
+```text
+turbovec 1.0.0, aarch64, 3.12.14, RAYON_NUM_THREADS=1; IdMapIndex 8192 x 1024, 4-bit, k=50, median of 300
+ nq   us/call  us/query  vs nq=1
+  1     120.0     120.0     1.00
+  2     556.7     278.3     2.32
+  3     768.9     256.3     2.14
+  4     797.6     199.4     1.66
+  5     785.2     157.0     1.31
+  8     982.4     122.8     1.02
+ 12    1408.9     117.4     0.98
+per-query cost vs nq=1: nq=2 2.32, nq=3 2.14, nq=4 1.66. Measured on GB10 NEON: nq=2 2.05, nq=3 4.89 (no sharing); on x86 AVX2 all below 0.7.
+```
+
+The output's last sentence is the repro's built-in quote of p3's 8,192-row run; this run's figures
+are the first sentence. The same day, pinned to one Cortex-X925 core (`taskset -c 5`), the repro
+printed nq=2 1.02, nq=3 1.01, nq=4 0.65: the 2-3-query tail shares no work, and the rest of the
+unpinned cost is the pool handoff that every multi-query search takes and a one-query search skips
+(turbovec-python/src/lib.rs:1211). The repro and its upstream draft were updated to say so.
