@@ -1561,6 +1561,23 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
 - **The publish measures the fixed tree** (X17). The candidate is `6d16471`, not the tuned `8976da3`. The two trees differ only in four doc files, the images carry no docs, and the deploy for `6d16471` produced the tuning's image, layer for layer (`378214d02e47`). No gate compares the tuning's tree with the publish's.
 - **The seed-42 publish started at 05:44:23Z** under a 270-minute cap: base `cdfbcbc` against candidate `6d16471`, with the reingests. Both images run CPython 3.12.15 with SQLite 3.53.1, and the host venv matches the tuning's (3.12.14, 3.53.1). The first flat runs gave 5,005 and 4,830 vec/s for the base and 5,255 for the candidate. Expected end: about 07:45Z.
 
+**05:45Z–07:10Z. The publish passes every gate, D2 merges and closes issue #3, and plan G's pre-flight is ruled.**
+- **The publish, 05:44–07:00Z: 76 minutes of its 270-minute cap.** The probes took 12 minutes and each reingest 16, against an estimate of about 24, so it ended 45 minutes early. All eight gates passed (section 4.18):
+  - IVF ingest at nlist 256: 851.6 → 2,235.3 vec/s, 2.6×, band 46.0.
+  - flat ingest: 4,829.7 → 5,163.8 vec/s, +7 %, inside its band of 346.1, which the gate allows.
+  - the reingest of 2,549,119 rows: 3,049.1 → 3,114.9 vec/s (836 → 818 s), band 32.9.
+  - every run ended with every job done, no payload row and an empty freelist, and both arms reached the same final state.
+- **Plan G's pre-flight, 05:49–06:43Z** (6 Sonnet agents, 54 minutes, against `6d16471` while the publish ran). It checked versions, drift against `main`, the plan's internal consistency and its gn100 steps, and replayed Tasks 1–9 in a sandbox on Windows with CPython 3.12 and 3.14t. Its verdict: executable after text refreshes. Every RED, GREEN and Review Focus mutation reproduced. The main findings:
+  - the pins are stale. G quotes uv 0.12.20 and Rust 1.98.1, where `main` has 0.12.22 and 1.99.0, and Task 7's CI job failed its own test with the old pins (G-R1).
+  - the interpreter moved under the plan. python-build-standalone's 20261001 release ships CPython 3.12.15, 3.14.8 and 3.14.8t (G-R2). CPython 3.15.0 is out, but python-build-standalone has only 3.15.0rc2, so G stays on 3.14t.
+  - the bug Task 4 fixes was fixed upstream (section 5.28). On 3.14.8t, Task 4's RED step did not go red.
+  - the fan-out probe's guard is called GATE in some steps and GUARD in others. It becomes GUARD with OK or REVISIT, and a REVISIT is recorded, not a stop (G-R17).
+- **The controller checked the Task 4 finding itself, 06:45–06:47Z.** Without Task 4, its pin and Plan B's delete test passed 25 of 25 times on 3.14.8t and failed 5 of 5 times on 3.14.7t. With Task 4, they passed 3 of 3 times on 3.14.7t. All on Windows.
+- **The rulings, 06:52Z (G-R1 to G-R31).** Task 4 stays, as a defence, and its RED step runs on 3.14.7t (X18). G runs on the frozen `uv.lock`, and the lock refresh is a separate bump after G (X19). Among the others: Task 9's docs test asserts that ADR 0006 holds no local path, ssh detail or IP address; the host venv is re-synced after every deploy; a `-` p99 verdict counts as missing; and ADR 0006 is refreshed with p4's numbers.
+- **Steps 13–19, 07:01–07:03Z.** The results were fetched and scrubbed of home paths, and the preview printed PASS on every gate. The gate test went in verbatim from the plan and failed on `Pending:`. The summary script then recorded the block in ADR 0001, and the suite passed with 471 tests: `17bc0fa`. A Sonnet reviewer recomputed every figure from the raw files and approved, with two minor notes and no fix.
+- **The merge, 07:07Z.** `bc00ded`, "Merge plan D2: batched index syncs": 471 passed on the merged tree, pushed, and CI green on both jobs. The push closed issue #3 through `9c96cec`'s "Closes #3" (07:07:43Z).
+- **Plan G starts** in `.worktrees/free-threaded-python`, from `bc00ded`. The source files there are the ones G's pre-flight replayed against.
+
 ## 3. Decision register
 
 ID prefixes:
@@ -1630,6 +1647,8 @@ ID prefixes:
 | X15 | 2026-10-02, 04:25Z | Python parity for D2's A/B. The probes run in gn100's host venv in both arms (CPython 3.12.14, SQLite 3.53.1, synced with `UV_PYTHON_PREFERENCE=only-managed UV_PYTHON=3.12`), and the reingests in both images (3.12.15, SQLite 3.53.1). Both versions are labelled, and the scripts check that the two images match. | Upgrade gn100's host uv to get 3.12.15: it changes the maintainer's tool install. Run the probes inside the images: it changes D1's probe regime, against which D2 is compared. | DGX scan (T10-02); plan F's hand-off on the 3.12.15 image. | Controller (W-14) | Ledger, D2-R21 | Planned |
 | X16 | 2026-10-02, 04:25Z | Three of plan D's Review Focus claims get pin tests: a sync may carry exactly `SYNC_MAX_REMOVALS` (Task 7), the sync retry never catches a cancel (Task 9), and a failed pre-sync keeps the removal count (Task 9). | Leave them as claims a reviewer checks by reading: each survived its mutation in the replay. | Section 5.26. | Controller (W-14) | Ledger, D2-R7, D2-R12, D2-R13 | Planned |
 | X17 | 2026-10-02, 05:41Z | D2's seed-42 publish measures the tree with the final review's doc fixes (`6d16471`), not the tuned tree (`8976da3`), so the ADR's candidate is the code that merges. | Publish `8976da3` and merge the fixes after it: the ADR would record a candidate that is not the merged tree. Rerun the tuning on `6d16471`: the trees differ only in four doc files, and the image is identical. | The deploy for `6d16471` produced the tuning's image (`378214d02e47`); no gate compares the tuning's tree with the publish's. | Controller (W-14) | Ledger, 05:36Z and 05:41Z | Adopted |
+| X18 | 2026-10-02, 06:52Z | Plan G keeps Task 4 (no SQLite statement cache on the free-threaded build) as a defence, although CPython 3.14.8 fixed the connection leak it was written for; its RED step runs on 3.14.7t. | Drop Task 4: Linux was not checked, and 3.14.7t and older still keep the connection open. Keep the RED step on 3.14.8t: it does not go red there. | On Windows, without Task 4: 25 of 25 green on 3.14.8t, 5 of 5 red on 3.14.7t; with it, 3 of 3 green on 3.14.7t. gh-157838 is in 3.14.8's changelog. The change costs only the 3.14t arm, so it biases G's A/B against free threading, not for it. | Controller (W-14) | G pre-flight rulings G-R3; section 5.28 | Adopted |
+| X19 | 2026-10-02, 06:52Z | Plan G runs on the frozen `uv.lock`; refreshing the lock is a separate bump on `main` after G. | Refresh the lock inside G: its A/B would mix free threading with dependency moves. | The pre-flight's replay ran green on the frozen lock with 3.14.8t. | Controller (W-14) | G pre-flight rulings G-R30 | Adopted |
 | W-1 | 2026-09-27 23:27Z | "Answer, don't act": a question such as "is it OK to X?" gets an answer and an offer, never an unrequested action. | None. | The gn100 restart incident (section 7). | Maintainer (correction) | Transcript | Standing rule |
 | W-2 | 2026-09-27 23:09Z to 2026-09-28 01:11Z | Offload work to gn100 "when it makes sense". First baseline: "not more than 65m". Later: "no limits" for this program while the PC stays on. The spec keeps a rule that DGX runs over about 5 minutes need a go-ahead with a time cap. | None. | None. | Maintainer | Transcript; spec §6 | Standing |
 | W-3 | 2026-09-28 18:45Z | Every question to the maintainer goes through the structured question tool. | None. | None. | Maintainer | Transcript | Standing |
@@ -1648,7 +1667,7 @@ ID prefixes:
 | W-13 | 2026-09-30, asked 10:05Z, answered 10:24Z | `main` is pushed after plan C: a fast-forward from 00c70a1 to d7f4b01 (plan C's 13 commits, its merge bb907ac, and the probe-path fix), no force. The docs branches and `bench-hardening` stay local. | "Not yet" (keep `main` local and ask again later). | Pushed 10:24:36Z; Actions green (tests, docs). A scan of 00c70a1..cd3cbf2, run after the pushes, finds no added home path, IP or key path; the only home-path lines are the ones d7f4b01 removes. | Maintainer (chose "Push main now", recommended) | Transcript; section 2 | Done. cd3cbf2 (the 4 GiB detach) followed at 10:37:21Z under W-14. |
 | W-14 | 2026-09-30, about 10:24Z | Routine decisions no longer go to the maintainer: "just assume that the reply is the same and ask only really blocking questions. If something needs to be double checked, just do it, assume I'm not at the desk and you have time to do stuff". The controller takes the usual answer for a local merge commit, pushing `main`, committing the journal, the recommended option, archiving ledgers and starting the next plan in the agreed order. It still asks before a history rewrite, a force-push, anything posted outside the repo (issues, upstream), deleting data, or touching the maintainer's containers. | None offered: a free-text instruction. | "I have replied in the same way for the past 10 times you've asked the same stuff". | Maintainer (free text) | Transcript; section 2 | In force |
 
-Register total: 73 entries (P 3, D 16, R 23, X 17, W 14). (Dated note, 2026-10-02 05:52Z: X17 added. Dated note, 2026-10-02 04:25Z: X13 to X16 added. Dated note, 2026-10-02 03:12Z: X11 and X12 added; X9 and X10, added on 2026-10-01 and 2026-10-02, had not been counted here. Dated note, 2026-10-01 21:45Z: X8 added. Dated note, 2026-10-01 21:26Z: R-D5 added; X7, added 2026-09-30 at 14:04Z, had not been counted here. Dated note, 2026-09-30 13:20Z: X6 added. Dated note, 2026-09-30 10:46Z: W-13 and W-14 added. Dated note, 2026-09-30 00:28Z: W-12 added. Dated note, 2026-09-30 00:08Z: R-A5 added. Dated note, 2026-09-29 21:05Z: W-11 added. Dated note, 08:30Z: R-A4 added. Dated note, 08:05Z: R-A3 and W-10 added; W-8 superseded. Dated note, 23:00Z: W-9 added. Dated note, 22:45Z: R-G8, R-G9 and W-8 added. Dated note, 21:20Z: R-G7 added. Dated note, 21:23Z: X4 added. Dated note, 21:45Z: X5 added. Dated note, 22:30Z: W-7 added.) (Dated note, 20:40Z: R-B1, R-B2, R-G5, R-G6, W-6 and X3 were added after p4; before them the total was 38 (P 3, D 16, R 12, X 2, W 5).) R-D3, R-G3 and R-G4 were added at 20:05Z, and R-D4 at about 20:15Z; the backfill written at about 19:30Z had 34.
+Register total: 75 entries (P 3, D 16, R 23, X 19, W 14). (Dated note, 2026-10-02 07:10Z: X18 and X19 added. Dated note, 2026-10-02 05:52Z: X17 added. Dated note, 2026-10-02 04:25Z: X13 to X16 added. Dated note, 2026-10-02 03:12Z: X11 and X12 added; X9 and X10, added on 2026-10-01 and 2026-10-02, had not been counted here. Dated note, 2026-10-01 21:45Z: X8 added. Dated note, 2026-10-01 21:26Z: R-D5 added; X7, added 2026-09-30 at 14:04Z, had not been counted here. Dated note, 2026-09-30 13:20Z: X6 added. Dated note, 2026-09-30 10:46Z: W-13 and W-14 added. Dated note, 2026-09-30 00:28Z: W-12 added. Dated note, 2026-09-30 00:08Z: R-A5 added. Dated note, 2026-09-29 21:05Z: W-11 added. Dated note, 08:30Z: R-A4 added. Dated note, 08:05Z: R-A3 and W-10 added; W-8 superseded. Dated note, 23:00Z: W-9 added. Dated note, 22:45Z: R-G8, R-G9 and W-8 added. Dated note, 21:20Z: R-G7 added. Dated note, 21:23Z: X4 added. Dated note, 21:45Z: X5 added. Dated note, 22:30Z: W-7 added.) (Dated note, 20:40Z: R-B1, R-B2, R-G5, R-G6, W-6 and X3 were added after p4; before them the total was 38 (P 3, D 16, R 12, X 2, W 5).) R-D3, R-G3 and R-G4 were added at 20:05Z, and R-D4 at about 20:15Z; the backfill written at about 19:30Z had 34.
 
 Three recommended options were overridden: the review scope at 18:46:59Z (R-EX, "Go through the key ones" instead of "Accept all defaults"), and R-A1 and W-5 at 18:51:48Z. At 18:46:59Z the commit question's recommended "I commit in my terminal" was also answered with free text instead: "I already committed, let's debug the shell, I can also reboot if necessary". Separately, spec §3.1 says two of its rows override a plan's default: A1 and the fallback in G2.
 
@@ -2339,6 +2358,56 @@ Reading:
 - **It costs CPU.** CPU per query doubles: 5.19 to 10.09 ms at c=8, 5.34 to 10.23 at c=16. In process, the same 128 calls of an nq=8 batch take 63.46 ms of summed kernel time on 12 threads against 27.34 ms on one, while the index stage's wall time falls 3.7×. Each call costs more on the pool. The placement table gives one reason: a call on an A725 takes about 3.2× as long, and one on another core or the other L3 starts with cold caches. This was not profiled further.
 - **The server leaves most cores idle.** At c=16, F keeps 4.18 of 20 cores busy across 15 threads, with the event loop at 0.38 cores. Its 408 QPS at c=16 is above p3's 345–370 for the prototype at the same concurrency (section 4.5).
 
+### 4.18 D2's tuning and A/B on gn100: batched index syncs
+
+Plan D2's Task 10, run on gn100 on 2026-10-02. The full record is ADR 0001's "Results — DGX A/B (D2)".
+- The tuning, 05:14–05:33Z, seed 7, on the D2 tree `8976da3` alone. It tried (1, 0), (8, 1000), (32, 1000) and (32, 4000), flat and IVF nlist 256, three rounds after a discarded warm-up, rotating the pair order each round. It kept the defaults (section 2, 05:14Z).
+- The publish, 05:44:23–07:00:07Z, seed 42, cap 270 minutes. Arms: base = `cdfbcbc` (`main` after D1, E and F), candidate = `6d16471` (D2 at the defaults, X17).
+- The probes ran in the host venv (CPython 3.12.14, SQLite 3.53.1), host-warm and uncapped. The reingests ran in the images (CPython 3.12.15, SQLite 3.53.1), each in a fresh 4 GiB container, in the order base, D2, base, D2. `OPENBLAS_NUM_THREADS=1` everywhere.
+
+The gated rows (Plan A's rule, as in section 4.15):
+
+| Row (vec/s) | Base runs | D2 runs | Base median | D2 median | Gain | Band | Verdict |
+|---|---|---|---|---|---|---|---|
+| Probe, flat | 4,829.7 / 5,074.4 / 4,728.3 | 5,254.7 / 5,163.8 / 5,061.2 | 4,829.7 | 5,163.8 | 334.1 | 346.1 | within band |
+| Probe, IVF 256 | 854.7 / 851.6 / 808.7 | 2,204.4 / 2,235.3 / 2,236.0 | 851.6 | 2,235.3 | 1,383.7 | 46.0 | better |
+| Reingest, flat | 3,065.3 / 3,032.8 | 3,098.5 / 3,131.4 | 3,049.1 | 3,114.9 | 65.9 | 32.9 | better |
+
+Gates: `D2-run`, `D2-tuning`, `D2-flat`, `D2-ivf256`, `D2-fingerprints`, `D2-jobs`, `D2-bench` and `D2-labels` PASS. `D2-flat` and `D2-bench` only need "not worse".
+
+Where the time goes, per probe run (base → D2, ranges over runs 1–3). The event loop did not stall in any run of either arm.
+
+| Probe | Enqueue (s) | Drain (s) |
+|---|---|---|
+| Flat | 2.8–3.2 → 3.0–3.3 | 9.9–10.6 → 9.5–9.9 |
+| IVF 256 | 2.0–2.3 → 2.2–2.4 | 58.5–61.8 → 22.4–22.7 |
+
+`compare.py` on the reingest sessions (two runs per side, so its bands are two-run ranges):
+
+| Row | Base | D2 | Verdict |
+|---|---|---|---|
+| Ingest wall time (s) | 836 | 818 | better |
+| Search p50 / p95 / p99 (ms) | 23.2 / 27.6 / 30.3 | 22.7 / 25.5 / 28.5 | better |
+| QPS serial | 41 | 44 | better |
+| QPS concurrent | 100 | 128 | better, reported and not claimed (fewer than 3 runs per side) |
+| p95 under concurrency (ms) | 88.0 | 67.5 | better |
+| Hybrid, slowest of the first 10 queries (ms) | 492.7 | 423.5 | better |
+| Disk footprint (MB) | 16,496 | 16,495 | better, by 1 MB |
+| Memory after ingest (MB) | 596 | 1,586 | worse |
+| Hybrid QPS serial | 11.0 | 10.6 | worse |
+| Every other row (memory under load, filtered, recall, hybrid p50/p95/p99, hybrid concurrent, text-hit@10) | | | within band |
+
+Cold start (2.8 → 2.5 s) is "not claimable": one reading per run.
+
+Reading it:
+- **Batching does what it was built for, on IVF.** One index sync per batch of up to 8 jobs, instead of one per job, cut the IVF probe's drain from about 59 s to 22 s. IVF ingest went up 2.6× (2.7× on seed 7).
+- **Flat moved little: +7 %, inside the band.** That is about what was left to save: after D1, a flat sync is about 15 % of a flat job (ADR 0001).
+- **The reingest gained 2.2 %** (836 → 818 s). The bench collection is flat, so this is the flat effect at full scale. D1 made the large reingest gain, and D2 claims only "not worse".
+- **IVF ingest across the program**, the same probe command on seed 42 and the same host, on different days: 533.5 vec/s before D1, 612.0 with D1, 851.6 with D1, E and F (F's sync writes only dirty shards), and 2,235.3 with D2, 4.2× in all. Flat went 2,342.4 → 4,982.0 → 4,829.7 → 5,163.8 vec/s, and the reingest 1,530.9 → 3,035.4 → 3,049.1 → 3,114.9.
+- **The search rows moved**, beyond their two-run bands: concurrent QPS 100 → 128 and p95 under concurrency 88.0 → 67.5 ms, while hybrid serial QPS went the other way, 11.0 → 10.6. D2 does not touch the search path; none of these rows is gated, and none was investigated (section 9.4).
+- **Memory:** section 9.4.
+- **The outcome:** ADR 0001 records all eight PASS lines (`17bc0fa`). D2 is merged into `main` (`bc00ded`) and pushed, which closed issue #3.
+
 ## 5. Negative results and surprises
 
 ### 5.1 Audience batching lost on NEON
@@ -2496,6 +2565,14 @@ Section 5.26's R4 mutant, a sync retry that catches `BaseException`, makes its p
 The controller tried it with the mutant in place, and the test still hung until a 120-second timeout killed it. The mutant worker swallows every cancel. `stop()` waits for the worker, and a cancel that reaches `stop()` at that await is absorbed there (`except asyncio.CancelledError: pass`). So `wait_for`'s cancel ends nothing. The test stays as it was, and the mutant still cannot pass it.
 
 A reviewer's suggested fix to a test is a claim like any other, and it gets the same mutation run before it lands.
+
+### 5.28 The bug plan G's Task 4 fixes was fixed upstream two days before G ran
+
+Plan G's Task 4 turns off SQLite's statement cache on the free-threaded build. The plan's sandbox found that on CPython 3.14.7t a `meta.db` connection closed by `stop()` from another thread stayed alive. A statement cached by its owning thread was freed only when that thread next ran Python (biased reference counting), so `meta.db-wal` and `meta.db-shm` stayed on disk, and on Windows a delete could not remove the directory. Task 4's RED step expects exactly that.
+
+In G's pre-flight, on 3.14.8t, the RED step did not go red. CPython 3.14.8, released 2026-09-30, contains gh-157838, which merges a detached thread's biased counts at once instead of waiting for the thread to run again. The controller checked it on Windows: without Task 4, its pin and Plan B's delete test passed 25 of 25 times on 3.14.8t and failed 5 of 5 times on 3.14.7t. Linux was not checked.
+
+Task 4 stays as a defence for older interpreters and for Linux, and its RED step runs on 3.14.7t (X18). A RED step is a claim about the interpreter as well as the code, and a patch release can turn it green.
 
 ## 6. Method: how we measured
 
@@ -2696,6 +2773,7 @@ State as of 2026-09-28, about 19:30Z.
 - Dated note, 2026-10-02 04:58Z: D2's Tasks 7 and 8 are approved (`4786777`, 455 passed), and the gn100 scripts are reviewed and ready (section 2, 04:26Z). Task 9 is running; then Task 9b, Task 10's documentation step, and the tuning and A/B on gn100.
 - Dated note, 2026-10-02 05:16Z: D2's code and docs are done and checked at `8976da3` (470 passed). Issue #3 is fixed in `9c96cec`, and the push to `main` will close it. The final review on Opus and the seed-7 tuning on gn100 (DGX Spark) run in parallel (section 2, 04:55Z). Then the fix wave, the seed-42 publish, the gate test, and the merge.
 - Dated note, 2026-10-02 05:52Z: D2's tuning kept the defaults, 8 jobs and 1,000 ms. The final review on Opus asked for four doc fixes, which are in at `6d16471` (470 passed; section 2, 05:14Z). The seed-42 publish has been running on gn100 (DGX Spark) since 05:44Z, with the reingests, and should end about 07:45Z. Plan G's pre-flight runs meanwhile, against `6d16471`.
+- Dated note, 2026-10-02 07:10Z: D2's publish passed all eight gates (section 4.18). Its results are in ADR 0001 (`17bc0fa`, 471 passed), and D2 is merged into `main` as `bc00ded` and pushed, with CI green. The push closed issue #3. Plan G's pre-flight is ruled (G-R1 to G-R31; X18, X19; section 5.28). G runs in `.worktrees/free-threaded-python` from `bc00ded`: the baselines, then Task 1 on Sonnet.
 
 ### 9.2 Open questions in the plans
 
@@ -2726,8 +2804,9 @@ State as of 2026-09-28, about 19:30Z.
 - **a-equiv's flat memory** (2026-09-29): 1528–1529 MB in runs 2 and 3, against 1547–1551 MB in baseline3, control1 and a-equiv2. It is not the run order, because control1 ran in the same order, and not the bench, because a-equiv2 ran the same bench.
 - **From p4 (20:40Z):** the two states of the flat concurrent row (section 5.8); the multi-second hybrid p99 tails on every arm at c=8 and c=16; why R1 fails 12–15× less often on 3.14t (section 5.15).
 - p3 attributes the server gap (203–408 QPS against an in-process ceiling of 610–662) to "serial drain plus event-loop pipeline", inferred from per-thread CPU sampling, not a per-stage trace.
-- **Memory right after a reingest** (D1's A/B, 2026-09-30). The base measured 388 and 533 MB after its reingests, against 1,617–1,623 MB for D1's candidate and 1,502–1,551 MB in every adopt session. Under load both arms reach about 1.6 GB. `bench.py` reads `podman stats`, which leaves inactive file pages out. Why the base's index looks non-resident right after its reingest was not investigated.
-- **D1's third IVF candidate run** drained in 70.4 s, against 81.7 s for the other two and 93–99 s for the base. It was the last probe run. Nothing in the log explains it.
+- **Memory right after a reingest** (D1's A/B, 2026-09-30). The base measured 388 and 533 MB after its reingests, against 1,617–1,623 MB for D1's candidate and 1,502–1,551 MB in every adopt session. Under load both arms reach about 1.6 GB. `bench.py` reads `podman stats`, which leaves inactive file pages out. Why the base's index looks non-resident right after its reingest was not investigated. (Dated note, 2026-10-02: D2's A/B repeated it. The base read 613.9 and 578.0 MB after its reingests, against 1,524 and 1,649 MB for D2, and under load both reached 1,546–1,652 MB. D2's base carries D1's code, which read high as D1's candidate, so the low reading follows the base arm, the first of each pair, more than any one change. Not tested.)
+- **D1's third IVF candidate run** drained in 70.4 s, against 81.7 s for the other two and 93–99 s for the base. It was the last probe run. Nothing in the log explains it. (Dated note, 2026-10-02: D2's A/B had no such outlier; its IVF drains were 22.36–22.68 s.)
+- **D2's A/B search rows** (2026-10-02). On the flat reingest sessions, concurrent QPS read 100 for the base against 128 for D2, and p95 under concurrency 88.0 against 67.5 ms, although D2 does not touch search. Hybrid serial QPS moved the other way, 11.0 against 10.6. Two runs per side; not investigated.
 - **Base run 1's memory peak** (plan F's A/B, 2026-10-02): 4,096 MB before the restart, the cap, in the first measured container after run0's index build. Every other measured run peaked at 1,527–1,562 MB. Not investigated.
 - **F6's gap** (section 5.24): the A/B's T=1 serial runs read 8.70, 7.65 and 7.66 ms, and no follow-up run went below 8.34. What made two runs fast, and one QPS run slow, is not known.
 - **F doubles CPU per query** (5.19 to 10.09 ms at c=8) and the summed kernel time of a batch (27.34 to 63.46 ms in process). Pool-thread placement is a candidate for part of it (section 5.25), measured only in a microbenchmark; neither was profiled in the server.
