@@ -721,3 +721,76 @@ def test_failed_shard_sync_stays_dirty(tmp_path):
     assert ivf.sync(tmp_path) == 1 and log == [4] and ivf.dirty_shards == frozenset()
     reloaded = _IvfIndex.load(tmp_path, DIM, 4, 3)
     assert reloaded.shards[1].contains(80_001) and reloaded.shards[4].contains(80_002)
+
+
+# ---- bench/ivf_fanout_probe.py smoke (the DGX stage/fan-out probe) ----
+
+
+def load_probe():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("ivf_fanout_probe", "bench/ivf_fanout_probe.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def probe_collection(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+
+    async def go():
+        mgr = CollectionManager(Settings(), embedder_factory=lambda cfg: None)
+        await mgr.create_collection("p", DIM, 4, None, None, None)
+        col = await mgr.touch("p")
+        docs = [
+            {"doc_id": f"d{i}", "chunks": [{"id": f"c{i}", "text": f"chunk {i}",
+                                            "vector": rowvec(i), "metadata": {"year": str(2000 + i % 3)}}]}
+            for i in range(400)
+        ]
+        await col._process_job({"documents": docs})
+        await col._process_job({"op": "attach_index", "nlist": 8, "nprobe": 3})
+        await mgr.shutdown()
+
+    asyncio.run(go())
+
+
+def test_probe_stages_smoke(tmp_path, monkeypatch):
+    probe_collection(tmp_path, monkeypatch)
+    rows = load_probe().main([
+        "stages", "--data", str(tmp_path), "--collection", "p", "--nq", "1,8",
+        "--threads", "1,4", "--batches", "3", "--filter-key", "year",
+    ])
+    assert [(r["path"], r["nq"], r["threads"]) for r in rows] == [
+        ("vector", 1, 1), ("vector", 1, 4), ("vector", 8, 1), ("vector", 8, 4),
+        ("filtered", 1, 1), ("filtered", 1, 4),
+    ]
+    for r in rows:
+        assert r["calls"] == r["nq"] * 3 and r["total"] >= r["index"] > 0
+
+
+def test_probe_fanout_smoke(tmp_path, monkeypatch):
+    probe_collection(tmp_path, monkeypatch)
+    out = load_probe().main([
+        "fanout", "--data", str(tmp_path), "--collection", "p", "--threads", "1,4",
+        "--batches", "4",
+    ])
+    assert sum(size * n for size, n in enumerate(out["hist"], 1)) == 8 * 3 * 4  # every call
+    assert all(c["plain_exact"] and c["grouped_same"] == 4 for c in out["cells"])
+    assert out["best_threads"] in (1, 4) and out["guard"] in ("OK", "REVISIT")
+
+
+def test_probe_exact_smoke(tmp_path, monkeypatch):
+    # spec §7 F items 1 and 7: bit identity against IVF_SEARCH_THREADS=1 on bench.py's
+    # own query selection (seed 42), unfiltered, filtered (>128 ids) and tiny (<=128)
+    probe_collection(tmp_path, monkeypatch)
+    np.save(tmp_path / "v.npy", unit(50, 3))
+    out = load_probe().main([
+        "exact", "--data", str(tmp_path), "--collection", "p", "--threads", "4",
+        "--vectors", str(tmp_path / "v.npy"), "--limit", "50", "--queries", "16",
+        "--seed", "42", "--filter-key", "year",
+    ])
+    assert out["threads"] == 4 and out["seed"] == 42 and out["queries"] == 16
+    assert out["batches"] == 2 and out["unfiltered_same"] == 2
+    assert out["filtered_same"] == 16 and out["tiny_same"] == 16 and out["verdict"] == "PASS"
+    assert out["filter_ids"] > 128 >= out["tiny_ids"] > 0
+    assert 0 < out["max_list"] < out["cliff"] == 32_768
