@@ -493,3 +493,31 @@ def test_drift_probe_scan_counts_corpus_rows_with_a_drifted_code_point(tmp_path)
     assert probe.scan(drift, corpus, limit=3) == {
         "rows": 3, "rows_with_drift": 2, "rows_with_token_drift": 1,
         "first_rows_with_drift": [1, 2]}
+
+
+# ---- docs: ADR 0006, the knob, the /healthz example, the build arg ----
+
+
+def test_docs_record_the_evaluation_and_document_the_knob(make_app):
+    import json
+
+    adr = (ROOT / "docs/adr/0006-free-threaded-python.md").read_text(encoding="utf-8")
+    for needle in ("PYTHON=3.14t", "GC_FREEZE", "gil_enabled", "cp314t", "## Decision rule",
+                   "**Continue**", "**Hold**", "**Park**", "## Verification",
+                   "bench/unicode_drift_probe.py", "docker/check_image.py",
+                   "sqlite_version", "OPENBLAS_NUM_THREADS=1"):  # spec D15, D16
+        assert needle in adr, needle
+    # committed text names no local path, ssh detail, user or host address (G-R16)
+    for private in ("D:/", "C:/", "/home/", "/Users/", "/root/",
+                    "ssh_config", ".ssh/", "@gn100"):
+        assert private not in adr, private
+    assert re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", adr) is None
+    for path in ("README.md", "docs/getting-started.md"):
+        text = (ROOT / path).read_text(encoding="utf-8")
+        assert "| `GC_FREEZE` |" in text, path
+        assert "podman build --build-arg PYTHON=3.14t -t raggio:py314t ." in text, path
+    # the /healthz example in the API reference shows every key the endpoint returns
+    api = (ROOT / "docs/api.md").read_text(encoding="utf-8")
+    example = re.search(r"`GET /healthz`.*?\*\*200\*\* `(\{.*?\})`", api, re.S).group(1)
+    with TestClient(make_app()) as client:
+        assert set(json.loads(example)) == set(client.get("/healthz").json())
