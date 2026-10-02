@@ -6,6 +6,7 @@ import importlib.machinery
 import importlib.util
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -311,15 +312,50 @@ def test_check_image_finds_every_compiled_module_it_can_import(tmp_path):
 
 @pytest.fixture
 def gil_needing_extension(tmp_path):
-    """CPython's own _testmultiphase test extension, copied under the name of the one
-    module in it that declares no free-threading support: importing that really
-    re-enables the GIL. Returns the code that puts the copy on sys.path."""
+    """An extension module that declares no free-threading support, so importing it
+    really re-enables the GIL, under the name _testmultiphase_nonmodule. Where CPython
+    ships its _testmultiphase test extension (Windows), that is copied under the name of
+    the one module in it that declares none. Where it ships none (uv's Linux
+    interpreters have no lib-dynload), a one-function single-phase module with no
+    Py_mod_gil slot is compiled instead. Returns the code that puts it on sys.path."""
     spec = importlib.util.find_spec("_testmultiphase")
-    if spec is None:
+    if spec is not None:
+        suffix = next(s for s in importlib.machinery.EXTENSION_SUFFIXES if spec.origin.endswith(s))
+        shutil.copy(spec.origin, tmp_path / f"_testmultiphase_nonmodule{suffix}")
+    elif sys.platform.startswith("linux"):
+        _compile_gil_needing_extension(tmp_path)
+    else:
         pytest.skip("this CPython build ships no _testmultiphase test extension")
-    suffix = next(s for s in importlib.machinery.EXTENSION_SUFFIXES if spec.origin.endswith(s))
-    shutil.copy(spec.origin, tmp_path / f"_testmultiphase_nonmodule{suffix}")
     return f"import sys; sys.path.insert(0, {str(tmp_path)!r}); "
+
+
+def _compile_gil_needing_extension(tmp_path):
+    def unavailable(why):
+        # REQUIRE_NATIVE=1 (CI's free-threaded step, the DGX runs) turns the skip into a failure
+        (pytest.fail if os.environ.get("REQUIRE_NATIVE") == "1" else pytest.skip)(why)
+
+    include = sysconfig.get_path("include")
+    if not (Path(include) / "Python.h").is_file():
+        unavailable(f"no Python.h in {include}, so no GIL-needing test extension can be built")
+    cc = shlex.split(sysconfig.get_config_var("CC") or "cc")
+    if not shutil.which(cc[0]):
+        cc = [shutil.which("cc")] if shutil.which("cc") else []
+    if not cc:
+        unavailable("no C compiler, so no GIL-needing test extension can be built")
+    src = tmp_path / "_testmultiphase_nonmodule.c"
+    src.write_text(
+        "#include <Python.h>\n"
+        "static struct PyModuleDef def = "
+        '{PyModuleDef_HEAD_INIT, "_testmultiphase_nonmodule", NULL, -1, NULL};\n'
+        "PyMODINIT_FUNC PyInit__testmultiphase_nonmodule(void) { return PyModule_Create(&def); }\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / f"_testmultiphase_nonmodule{importlib.machinery.EXTENSION_SUFFIXES[0]}"
+    r = subprocess.run([*cc, "-shared", "-fPIC", "-I", include, str(src), "-o", str(out)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        pytest.fail(f"compiling the GIL-needing test extension failed (rc {r.returncode}):\n"
+                    + r.stderr[-2000:])
 
 
 @needs_ft
