@@ -1338,6 +1338,35 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
 - **Versions (W-11).** turbovec 1.0.0 is the latest, and its GitHub `main` equals v1.0.0. uv 0.12.21 is the latest. numpy 2.5.3 exists with no relevant change, so it goes into a maintenance commit after F. CPython 3.12.15 (PBS 20261001, still SQLite 3.53.1) arrives with the next uncached image build. `rust:1.99.0-slim-trixie` still returns 404.
 - **The trailer (F-R8).** The scan agents saw a Sonnet attribution in their own context. F keeps the Opus line that every A–E commit carries.
 
+**00:06Z–01:08Z. Plan F Tasks 1–5: the pool, the intersection, two cache races and dirty-shard sync. A dropped space changed how literals are checked.**
+- **Setup.** The worktree `.worktrees/ivf-fanout-and-upstream` was created from `main` at fa0fa9f. The baseline was 398 passed with the extension, which confirms P.
+- **Task 1 (4cdeb04): `_ShardPool` and the parallel fan-out.** 413 passed.
+  - A grep confirmed F-R1, F-R2 and F-R4 in place:
+    - `train` gains only `pool=` and keeps plan C's sample handling;
+    - the keyword follows `native_bm25=`;
+    - the import sits before `contextlib`.
+  - The review approved with one Minor note, and nothing changed. A cold filtered fan-out can compute a shard's ids once per concurrent task. The cache keeps the last write, which is correct, and prewarming would contradict the spec.
+- **Task 2 (f57b5ae, then f35c207): sorted allowlists and the smaller-side `_intersect`.** 418 passed.
+  - The controller's check compares every added line with the brief. It found `tiny =allowlist` in a test line: an editing tool had dropped a plain space.
+  - The implementer's own check had compared only lines with non-ASCII characters or a backslash, the kind that plan E's tools had changed (section 5.21). Their report said the check showed no differing lines.
+  - The fix went in as a follow-up commit, with no amend.
+  - Pin 3's mutation fails with turbovec's `ValueError: allowlist is empty`.
+- **Refinement C-1.** The literal check now also runs on the staged diff. From Task 3 on, each brief tells the implementer to run it after `git add` and before `git commit`, over every added line, and to fix or explain each hit. Rebuilding the briefs left those for Tasks 1, 2 and 8 byte-identical.
+- **Task 3 (01dbcc2): R2.** `_allow_gen` and `_invalidate_allow` are now the only way to clear the allowlist cache. 420 passed.
+  - The staged check caught a second dropped space before the commit, in `_upsert_rows(self, rows`.
+  - The F-R5 greps found one `_allow_cache.clear()`, inside `_invalidate_allow`, and three call sites.
+- **Task 4 (2c7482b): R2b.** A per-shard `_id_gen` under `_id_lock` guards the IVF id cache. 422 passed.
+  - Plan B's AST lock test now also watches `_allow_lock` and `_id_lock` (F-R11), and it passes.
+- **Task 5 (8002a84): dirty-shard sync.** A job writes only the shards it touched. 427 passed.
+  - Pin 4's mutation fails as `[3] == [2, 3]`: `remove()` bumps the generation and clears the cache without marking the shard dirty.
+  - The implementer had not read why one RED failure failed, so the controller re-ran RED in a temporary worktree at 2c7482b with the new test file. Four failures were the missing `dirty_shards`. The fifth was the behavioural one: the old code synced every shard.
+  - The review's Minor notes needed no change:
+    - Dirtiness is tracked per index, not per directory. The only callers sync to the index's own `ivf/` directory or to attach's fresh temporary directory.
+    - A write racing a sync keeps its shard dirty. The shard write happens before the generation bump, and the sync reads the generation before it snapshots the shard.
+- **Task 9's brief.** The four ruled DGX scripts come from the plan's blocks through 33 asserted one-match substitutions, and each is embedded whole in the brief. The other two scripts are the plan's blocks unchanged.
+  - On the pre-flight replay's tree, the check prints "Plan F DGX scripts OK".
+  - The new floor fixture works. With the display-resolution floor removed, F6 fails with "diff +0.10, band 0.00".
+
 ## 3. Decision register
 
 ID prefixes:
@@ -2272,6 +2301,7 @@ Recorded subagent tokens for the completed workflows sum to 10,021,309. That tot
 - Resuming a workflow replays cached agents only when the prompt is byte-identical.
 - Separate verifiers find real defects even in edits that read as one-liners. Examples: the `done|failed` catch above; and on 2026-09-28 at 19:32Z, a float-boundary bug, a regex that could never match podman's output, and a crash that depends on merge order, all in the §3.1 edits (section 2).
 - Do not put backslash-bearing text in a Bash heredoc or `python -c` from the agent's shell tool: a double backslash arrives as one. Write the script with the file tool (section 2, 2026-10-01).
+- Check every added line, not only the non-ASCII ones, and do it before the commit. In plan F an editing tool dropped a plain space twice. The first one reached a commit because the implementer's check looked only at non-ASCII lines. The second was caught on the staged diff (section 2, 2026-10-02).
 - Compare test literals with their source by code point, not by eye, when they hold non-ASCII text or backslashes. Agents' editing tools have composed Unicode and dropped a backslash, and a diff view shows neither (section 5.21).
 - Verify claims of having told the user against the transcript. A compaction summary said the maintainer had been told about the removed `bench-wv` container; the transcript showed no such message (section 7.5).
 
@@ -2350,6 +2380,7 @@ State as of 2026-09-28, about 19:30Z.
 - Dated note, 2026-10-01 22:59Z: plan E's ten tasks, the final review and one fix wave are approved (f95b3b8, 397 passed). I-1, D14's compatibility-form loss, is documented under E-R15, with two issue drafts not posted. Task 11's A/B is running on gn100 (22:56Z, cap 110 minutes).
 - Dated note, 2026-10-01 23:22Z: plan E is done. Its A/B passed every gate (section 4.16), and it is merged into `main` and pushed (fa0fa9f). Next: plan F, `ivf-fanout-and-upstream`, after its pre-flight. G's uv quotes need re-anchoring to 0.12.21 at G's pre-flight.
 - Dated note, 2026-10-02 00:03Z: plan F's pre-flight is done and ruled (section 2, 2026-10-02; F-R1 to F-R39 in the ledger). F runs in `.worktrees/ivf-fanout-and-upstream` from `main` at fa0fa9f; Task 1 is next, on Sonnet.
+- Dated note, 2026-10-02 01:10Z: plan F's Tasks 1–5 are approved (8002a84, 427 passed; section 2, 2026-10-02). Task 6, the probe, is running. Still to come: Tasks 7–9, the final review on Opus, and Task 10's A/B on gn100 (DGX Spark).
 
 ### 9.2 Open questions in the plans
 
