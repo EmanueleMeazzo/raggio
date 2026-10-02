@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+import time
 import zlib
 from pathlib import Path
 
@@ -121,6 +122,19 @@ def test_gc_freeze_runs_after_resume_pending_and_unfreezes_after_shutdown(
     assert calls == expected
 
 
+def _collect_until_dead(ref):
+    # gc.collect() returns 0 without collecting while another thread's collection is
+    # still running, so one call can leave a dead cycle alive: retry, bounded. A frozen
+    # cycle is never collected, however often this runs
+    import gc
+
+    for _ in range(100):
+        gc.collect()
+        if ref() is None:
+            break
+        time.sleep(0.01)
+
+
 def test_gc_freeze_freezes_the_startup_heap_but_still_collects_new_cycles(
     make_app, monkeypatch
 ):
@@ -139,7 +153,7 @@ def test_gc_freeze_freezes_the_startup_heap_but_still_collects_new_cycles(
         a.other, b.other = b, a
         alive = weakref.ref(a)
         del a, b
-        gc.collect()
+        _collect_until_dead(alive)
         assert alive() is None  # a cycle allocated after the freeze is still collected
     assert gc.get_freeze_count() == 0  # unfrozen on shutdown
 
@@ -149,7 +163,6 @@ def test_gc_freeze_still_frees_a_collection_loaded_before_the_freeze(make_app, m
     # of the frozen heap. Deleting it must still free it and its index: reference counting
     # does that, and the collector, which skips frozen objects, is never needed
     import gc
-    import time
     import weakref
 
     from raggio.store import CollectionManager
@@ -160,7 +173,9 @@ def test_gc_freeze_still_frees_a_collection_loaded_before_the_freeze(make_app, m
         assert client.post("/collections", headers=root, json={"name": "kb", "dim": DIM}).status_code == 201
         job = client.post("/collections/kb/documents", headers=root, json={"documents": [
             {"doc_id": "d", "chunks": [{"id": "c", "text": "t", "vector": unit}]}]}).json()["job_id"]
+        deadline = time.monotonic() + 30
         while client.get(f"/collections/kb/jobs/{job}", headers=root).json()["status"] != "done":
+            assert time.monotonic() < deadline, "the ingest job did not finish"
             time.sleep(0.01)
     loaded = []
     real_resume = CollectionManager.resume_pending
@@ -175,7 +190,7 @@ def test_gc_freeze_still_frees_a_collection_loaded_before_the_freeze(make_app, m
     with TestClient(make_app()) as client:
         assert gc.get_freeze_count() > 0 and loaded[0]() is not None
         assert client.delete("/collections/kb", headers=root).status_code == 200
-        gc.collect()
+        _collect_until_dead(loaded[0])
         assert loaded[0]() is None
 
 
@@ -230,7 +245,9 @@ def test_stop_really_closes_meta_db_after_reads_on_many_threads(tmp_path, monkey
         c = await m.touch("x")
         await c.enqueue({"documents": [
             {"doc_id": "d", "chunks": [{"id": "c", "text": "t", "vector": unit.tolist()}]}]})
+        deadline = time.monotonic() + 30
         while c.pending_jobs():
+            assert time.monotonic() < deadline, "the ingest job did not drain"
             await asyncio.sleep(0.01)
         # the default executor's threads stay alive and idle across shutdown
         await asyncio.gather(*(asyncio.to_thread(c.list_records, "both", None, None, 10, 0)
