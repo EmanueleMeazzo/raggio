@@ -25,8 +25,7 @@ the uv-managed CPython that probe p2 used, 28.6 / 47.6 / 45.4 / 39.4 q/s, a plat
 39–48 q/s whatever the GIL does (`docs/superpowers/research/2026-09-28-dgx-probe-p2-hybrid-native.md`).
 p4's interpreters (uv 0.12.19: 3.12.14, 3.14.7t) bundle SQLite 3.53.1 (probe p4,
 `docs/superpowers/research/2026-09-28-dgx-probe-p4-freethreaded.md`); G's images (uv 0.12.22:
-3.12.15, 3.14.8t) report theirs at Task 11 Step 7. p4 ran on uv 0.12.19's 3.12.14 and
-3.14.7t; G's images run uv 0.12.22's 3.12.15 and 3.14.8t. p2's figures were not re-measured
+3.12.15, 3.14.8t) report theirs at Task 11 Step 7. p2's figures were not re-measured
 on 3.53.1. Memstatus cannot be switched off from Python
 (`sqlite3_config` is not exported), and building a custom SQLite is out of scope. So the
 concurrent hybrid rows are SQLite-bound, and two interpreters can bundle different SQLite
