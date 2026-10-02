@@ -12,6 +12,11 @@ from raggio.app import create_app
 DIM = 32
 ROOT = {"x-api-key": "root-key"}
 
+# the deadline of each wait for something that must happen. Generous on purpose: with
+# every CPU busy, a thread hand-off on the free-threaded build can take a second or more
+# (a contended PyMutex yields the CPU up to 40 times before it parks)
+WAIT_SECONDS = 360
+
 
 class FakeEmbedder:
     """Deterministic: same text -> same unit vector; different texts ~orthogonal."""
@@ -41,7 +46,7 @@ def client(make_app):
         yield c
 
 
-def wait_job(client, coll, job_id, timeout=10.0):
+def wait_job(client, coll, job_id, timeout=WAIT_SECONDS):
     deadline = time.time() + timeout
     while time.time() < deadline:
         r = client.get(f"/collections/{coll}/jobs/{job_id}", headers=ROOT).json()

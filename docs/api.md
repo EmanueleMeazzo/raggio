@@ -242,9 +242,12 @@ configured.
 
 `GET /healthz` — no auth
 
-**200** `{"status": "ok", "resident_collections": ["kb"], "bm25": "native"}`
+**200** `{"status": "ok", "resident_collections": ["kb"], "bm25": "native", "gil_enabled": true}`
 
 `bm25` is the stage-2 BM25 scorer this instance runs: `native` (the `raggio_native`
 extension, [ADR 0004](adr/0004-native-bm25.md)) or `python` (the extension is not
 installed, was built for another Unicode version, or `NATIVE_BM25=0`). Both return the
 same results.
+
+`gil_enabled` is `false` only on the experimental free-threaded 3.14t image
+([ADR 0006](adr/0006-free-threaded-python.md)).

@@ -1,6 +1,8 @@
 import asyncio
+import gc
 import hmac
 import json
+import sys
 from contextlib import asynccontextmanager
 from typing import Any, Literal
 
@@ -10,6 +12,11 @@ from pydantic import BaseModel, Field
 
 from .config import Settings
 from .store import CollectionDeletedError, CollectionManager, _normalize, hash_key
+
+
+def _gil_enabled() -> bool:
+    """False only on a free-threaded build (3.13t+) that is really running without the GIL."""
+    return getattr(sys, "_is_gil_enabled", lambda: True)()
 
 
 # ---- request models ----
@@ -86,10 +93,17 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await manager.resume_pending()
+        if settings.gc_freeze:
+            # after resume_pending: what it loaded is startup heap too. A frozen
+            # collection that is evicted or deleted is still freed, by reference counting
+            gc.collect()
+            gc.freeze()
         housekeeping = asyncio.create_task(manager.housekeeping())
         yield
         housekeeping.cancel()
         await manager.shutdown()
+        if settings.gc_freeze:
+            gc.unfreeze()
 
     app = FastAPI(title="raggio", lifespan=lifespan)
 
@@ -297,6 +311,7 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
             "status": "ok",
             "resident_collections": list(manager.resident),
             "bm25": manager.bm25_backend(),
+            "gil_enabled": _gil_enabled(),
         }
 
     return app

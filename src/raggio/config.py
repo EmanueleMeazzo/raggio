@@ -34,3 +34,9 @@ class Settings:
             raise ValueError(f"SYNC_BATCH_JOBS must be >= 1, not {self.sync_batch_jobs}")
         if not self.sync_batch_ms >= 0:  # also refuses nan
             raise ValueError(f"SYNC_BATCH_MS must be >= 0, not {self.sync_batch_ms}")
+        # "1" collects and freezes the startup heap before serving (ADR 0006): a
+        # free-threaded build's stop-the-world collections then skip it; "0" = off
+        gc_freeze = os.environ.get("GC_FREEZE") or "0"
+        if gc_freeze not in ("0", "1"):
+            raise ValueError(f"GC_FREEZE must be '0' or '1', not {gc_freeze!r}")
+        self.gc_freeze = gc_freeze == "1"

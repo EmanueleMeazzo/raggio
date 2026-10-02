@@ -19,6 +19,11 @@ from raggio.store import Collection, CollectionConfig, CollectionManager, _IvfIn
 
 DIM = 8
 
+# the deadline of each wait for something that must happen. Generous on purpose: with
+# every CPU busy, a thread hand-off on the free-threaded build can take a second or more
+# (a contended PyMutex yields the CPU up to 40 times before it parks)
+WAIT_SECONDS = 360
+
 
 def unit(n, seed):
     v = np.random.default_rng(seed).standard_normal((n, DIM)).astype(np.float32)
@@ -244,7 +249,7 @@ def test_large_shard_concurrent_callers_match_serial():
     for t in threads:
         t.start()
     for t in threads:
-        t.join(60)
+        t.join(WAIT_SECONDS)
     assert not errors and len(results) == 20
     for got in results:
         assert_same(got, ref)
@@ -280,7 +285,7 @@ def test_single_worker_default_executor_does_not_deadlock(tmp_path):
             col.search("vector", q(i), None, 5, "chunks", {"g": i % 2} if i % 2 else None, None)
             for i in range(16)
         ]
-        return await asyncio.wait_for(asyncio.gather(*searches), 10)
+        return await asyncio.wait_for(asyncio.gather(*searches), WAIT_SECONDS)
 
     hits = asyncio.run(go())
     assert all(hits) and hits[0][0]["id"] == "c0"
@@ -326,7 +331,7 @@ class Held(ThreadSpy):
 
     def search(self, q, k, allowlist=None):
         self.entered.set()
-        assert self.release.wait(5)
+        assert self.release.wait(WAIT_SECONDS)
         return self.inner.search(q, k=k, allowlist=allowlist)
 
 
@@ -348,13 +353,13 @@ def test_close_during_a_fanned_out_search_lets_it_finish():
 
     t = threading.Thread(target=search)
     t.start()
-    assert held.entered.wait(5)  # a pool thread sits in shard 0; the rest of the 32 queue
+    assert held.entered.wait(WAIT_SECONDS)  # a pool thread sits in shard 0; the rest of the 32 queue
     closer = threading.Thread(target=ivf._pool.close)
     closer.start()
     closer.join(0.1)  # close() is now blocked waiting on the pool
     held.release.set()
-    t.join(10)
-    closer.join(10)
+    t.join(WAIT_SECONDS)
+    closer.join(WAIT_SECONDS)
     assert not t.is_alive() and not closer.is_alive() and not errors
     assert_same(got[0], ref)
 
@@ -581,7 +586,7 @@ class GatedProbe:
     def search(self, q, k, allowlist=None):
         res = self.inner.search(q, k=k, allowlist=allowlist)
         self.started.set()
-        assert self.release.wait(5)
+        assert self.release.wait(WAIT_SECONDS)
         return res
 
 
@@ -593,11 +598,11 @@ def test_orphaned_id_probe_cannot_cache_stale_shard_ids():
     got = []
     t = threading.Thread(target=lambda: got.append(ivf._shard_ids(j)))
     t.start()
-    assert gate.started.wait(5)  # the probe holds a pre-write snapshot of shard j
+    assert gate.started.wait(WAIT_SECONDS)  # the probe holds a pre-write snapshot of shard j
     ivf.add_with_ids(ivf.centroids[j : j + 1].copy(), np.array([new_id], dtype=np.uint64))
     assert gate.inner.contains(new_id)  # routed to shard j
     gate.release.set()
-    t.join(5)
+    t.join(WAIT_SECONDS)
     assert new_id not in got[0]  # the racing caller used its own snapshot once...
     assert ivf._id_cache[j] is None  # ...but did not cache it over the write
     assert new_id in ivf._shard_ids(j)

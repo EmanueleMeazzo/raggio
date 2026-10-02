@@ -17,6 +17,11 @@ from raggio.store import Collection, CollectionConfig, IdMapIndex, _IvfIndex, op
 
 DIM = 8
 
+# the deadline of each wait for something that must happen. Generous on purpose: with
+# every CPU busy, a thread hand-off on the free-threaded build can take a second or more
+# (a contended PyMutex yields the CPU up to 40 times before it parks)
+WAIT_SECONDS = 360
+
 
 def make_collection(tmp_path):
     return Collection(CollectionConfig("t", DIM, 4, None, None, None), Path(tmp_path), lambda: None)
@@ -178,7 +183,7 @@ API_DIM = 32
 ROOT = {"x-api-key": "root-key"}
 
 
-def wait_job(client, job_id, timeout=30.0):
+def wait_job(client, job_id, timeout=WAIT_SECONDS):
     deadline = time.time() + timeout
     while time.time() < deadline:
         r = client.get(f"/collections/t/jobs/{job_id}", headers=ROOT).json()

@@ -2,6 +2,7 @@
 pruning, micro-batcher, RW lock) and the crash-consistency fixes around them."""
 import asyncio
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,12 @@ sys.path.insert(0, "src")
 import raggio.store as store
 from raggio.store import Collection, CollectionConfig, _RWLock, _fold, open_meta_db
 from turbovec import IdMapIndex
+
+# the deadline of each wait for something that must happen. Generous on purpose: with
+# every CPU busy, a thread hand-off on the free-threaded build can take a second or more
+# (a contended PyMutex yields the CPU up to 40 times before it parks); the concurrent
+# enqueue test took 51.7-83.4 s under 6 busy loops on a 6-core laptop (0.5 s unloaded)
+WAIT_SECONDS = 360
 
 
 def make_collection(tmp_path, dim=8):
@@ -120,7 +127,7 @@ def test_rwlock_writer_cancelled_while_waiting_wakes_readers():
         await asyncio.sleep(0.01)
         tw.cancel()
         r1_go.set()
-        await asyncio.wait_for(done.wait(), timeout=2)  # hangs without the fix
+        await asyncio.wait_for(done.wait(), timeout=WAIT_SECONDS)  # hangs without the fix
         await asyncio.gather(t1, t2)
 
     asyncio.run(run())
@@ -250,9 +257,9 @@ def test_concurrent_enqueue_with_worker_loses_nothing(tmp_path):
 
         ids = await asyncio.gather(*(enqueuer(b) for b in (0, 100, 200)))
         assert len({j for sub in ids for j in sub}) == 30  # all job ids distinct
-        for _ in range(300):
-            if col.pending_jobs() == 0:
-                break
+        deadline = time.monotonic() + WAIT_SECONDS
+        while col.pending_jobs():
+            assert time.monotonic() < deadline, f"{col.pending_jobs()} jobs open after {WAIT_SECONDS} s"
             await asyncio.sleep(0.05)
         assert not col._worker.done()  # worker alive (a lock error would kill it)
         assert col._rdb().execute("SELECT COUNT(*) FROM records").fetchone()[0] == 300
@@ -280,9 +287,9 @@ def test_job_payload_pages_are_returned_after_processing(tmp_path):
         await col.enqueue({"documents": [
             {"doc_id": "d", "chunks": [{"id": f"c{j}", "text": "x" * 5000, "vector": vec(j)}
                                        for j in range(50)]}]})
-        for _ in range(200):
-            if col.pending_jobs() == 0:
-                break
+        deadline = time.monotonic() + WAIT_SECONDS
+        while col.pending_jobs():
+            assert time.monotonic() < deadline, f"{col.pending_jobs()} jobs open after {WAIT_SECONDS} s"
             await asyncio.sleep(0.05)
         assert col.db.execute("PRAGMA freelist_count").fetchone()[0] <= 1
         await col.stop()
@@ -398,6 +405,23 @@ def test_python_bm25_matches_fts5_ranking(tmp_path, monkeypatch):
     cand = col._rdb().execute("SELECT id, text FROM records").fetchall()
     ids, _ = col._bm25_rescore("alpha beta", list(cand), 10)
     assert ids[: len(fts)] == fts
+
+
+def test_bm25_rescoring_survives_a_df_cache_stale_after_deletes(tmp_path, monkeypatch):
+    col = make_collection(tmp_path)
+    common = " ".join(f"w{i}" for i in range(1, 40))
+    asyncio.run(col._process_job({"documents": [
+        {"doc_id": f"d{i}", "chunks": [{"id": f"c{i}", "text": common, "vector": vec(i)}]}
+        for i in range(50)
+    ]}))
+    monkeypatch.setattr(store, "FTS_SCAN_BUDGET_MIN_ROWS", 0)  # prune, so stage 2 rescoring runs
+    query = common + " rare3"
+    assert len(col._prune_common(query)[0]) < len(col._prune_common(query)[1])  # precondition
+    assert asyncio.run(col.search("text", None, query, 5, "chunks", None, None))  # caches df(w1) = 50
+    for i in range(3):  # churn 53 stays far under the 1000-row refresh: the cached df is now stale
+        asyncio.run(col.delete_document(f"d{i}"))
+    assert col._df_cache["w1"] == 50 and sum(col.indexed_counts.values()) == 47
+    assert asyncio.run(col.search("text", None, query, 5, "chunks", None, None))
 
 
 def test_unpruned_query_skips_stage_two(tmp_path, monkeypatch):

@@ -16,6 +16,12 @@ Any OpenAI-compatible `/embeddings` endpoint works. For Azure AI Foundry, set
 `EMBEDDING_BASE_URL` to the full deployment URL — the key is sent as both
 `Authorization: Bearer` and `api-key`, so both providers work unchanged.
 
+!!! note "Experimental: free-threaded Python"
+    `podman build --build-arg PYTHON=3.14t -t raggio:py314t .` builds the same image on
+    free-threaded CPython 3.14t, for evaluation only
+    ([ADR 0006](adr/0006-free-threaded-python.md)). It compiles turbovec from source and
+    fails the build if anything re-enables the GIL; `/healthz` reports `gil_enabled`.
+
 !!! tip "No embedding endpoint?"
     raggio works without one: ingest pre-computed vectors and search with
     `mode: "vector"` + a raw query vector, or use `mode: "text"` (BM25), which
@@ -39,6 +45,7 @@ All configuration is via environment variables:
 | `IVF_SEARCH_THREADS` | `min(12, CPUs)` | Threads per indexed collection that scan IVF shards in parallel; `1` restores the serial loop |
 | `SYNC_BATCH_JOBS` | `8` | Ingest jobs covered by one vector-index sync; each job turns `done` only after the sync that covers it. `1` syncs after every job |
 | `SYNC_BATCH_MS` | `1000` | Milliseconds after a batch's first job at which the batch syncs even if it holds fewer jobs (checked as each job joins); `0` closes each batch at its first job |
+| `GC_FREEZE` | `0` | `1` collects and freezes the startup heap before serving, so later garbage collections skip it. Meant for the experimental 3.14t image, whose collector walks the whole heap every time |
 
 ## Authentication
 

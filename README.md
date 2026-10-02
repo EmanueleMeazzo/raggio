@@ -61,6 +61,11 @@ podman run -p 8000:8000 -v raggio-data:/data \
   raggio
 ```
 
+The image runs CPython 3.12. An experimental free-threaded CPython 3.14t image builds from
+the same Dockerfile, for evaluation only ([ADR 0006](docs/adr/0006-free-threaded-python.md)):
+`podman build --build-arg PYTHON=3.14t -t raggio:py314t .`. It compiles turbovec from source
+and fails the build if anything re-enables the GIL; `/healthz` reports `gil_enabled`.
+
 ### Config (env)
 
 | Var | Default | |
@@ -75,6 +80,7 @@ podman run -p 8000:8000 -v raggio-data:/data \
 | `IVF_SEARCH_THREADS` | `min(12, CPUs)` | threads per indexed collection scanning IVF shards in parallel; `1` = serial |
 | `SYNC_BATCH_JOBS` | `8` | ingest jobs per vector-index sync; a job is `done` only after its sync; `1` = sync per job |
 | `SYNC_BATCH_MS` | `1000` | ms after a batch's first job before its sync runs, even if fewer jobs arrived (checked as each job joins); `0` = sync per job |
+| `GC_FREEZE` | `0` | `1` freezes the startup heap so garbage collections skip it (experimental 3.14t image) |
 
 ## API
 

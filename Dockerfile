@@ -6,6 +6,10 @@
 # (native/Cargo.lock, built --locked). The wheel is not manylinux-audited, so the builder
 # runs trixie like the runtime; the runtime stage copies no toolchain. RUST_VERSION is the
 # same pin as the native job in .github/workflows/tests.yml.
+# PYTHON=3.14t is the experimental free-threaded image (ADR 0006): turbovec ships no
+# cp314t wheel, so uv builds it from its sdist here (rust-version 1.89). The check at the
+# end of the builder fails the build if the interpreter is not the flavour PYTHON names or
+# anything the app loads re-enables the GIL.
 ARG UV_VERSION=0.12.22
 ARG PYTHON=3.12
 ARG RUST_VERSION=1.99.0
@@ -15,6 +19,9 @@ FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 FROM docker.io/library/rust:${RUST_VERSION}-slim-trixie AS builder
 COPY --from=uv /uv /uvx /bin/
 ARG PYTHON
+# unset by default; 3.14t needs none. --build-arg UV_NO_BINARY_PACKAGE=turbovec (C1) builds
+# the sdist on a GIL interpreter too: a local abi3 wheel (abi3-py39), not 3.14t's cp314t
+ARG UV_NO_BINARY_PACKAGE
 ENV UV_PYTHON_INSTALL_DIR=/python \
     UV_PYTHON_PREFERENCE=only-managed \
     UV_PYTHON=${PYTHON} \
@@ -33,6 +40,8 @@ COPY native ./native
 RUN uv sync --frozen --no-install-project --no-dev --extra native
 COPY src ./src
 RUN uv sync --frozen --no-dev --extra native
+COPY docker/check_image.py /tmp/check_image.py
+RUN /app/.venv/bin/python /tmp/check_image.py --python "${PYTHON}" --require-native
 
 FROM docker.io/library/debian:trixie-slim
 COPY --from=builder /python /python
@@ -43,6 +52,9 @@ USER app
 # one OpenBLAS thread (spec D16): numpy's scipy-openblas otherwise starts one busy-spinning thread per core under search load
 ENV OPENBLAS_NUM_THREADS=1
 ENV LANG=C.UTF-8 DATA_DIR=/data PATH="/app/.venv/bin:$PATH"
+# a lazy import that re-enables the GIL on 3.14t raises instead of silently serving with
+# it (docker/check_image.py GIL_WARNING_FILTER); on a GIL build it never fires
+ENV PYTHONWARNINGS="error:The global interpreter lock (GIL) has been enabled:RuntimeWarning"
 VOLUME /data
 EXPOSE 8000
 
