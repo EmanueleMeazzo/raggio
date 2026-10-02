@@ -757,6 +757,10 @@ class _IvfIndex:
         # ids an index doesn't hold): built lazily via a full-k probe, dropped for any
         # shard a write touches. ~8 bytes/row when filtered queries occur, else nothing.
         self._id_cache: list = [None] * len(shards)
+        # per-shard write generation: an id probe that started before a write to its
+        # shard may not cache its (older) snapshot. Read lock-free, bumped under the lock.
+        self._id_gen = [0] * len(shards)
+        self._id_lock = threading.Lock()
 
     @property
     def nlist(self) -> int:
@@ -835,24 +839,31 @@ class _IvfIndex:
     def calibration_state(self) -> str:
         return self.shards[0].calibration_state if self.shards else "uncalibrated"
 
+    def _shard_written(self, j: int) -> None:
+        """Every write to shard j calls this AFTER modifying the shard."""
+        with self._id_lock:
+            self._id_gen[j] += 1
+            self._id_cache[j] = None
+
     def add_with_ids(self, mat: np.ndarray, ids: np.ndarray) -> None:
         asg = self._assign(mat, self.centroids)
         for j in np.unique(asg):
             m = asg == j
             self.shards[j].add_with_ids(np.ascontiguousarray(mat[m]), ids[m])
-            self._id_cache[j] = None
+            self._shard_written(int(j))
 
     def remove(self, rid: int) -> None:
         # ponytail: O(nlist) contains scan (~us each) beats maintaining an id->shard map
         for j, sh in enumerate(self.shards):
             if sh.contains(rid):
                 sh.remove(rid)
-                self._id_cache[j] = None
+                self._shard_written(j)
                 return
 
     def _shard_ids(self, j: int) -> np.ndarray:
         ids = self._id_cache[j]
         if ids is None:
+            gen = self._id_gen[j]  # read BEFORE the probe snapshots the shard
             sh = self.shards[j]
             if len(sh):
                 probe = np.zeros((1, self.centroids.shape[1]), dtype=np.float32)
@@ -861,7 +872,11 @@ class _IvfIndex:
                 # use searchsorted instead of a per-call re-sort
             else:
                 ids = np.empty(0, np.uint64)
-            self._id_cache[j] = ids  # racing readers compute the same array; last wins
+            with self._id_lock:
+                # a write since `gen` may postdate our snapshot (an orphaned search whose
+                # task was cancelled holds no read lock): use it once, never cache it
+                if gen == self._id_gen[j]:
+                    self._id_cache[j] = ids
         return ids
 
     def _intersect(self, allow: np.ndarray, j: int) -> np.ndarray:

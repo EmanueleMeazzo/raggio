@@ -560,3 +560,55 @@ def test_every_membership_write_bumps_the_allow_generation(tmp_path):
     ingest(col, 3)  # upserts d0..d2
     assert col._allow_gen == gen + 3
     asyncio.run(col.stop())
+
+
+# ---- R2b: IVF shard id-cache generation ----
+
+
+class GatedProbe:
+    """Delegating shard proxy: a search snapshots the shard first, then waits."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.started, self.release = threading.Event(), threading.Event()
+
+    def __len__(self):
+        return len(self.inner)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def search(self, q, k, allowlist=None):
+        res = self.inner.search(q, k=k, allowlist=allowlist)
+        self.started.set()
+        assert self.release.wait(5)
+        return res
+
+
+def test_orphaned_id_probe_cannot_cache_stale_shard_ids():
+    ivf, _ = build_ivf()
+    j, new_id = 2, 70_000
+    gate = GatedProbe(ivf.shards[j])
+    ivf.shards[j] = gate
+    got = []
+    t = threading.Thread(target=lambda: got.append(ivf._shard_ids(j)))
+    t.start()
+    assert gate.started.wait(5)  # the probe holds a pre-write snapshot of shard j
+    ivf.add_with_ids(ivf.centroids[j : j + 1].copy(), np.array([new_id], dtype=np.uint64))
+    assert gate.inner.contains(new_id)  # routed to shard j
+    gate.release.set()
+    t.join(5)
+    assert new_id not in got[0]  # the racing caller used its own snapshot once...
+    assert ivf._id_cache[j] is None  # ...but did not cache it over the write
+    assert new_id in ivf._shard_ids(j)
+    allow = store._sorted_ids([new_id, 1, 2])
+    assert new_id in ivf._intersect(allow, j)
+
+
+def test_remove_invalidates_shard_ids():
+    ivf, _ = build_ivf()
+    j = next(j for j in range(ivf.nlist) if len(ivf.shards[j]))
+    victim = int(ivf._shard_ids(j)[0])
+    gen = ivf._id_gen[j]
+    ivf.remove(victim)
+    assert ivf._id_gen[j] == gen + 1 and victim not in ivf._shard_ids(j)
