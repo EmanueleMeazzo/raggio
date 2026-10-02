@@ -47,7 +47,7 @@ Probe tooling referenced here is committed under `bench/`.
 
 - turbovec is an external dependency — kernel changes (SIMD, ANN, multi-partition search) are out of scope; everything layers on `IdMapIndex`. *Partly superseded by ADR 0005: upstream turbovec proposals are in scope; raggio still carries no turbovec kernel code and never forks it (first-party native code: ADR 0004).*
 - Remaining known headroom needs one of: an ANN index in the kernel, more CPUs, or free-threaded Python. Application-level paths are exhausted as of this ADR. *Withdrawn by ADR 0005: parallel IVF shard fan-out was an untried application-level path.*
-- Ingest throughput has a known lever if it ever matters: batch index syncs / vacuum every N jobs instead of per job (`ponytail:` comment in `store.py`).
+- Ingest index syncs are batched: one sync covers up to `SYNC_BATCH_JOBS` jobs or `SYNC_BATCH_MS` ms, and a job turns `done` only after that sync. The full vacuum waits for an idle queue. See "Addendum 2026-09 — ingest path" below.
 
 ## Addendum 2026-09 — concurrency correctness
 
@@ -150,7 +150,7 @@ Date: 2026-09-30 · Plan D, phase D1, of the 2026-09-28 performance program (`do
 | A failure after the commit (`add_with_ids`, calibration) | **Unchanged (known gap)** | It still leaves an `error` job whose committed rows are missing from the index. `_reconcile_ghosts` only evicts; it never re-adds |
 | Vacuum policy: a full `incremental_vacuum` only when no job is open. While jobs are open, a finish that sees `VACUUM_FREELIST_PAGES` (16,384 pages, 64 MB at 4 KiB) or more trims the freelist back to `VACUUM_FREELIST_PAGES − VACUUM_CHUNK_PAGES` (`VACUUM_CHUNK_PAGES` = 2,048, so 14,336 pages). Both pragmas are drained with `.fetchall()` | **Accepted** | Per-job vacuum with the side table cost 38–54 ms; idle-only, 7–20 ms. A fixed-size chunk would let the freelist grow whenever a job frees more than one chunk |
 | `bench/ingest_probe.py`, an in-process drain benchmark (flat and IVF) that also runs in the base tree | **Accepted (tooling)** | `bench.py` never ingests into an IVF collection: `--engine raggio-ivf --reingest` only rebuilds the index. Probe rows are labelled host-warm, uncapped host process |
-| Batched index syncs (the lever in the standing constraints above) | **Deferred to D2** | D1 keeps one sync per job. Prototype, laptop: base 468–483 → + binary journal 810–849 → + set-based upsert 815–955 → + vacuum policy 995–1046 vec/s (flat); IVF nlist 64: 254 → 408 vec/s. Every variant's final state was identical to base |
+| Batched index syncs (the lever in the standing constraints above) | **Deferred to D2** | D1 keeps one sync per job. Prototype, laptop: base 468–483 → + binary journal 810–849 → + set-based upsert 815–955 → + vacuum policy 995–1046 vec/s (flat); IVF nlist 64: 254 → 408 vec/s. Every variant's final state was identical to base; done in D2, see "Batched sync (D2)" below |
 
 ### Results — DGX A/B (D1)
 
@@ -398,3 +398,21 @@ Run 2026-09-30 on gn100 (NVIDIA DGX Spark, GB10 Grace, 20 aarch64 cores), base `
   }
 }
 ```
+
+### Batched sync (D2)
+
+Date: 2026-10-02 · Plan D, phase D2. It replaces the "Deferred to D2" row above: D1 kept one index sync per job. Direction from the item2a research (laptop): turbovec v7 writes appends whole and keeps each removal as a header redo op until the next sync, which rewrites the 32-row unit; past 1024 ops a sync rewrites the whole file through a temp file and a rename (about 7 µs per row). A flat sync costs 7–9 ms (laptop), about 15 % of a flat job on gn100 after D1 (about 0.05 s per 250-row job). An IVF sync writes only the shards a job dirtied (Plan F), at about 8 ms per shard (laptop, nlist 64). One 250-row job of evenly spread rows dirties about 160 of 256 shards and a batch of 8 jobs nearly all 256, so one batched sync writes about a fifth of the shards that 8 per-job syncs write (an estimate, not measured; a whole IVF probe job took 0.35–0.41 s on gn100 after D1). The knob defaults are chosen on seed 7 and published on seed 42 (spec §6), under "Results — DGX A/B (D2)" below. Every row is pinned by `tests/test_ingest_path.py`.
+
+| Decision | Verdict | Evidence / rationale |
+|---|---|---|
+| One index sync per batch of ingest jobs. A batch closes when it holds `SYNC_BATCH_JOBS` jobs (default 8), when `SYNC_BATCH_MS` ms (default 1000) have passed since its first job joined, when the queue goes idle, before an attach or detach job (which then runs alone), and in `stop()`. `SYNC_BATCH_JOBS=1` syncs after every job, as D1 did | **Accepted** | Per-job syncs are a large part of IVF ingest: in the laptop prototype (nlist 64) batching doubled IVF ingest, 404 → 802 vec/s. The seed-7 grid (1, 0), (8, 1000), (32, 1000), (32, 4000) in the results below picks the defaults. On the probe's job mix every fifth job replaces 250 rows, so the removal cap ends a batch about every 10 jobs and the (32, *) pairs act as N ≈ 10 |
+| Done-after-sync: a job's rows are committed and indexed in memory, and the job stays `processing` until the sync that covers it returns. The batch's jobs then finish in order, `error` jobs included | **Accepted** | No job reads `done` before its vectors are on disk. A crash before the batch's sync returns leaves all of its jobs `processing`, and a crash during its finishes leaves the unfinished rest `processing`. The idempotent replay redoes them. A document deleted or patched after a job that wrote it ran, but before that job's batch synced, comes back or reverts if the server crashes in between: the replay re-runs the job (spec §3 D8). Batching widens this window from one finish to up to `SYNC_BATCH_MS` plus one job. |
+| Claim cursor: the claim adds `AND id > ?` to its `INDEXED BY idx_jobs_open` query, so the worker never re-claims its own `processing` jobs | **Accepted** | A batch's jobs stay `processing` until its sync |
+| Removal cap: no sync carries more than `SYNC_MAX_REMOVALS` (512) removals accumulated across a batch's jobs. The job that would pass it syncs first, after its own commit. A lone job over the cap is not split | **Accepted** | Removals pile up as header ops; past 1024 ops the sync becomes a full-file rewrite, extrapolated at about 20 s under the collection's write lock at 2.55M rows |
+| A failed sync is logged and retried after `SYNC_RETRY_MIN_S` (1 s), doubling up to `SYNC_RETRY_MAX_S` (30 s). Meanwhile the batch's jobs stay `processing` and the worker claims nothing new; the wait holds no lock. A failed removal-cap pre-sync is logged, and the job goes on | **Accepted (bug fix)** | Before, a sync that raised failed its job as `error`: terminal, never replayed, with committed rows missing from the index file |
+| `stop()` syncs the open batch and finishes its jobs. If that sync fails, `stop()` logs it and completes the shutdown without raising: it finishes nothing, the jobs stay `processing` with their payloads, and the next open replays them. A dead worker's exception, and a finish that fails after that sync landed, are logged the same way, and their jobs replay too. A failure to close the SQLite connections, the embedding client or the IVF shard pool is logged, and the next close step still runs | **Accepted** | A clean shutdown finishes what it synced; a failing index file, meta.db or close step never stops a shutdown half-way, so every collection and the catalog close, and the journal carries the unfinished jobs to the next open |
+| Several jobs per SQLite transaction | **Still rejected** | Each job keeps its own transaction and its own finish; only the index sync is shared |
+
+### Results — DGX A/B (D2)
+
+Pending: the gn100 A/B of Plan D Task 10 has not run yet.

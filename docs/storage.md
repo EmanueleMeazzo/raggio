@@ -30,7 +30,11 @@ records which one is current).
    request's JSON fields, with the vectors stored as little-endian float32).
 2. A per-collection worker embeds missing vectors, writes records, and
    updates both indexes.
-3. The job is marked `done` only after the vector index is synced to disk.
+3. The job is marked `done` only after the index sync that covers it has
+   written its vectors to disk. One sync covers a batch of up to
+   `SYNC_BATCH_JOBS` jobs, or the jobs of `SYNC_BATCH_MS` milliseconds (see
+   [Configuration](getting-started.md#configuration)), so a finished job can
+   stay `processing` that long.
    A successful job's payload row is deleted so vector-heavy jobs don't
    accumulate; a failed job keeps it for diagnosis. A payload that cannot
    be read fails its job with a `bad job payload: ...` error. Freed pages
@@ -38,7 +42,17 @@ records which one is current).
    `meta.db` keeps at most 16,384 free pages (64 MB at SQLite's default
    4 KiB page size) and trims the excess as each job finishes.
 
-After a crash, any `pending` or `processing` job is replayed on boot.
+After a crash, any `pending` or `processing` job is replayed on boot. A
+crash before a batch's sync lands leaves all of the batch's jobs
+`processing`, so the whole batch replays; a crash while its jobs finish
+replays only the ones not yet `done`. A shutdown whose last index sync
+fails (a full disk, say) logs the error and still closes; that batch's
+jobs stay `processing` and replay the same way. The same holds when the
+shutdown finds the ingest worker stopped by an error, or cannot mark
+synced jobs `done`: the error is logged, every collection still closes,
+and the unfinished jobs replay. A collection whose database connections,
+embedding client or IVF thread pool fail to close logs the error, and
+the shutdown goes on to its next close step and the next collection.
 Replays are idempotent: records are upserted by id. Jobs journaled by a
 release from before the binary job journal, whose JSON payload sits in
 `jobs.payload`, still replay after an upgrade. The reverse does not hold: an
@@ -49,7 +63,8 @@ before downgrading.
 ## Backup
 
 There is no backup API; a backup is a copy of `DATA_DIR`. `meta.db` is a WAL
-SQLite database and `index.tvim` is rewritten on every sync, so copy while
+SQLite database, and every index sync writes to `index.tvim` (or to the
+changed shard files under `ivf/`), so copy while
 nothing writes: stop the container, or copy a collection's directory while it
 is offloaded (idle past `COLLECTION_IDLE_TTL` with no pending jobs — `/healthz`
 lists the resident ones). Restore by placing the directory back on the volume

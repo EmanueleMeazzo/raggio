@@ -73,6 +73,8 @@ podman run -p 8000:8000 -v raggio-data:/data \
 | `COLLECTION_IDLE_TTL` | `900` | seconds before an idle collection is offloaded to disk |
 | `NATIVE_BM25` | `auto` | stage-2 BM25 scorer: `auto` runs the native extension when installed (the image builds it), `0` the pure-Python one; same results |
 | `IVF_SEARCH_THREADS` | `min(12, CPUs)` | threads per indexed collection scanning IVF shards in parallel; `1` = serial |
+| `SYNC_BATCH_JOBS` | `8` | ingest jobs per vector-index sync; a job is `done` only after its sync; `1` = sync per job |
+| `SYNC_BATCH_MS` | `1000` | ms after a batch's first job before its sync runs, even if fewer jobs arrived; `0` = sync per job |
 
 ## API
 
