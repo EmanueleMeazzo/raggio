@@ -2255,7 +2255,7 @@ class Collection:
         total = sum(self.indexed_counts.values())
         idf = {}
         for t in dict.fromkeys(qtoks):
-            df = self._df(t)
+            df = min(self._df(t), total)  # FTS5's own nHit <= N; the df cache can be stale after deletes
             idf[t] = max(math.log((total - df + 0.5) / (df + 0.5)), 1e-6)
         rids = [rid for rid, _ in cand]
         texts = [text for _, text in cand]

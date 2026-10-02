@@ -400,6 +400,23 @@ def test_python_bm25_matches_fts5_ranking(tmp_path, monkeypatch):
     assert ids[: len(fts)] == fts
 
 
+def test_bm25_rescoring_survives_a_df_cache_stale_after_deletes(tmp_path, monkeypatch):
+    col = make_collection(tmp_path)
+    common = " ".join(f"w{i}" for i in range(1, 40))
+    asyncio.run(col._process_job({"documents": [
+        {"doc_id": f"d{i}", "chunks": [{"id": f"c{i}", "text": common, "vector": vec(i)}]}
+        for i in range(50)
+    ]}))
+    monkeypatch.setattr(store, "FTS_SCAN_BUDGET_MIN_ROWS", 0)  # prune, so stage 2 rescoring runs
+    query = common + " rare3"
+    assert len(col._prune_common(query)[0]) < len(col._prune_common(query)[1])  # precondition
+    assert asyncio.run(col.search("text", None, query, 5, "chunks", None, None))  # caches df(w1) = 50
+    for i in range(3):  # churn 53 stays far under the 1000-row refresh: the cached df is now stale
+        asyncio.run(col.delete_document(f"d{i}"))
+    assert col._df_cache["w1"] == 50 and sum(col.indexed_counts.values()) == 47
+    assert asyncio.run(col.search("text", None, query, 5, "chunks", None, None))
+
+
 def test_unpruned_query_skips_stage_two(tmp_path, monkeypatch):
     col = make_collection(tmp_path)
     asyncio.run(col._process_job({"documents": [
