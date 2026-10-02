@@ -1050,6 +1050,12 @@ class Collection:
         self.sync_batch_jobs = sync_batch_jobs
         self.sync_batch_ms = sync_batch_ms
         self._removed_since_sync = 0
+        # the worker's open batch: (job_id, status, error) for each job it processed
+        # that no index sync covers yet. Each one finishes only after such a sync
+        # (_flush_unsynced). _batch_t0 is time.monotonic() when the batch's first job
+        # joined, and None while no batch is open
+        self._unsynced: list[tuple[int, str, str | None]] = []
+        self._batch_t0: float | None = None
         # the catalog decides which representation is live; a stale sibling on disk
         # (crashed attach/detach) is ignored and rebuilt by the replayed job
         if cfg.index_config and (self.ivf_dir / "centroids.npy").exists():
@@ -1315,27 +1321,77 @@ class Collection:
             self.db.execute(f"PRAGMA incremental_vacuum({n})").fetchall()
 
     async def _run_worker(self) -> None:
+        # claim cursor: a claimed job stays 'processing' until its batch's sync, so each
+        # claim starts above the last job this worker claimed. It is 0 on every start,
+        # so the jobs a crash or a stop() left 'processing' replay first, in id order
+        after = 0
         while True:
             # clear BEFORE claiming: an enqueue landing during the claim either becomes
             # visible to the claim itself or re-sets the event, so no wakeup is lost
             self._wake.clear()
-            row = await asyncio.to_thread(self._claim_next)
+            row = await asyncio.to_thread(self._claim_next, after)
             if row is None:
+                if self._unsynced:
+                    # the queue is idle: close the open batch now, not at a cap
+                    await self._flush_unsynced()
+                    continue
                 await self._wake.wait()
                 continue
             # decoded in the claim's thread; an undecodable row comes back as
             # (job_id, None, reason) and finishes as 'error' like any failed job
             job_id, payload, bad = row
+            after = job_id
+            if bad is None and payload.get("op") in ("attach_index", "detach_index"):
+                # an index job is a barrier: it rebuilds the index and writes the new
+                # one itself. The open batch syncs and finishes first, then the index
+                # job runs alone and finishes at once
+                if self._unsynced:
+                    await self._flush_unsynced()
+                try:
+                    await self._process_job(payload)
+                    status, error = "done", None
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    status, error = "error", str(e)
+                await asyncio.to_thread(self._finish_job, job_id, status, error)
+                continue
             try:
                 if bad is not None:
                     raise ValueError(bad)
-                await self._process_job(payload)
+                # sync=False: the job commits its rows and updates the in-memory index.
+                # The batch's one sync writes the file, and only then does the job finish
+                await self._process_job(payload, sync=False)
                 status, error = "done", None
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 status, error = "error", str(e)
-            await asyncio.to_thread(self._finish_job, job_id, status, error)
+            # a failed job joins the batch too: finishes stay in claim order, and one
+            # finish path covers every job
+            if not self._unsynced:
+                self._batch_t0 = time.monotonic()
+            self._unsynced.append((job_id, status, error))
+            if (
+                len(self._unsynced) >= self.sync_batch_jobs
+                or (time.monotonic() - self._batch_t0) * 1000.0 >= self.sync_batch_ms
+            ):
+                await self._flush_unsynced()
+
+    async def _flush_unsynced(self) -> None:
+        """Close the worker's open batch: one index sync covers every job in it, then
+        each job finishes, in claim order. None of them is 'done' before that sync
+        returns (the job journal invariant), so a crash before it leaves them all
+        'processing' and the replay redoes them. A crash between the sync and the last
+        finish replays the unfinished rest, which rewrites the same rows."""
+        async with self.lock.write():  # the per-job sync ran under it too
+            await asyncio.to_thread(self._sync_index)
+        self._batch_t0 = None  # the batch closed at its sync
+        while self._unsynced:
+            # pop BEFORE the await: a stop() that cancels the worker mid-finish leaves
+            # this job to the orphaned thread, and nothing finishes it twice
+            job = self._unsynced.pop(0)
+            await asyncio.to_thread(self._finish_job, *job)
 
     async def _process_job(self, payload: dict, *, sync: bool = True) -> None:
         """Run one job. An ingest job ends by writing the index file (_sync_index) only
