@@ -1338,7 +1338,7 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
 - **Versions (W-11).** turbovec 1.0.0 is the latest, and its GitHub `main` equals v1.0.0. uv 0.12.21 is the latest. numpy 2.5.3 exists with no relevant change, so it goes into a maintenance commit after F. CPython 3.12.15 (PBS 20261001, still SQLite 3.53.1) arrives with the next uncached image build. `rust:1.99.0-slim-trixie` still returns 404.
 - **The trailer (F-R8).** The scan agents saw a Sonnet attribution in their own context. F keeps the Opus line that every A–E commit carries.
 
-**00:06Z–01:08Z. Plan F Tasks 1–5: the pool, the intersection, two cache races and dirty-shard sync. A dropped space changed how literals are checked.**
+**00:06Z–00:58Z. Plan F Tasks 1–5: the pool, the intersection, two cache races and dirty-shard sync. A dropped space changed how literals are checked.**
 - **Setup.** The worktree `.worktrees/ivf-fanout-and-upstream` was created from `main` at fa0fa9f. The baseline was 398 passed with the extension, which confirms P.
 - **Task 1 (4cdeb04): `_ShardPool` and the parallel fan-out.** 413 passed.
   - A grep confirmed F-R1, F-R2 and F-R4 in place:
@@ -1366,6 +1366,41 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
 - **Task 9's brief.** The four ruled DGX scripts come from the plan's blocks through 33 asserted one-match substitutions, and each is embedded whole in the brief. The other two scripts are the plan's blocks unchanged.
   - On the pre-flight replay's tree, the check prints "Plan F DGX scripts OK".
   - The new floor fixture works. With the display-resolution floor removed, F6 fails with "diff +0.10, band 0.00".
+
+**00:58Z–01:24Z. Plan F Tasks 6–9: the probe, ADR 0005, the upstream drafts and the DGX scripts. Then the final review on Opus.**
+- **Pace.** On Sonnet, each implementer took one to four minutes from dispatch to report, and each task review under a minute. Tasks 4–9 took 36 minutes in all, including the controller's checks.
+- **Task 6 (a2614de): `bench/ivf_fanout_probe.py`,** with three modes: `stages`, `fanout` with the grouped-search guard, and `exact`, which checks seed-42 bit identity against the serial path. 430 passed.
+  - The file equals the brief's block, apart from F-R33's comment on the read-only connection.
+  - The review approved it with five Minor notes. Four are the plan's own text in a one-shot probe:
+    - pools closed without `try/finally`;
+    - a bare `TypeError` when `--filter-key` matches no row;
+    - a failure when every probed shard of a query is empty;
+    - a docstring that says "in id order" for a permutation.
+  - The fifth was the real risk: no test pins the output lines that Task 9's scripts parse.
+  - The controller ran the probe's `fanout` and `exact` modes on the smoke tests' 400-row collection and applied Task 9's parsers to the real output. The GUARD regex, the `LISTS largest (\d+) rows` regex and the `EXACT …: PASS` line all matched. Nothing changed.
+- **Task 7 (ff7695c): ADR 0005, and the "~0.4 ms fixed cost" corrected in ADR 0001, ADR 0002, the IVF docs and the store comments.** 431 passed; the strict docs build passes.
+  - The ADR equals the plan's block once F-R30's date (2026-10-02) is mapped back.
+  - ADR 0001 changed on exactly four lines: the plan's three, plus F-R31's sentence on the Deferred row, which is otherwise unchanged.
+  - Two Minor notes, no change:
+    - The docs test reads files by paths relative to the working directory, as three older test files do.
+    - `bench/ivf_probe.py` still names a "per-shard fixed cost". That is the 2026-08 probe's original hypothesis, and ADR 0005 corrects the claim where it was made.
+- **Task 8: six upstream drafts and the NEON repro**, in a scratch folder outside the repo. Nothing was posted; the maintainer posts them personally.
+  - All eight files equal the plan's blocks byte for byte. One draft's block uses a four-backtick fence because it contains a code block.
+  - The repro ran in 4.1 s on the x86 workstation. Relative to `nq=1`, the per-query cost was 0.58 at `nq=2`, 0.40 at 3 and 0.33 at 4.
+  - The NEON draft says the repro takes "about 30 s". Task 10 times it on gn100 (DGX Spark) before the drafts are final.
+- **Task 9: the six DGX scripts.** The implementer lifted each file from the brief with a slicer script instead of retyping it.
+  - All six equal the controller's expected copies byte for byte.
+  - The check passes against the branch's ADR and the drafts. It writes no byte code, and the drafts' hashes do not change.
+- **Reviews for Tasks 8 and 9.** Neither makes a commit, and both files are the plan's text (plus the controller's own substitutions in Task 9). So the controller's byte comparison served as the task review. The final review covers the drafts' claims and the scripts' safety on the shared gn100.
+- **Final review.** Dispatched at 01:24Z on Opus, read-only.
+  - Range: fa0fa9f..ff7695c, 12 files, +1662/−71.
+  - It also covers the drafts and the DGX scripts.
+  - Nine focus areas, from bit identity to the gn100 safety rules.
+  - 13 deferred Minor notes, each to be ruled fix-now or accept.
+- **A clock correction.** From Task 4 on, the controller's ledger stamps had been estimates, and they drifted up to 12 minutes ahead of real time.
+  - The session transcript's timestamps and the commit times corrected 14 ledger lines.
+  - The same check fixed this journal's previous entry: its header now reads 00:58Z, not 01:08Z, and the dated note in 9.1 reads 00:59Z, not 01:10Z.
+  - Every stamp since comes from `date -u` (section 7.6).
 
 ## 3. Decision register
 
@@ -2304,6 +2339,7 @@ Recorded subagent tokens for the completed workflows sum to 10,021,309. That tot
 - Check every added line, not only the non-ASCII ones, and do it before the commit. In plan F an editing tool dropped a plain space twice. The first one reached a commit because the implementer's check looked only at non-ASCII lines. The second was caught on the staged diff (section 2, 2026-10-02).
 - Compare test literals with their source by code point, not by eye, when they hold non-ASCII text or backslashes. Agents' editing tools have composed Unicode and dropped a backslash, and a diff view shows neither (section 5.21).
 - Verify claims of having told the user against the transcript. A compaction summary said the maintainer had been told about the removed `bench-wv` container; the transcript showed no such message (section 7.5).
+- Read every ledger stamp from the clock (`date -u`); do not advance it by estimate. In plan F the implementers finished a task in two to four minutes, much faster than earlier plans. The controller's estimated stamps drifted up to 12 minutes ahead: one ledger line put Task 6's dispatch at 01:08Z, after its 01:01Z commit. The transcript's own timestamps and the commit times fixed them (section 2, 2026-10-02).
 
 ### 7.7 Working agreements with the maintainer
 
@@ -2380,7 +2416,8 @@ State as of 2026-09-28, about 19:30Z.
 - Dated note, 2026-10-01 22:59Z: plan E's ten tasks, the final review and one fix wave are approved (f95b3b8, 397 passed). I-1, D14's compatibility-form loss, is documented under E-R15, with two issue drafts not posted. Task 11's A/B is running on gn100 (22:56Z, cap 110 minutes).
 - Dated note, 2026-10-01 23:22Z: plan E is done. Its A/B passed every gate (section 4.16), and it is merged into `main` and pushed (fa0fa9f). Next: plan F, `ivf-fanout-and-upstream`, after its pre-flight. G's uv quotes need re-anchoring to 0.12.21 at G's pre-flight.
 - Dated note, 2026-10-02 00:03Z: plan F's pre-flight is done and ruled (section 2, 2026-10-02; F-R1 to F-R39 in the ledger). F runs in `.worktrees/ivf-fanout-and-upstream` from `main` at fa0fa9f; Task 1 is next, on Sonnet.
-- Dated note, 2026-10-02 01:10Z: plan F's Tasks 1–5 are approved (8002a84, 427 passed; section 2, 2026-10-02). Task 6, the probe, is running. Still to come: Tasks 7–9, the final review on Opus, and Task 10's A/B on gn100 (DGX Spark).
+- Dated note, 2026-10-02 00:59Z: plan F's Tasks 1–5 are approved (8002a84, 427 passed; section 2, 2026-10-02). Task 6, the probe, is running. Still to come: Tasks 7–9, the final review on Opus, and Task 10's A/B on gn100 (DGX Spark).
+- Dated note, 2026-10-02 01:25Z: plan F's Tasks 1–9 are done and checked (ff7695c, 431 passed). The drafts and DGX scripts are outside the repo. The final review on Opus is running (section 2, 2026-10-02). Still to come: any fix wave, then Task 10's A/B on gn100, then the merge.
 
 ### 9.2 Open questions in the plans
 
