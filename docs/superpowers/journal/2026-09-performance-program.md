@@ -1577,6 +1577,11 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
 - **Steps 13–19, 07:01–07:03Z.** The results were fetched and scrubbed of home paths, and the preview printed PASS on every gate. The gate test went in verbatim from the plan and failed on `Pending:`. The summary script then recorded the block in ADR 0001, and the suite passed with 471 tests: `17bc0fa`. A Sonnet reviewer recomputed every figure from the raw files and approved, with two minor notes and no fix.
 - **The merge, 07:07Z.** `bc00ded`, "Merge plan D2: batched index syncs": 471 passed on the merged tree, pushed, and CI green on both jobs. The push closed issue #3 through `9c96cec`'s "Closes #3" (07:07:43Z).
 - **Plan G starts** in `.worktrees/free-threaded-python`, from `bc00ded`. The source files there are the ones G's pre-flight replayed against.
+- **G's baselines and briefs, 07:05–07:17Z.** In the worktree, CPython 3.12 passed 471 tests, and 3.14.8t passed 453 with 4 skipped, as the pre-flight predicted. A script cut the plan into one brief per task. Each brief carries the task's rulings, its expected counts on both interpreters and its mutation checks. As in D2, a checker compares every added line with the brief.
+- **Task 1, 07:18–07:26Z.** `a7c58f4` reports `gil_enabled` in `/healthz`: 473 passed on 3.12, and 455 with 4 skipped on 3.14.8t. A Sonnet reviewer approved, with two minor notes about code the plan prescribes; no change.
+- **Task 2, 07:26–07:37Z.** `05c2731` adds the `GC_FREEZE` knob. Approved, with two minor notes, kept as the plan wrote them. In the controller's own check, the 3.14.8t suite failed one test once, 1 failed and 460 passed, and the check's one-line summary dropped the test's name.
+- **The failure hunt, 07:37–07:50Z.** A re-run and six serial runs were green. Eight more runs, in concurrent pairs to add CPU contention, were green too. That is 1 failure in 16 runs, test unknown. The reviewer, asked to look for a flake source, found none in Task 2's diff. G goes on. The check now prints failing tests' names, and implementers are told to keep the output of any failure and re-run that test 5 times (section 9.4).
+- **Task 3** was dispatched at 07:51Z.
 
 ## 3. Decision register
 
@@ -2774,6 +2779,7 @@ State as of 2026-09-28, about 19:30Z.
 - Dated note, 2026-10-02 05:16Z: D2's code and docs are done and checked at `8976da3` (470 passed). Issue #3 is fixed in `9c96cec`, and the push to `main` will close it. The final review on Opus and the seed-7 tuning on gn100 (DGX Spark) run in parallel (section 2, 04:55Z). Then the fix wave, the seed-42 publish, the gate test, and the merge.
 - Dated note, 2026-10-02 05:52Z: D2's tuning kept the defaults, 8 jobs and 1,000 ms. The final review on Opus asked for four doc fixes, which are in at `6d16471` (470 passed; section 2, 05:14Z). The seed-42 publish has been running on gn100 (DGX Spark) since 05:44Z, with the reingests, and should end about 07:45Z. Plan G's pre-flight runs meanwhile, against `6d16471`.
 - Dated note, 2026-10-02 07:10Z: D2's publish passed all eight gates (section 4.18). Its results are in ADR 0001 (`17bc0fa`, 471 passed), and D2 is merged into `main` as `bc00ded` and pushed, with CI green. The push closed issue #3. Plan G's pre-flight is ruled (G-R1 to G-R31; X18, X19; section 5.28). G runs in `.worktrees/free-threaded-python` from `bc00ded`: the baselines, then Task 1 on Sonnet.
+- Dated note, 2026-10-02 07:52Z: plan G's Tasks 1 and 2 are approved (`05c2731`; 479 passed on 3.12, 461 with 4 skipped on 3.14.8t). One 3.14.8t suite run failed one unnamed test (section 9.4). Task 3 is running.
 
 ### 9.2 Open questions in the plans
 
@@ -2811,6 +2817,7 @@ State as of 2026-09-28, about 19:30Z.
 - **F6's gap** (section 5.24): the A/B's T=1 serial runs read 8.70, 7.65 and 7.66 ms, and no follow-up run went below 8.34. What made two runs fast, and one QPS run slow, is not known.
 - **F doubles CPU per query** (5.19 to 10.09 ms at c=8) and the summed kernel time of a batch (27.34 to 63.46 ms in process). Pool-thread placement is a candidate for part of it (section 5.25), measured only in a microbenchmark; neither was profiled in the server.
 - **The grouped-call guard's REVISIT** at 12 threads only, in one probe run (both of its repetitions), with 2.39 queries per probed shard on the rebuilt index against p3's 1.40. Whether it holds is a question for reopening spec D3.
+- **One 3.14.8t suite failure at plan G's `05c2731`** (Task 2, 2026-10-02): 1 failed and 460 passed, once, in the controller's check. The next 15 runs were green, 8 of them in concurrent pairs. The summary line lost the test's name, so it is not known which test failed, or whether Task 2's change is involved.
 
 ### 9.5 Disputed, unaddressed, and limits
 
