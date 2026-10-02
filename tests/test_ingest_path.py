@@ -1760,8 +1760,9 @@ def test_stop_during_sync_backoff_finishes_the_batch(tmp_path, monkeypatch):
 def test_a_cancel_inside_a_sync_retry_ends_the_worker(tmp_path, monkeypatch):
     # the retry catches Exception, never BaseException: a cancel that lands while the
     # retry waits for the write lock ends the worker. It is not logged as one more
-    # failed sync and retried
-    monkeypatch.setattr(store, "SYNC_RETRY_MIN_S", 0.5, raising=False)
+    # failed sync and retried. The retry's first wait is the window in which the test
+    # must take the read lock, so it is long enough for a loaded runner
+    monkeypatch.setattr(store, "SYNC_RETRY_MIN_S", 2.0, raising=False)
     col = make_collection(tmp_path)
     failing_sync(col, 1)
     logs = LogRecords()
