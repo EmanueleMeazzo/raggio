@@ -2346,3 +2346,102 @@ def test_a_cancelled_eviction_keeps_the_load_lock_until_stop_ends(tmp_path, monk
     assert cancelled
     assert reloaded  # touch() loaded the collection anew, once the old one had closed
     assert state == (True, False, 0, True)
+
+
+# ---- ADR 0001 addendum: D2 DGX results
+
+D2_RESULTS = "### Results " + chr(0x2014) + " DGX A/B (D2)"
+
+
+def adr_d2_results():
+    """(the D2 results subsection with \\r\\n normalized, its Measurements JSON or {}).
+    The subsection ends at the next ### or ## heading, or at the end of the file."""
+    adr = Path(__file__).resolve().parents[1] / "docs" / "adr" / "0001-performance-optimization-decisions.md"
+    text = adr.read_text(encoding="utf-8").replace("\r\n", "\n")
+    start = text.index(D2_RESULTS)
+    ends = [i for i in (text.find("\n### ", start + 1), text.find("\n## ", start + 1)) if i != -1]
+    section = text[start:min(ends, default=len(text))]
+    fence = "`" * 3
+    if "#### Measurements (D2)" not in section or fence + "json\n" not in section:
+        return section, {}
+    raw = section.split(fence + "json\n", 1)[1].split("\n" + fence, 1)[0]
+    return section, json.loads(raw)
+
+
+def test_adr_ingest_path_d2_results_pass_the_gates(monkeypatch):
+    """Spec sections 6 and 7 D for D2 on gn100: N and T chosen on seed 7; on seed 42, ingest
+    vec/s beyond the band on IVF nlist 256 and not worse on flat, every job done with no
+    payload row left, one final state across arms; and the shipped defaults are the choice."""
+    import inspect
+    import statistics
+
+    section, m = adr_d2_results()
+    assert "Pending:" not in section
+    assert "#### Measurements (D2)" in section and m, "no Measurements (D2) JSON block"
+    assert sorted(m) == ["base_sha", "bench", "cand_sha", "date", "gates", "labels", "probe", "tuning"]
+    assert m["base_sha"] != m["cand_sha"]
+
+    def gain_band(base, cand, floor=1.0):  # Plan A's rule: band = max(both spreads, resolution)
+        band = max(max(base) - min(base), max(cand) - min(cand), floor)
+        return statistics.median(cand) - statistics.median(base), band
+
+    def labelled(lab):  # spec section 6: each row names its regime, cap, sqlite and BLAS threads
+        return (lab["regime"] == ["host-warm, uncapped host process"] and bool(lab["cap"])
+                and lab["openblas_num_threads"] == ["1"] and len(lab["sqlite_version"]) == 1)
+
+    # seed 7: four pairs x 3 runs per mode, and a batched choice that beats (1, 0) on ivf256
+    t = m["tuning"]
+    assert t["seed"] == 7 and t["complete"] and t["fingerprints_equal"] and t["labels_ok"]
+    assert sorted(t["pairs"]) == ["n1-t0", "n32-t1000", "n32-t4000", "n8-t1000"]
+    assert all(len(p[mode]) == 3 for p in t["pairs"].values() for mode in ("flat", "ivf256"))
+    n, ms = t["choice"]
+    assert (n, ms) != (1, 0), "the choice must batch"
+    ref, pick = t["pairs"]["n1-t0"], t["pairs"][f"n{n}-t{ms}"]
+    gain, band = gain_band(ref["ivf256"], pick["ivf256"])
+    assert gain > band and pick["ivf256_vs_ref"] == "better", "seed 7: the ivf256 gain is within the band"
+    gain, band = gain_band(ref["flat"], pick["flat"])
+    assert -gain <= band and pick["flat_vs_ref"] in ("better", "within band"), "seed 7: flat is worse"
+    assert f"Chosen: SYNC_BATCH_JOBS={n}, SYNC_BATCH_MS={ms}.\n" in section
+    assert labelled(m["labels"]["tune"])
+
+    # seed 42: base (main after D1, E and F) against D2 at the chosen defaults
+    for mode in ("flat", "ivf256"):
+        p = m["probe"][mode]
+        assert len(p["base"]) == 3 and len(p["cand"]) == 3, mode
+        assert p["fingerprints_equal"] and p["jobs_all_done"], mode
+        assert set(p["payload_rows"]["base"]) == {0} and set(p["payload_rows"]["cand"]) == {0}, mode
+        assert f"- PASS: D2-{mode}\n" in section
+    ivf, flat = m["probe"]["ivf256"], m["probe"]["flat"]
+    gain, band = gain_band(ivf["base"], ivf["cand"])
+    assert gain > band and ivf["verdict"] == "better", "probe ivf256: the gain is within the band"
+    gain, band = gain_band(flat["base"], flat["cand"])
+    assert -gain <= band and flat["verdict"] in ("better", "within band"), "probe flat: worse"
+    assert labelled(m["labels"]["probe"])
+    b = m["bench"]
+    if b is None:  # probe-only window, or not enough time left for the reingests
+        assert "Not run: the bench reingest" in section and "- SKIP: D2-bench\n" in section
+    else:
+        assert len(b["base"]) == 2 and len(b["cand"]) == 2 and len(b["runs"]) == 4
+        gain, band = gain_band(b["base"], b["cand"])
+        assert -gain <= band and b["verdict"] in ("better", "within band"), "bench reingest: worse"
+        for name, run in b["runs"].items():
+            assert set(run["jobs"]) == {"done"} and run["payload_rows"] == 0, name  # no error job
+        lb = m["labels"]["bench"]
+        assert lb["regime"] == ["host-warm"] and lb["cap"] == ["4g"] and lb["openblas_num_threads"] == ["1"]
+        assert all(len(v) == 1 for v in lb["sqlite_version"].values())
+        assert "- PASS: D2-bench\n" in section
+    for gate in ("D2-run", "D2-tuning", "D2-fingerprints", "D2-jobs", "D2-labels"):
+        assert f"- PASS: {gate}\n" in section, gate
+    assert "- FAIL:" not in section
+
+    # what ships is what was measured: the defaults and the documented rows are the choice
+    monkeypatch.delenv("SYNC_BATCH_JOBS", raising=False)
+    monkeypatch.delenv("SYNC_BATCH_MS", raising=False)
+    s = Settings()
+    assert (s.sync_batch_jobs, s.sync_batch_ms) == (n, float(ms))
+    params = inspect.signature(Collection).parameters
+    assert (params["sync_batch_jobs"].default, params["sync_batch_ms"].default) == (n, float(ms))
+    root = Path(__file__).resolve().parents[1]
+    for doc in ("README.md", "docs/getting-started.md"):
+        text = (root / doc).read_text(encoding="utf-8")
+        assert f"| `SYNC_BATCH_JOBS` | `{n}` |" in text and f"| `SYNC_BATCH_MS` | `{ms}` |" in text, doc

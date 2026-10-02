@@ -415,4 +415,395 @@ Date: 2026-10-02 · Plan D, phase D2. It replaces the "Deferred to D2" row above
 
 ### Results — DGX A/B (D2)
 
-Pending: the gn100 A/B of Plan D Task 10 has not run yet.
+#### Measurements (D2)
+
+Tuning run 2026-10-02 on gn100 (NVIDIA DGX Spark, GB10 Grace, 20 aarch64 cores), D2 tree `8976da3ea121` only: `bench/ingest_probe.py --seed 7 --prefill 100000 --jobs 200 --job-rows 250 --batch-jobs N --batch-ms T` with `--ivf 0` and `--ivf 256`, one discarded (8, 1000) run0 and then 3 rounds per mode, each running the four pairs, the order rotating by round (round r starts at pair r mod 4). Values are ingest vec/s. (1, 0) syncs after every job, as D1 did. Band = max(max - min of each side, 1 vec/s); a claim needs gain > band.
+
+| SYNC_BATCH_JOBS | SYNC_BATCH_MS | Regime | Cap | sqlite_version | python | OPENBLAS_NUM_THREADS | flat (3 runs) | flat median | flat vs (1, 0) | ivf256 (3 runs) | ivf256 median | ivf256 vs (1, 0) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 0 | host-warm, uncapped host process | none (uncapped host process) | 3.53.1 | 3.12.14 | 1 | 4765.7, 4855.0, 4678.4 | 4765.7 | reference | 845.8, 788.8, 839.6 | 839.6 | reference |
+| 8 | 1000 | host-warm, uncapped host process | none (uncapped host process) | 3.53.1 | 3.12.14 | 1 | 4953.9, 5459.1, 5159.8 | 5159.8 | within band | 2237.2, 2342.1, 2265.3 | 2265.3 | better |
+| 32 | 1000 | host-warm, uncapped host process | none (uncapped host process) | 3.53.1 | 3.12.14 | 1 | 4838.2, 5332.2, 5456.0 | 5332.2 | within band | 2104.3, 2263.4, 2219.2 | 2219.2 | better |
+| 32 | 4000 | host-warm, uncapped host process | none (uncapped host process) | 3.53.1 | 3.12.14 | 1 | 5149.2, 5443.9, 5322.4 | 5322.4 | better | 2305.5, 2455.0, 2931.5 | 2455.0 | better |
+
+Chosen: SYNC_BATCH_JOBS=8, SYNC_BATCH_MS=1000.
+
+Publish run 2026-10-02: base `cdfbcbc6baed` (main after D1, E and F) against cand `6d164712cdd6` (D2 at the chosen defaults). Probe rows: `bench/ingest_probe.py --seed 42 --prefill 100000 --jobs 200 --job-rows 250` with `--ivf 0` and `--ivf 256`, each arm running its own tree with D2's probe, one discarded base run0 and then 3 interleaved rounds per mode. Bench row: `bench.py --limit 2549619 --engine raggio --reingest` (2,549,119 x 1024) in the order base, cand, base, cand, each in a fresh 4 GiB container. D2-flat and D2-bench need not worse (better or within band); D2-ivf256 needs better.
+
+| Row | Regime | Cap | sqlite_version | OPENBLAS_NUM_THREADS | base median | cand median | gain | band | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| probe flat | host-warm, uncapped host process | none (uncapped host process) | 3.53.1 | 1 | 4829.7 | 5163.8 | 334.1 | 346.1 | within band |
+| probe ivf256 | host-warm, uncapped host process | none (uncapped host process) | 3.53.1 | 1 | 851.6 | 2235.3 | 1383.7 | 46.0 | better |
+| bench reingest | host-warm | 4g | base 3.53.1, cand 3.53.1 | 1 | 3049.1 | 3114.9 | 65.9 | 32.9 | better |
+
+Interpreters: the probe rows ran in the host venv (CPython 3.12.14, SQLite 3.53.1), the same for both arms and for the tuning. The bench rows ran in the images (CPython 3.12.15, SQLite 3.53.1), the same for both arms.
+
+IVF reference: the base arm's ivf256 probe median is 851.6 vec/s, next to 612.0 vec/s for D1's tree in D1's A/B. The base arm now also carries E and F, so the difference shows whether F's dirty-shard sync moves per-job IVF ingest. Not gated.
+
+Min to max over the runs of each arm (the band is set by one run):
+- probe flat: base 4728.3 to 5074.4, cand 5061.2 to 5254.7 vec/s
+- probe ivf256: base 808.7 to 854.7, cand 2204.4 to 2236.0 vec/s
+- bench reingest: base 3032.8 to 3065.3, cand 3098.5 to 3131.4 vec/s
+- Memory after ingest (MB): base 613.9, 578.0, cand 1524.0, 1649.0
+- Memory under load (MB): base 1554.0, 1546.0, cand 1555.0, 1652.0
+
+Not measured: search latency during batched ingest.
+
+D2 does not re-claim the flat or reingest gains that D1 claimed: D2's flat and bench gates only require not worse (better or within band).
+
+- PASS: D2-run
+- PASS: D2-tuning
+- PASS: D2-flat
+- PASS: D2-ivf256
+- PASS: D2-fingerprints
+- PASS: D2-jobs
+- PASS: D2-bench
+- PASS: D2-labels
+
+```json
+{
+  "date": "2026-10-02",
+  "base_sha": "cdfbcbc6baed",
+  "cand_sha": "6d164712cdd6",
+  "tuning": {
+    "seed": 7,
+    "pairs": {
+      "n1-t0": {
+        "flat": [
+          4765.7,
+          4855.0,
+          4678.4
+        ],
+        "flat_median": 4765.7,
+        "ivf256": [
+          845.8,
+          788.8,
+          839.6
+        ],
+        "ivf256_median": 839.6,
+        "flat_vs_ref": "reference",
+        "ivf256_vs_ref": "reference"
+      },
+      "n8-t1000": {
+        "flat": [
+          4953.9,
+          5459.1,
+          5159.8
+        ],
+        "flat_median": 5159.8,
+        "ivf256": [
+          2237.2,
+          2342.1,
+          2265.3
+        ],
+        "ivf256_median": 2265.3,
+        "flat_vs_ref": "within band",
+        "ivf256_vs_ref": "better"
+      },
+      "n32-t1000": {
+        "flat": [
+          4838.2,
+          5332.2,
+          5456.0
+        ],
+        "flat_median": 5332.2,
+        "ivf256": [
+          2104.3,
+          2263.4,
+          2219.2
+        ],
+        "ivf256_median": 2219.2,
+        "flat_vs_ref": "within band",
+        "ivf256_vs_ref": "better"
+      },
+      "n32-t4000": {
+        "flat": [
+          5149.2,
+          5443.9,
+          5322.4
+        ],
+        "flat_median": 5322.4,
+        "ivf256": [
+          2305.5,
+          2455.0,
+          2931.5
+        ],
+        "ivf256_median": 2455.0,
+        "flat_vs_ref": "better",
+        "ivf256_vs_ref": "better"
+      }
+    },
+    "choice": [
+      8,
+      1000
+    ],
+    "complete": true,
+    "fingerprints_equal": true,
+    "labels_ok": true
+  },
+  "probe": {
+    "flat": {
+      "base": [
+        4829.7,
+        5074.4,
+        4728.3
+      ],
+      "cand": [
+        5254.7,
+        5163.8,
+        5061.2
+      ],
+      "base_median": 4829.7,
+      "cand_median": 5163.8,
+      "gain": 334.1,
+      "band": 346.1,
+      "verdict": "within band",
+      "drain_s": {
+        "base": [
+          10.35,
+          9.85,
+          10.57
+        ],
+        "cand": [
+          9.52,
+          9.68,
+          9.88
+        ]
+      },
+      "loop_stall_s": {
+        "base": [
+          0,
+          0,
+          0
+        ],
+        "cand": [
+          0,
+          0,
+          0
+        ]
+      },
+      "payload_rows": {
+        "base": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "cand": [
+          0,
+          0,
+          0
+        ]
+      },
+      "complete": true,
+      "fingerprints_equal": true,
+      "jobs_all_done": true
+    },
+    "ivf256": {
+      "base": [
+        854.7,
+        851.6,
+        808.7
+      ],
+      "cand": [
+        2204.4,
+        2235.3,
+        2236.0
+      ],
+      "base_median": 851.6,
+      "cand_median": 2235.3,
+      "gain": 1383.7,
+      "band": 46.0,
+      "verdict": "better",
+      "drain_s": {
+        "base": [
+          58.5,
+          58.71,
+          61.83
+        ],
+        "cand": [
+          22.68,
+          22.37,
+          22.36
+        ]
+      },
+      "loop_stall_s": {
+        "base": [
+          0,
+          0,
+          0
+        ],
+        "cand": [
+          0,
+          0,
+          0
+        ]
+      },
+      "payload_rows": {
+        "base": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "cand": [
+          0,
+          0,
+          0
+        ]
+      },
+      "complete": true,
+      "fingerprints_equal": true,
+      "jobs_all_done": true
+    }
+  },
+  "bench": {
+    "base": [
+      3065.3,
+      3032.8
+    ],
+    "cand": [
+      3098.5,
+      3131.4
+    ],
+    "base_median": 3049.1,
+    "cand_median": 3114.9,
+    "gain": 65.9,
+    "band": 32.9,
+    "verdict": "better",
+    "runs": {
+      "base-run1": {
+        "ingest_s": 831.6,
+        "jobs": {
+          "done": 10197
+        },
+        "payload_rows": 0,
+        "freelist": 0
+      },
+      "base-run2": {
+        "ingest_s": 840.5,
+        "jobs": {
+          "done": 10197
+        },
+        "payload_rows": 0,
+        "freelist": 0
+      },
+      "cand-run1": {
+        "ingest_s": 822.7,
+        "jobs": {
+          "done": 10197
+        },
+        "payload_rows": 0,
+        "freelist": 0
+      },
+      "cand-run2": {
+        "ingest_s": 814.1,
+        "jobs": {
+          "done": 10197
+        },
+        "payload_rows": 0,
+        "freelist": 0
+      }
+    },
+    "mem_after_ingest_mb": {
+      "base": [
+        613.9,
+        578.0
+      ],
+      "cand": [
+        1524.0,
+        1649.0
+      ]
+    },
+    "mem_under_load_mb": {
+      "base": [
+        1554.0,
+        1546.0
+      ],
+      "cand": [
+        1555.0,
+        1652.0
+      ]
+    }
+  },
+  "labels": {
+    "tune": {
+      "regime": [
+        "host-warm, uncapped host process"
+      ],
+      "sqlite_version": [
+        "3.53.1"
+      ],
+      "openblas_num_threads": [
+        "1"
+      ],
+      "turbovec": [
+        "1.0.0"
+      ],
+      "python": [
+        "3.12.14"
+      ],
+      "cap": [
+        "none (uncapped host process)"
+      ]
+    },
+    "probe": {
+      "regime": [
+        "host-warm, uncapped host process"
+      ],
+      "sqlite_version": [
+        "3.53.1"
+      ],
+      "openblas_num_threads": [
+        "1"
+      ],
+      "turbovec": [
+        "1.0.0"
+      ],
+      "python": [
+        "3.12.14"
+      ],
+      "cap": [
+        "none (uncapped host process)"
+      ]
+    },
+    "bench": {
+      "regime": [
+        "host-warm"
+      ],
+      "cap": [
+        "4g"
+      ],
+      "openblas_num_threads": [
+        "1"
+      ],
+      "sqlite_version": {
+        "base": [
+          "3.53.1"
+        ],
+        "cand": [
+          "3.53.1"
+        ]
+      },
+      "python": {
+        "base": [
+          "3.12.15"
+        ],
+        "cand": [
+          "3.12.15"
+        ]
+      }
+    }
+  },
+  "gates": {
+    "D2-run": "PASS",
+    "D2-tuning": "PASS",
+    "D2-flat": "PASS",
+    "D2-ivf256": "PASS",
+    "D2-fingerprints": "PASS",
+    "D2-jobs": "PASS",
+    "D2-bench": "PASS",
+    "D2-labels": "PASS"
+  }
+}
+```
