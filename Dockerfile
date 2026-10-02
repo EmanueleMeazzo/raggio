@@ -8,7 +8,7 @@
 # same pin as the native job in .github/workflows/tests.yml.
 ARG UV_VERSION=0.12.22
 ARG PYTHON=3.12
-ARG RUST_VERSION=1.98.1
+ARG RUST_VERSION=1.99.0
 
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 
