@@ -176,3 +176,30 @@ def test_gc_freeze_still_frees_a_collection_loaded_before_the_freeze(make_app, m
         assert client.delete("/collections/kb", headers=root).status_code == 200
         gc.collect()
         assert loaded[0]() is None
+
+
+# ---- the local free-threaded venv and the GIL guard ----
+
+
+def test_the_314t_venv_stays_out_of_git_and_the_image_context():
+    # UV_PROJECT_ENVIRONMENT=.venv-ft sits next to .venv in the checkout; podman build .
+    # would otherwise send it along
+    assert ".venv-ft/" in (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert ".venv-ft" in (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+
+
+FT = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+needs_ft = pytest.mark.skipif(not FT, reason="the GIL guard needs a free-threaded build")
+
+
+def test_the_suite_never_runs_with_the_gil_check_switched_off():
+    # PYTHON_GIL=0 / -X gil=0 keep the GIL off even for an extension that needs it: the
+    # free-threaded job would pass while hiding exactly what it exists to catch
+    assert os.environ.get("PYTHON_GIL") != "0" and sys._xoptions.get("gil") != "0"
+
+
+@needs_ft
+def test_the_gil_is_still_disabled():
+    # pytest imported every test module (raggio, raggio_native, turbovec, numpy, fastapi,
+    # ...) before running any test, and the tests before this one ran on this interpreter
+    assert sys._is_gil_enabled() is False

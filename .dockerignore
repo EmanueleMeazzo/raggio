@@ -1,5 +1,6 @@
 .git
 .venv
+.venv-ft
 tests
 docs
 bench
