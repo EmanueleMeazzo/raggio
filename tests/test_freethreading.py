@@ -574,3 +574,239 @@ def test_docs_record_the_evaluation_and_document_the_knob(make_app):
     example = re.search(r"`GET /healthz`.*?\*\*200\*\* `(\{.*?\})`", api, re.S).group(1)
     with TestClient(make_app()) as client:
         assert set(json.loads(example)) == set(client.get("/healthz").json())
+
+
+# ---- ADR 0006: the DGX ABAB and its decision ----
+
+# the rows that can carry B's win: `better` in A1 → B1 and A2 → B2, and neither `better` nor
+# `worse` in A1 → A2 and B1 → B2 (spec §6: the band includes between-server variance).
+# QPS concurrent is vector search and its rescoring, CPU-bound: where the GIL was the lock.
+GATE_BETTER = ("QPS concurrent", "Hybrid QPS concurrent")
+GATE_NOT_WORSE = ("QPS concurrent", "p95 under concurrency (ms)", "Recall@10 vs exact",
+                  "Hybrid text-hit@10")
+# the two rows of the same flat concurrent runs, which the fast/slow split moves (spec §3.1 G9)
+FLAT_CONCURRENT = ("QPS concurrent", "p95 under concurrency (ms)")
+# the hybrid timing rows run FTS5 under SQLite's global memstatus mutex, whatever the GIL does
+# (spec D15): never read as a free-threading failure, and a win only on equal sqlite_versions
+SQLITE_BOUND = ("Hybrid p50 (ms)", "Hybrid p95 (ms)", "Hybrid p99 (ms)",
+                "Hybrid first 10 queries, slowest (ms)", "Hybrid p99 without the first 10 (ms)",
+                "Hybrid QPS serial", "Hybrid QPS concurrent")
+# spec §3.1 G5: a Hybrid QPS concurrent win needs this row present and not `worse` in either
+# cross pair (p4: 3.14t's c=16 hybrid gain came with a p99 3.8-4.0x worse)
+HYBRID_P99 = "Hybrid p99 under concurrency (ms)"
+# spec §3.1 G5: the flat QPS concurrent row is bimodal on every interpreter (p4: slow runs at
+# 115.9-117.6 ms CPU per query, fast ones at 50.8-56.8 ms). A flat run is high-CPU at >= 1.5x
+# the lowest CPU per query in its cross pair; the row wins only on an even split.
+HIGH_CPU = 1.5
+FREE_THREADED_ARMS = {"A": False, "B": True, "C": False, "D": True}  # C: 3.14, D: 3.14t GC_FREEZE=1
+OUTCOMES = ("Continue", "Hold", "Park")
+CROSS_PAIRS, SAME_ARM_PAIRS = ("A1 → B1", "A2 → B2"), ("A1 → A2", "B1 → B2")
+C16 = " (c=16)"  # suffix of the c=16 tables' titles: reported, never read by the decision (G7)
+
+
+def _cells(line):
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def _flat(section):
+    """{metric: (base median, cand median, verdict)}: the flat rows of a compare.py A/B table."""
+    return {c[1]: (c[2], c[4], c[6]) for c in map(_cells, section.splitlines())
+            if len(c) == 7 and c[0] == "raggio"}
+
+
+def _gil_rows(section):
+    """[(session, arm, /healthz answers, gil_enabled false, gil_enabled true, logs, bad lines)]"""
+    return [(c[0], c[1], *map(int, c[2:])) for c in map(_cells, section.splitlines())
+            if len(c) == 7 and c[1] in FREE_THREADED_ARMS]
+
+
+def _json_block(section):
+    import json
+
+    return json.loads(section.split("```json\n", 1)[1].split("\n```", 1)[0])
+
+
+def _regimes(section):
+    """{"baseline" | "candidate": {label: value}} from compare.py's `Regime (...)` lines."""
+    return {side: dict(kv.split("=", 1) for kv in labels.split(", "))
+            for side, labels in re.findall(r"^Regime \((baseline|candidate)\): (.+)$", section, re.M)}
+
+
+def _differ(section):
+    """The regime labels compare.py says the two arms of a table differ in."""
+    line = re.search(r"^The arms differ in (.+?): a re-baseline", section, re.M)
+    return line[1].split(", ") if line else []
+
+
+def sqlite_versions(sections):
+    """(A's, B's) sqlite_version over the A1 → B1 and A2 → B2 tables (spec D15)."""
+    regimes = [_regimes(sections[pair]) for pair in CROSS_PAIRS]
+    return tuple(", ".join(sorted({r[side]["sqlite_version"] for r in regimes}))
+                 for side in ("baseline", "candidate"))
+
+
+def abab_sections(adr):
+    """{title: body} of the ### subsections of ADR 0006's Verification."""
+    verification = adr.split("\n## Verification\n", 1)[1]
+    return dict(re.findall(r"^### (.+?)\n(.*?)(?=^### |\Z)", verification, re.M | re.S))
+
+
+def _flat_cpu(section):
+    """{"baseline" | "candidate": [CPU per query under concurrency (ms) of each measured flat
+    run, None where cpu.stat was unreadable]}: the json block g-render.py writes under a table.
+    {} when the block is missing."""
+    try:
+        return _json_block(section)["cpu_ms_per_q_c"]
+    except (IndexError, KeyError, TypeError, ValueError):
+        return {}
+
+
+def uneven_states(sections):
+    """Why the flat runs' fast/slow state keeps `QPS concurrent` from counting (spec §3.1 G5):
+    per cross pair, an unknown state or an uneven split of high-CPU runs."""
+    why = []
+    for pair in CROSS_PAIRS:
+        cpu = _flat_cpu(sections[pair])
+        runs = [cpu.get(side) or [] for side in ("baseline", "candidate")]
+        values = runs[0] + runs[1]
+        if not (runs[0] and runs[1]) or None in values:
+            why.append(f"{pair}: no CPU per query under concurrency for every flat run, so their"
+                       " fast/slow state is unknown")
+            continue
+        high = [sum(v >= HIGH_CPU * min(values) for v in r) for r in runs]
+        if high[0] != high[1]:
+            split = ", ".join(f"{s} {h} high/{len(r) - h} low"
+                              for s, h, r in zip(pair.split(" → "), high, runs))
+            why.append(f"{pair}: {split} (high-CPU: >= {HIGH_CPU}x the pair's lowest CPU per query)")
+    return why
+
+
+def worse_in_both(sections):
+    """The flat metrics compare.py calls `worse` in both A1 → B1 and A2 → B2."""
+    pairs = [_flat(sections[pair]) for pair in CROSS_PAIRS]
+    # spec §3.1 G9: both rows come from the same flat runs, so on an uneven or unknown
+    # fast/slow split (the one rule that keeps `QPS concurrent` from winning) they count
+    # neither as a win nor as a cost; gate_rows, abab_decision and g-decide.py all read this
+    skip = FLAT_CONCURRENT if uneven_states(sections) else ()
+    return [m for m in pairs[0] if m not in skip
+            and all(p.get(m, ("", "", ""))[2] == "worse" for p in pairs)]
+
+
+def gate_rows(sections):
+    """(the GATE_BETTER rows that carry B's win, why each other one does not)."""
+    cross = [_flat(sections[pair]) for pair in CROSS_PAIRS]
+    same = [_flat(sections[pair]) for pair in SAME_ARM_PAIRS]
+    sqlite_a, sqlite_b = sqlite_versions(sections)
+    p99 = [p.get(HYBRID_P99, ("", "", "missing"))[2] for p in cross]
+    wins, misses = [], []
+    for m in GATE_BETTER:
+        verdicts = [p.get(m, ("", "", "-"))[2] for p in cross]
+        noise = [p.get(m, ("", "", "-"))[2] for p in same]
+        uneven = uneven_states(sections) if m == "QPS concurrent" else []
+        if uneven:  # an uneven split moves the median with no interpreter effect (p4)
+            misses.append(f"{m}: {'; '.join(uneven)}. The flat runs' fast/slow state must split"
+                          " evenly on both sides of a pair; until it does, the pair is neither a"
+                          " win nor a miss (spec §3.1 G5)")
+        elif verdicts != ["better", "better"]:
+            misses.append(f"{m}: {verdicts} in {', '.join(CROSS_PAIRS)}; a win needs `better`"
+                          " (beyond the noise band) in both")
+        elif {"better", "worse"} & set(noise):
+            misses.append(f"{m}: {noise} in {', '.join(SAME_ARM_PAIRS)}: the same image moved beyond"
+                          " the band between fresh containers, so the win is not beyond the"
+                          " between-server variance (spec §6)")
+        elif m in SQLITE_BOUND and sqlite_a != sqlite_b:
+            misses.append(f"{m}: better in both, but A runs SQLite {sqlite_a} and B SQLite {sqlite_b};"
+                          " a SQLite-bound row credits free threading only on one SQLite build (spec D15)")
+        elif m == "Hybrid QPS concurrent" and {"worse", "missing", "-"} & set(p99):
+            misses.append(f"{m}: better in both, but `{HYBRID_P99}` is {p99} in"
+                          f" {', '.join(CROSS_PAIRS)}; a hybrid win needs that row present and not"
+                          " `worse` in either (spec §3.1 G5)")
+        else:
+            wins.append(m)
+    return wins, misses
+
+
+def abab_decision(sections):
+    """(outcome, reasons B did not win): ADR 0006's decision rule over its Verification."""
+    # the c=16 tables are reported, not gated (spec §3.1 G7): none of them is passed in below
+    sections = {title: body for title, body in sections.items() if not title.endswith(C16)}
+    wins, misses = gate_rows(sections)
+    reasons = [] if wins else misses  # one winning row is a win; the other's miss is recorded
+    reasons += [f"{m}: worse beyond the noise band in both pairs"
+                for m in worse_in_both(sections) if m in GATE_NOT_WORSE]
+    for session, arm, answers, off, on, _, bad in _gil_rows(sections["GIL and logs"]):
+        if FREE_THREADED_ARMS[arm] and not (answers > 0 and off == answers):
+            reasons.append(f"{session}: gil_enabled false in only {off} of {answers} /healthz answers")
+        if bad:
+            reasons.append(f"{session}: {bad} Traceback or GIL lines in the container logs")
+    if reasons:
+        return "Park", reasons
+    return ("Continue" if _json_block(sections["Upstream wheels"])["cp314t_wheels"] else "Hold"), []
+
+
+def test_adr_0006_records_the_dgx_abab_and_its_decision():
+    adr = (ROOT / "docs/adr/0006-free-threaded-python.md").read_text(encoding="utf-8")
+    verification = adr.split("\n## Verification\n", 1)[1]
+    assert not verification.lstrip().startswith("Pending"), "Task 12 records the DGX ABAB"
+    assert "Task 11" not in adr, "G-R37: the sentences that wait for Task 11 name the measured SQLite"
+    sections = abab_sections(adr)
+    # ABAB on one boot
+    boots = re.findall(r"boot_id\s+`([0-9a-f-]{36})`", verification)
+    assert len(boots) == 2 and boots[0] == boots[1], boots
+    # one commit; A is the abi3 turbovec wheel with the GIL, B the cp314t sdist build without
+    images = re.findall(r"^- ([ABCD]): `localhost/raggio:([0-9a-f]{7,40})[^`]*`: (.+)$",
+                        sections["Images"], re.M)
+    assert len({sha for _, sha, _ in images}) == 1, images
+    facts = {arm: text for arm, _, text in images}
+    assert "GIL enabled" in facts["A"] and "abi3" in facts["A"], facts["A"]
+    assert "GIL disabled" in facts["B"] and "cp314t" in facts["B"], facts["B"]
+    # raggio_native is built for each image's own interpreter, never abi3 (spec §4.2); every
+    # image runs one OpenBLAS thread (D16) and names its SQLite (D15)
+    native = {arm: re.search(r"raggio_native \S+ \(([^)]*)\)", text)[1] for arm, text in facts.items()}
+    assert "cpython-312-" in native["A"] and "cpython-314t-" in native["B"], native
+    assert not [arm for arm, files in native.items() if "abi3" in files], native
+    for arm, text in facts.items():
+        assert ", OPENBLAS_NUM_THREADS 1," in text and ", SQLite 3." in text, (arm, text)
+    # every session left /healthz samples and container logs, and each GIL arm really had it
+    gil = _gil_rows(sections["GIL and logs"])
+    # G8: the four c=8 sessions and the four -c16 ones each have a row
+    assert sorted(arm for _, arm, *_ in gil if arm in "AB") == ["A"] * 4 + ["B"] * 4
+    for session, arm, answers, off, on, logs, _ in gil:
+        assert answers > 0 and logs > 0, session
+        if not FREE_THREADED_ARMS[arm]:
+            assert on == answers and off == 0, session
+    for pair in (*CROSS_PAIRS, *SAME_ARM_PAIRS):
+        assert set(GATE_BETTER) <= set(_flat(sections[pair])), pair
+    # every A/B table states both regimes (spec §6). The arms run the same BLAS threads (D16),
+    # every row has a sqlite_version (D15), and the concurrent-QPS rows have >= 3 runs a side.
+    # A and B may differ only in the interpreter and the SQLite it bundles; two sessions of
+    # one image in nothing.
+    for title, body in sections.items():
+        if " → " not in title:
+            continue
+        regimes = _regimes(body)
+        assert sorted(regimes) == ["baseline", "candidate"], title
+        for labels in regimes.values():
+            assert labels["openblas_num_threads"] == "1", (title, labels)
+            assert labels["sqlite_version"] != "unknown", (title, labels)
+        base, cand = title.split(" → ")
+        allowed = set() if base[0] == cand[0] else {"python", "sqlite_version"}
+        assert set(_differ(body)) <= allowed, (title, _differ(body))
+        assert "Reported, not claimed" not in body, title
+        # G-R25 (spec G5, recorded and not gated): every run file of every session, flat and
+        # IVF, c=8 and c=16, has a CPU per query row; a missing one is a harness failure
+        assert _json_block(body)["cpu_missing"] == [], (title, "run files without a CPU row")
+    assert "#### A" in sections["IVF fan-out"] and "#### B" in sections["IVF fan-out"]
+    assert _json_block(sections["Unicode drift"])["rows"] == 2549619
+    assert _json_block(sections["Upstream wheels"])["turbovec"]
+    decision, reasons = abab_decision(sections)
+    assert f"**{decision}**" in sections["Decision"], (decision, reasons)
+    for other in set(OUTCOMES) - {decision}:
+        assert f"**{other}**" not in sections["Decision"], other
+    for metric in worse_in_both(sections):  # the costs are on record
+        assert metric in sections["Decision"], metric
+    sqlite_a, sqlite_b = sqlite_versions(sections)  # the verdict accounts for SQLite (spec D15)
+    assert f"A runs SQLite {sqlite_a}, B runs SQLite {sqlite_b}" in sections["Decision"]
+    measured = (f"both bundle SQLite {sqlite_a}" if sqlite_a == sqlite_b
+                else f"bundle SQLite {sqlite_a} and {sqlite_b} respectively") + ", as Verification records"
+    assert adr.split("\n## Verification\n", 1)[0].count(measured) == 2, measured  # G-R37
