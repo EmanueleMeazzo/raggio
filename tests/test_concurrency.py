@@ -29,6 +29,12 @@ from raggio.store import Collection, CollectionConfig, CollectionDeletedError, C
 DIM = 8
 ROOT = {"x-api-key": "root-key"}
 
+# the deadline of each wait for something that must happen. Generous on purpose: with
+# every CPU busy, a thread hand-off on the free-threaded build can take a second or more
+# (a contended PyMutex yields the CPU up to 40 times before it parks), and one ingest
+# job took up to 5.8 s from enqueue to finish on a 6-core laptop under 6 busy loops
+WAIT_SECONDS = 60
+
 
 class FakeEmbedder:
     """Deterministic: same text -> same unit vector."""
@@ -296,7 +302,7 @@ def test_stop_does_not_cancel_the_worker_inside_its_write_section(tmp_path):
 
     def slow_upsert(rows, mat):
         inside.set()
-        release.wait(5)
+        release.wait(WAIT_SECONDS)
         return real_upsert(rows, mat)
 
     col._upsert_rows = slow_upsert
@@ -305,12 +311,12 @@ def test_stop_does_not_cancel_the_worker_inside_its_write_section(tmp_path):
         col.start_worker()
         await col.enqueue({"documents": [
             {"doc_id": "d", "chunks": [{"id": "c", "text": "t", "vector": vec(1)}]}]})
-        assert await asyncio.to_thread(inside.wait, 5)
+        assert await asyncio.to_thread(inside.wait, WAIT_SECONDS)
         stopper = asyncio.create_task(col.stop())
         await asyncio.sleep(0.1)
         cancelled_mid_write = col._worker.done()
         release.set()
-        await asyncio.wait_for(stopper, 5)
+        await asyncio.wait_for(stopper, WAIT_SECONDS)
         return cancelled_mid_write
 
     assert asyncio.run(run()) is False  # stop() waited for upsert -> add -> sync
@@ -330,7 +336,7 @@ def test_stop_waits_for_a_write_transaction_its_cancelled_worker_left_running(tm
     def slow_finish(job_id, status, error):  # the worker's to_thread body, still running
         with col.db_lock:  # once stop() cancels the task that awaited it
             inside.set()
-            release.wait(5)
+            release.wait(WAIT_SECONDS)
             try:
                 col.db.execute("UPDATE jobs SET status=? WHERE id=?", (status, job_id))
                 col.db.commit()
@@ -344,9 +350,10 @@ def test_stop_waits_for_a_write_transaction_its_cancelled_worker_left_running(tm
         col.start_worker()
         await col.enqueue({"documents": [
             {"doc_id": "d", "chunks": [{"id": "c", "text": "t", "vector": vec(1)}]}]})
-        assert await asyncio.to_thread(inside.wait, 5)
+        assert await asyncio.to_thread(inside.wait, WAIT_SECONDS)
         stopper = asyncio.create_task(col.stop())
-        for _ in range(500):  # until stop() has marked the collection closed
+        deadline = time.monotonic() + WAIT_SECONDS
+        while time.monotonic() < deadline:  # until stop() has marked the collection closed
             if col._closed:
                 break
             await asyncio.sleep(0.01)
@@ -354,7 +361,7 @@ def test_stop_waits_for_a_write_transaction_its_cancelled_worker_left_running(tm
         await asyncio.sleep(0.1)
         closed_under_the_writer = stopper.done()
         release.set()
-        await asyncio.wait_for(stopper, 5)
+        await asyncio.wait_for(stopper, WAIT_SECONDS)
         return closed_under_the_writer
 
     assert asyncio.run(run()) is False  # stop() waited for db_lock before closing
@@ -372,7 +379,7 @@ def test_read_connection_opened_during_stop_is_closed_not_leaked(tmp_path, monke
         opened.append(conn)
         if threading.current_thread().name == "late-reader":
             connecting.set()  # past _rdb's _closed check, not yet registered
-            release.wait(5)
+            release.wait(WAIT_SECONDS)
         return conn
 
     monkeypatch.setattr(store.sqlite3, "connect", spy_connect)
@@ -387,10 +394,10 @@ def test_read_connection_opened_during_stop_is_closed_not_leaked(tmp_path, monke
     async def run():
         reader = threading.Thread(target=late_reader, name="late-reader")
         reader.start()
-        assert await asyncio.to_thread(connecting.wait, 5)
+        assert await asyncio.to_thread(connecting.wait, WAIT_SECONDS)
         await col.stop()
         release.set()
-        await asyncio.to_thread(reader.join, 5)
+        await asyncio.to_thread(reader.join, WAIT_SECONDS)
 
     asyncio.run(run())
     assert "error" in outcome  # a closed collection hands out no connection
@@ -443,7 +450,7 @@ def test_deleted_collection_leaves_no_files_and_its_name_can_be_reused(tmp_path,
         c = await m.touch("x")
         await c.enqueue({"documents": [
             {"doc_id": "d", "chunks": [{"id": "c", "text": "t", "vector": vec(1)}]}]})
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + WAIT_SECONDS
         while c.pending_jobs():
             assert time.monotonic() < deadline, "ingest job never finished"
             await asyncio.sleep(0.01)
@@ -719,7 +726,7 @@ def test_http_searches_at_c16_and_racing_a_collection_delete(tmp_path, monkeypat
     def gated_patch(self, *args):  # holds a PATCH inside its write section
         gate["col"] = self
         inside.set()
-        release.wait(5)
+        release.wait(WAIT_SECONDS)
         return real_patch(self, *args)
 
     def body(i):
@@ -741,7 +748,8 @@ def test_http_searches_at_c16_and_racing_a_collection_delete(tmp_path, monkeypat
                     for j in range(3)]} for i in range(40)]
                 r = await c.post("/collections/x/documents", headers=ROOT, json={"documents": docs})
                 job = r.json()["job_id"]
-                for _ in range(500):
+                deadline = time.monotonic() + WAIT_SECONDS
+                while time.monotonic() < deadline:
                     r = await c.get(f"/collections/x/jobs/{job}", headers=ROOT)
                     if r.json()["status"] == "done":
                         break
@@ -769,10 +777,11 @@ def test_http_searches_at_c16_and_racing_a_collection_delete(tmp_path, monkeypat
                 await asyncio.sleep(0.05)
                 patch = asyncio.create_task(c.patch("/collections/x/documents/d0", headers=ROOT,
                                                     json={"metadata": {"g": 1}}))
-                assert await asyncio.to_thread(inside.wait, 5)
+                assert await asyncio.to_thread(inside.wait, WAIT_SECONDS)
                 await asyncio.sleep(0.1)  # the loopers' next searches queue behind it
                 delete = asyncio.create_task(c.delete("/collections/x", headers=ROOT))
-                for _ in range(500):  # until stop() waits for the write lock too
+                deadline = time.monotonic() + WAIT_SECONDS
+                while time.monotonic() < deadline:  # until stop() waits for the write lock too
                     if gate["col"].lock._writers_waiting:
                         break
                     await asyncio.sleep(0.01)
@@ -834,7 +843,8 @@ def test_http_search_embedding_while_delete_lands_answers_404(tmp_path, monkeypa
                     for j in range(3)]} for i in range(5)]
                 r = await c.post("/collections/x/documents", headers=ROOT, json={"documents": docs})
                 job = r.json()["job_id"]
-                for _ in range(500):
+                deadline = time.monotonic() + WAIT_SECONDS
+                while time.monotonic() < deadline:
                     r = await c.get(f"/collections/x/jobs/{job}", headers=ROOT)
                     if r.json()["status"] == "done":
                         break
@@ -842,9 +852,9 @@ def test_http_search_embedding_while_delete_lands_answers_404(tmp_path, monkeypa
                 assert r.json()["status"] == "done", r.text
                 search = asyncio.create_task(
                     c.post("/collections/x/search", headers=ROOT, json=search_body))
-                await asyncio.wait_for(emb.entered.wait(), 5)
+                await asyncio.wait_for(emb.entered.wait(), WAIT_SECONDS)
                 d = await c.delete("/collections/x", headers=ROOT)
-                s = await asyncio.wait_for(search, 10)
+                s = await asyncio.wait_for(search, WAIT_SECONDS)
                 after = await c.post("/collections/x/search", headers=ROOT, json=search_body)
         return d.status_code, s.status_code, after.status_code
 
