@@ -13,12 +13,14 @@ against the centroids and scans only the `nprobe` closest shards.
 
 ## When to add an index
 
-**Don't index below ~1M vectors.** Measured on the real 553k × 1536 benchmark corpus,
-every IVF configuration that preserved recall@10 ≥ 0.95 was at best 1.6x faster than
-the flat scan — and most were slower, because each probed shard carries a fixed
-~0.4 ms search cost (`bench/ivf_probe.py`, ADR 0001). The flat scan also batches
-concurrent queries into one kernel pass; the index cannot, so high-QPS workloads lose
-more.
+**Don't index below ~1M vectors.** Measured on the real 553k × 1536 benchmark corpus
+with the serial shard loop that ADR 0005 later replaced, every IVF configuration that
+preserved recall@10 ≥ 0.95 was at best 1.6x faster than the flat scan — and most were
+slower (`bench/ivf_probe.py`, ADR 0001). A probed shard costs its bytes scanned on one
+core, while the flat scan reads every byte on all cores at once. Since ADR 0005 the
+probed shards of a query batch are scanned in parallel on `IVF_SEARCH_THREADS` threads;
+the flat scan still answers a batch of concurrent queries in one kernel pass, so
+high-QPS workloads on small collections still favour it.
 
 **Consider indexing above ~2M vectors.** The flat scan is linear in collection size
 while the indexed scan is roughly `nprobe / nlist` of it. On the same corpus scaled to
@@ -40,7 +42,7 @@ For calibration, the full served picture at 552k (REST round-trip, DGX Spark,
 `bench/results-ivf-553k.md`): serial p50 improves 9.3 → 6.8 ms and serial QPS
 101 → 144, but recall@10 drops 0.976 → 0.960, concurrent QPS stays flat (~300, the
 index gives up the flat scan's query micro-batching), and large filtered searches
-get slower (8.0 → 15.8 ms p50 — big allowlists are intersected per probed shard).
+get slower (8.0 → 15.8 ms p50 — big allowlists are intersected per probed shard). *(measured before ADR 0005's shard fan-out)*
 Attach took 40 s, detach 24 s, both online.
 
 Rules of thumb:

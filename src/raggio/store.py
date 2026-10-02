@@ -106,9 +106,10 @@ VACUUM_CHUNK_PAGES = 2_048
 
 # Optional ScaNN-style IVF index, attached/removed per collection via the index API.
 # Measured (bench/ivf_probe.py, ADR 0002): at ~550k rows every recall-preserving cell
-# is slower or barely faster than the flat scan (~0.4ms fixed cost per probed shard),
-# so it stays opt-in; at 2.2M rows it wins 3.5-6.8x. nprobe=16 keeps recall@10 >=0.95
-# on the real corpus. Fixed RAM cost is ~0.5-1 MB per shard (bench/shard_mem_probe.py).
+# is slower or barely faster than the flat scan (each probed shard is a single-core scan
+# of its bytes, ADR 0005), so it stays opt-in; at 2.2M rows it wins 3.5-6.8x.
+# nprobe=16 keeps recall@10 >=0.95 on the real corpus. Fixed RAM cost is ~0.5-1 MB per
+# shard (bench/shard_mem_probe.py).
 IVF_DEFAULT_NPROBE = 16
 IVF_MIN_ROWS = 1024  # k-means needs a training corpus; below this, attach is refused
 IVF_TRAIN_SAMPLE = 65_536
@@ -677,8 +678,8 @@ def _ensure_fts(db: sqlite3.Connection, tokenizer: str) -> None:
 
 
 def _ivf_auto_nlist(n: int) -> int:
-    # ~8k rows per shard, power of two: smaller shards pay more in per-shard fixed
-    # search cost (~0.4ms each) than they save in rows scanned
+    # ~8k rows per shard, power of two (ADR 0002's measured sweet spot); below 32,768
+    # rows turbovec scans a one-query search inline on the calling thread (ADR 0005)
     return int(np.clip(2 ** round(np.log2(max(n, 1) / 8192)), 16, 1024))
 
 

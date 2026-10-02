@@ -148,9 +148,11 @@ the `nlist` centroids, then scans the `nprobe` closest shards — roughly
 `nprobe / nlist` of the flat scan's work, e.g. 5.1 ms instead of 18.1 ms at
 2.2M vectors with the `nlist=256, nprobe=16` defaults. The price is recall
 (true neighbors sitting in unprobed shards are invisible — about 1 point of
-recall@10 at the defaults), plus per-shard fixed costs: ~0.4 ms per probed
-shard, allowlists intersected per shard, and no query micro-batching — which
-is why it only pays off past ~2M vectors ([Vector indexing](indexing.md)).
+recall@10 at the defaults), plus per-shard work: each probed shard is its own
+single-core scan (raggio runs them on parallel threads,
+[ADR 0005](adr/0005-ivf-fanout-and-upstream-stance.md)) and filters are
+intersected per shard — which is why it only pays off past ~2M vectors
+([Vector indexing](indexing.md)).
 
 ### HNSW
 

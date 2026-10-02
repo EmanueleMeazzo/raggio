@@ -1,6 +1,6 @@
 # ADR 0002 — Optional IVF index as an attachable per-collection object
 
-Status: accepted · Date: 2026-08-22
+Status: accepted · Date: 2026-08-22 · The "~0.4 ms fixed cost" in Context is corrected by ADR 0005
 
 ## Context
 
@@ -74,5 +74,6 @@ real data); the honest recall anchor is the real 553k corpus: nprobe=16 costs ~1
 - `meta.db` grows by `dim × 2` bytes/record for every collection (1536-d ≈ +3 KB/rec).
 - Ingest writes one more blob per record; measured impact within noise at bench scale.
 - Batched concurrent scans degrade to per-query probing on indexed collections —
-  documented; high-QPS small collections should stay unindexed.
+  documented; high-QPS small collections should stay unindexed. Since ADR 0005 the
+  per-query shard probes of a batch run in parallel threads.
 - Docs: `docs/indexing.md` (when/how), README section, API reference, storage sizing.

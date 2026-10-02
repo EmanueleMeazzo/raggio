@@ -794,3 +794,25 @@ def test_probe_exact_smoke(tmp_path, monkeypatch):
     assert out["filtered_same"] == 16 and out["tiny_same"] == 16 and out["verdict"] == "PASS"
     assert out["filter_ids"] > 128 >= out["tiny_ids"] > 0
     assert 0 < out["max_list"] < out["cliff"] == 32_768
+
+
+# ---- docs: ADR 0005 replaces the "~0.4 ms fixed cost" reading and documents the knob ----
+
+
+def test_docs_drop_the_fixed_cost_claim_and_document_the_knob():
+    import re
+
+    for path in ("src/raggio/store.py", "docs/concepts.md", "docs/indexing.md"):
+        text = Path(path).read_text(encoding="utf-8")
+        assert not re.search(r"0\.4 ?ms", text), path
+    adr = Path("docs/adr/0005-ivf-fanout-and-upstream-stance.md").read_text(encoding="utf-8")
+    assert "IVF_SEARCH_THREADS" in adr and "0001:48" in adr and "## Verification" in adr
+    # spec §4.2 and §2 row 6: the default, the pooled-path cliff, the rayon warning
+    assert "min(12, os.cpu_count())" in adr and "min(32" not in adr
+    assert "32,768" in adr and "RAYON_NUM_THREADS=1" in adr
+    for path in ("docs/adr/0001-performance-optimization-decisions.md",
+                 "docs/adr/0002-optional-ivf-index.md"):
+        assert "ADR 0005" in Path(path).read_text(encoding="utf-8"), path
+    for path in ("README.md", "docs/getting-started.md"):
+        text = Path(path).read_text(encoding="utf-8")
+        assert "| `IVF_SEARCH_THREADS` | `min(12, CPUs)` |" in text, path

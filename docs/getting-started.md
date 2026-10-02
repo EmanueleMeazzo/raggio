@@ -36,6 +36,7 @@ All configuration is via environment variables:
 | `MAX_RESIDENT_COLLECTIONS` | `4` | LRU cap on in-memory collections |
 | `COLLECTION_IDLE_TTL` | `900` | Seconds before an idle collection is offloaded to disk |
 | `NATIVE_BM25` | `auto` | Stage-2 BM25 scorer: `auto` runs the native `raggio_native` extension when it is installed (the container image builds it), `0` forces the pure-Python scorer. Both return the same results; `GET /healthz` reports which one runs |
+| `IVF_SEARCH_THREADS` | `min(12, CPUs)` | Threads per indexed collection that scan IVF shards in parallel; `1` restores the serial loop |
 
 ## Authentication
 
