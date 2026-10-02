@@ -1012,6 +1012,10 @@ class Collection:
         self._scan_queue: list = []  # (qvec, n, future) waiting for a batched scan
         self._scan_task: asyncio.Task | None = None
         self._allow_cache: dict[str, np.ndarray] = {}  # (scope, filter) -> allowlist ids
+        # bumped by every metadata/membership write; a filter scan that started before
+        # a write may not cache its (older) snapshot. Read lock-free, bumped under the lock.
+        self._allow_gen = 0
+        self._allow_lock = threading.Lock()
         # folded token -> doc frequency: a fts5vocab df lookup walks the term's whole
         # doclist (~15-30ms for near-universal tokens), and exactly those hot tokens
         # recur in every query — cached, pruning costs ~0 after warmup
@@ -1346,6 +1350,12 @@ class Collection:
             return np.vstack(self._cal_reservoir)  # caller disarms after calibrate succeeds
         return None
 
+    def _invalidate_allow(self) -> None:
+        """Every metadata/membership write calls this AFTER its commit."""
+        with self._allow_lock:
+            self._allow_gen += 1
+            self._allow_cache.clear()
+
     def _upsert_rows(self, rows: list, mat: np.ndarray) -> tuple[list[int], list[bool], list[int]]:
         """Insert `rows` (_payload_rows' shape) with `mat` as their vectors, replacing
         any record with the same external_id: one transaction, rolled back on any
@@ -1407,7 +1417,7 @@ class Collection:
             for r in rows:
                 counts[r[2]] = counts.get(r[2], 0) + 1
             self.indexed_counts = counts  # one reference store: readers see old or new
-        self._allow_cache.clear()
+        self._invalidate_allow()
         self._df_cache_churn += len(rows)
         fresh = [r[0] not in old for r in rows]
         replaced = [rid for rid, indexed, _ in old.values() if indexed]
@@ -1839,18 +1849,19 @@ class Collection:
             key = f"{scope}|{json.dumps(filt, sort_keys=True)}"
             allow = self._allow_cache.get(key)
             if allow is None:
+                gen = self._allow_gen  # read BEFORE the SELECT takes its snapshot
                 where, params = _filter_sql(scope, filt)
                 ids = [r[0] for r in self._rdb().execute(f"SELECT id FROM records WHERE {where}", params)]
                 # sorted once per miss, whatever order the query plan returns: the IVF
                 # path intersects by binary search (flat turbovec ignores the order)
                 allow = np.sort(np.array(ids, dtype=np.uint64))
-                try:  # ponytail: tiny FIFO; LRU if filters vary widely. Concurrent
-                    # searches race the eviction — losing the race is fine, crashing isn't.
-                    if len(self._allow_cache) >= 8:
-                        self._allow_cache.pop(next(iter(self._allow_cache)), None)
-                except (StopIteration, RuntimeError):  # emptied / resized mid-iteration
-                    pass
-                self._allow_cache[key] = allow
+                with self._allow_lock:
+                    # a write since `gen` may postdate our snapshot (an orphaned scan whose
+                    # task was cancelled holds no read lock): use it once, never cache it
+                    if gen == self._allow_gen:
+                        if len(self._allow_cache) >= 8:  # ponytail: tiny FIFO; LRU if filters vary widely
+                            self._allow_cache.pop(next(iter(self._allow_cache)))
+                        self._allow_cache[key] = allow
             if len(allow) == 0:
                 return [], []
             kw = {"nprobe": nprobe} if isinstance(self.index, _IvfIndex) else {}
@@ -2192,7 +2203,7 @@ class Collection:
             # under db_lock, as the next upsert reads MAX(id) there and would reuse them,
             # even when a cancelled caller has already released lock.write()
             self._unindex([rid for rid, indexed, _ in rows if indexed])
-        self._allow_cache.clear()
+        self._invalidate_allow()
         self._df_cache_churn += len(rows)
         return len(rows)
 
@@ -2252,7 +2263,7 @@ class Collection:
                 (json.dumps(patch), doc_id),
             )
             self.db.commit()
-        self._allow_cache.clear()  # cached allowlists were evaluated over the old metadata
+        self._invalidate_allow()  # cached allowlists were evaluated over the old metadata
         return cur.rowcount
 
     def stats(self) -> dict:

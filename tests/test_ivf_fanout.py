@@ -4,6 +4,7 @@ Collection.stop(), and the IVF_SEARCH_THREADS knob reaches every collection."""
 import asyncio
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -501,4 +502,61 @@ def test_allow_cache_holds_sorted_arrays(tmp_path):
     assert hits[0]["id"] == "c1"
     (allow,) = col._allow_cache.values()
     assert len(allow) == 150 and bool((allow[1:] > allow[:-1]).all())
+    asyncio.run(col.stop())
+
+
+# ---- R2: filter allowlist cache generation ----
+
+
+class SlowFilterScan:
+    """Stands in for a big-collection filter scan: the SELECT snapshots, then stalls."""
+
+    def __init__(self, db):
+        self.db = db
+
+    def execute(self, sql, *a):
+        cur = self.db.execute(sql, *a)
+        if sql.startswith("SELECT id FROM records WHERE"):
+            rows = cur.fetchall()
+            time.sleep(0.3)
+            return iter(rows)
+        return cur
+
+
+def test_orphaned_filter_scan_cannot_cache_a_stale_allowlist(tmp_path):
+    col = make_collection(tmp_path)
+    ingest(col, 20)  # metadata g = i % 2: d3 starts in g=1
+    real_rdb = col._rdb
+    q = np.array([rowvec(3)], dtype=np.float32)
+
+    async def go():
+        col._rdb = lambda: SlowFilterScan(real_rdb())
+        t = asyncio.create_task(col.search("vector", q, None, 50, "chunks", {"g": 1}, None))
+        await asyncio.sleep(0.05)
+        t.cancel()  # client timeout: the task drops its read lock, its thread runs on
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+        col._rdb = real_rdb
+        assert await col.patch_metadata("d3", {"g": 0}, True) == 1
+        await asyncio.sleep(0.5)  # the orphaned scan finishes and offers its allowlist
+        return await col.search("vector", q, None, 50, "chunks", {"g": 1}, None)
+
+    hits = asyncio.run(go())
+    assert "d3" not in {h["doc_id"] for h in hits}
+    assert {h["doc_id"] for h in hits} == {f"d{i}" for i in range(1, 20, 2)} - {"d3"}
+    asyncio.run(col.stop())
+
+
+def test_every_membership_write_bumps_the_allow_generation(tmp_path):
+    col = make_collection(tmp_path)
+    ingest(col, 10)
+    gen = col._allow_gen
+    asyncio.run(col.patch_metadata("d1", {"g": 5}, True))
+    assert col._allow_gen == gen + 1
+    asyncio.run(col.delete_document("d2"))
+    assert col._allow_gen == gen + 2
+    ingest(col, 3)  # upserts d0..d2
+    assert col._allow_gen == gen + 3
     asyncio.run(col.stop())
