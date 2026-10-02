@@ -761,6 +761,9 @@ class _IvfIndex:
         # shard may not cache its (older) snapshot. Read lock-free, bumped under the lock.
         self._id_gen = [0] * len(shards)
         self._id_lock = threading.Lock()
+        # shards whose file lags memory: sync() writes only these (plus any shard file
+        # the target dir lacks). train() marks every shard, load() none.
+        self._dirty: set[int] = set()
 
     @property
     def nlist(self) -> int:
@@ -797,7 +800,9 @@ class _IvfIndex:
             sh = IdMapIndex(dim=dim, bit_width=bit_width)
             sh.calibrate(cal)
             shards.append(sh)
-        return cls(np.ascontiguousarray(C), shards, nprobe, pool)
+        ivf = cls(np.ascontiguousarray(C), shards, nprobe, pool)
+        ivf._dirty.update(range(nlist))  # nothing on disk yet
+        return ivf
 
     @classmethod
     def load(
@@ -813,14 +818,35 @@ class _IvfIndex:
             )
         return cls(C, shards, nprobe, pool)
 
-    def sync(self, directory) -> None:
+    @property
+    def dirty_shards(self) -> frozenset[int]:
+        """Shards with writes not yet synced to disk (empty: sync() is a no-op)."""
+        with self._id_lock:
+            return frozenset(self._dirty)
+
+    def sync(self, directory) -> int:
+        """Persist to `directory`: centroids once, then every dirty shard and every
+        shard whose file the directory lacks (a fresh attach tmp dir gets them all).
+        A shard's flag clears only after its own sync lands and no write raced it, so
+        a failure part-way leaves the rest dirty for the next call. Returns the number
+        of shard files written."""
         d = Path(directory)
         d.mkdir(exist_ok=True)
         cpath = d / "centroids.npy"
         if not cpath.exists():  # static after train; shard syncs are incremental
             np.save(cpath, self.centroids)
+        written = 0
         for j, sh in enumerate(self.shards):
-            sh.sync(str(d / f"shard-{j:04d}.tvim"))
+            path = d / f"shard-{j:04d}.tvim"
+            if j not in self._dirty and path.exists():
+                continue
+            gen = self._id_gen[j]
+            sh.sync(str(path))
+            written += 1
+            with self._id_lock:
+                if gen == self._id_gen[j]:
+                    self._dirty.discard(j)
+        return written
 
     # ---- the IdMapIndex surface Collection uses ----
 
@@ -844,6 +870,7 @@ class _IvfIndex:
         with self._id_lock:
             self._id_gen[j] += 1
             self._id_cache[j] = None
+            self._dirty.add(j)
 
     def add_with_ids(self, mat: np.ndarray, ids: np.ndarray) -> None:
         asg = self._assign(mat, self.centroids)

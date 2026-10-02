@@ -612,3 +612,112 @@ def test_remove_invalidates_shard_ids():
     gen = ivf._id_gen[j]
     ivf.remove(victim)
     assert ivf._id_gen[j] == gen + 1 and victim not in ivf._shard_ids(j)
+
+
+# ---- dirty-shard sync ----
+
+
+class SyncSpy:
+    """Delegating shard proxy that logs (or fails) sync calls."""
+
+    def __init__(self, inner, log, j, fail=False):
+        self.inner, self.log, self.j, self.fail = inner, log, j, fail
+
+    def __len__(self):
+        return len(self.inner)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def sync(self, path):
+        if self.fail:
+            raise OSError("disk full")
+        self.log.append(self.j)
+        return self.inner.sync(path)
+
+
+def spy_syncs(ivf, fail=()):
+    log = []
+    ivf.shards = [
+        SyncSpy(getattr(sh, "inner", sh), log, j, j in fail) for j, sh in enumerate(ivf.shards)
+    ]
+    return log
+
+
+def test_one_row_job_syncs_one_shard(tmp_path):
+    col = make_collection(tmp_path, threads=1)
+    ingest(col, 300)
+    attach(col, nlist=8, nprobe=8)
+    assert col.index.dirty_shards == frozenset()  # the attach swap synced every shard
+    log = spy_syncs(col.index)
+    doc = {"doc_id": "n1", "chunks": [{"id": "n1", "text": "new", "vector": rowvec(5000)}]}
+    asyncio.run(col._process_job({"documents": [doc]}))
+    assert len(log) == 1 and col.index.dirty_shards == frozenset()
+    log.clear()
+    doc = {"doc_id": "d5", "chunks": [{"id": "c5", "text": "again", "vector": rowvec(5)}]}
+    asyncio.run(col._process_job({"documents": [doc]}))  # re-upsert: remove + add, same shard
+    assert len(log) == 1
+    asyncio.run(col.stop())
+
+
+def test_reload_then_stop_writes_no_shards(tmp_path):
+    col = make_collection(tmp_path, threads=1)
+    ingest(col, 300)
+    attach(col, nlist=8, nprobe=8)
+    asyncio.run(col.stop())
+    col2 = Collection(col.cfg, Path(tmp_path), lambda: None, ivf_search_threads=1)
+    assert isinstance(col2.index, _IvfIndex) and col2.index.dirty_shards == frozenset()
+    log = spy_syncs(col2.index)
+    asyncio.run(col2.stop())
+    assert log == []
+
+
+def test_first_sync_to_a_fresh_dir_writes_every_shard(tmp_path):
+    ivf, _ = build_ivf()
+    assert ivf.dirty_shards == frozenset(range(8))  # trained: nothing on disk yet
+    log = spy_syncs(ivf)
+    assert ivf.sync(tmp_path / "a") == 8
+    assert sorted(log) == list(range(8)) and ivf.dirty_shards == frozenset()
+    log.clear()
+    assert ivf.sync(tmp_path / "a") == 0 and log == []  # clean and every file present
+    assert ivf.sync(tmp_path / "b") == 8  # a new directory lacks every shard file
+    loaded = _IvfIndex.load(tmp_path / "b", DIM, 4, 3)
+    assert loaded.dirty_shards == frozenset() and len(loaded) == len(ivf)
+
+
+def test_reupsert_that_moves_a_row_syncs_both_shards(tmp_path):
+    # RF4: a re-upsert whose new vector routes to another shard removes the old id from
+    # shard A and adds the new id to shard B; both files must be rewritten, or the files
+    # hold the old id too (the reload's ghost reconcile would hide it, so read the files)
+    col = make_collection(tmp_path, threads=1)
+    ingest(col, 300)
+    attach(col, nlist=8, nprobe=8)
+    ivf = col.index
+    (old_id,) = col.db.execute("SELECT id FROM records WHERE external_id='c5'").fetchone()
+    a = next(j for j in range(ivf.nlist) if ivf.shards[j].contains(old_id))
+    b = (a + 1) % ivf.nlist
+    log = spy_syncs(ivf)
+    doc = {"doc_id": "d5", "chunks": [{"id": "c5", "text": "moved", "vector": ivf.centroids[b].tolist()}]}
+    asyncio.run(col._process_job({"documents": [doc]}))
+    (new_id,) = col.db.execute("SELECT id FROM records WHERE external_id='c5'").fetchone()
+    assert ivf.shards[b].contains(new_id) and sorted(log) == sorted({a, b})
+    asyncio.run(col.stop())
+    disk = _IvfIndex.load(col.ivf_dir, DIM, 4, 8)
+    assert [j for j in range(8) if disk.shards[j].contains(old_id)] == []
+    assert [j for j in range(8) if disk.shards[j].contains(new_id)] == [b]
+    assert len(disk) == 300
+
+
+def test_failed_shard_sync_stays_dirty(tmp_path):
+    ivf, _ = build_ivf()
+    ivf.sync(tmp_path)
+    ivf.add_with_ids(ivf.centroids[[1, 4]], np.array([80_001, 80_002], dtype=np.uint64))
+    assert ivf.dirty_shards == frozenset({1, 4})
+    spy_syncs(ivf, fail={4})
+    with pytest.raises(OSError):
+        ivf.sync(tmp_path)
+    assert ivf.dirty_shards == frozenset({4})  # shard 1 landed; shard 4 retries next time
+    log = spy_syncs(ivf)
+    assert ivf.sync(tmp_path) == 1 and log == [4] and ivf.dirty_shards == frozenset()
+    reloaded = _IvfIndex.load(tmp_path, DIM, 4, 3)
+    assert reloaded.shards[1].contains(80_001) and reloaded.shards[4].contains(80_002)
