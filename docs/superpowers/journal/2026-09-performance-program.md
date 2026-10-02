@@ -1649,6 +1649,24 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
   - Each test fails under a mutation. The first mutation set the warning filters to "ignore", and only one test failed (section 5.30). A second mutation disabled `check_image`'s post-import GIL check, and the other test failed too.
 - **The first Linux run's tree had CRLF line endings.** `git archive` on the laptop applies `core.autocrlf`. That run passed anyway. The re-run used `git -c core.autocrlf=false archive`, so it had LF endings, as CI's checkout does.
 
+**10:46Z–11:03Z. Task 11 on gn100 (DGX Spark): both images, their facts, and the fan-out probe.**
+- Task 11 built and checked the two arms at `e3f558e`. Its go-ahead was the maintainer's standing one for gn100 (W-2, W-14), so it was not asked again (G-R28).
+- **Deploy.** Plan A's deploy built image A, `localhost/raggio:e3f558e`, at 10:47:06Z. The host venv was re-synced (G-R18). It runs gn100's own uv-managed 3.12.14 with SQLite 3.53.1, while the images run 3.12.15.
+- **Image B.** `localhost/raggio:e3f558e-py314t` built in 38 s, against p4's 28.7 s cold without `raggio_native`. Four base layers came from the cache. The build compiled turbovec 1.0.0 and `raggio_native` from source, and `check_image` passed: Python 3.14.8 free-threaded, GIL disabled, 28 extension modules imported, `bm25=native`. Image A is 319 MB and image B 325 MB.
+- **The facts of each arm.**
+  - A: Python 3.12.15 with the GIL; turbovec 1.0.0 from the `cp39-abi3-manylinux_2_28_aarch64` wheel; SQLite 3.53.1; Unicode 15.0.0.
+  - B: Python 3.14.8t with the GIL disabled; turbovec 1.0.0 built as `cp314-cp314t-linux_aarch64`; SQLite 3.53.1; Unicode 16.0.0.
+  - Both arms set `OPENBLAS_NUM_THREADS=1`, and in each `raggio_native` reports the interpreter's Unicode version.
+  - Both arms bundle the same SQLite, so plan G's rule lets a hybrid win count (section 4.7).
+- **Unicode drift.** The 15.0.0 to 16.0.0 change newly assigns 5,812 code points and changes 1. It changes the tokens of 5,053 characters, the same counts as on the laptop. The scan of the bench corpus found none of them: 2,549,619 rows, 0 with drift, 0 with token drift.
+- **IVF.** The volume held a flat index, so Task 11 built the IVF index at 4 GiB with image A, in 2 min 41 s (10:52:09Z–10:54:50Z).
+- **The fan-out probe, on both images.** Each probe chooses the fan-out pool size its arm will run with. A chose 8 threads and B chose 16; the default on gn100 is 12. In both arms, grouped and plain search returned the same top-k, and the guard passed. Section 4.7 has the table.
+- No REVISIT; Task 11 took 17 minutes.
+
+**11:04Z. Task 12's ABAB starts, and a gap in the plan's move-aside.**
+- The ABAB chain started at 11:04:48Z on one boot: 8 sessions, each capped at 90 minutes, A1 B1 A2 B2 at concurrency 8 and 16, all from `e3f558e`. The first session is `g-a1-py312`. The early check at 11:08Z found its health log and container logs growing, and the session in its concurrent hybrid phase.
+- **The plan's move-aside step.** Before the chain, Task 12 moves any earlier ABAB's files into a dated folder. It lists them with `shopt -s nullglob; old=(g-[abcd][12]-* g-boot-*.txt g-abab.log g-verification.md)`. `nullglob` drops only patterns that match nothing, and the last two names have no wildcard, so the list keeps them even when the files do not exist. On a first ABAB there was nothing to move, yet the step made an empty folder and `mv` failed. The controller removed the empty folder and went on. A later rerun should write those two names as `g-abab.lo[g]` and `g-verification.m[d]` (section 7.6).
+
 ## 3. Decision register
 
 ID prefixes:
@@ -1990,6 +2008,20 @@ Correctness under load (plan B's bugs, section 5.15):
 - R1 hammer, collection key, c=16, 3 × 800 requests: failures base312 6.8 %, pbs312 5.4 %, py314 5.6 %, ft314t 0.46 %.
 - Searches racing `DELETE /collections/race`: 500s per run base312 464 and 704, py314 294 and 418, ft314t 193 and 171.
 - The stale check found 0 deleted documents coming back, in all 6 runs.
+
+**gn100, plan G's Task 11 at `e3f558e`** (2026-10-02, 10:59–11:00Z). The fan-out probe ran once per image, on the bench corpus's IVF index: 2,549,119 rows, nlist 256, nprobe 16. The largest list holds 23,552 rows, 72 % of the 32,768-row pooled-path cliff (section 4.17). A query probes on average 2.40 lists per shard. Serial search took 28.39 and 29.95 ms on A (3.12.15), and 29.65 and 28.51 ms on B (3.14.8t).
+
+Plain fan-out speedup over serial, by pool threads (the mean of two repetitions):
+
+| Arm | 1 | 2 | 4 | 8 | 12 | 16 | 20 | 32 | Chosen |
+|---|---|---|---|---|---|---|---|---|---|
+| A, 3.12.15 | 0.94 | 1.63 | 1.95 | 3.55 | 3.72 | 3.84 | 3.99 | 3.89 | 8 |
+| B, 3.14.8t | 1.03 | 1.79 | 2.91 | 4.01 | 4.17 | 4.31 | 4.38 | 4.14 | 16 |
+
+- A's two repetitions at 4 threads differed widely: 16.44 and 12.68 ms.
+- B's plain fan-out is faster than A's at every pool size.
+- The grouped call (sections 4.17 and 5.25) beat plain only on A, at 12, 16 and 32 threads, by 1.06–1.08×, inside the noise. On B it never won (0.54–0.97×).
+- Plain results equalled serial ones everywhere, and grouped ones gave the same top-k in 40 of 40 checks. The guard passed on both arms.
 
 **Laptop numbers, from before p4.** All numbers below are from a laptop.
 
@@ -2780,6 +2812,7 @@ Recorded subagent tokens for the completed workflows sum to 10,021,309. That tot
 - Compare test literals with their source by code point, not by eye, when they hold non-ASCII text or backslashes. Agents' editing tools have composed Unicode and dropped a backslash, and a diff view shows neither (section 5.21).
 - Verify claims of having told the user against the transcript. A compaction summary said the maintainer had been told about the removed `bench-wv` container; the transcript showed no such message (section 7.5).
 - Read every ledger stamp from the clock (`date -u`); do not advance it by estimate. In plan F the implementers finished a task in two to four minutes, much faster than earlier plans. The controller's estimated stamps drifted up to 12 minutes ahead: one ledger line put Task 6's dispatch at 01:08Z, after its 01:01Z commit. The transcript's own timestamps and the commit times fixed them (section 2, 2026-10-02).
+- `shopt -s nullglob` drops only the patterns that match nothing. A plain file name in the same list stays, whether or not the file exists. To make a name optional, give it a one-character bracket, such as `g-abab.lo[g]` (section 2, 2026-10-02 11:04Z).
 
 ### 7.7 Working agreements with the maintainer
 
