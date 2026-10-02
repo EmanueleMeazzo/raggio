@@ -440,3 +440,56 @@ def test_ci_314t_job_turns_a_gil_re_enable_into_a_failure():
     stress = runs['uv run --no-sync pytest -q tests/test_concurrency.py -k "mixed_workload or stop_under_load"']
     assert float(stress["RAGGIO_STRESS_SECONDS"]) >= 30
     assert "PYTHON_GIL" not in ci and "gil=0" not in ci.lower()
+
+
+# ---- Unicode drift between the arms (3.12: Unicode 15.0.0, 3.14t: 16.0.0) ----
+
+
+def load_drift_probe():
+    path = ROOT / "bench" / "unicode_drift_probe.py"
+    spec = importlib.util.spec_from_file_location("unicode_drift_probe", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_drift_probe_dump_records_what_the_tokenizer_does_per_code_point():
+    probe = load_drift_probe()
+    dump = probe.dump(range(0x41, 0x42))  # "A"
+    dump.update(probe.dump([0x5F, 0xE9, 0x301, 0xFB01, 0x378]))
+    assert dump["65"] == ["Lu", "a"]
+    assert dump["95"] == ["Pc", " "]  # '_' separates tokens
+    assert dump["233"] == ["Ll", "e"]  # NFKD folds the accent away
+    assert dump["769"] == ["Mn", ""]  # a combining mark alone vanishes
+    assert dump["64257"] == ["Ll", "fi"]
+    assert "888" not in dump  # U+0378 is unassigned and no word character: not recorded
+
+
+def test_drift_probe_diff_separates_new_code_points_from_changed_ones():
+    probe = load_drift_probe()
+    a = {"unidata": "15.0.0", "cp": {"65": ["Lu", "a"], "95": ["Pc", " "], "300": ["Lo", "x"]}}
+    b = {"unidata": "16.0.0", "cp": {"65": ["Lu", "a"], "95": ["Pc", " "], "300": ["Lo", " "],
+                                     "7000": ["Lo", "z"], "7001": ["So", " "]}}
+    assert probe.diff(a, b) == {
+        "from": "15.0.0", "to": "16.0.0",
+        "newly_assigned": [7000, 7001],  # unassigned (Cn) in the first dump
+        "changed": [300],  # assigned in both, recorded differently
+        "token_drift": [300, 7000],  # the ones whose tokens differ
+    }
+
+
+def test_drift_probe_scan_counts_corpus_rows_with_a_drifted_code_point(tmp_path):
+    import json
+
+    probe = load_drift_probe()
+    drift = {"from": "15.0.0", "to": "16.0.0", "newly_assigned": [0x1E5D0, 0x2B740],
+             "changed": [], "token_drift": [0x1E5D0]}
+    rows = [{"title": "plain", "text": "nothing new"},
+            {"title": "Ol Onal \U0001E5D0", "text": "a new word character"},
+            {"title": "t", "text": "a new symbol \U0002B740"},
+            {"title": "beyond the limit \U0001E5D0", "text": ""}]
+    corpus = tmp_path / "abstracts.jsonl"
+    corpus.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    assert probe.scan(drift, corpus, limit=3) == {
+        "rows": 3, "rows_with_drift": 2, "rows_with_token_drift": 1,
+        "first_rows_with_drift": [1, 2]}
