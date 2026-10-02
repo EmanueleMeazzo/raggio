@@ -103,6 +103,16 @@ CAL_SAMPLE = 1024  # ~1024 representative rows is enough per turbovec docs
 # since the last trim plus 8 MB and never stalls enqueues on a whole-file vacuum
 VACUUM_FREELIST_PAGES = 16_384
 VACUUM_CHUNK_PAGES = 2_048
+# removals one index sync may carry when a batch piles them up across jobs. turbovec
+# keeps each removal as a redo op in the index file's header and rewrites the whole
+# file past 1024 of them, so the worker syncs before a job would take the count over
+# this. A lone job over the cap is not split: it syncs with all its own removals
+SYNC_MAX_REMOVALS = 512
+# a failed index sync (a full disk, an I/O error) is retried after SYNC_RETRY_MIN_S s,
+# then twice as long after each failure, up to SYNC_RETRY_MAX_S s. The batch stays
+# 'processing' meanwhile, so if the process ends first the next open replays it
+SYNC_RETRY_MIN_S = 1.0
+SYNC_RETRY_MAX_S = 30.0
 
 # Optional ScaNN-style IVF index, attached/removed per collection via the index API.
 # Measured (bench/ivf_probe.py, ADR 0002): at ~550k rows every recall-preserving cell
@@ -312,11 +322,16 @@ def _decode_payload(data: bytes) -> dict:
     return payload
 
 
-# the worker's claim: the lowest open job. 'processing' is included so jobs interrupted
-# by a crash replay on boot. Keep the literal predicate byte for byte: it is what Plan
-# C's partial index idx_jobs_open matches (spec 4.1), and C's plan test pins this text
+# the worker's claim: the lowest open job above a cursor. 'processing' is included so
+# jobs interrupted by a crash replay on boot (cursor 0). The batched worker moves the
+# cursor past the jobs it claimed, which stay 'processing' until their batch's sync.
+# Keep the literal predicate byte for byte: Plan C's partial index idx_jobs_open
+# matches it (spec 4.1). INDEXED BY holds the plan on that index, so a planner change
+# cannot silently turn the claim into a journal walk over every done row (it fails
+# loudly, "no such index", and open_meta_db creates the index on every open)
 _CLAIM_SQL = (
-    "SELECT id, payload FROM jobs WHERE status IN ('pending','processing') ORDER BY id LIMIT 1"
+    "SELECT id, payload FROM jobs INDEXED BY idx_jobs_open"
+    " WHERE status IN ('pending','processing') AND id > ? ORDER BY id LIMIT 1"
 )
 
 
@@ -1012,6 +1027,8 @@ class Collection:
         set_index_config=None,
         native_bm25: bool = True,
         ivf_search_threads: int | None = None,
+        sync_batch_jobs: int = 8,
+        sync_batch_ms: float = 1000.0,
     ) -> None:
         self.cfg = cfg
         self.dir = directory
@@ -1032,6 +1049,18 @@ class Collection:
         # IVF shard fan-out (ADR 0005): threads start on the first multi-shard search and
         # stop with the collection; flat collections never start any. 1 = serial loop.
         self._shard_pool = _ShardPool(ivf_search_threads or default_ivf_search_threads(), cfg.name)
+        # the worker's batch bounds (Settings.sync_batch_jobs / sync_batch_ms) and the
+        # removals made since the last index sync: _unindex counts, _sync_index resets,
+        # and _process_job syncs first when a job would take the count over the cap
+        self.sync_batch_jobs = sync_batch_jobs
+        self.sync_batch_ms = sync_batch_ms
+        self._removed_since_sync = 0
+        # the worker's open batch: (job_id, status, error) for each job it processed
+        # that no index sync covers yet. Each one finishes only after such a sync
+        # (_flush_unsynced). _batch_t0 is time.monotonic() when the batch's first job
+        # joined, and None while no batch is open
+        self._unsynced: list[tuple[int, str, str | None]] = []
+        self._batch_t0: float | None = None
         # the catalog decides which representation is live; a stale sibling on disk
         # (crashed attach/detach) is ignored and rebuilt by the replayed job
         if cfg.index_config and (self.ivf_dir / "centroids.npy").exists():
@@ -1146,6 +1175,19 @@ class Collection:
         self._worker = asyncio.create_task(self._run_worker())
 
     async def stop(self) -> None:
+        async def close_step(what, step):
+            # spec 3.1 D4: a close step that raises an Exception is logged with its
+            # traceback and stop() goes on to the next one, so shutdown() still
+            # reaches every collection and the catalog. Only Exception: a cancel
+            # of stop(), a KeyboardInterrupt or a SystemExit propagates
+            try:
+                await step
+            except Exception:
+                _log.exception(
+                    "collection %s: closing %s failed in stop(); the shutdown goes on",
+                    self.cfg.name, what,
+                )
+
         async with self.lock.write():
             # cancel the worker only once write-locked: it is then outside its write
             # section (upsert -> index add -> sync), so no orphaned to_thread body is
@@ -1156,17 +1198,27 @@ class Collection:
                     await self._worker
                 except asyncio.CancelledError:
                     pass
-            await asyncio.to_thread(self._sync_index)
+                except Exception:
+                    # spec 3.1 D3: a worker that died of an exception (a finish or a
+                    # claim that raised) is logged, never re-raised, and stop() goes on
+                    # to flush and close. Any job the worker held stays 'processing'
+                    _log.exception(
+                        "collection %s: the ingest worker had died; stop() flushes its"
+                        " open batch of %d jobs, and any job it held stays 'processing'"
+                        " for the replay on the next open",
+                        self.cfg.name, len(self._unsynced),
+                    )
+            await asyncio.to_thread(self._sync_and_finish)
             self._closed = True
             # write-locked: no search holding the read lock is mid-query. Orphaned
             # to_thread bodies of cancelled searches, orphaned index builds and the
             # unlocked reads (list_records, get_document, job status) can still be
             # (ADR 0001, concurrency addendum, Deferred row)
-            await asyncio.to_thread(self._close_conns)
+            await close_step("the SQLite connections", asyncio.to_thread(self._close_conns))
         if self._embedder is not None:
-            await self._embedder.aclose()
+            await close_step("the embedder's HTTP client", self._embedder.aclose())
         # after _closed: an orphaned search still running falls back to the serial loop
-        await asyncio.to_thread(self._shard_pool.close)
+        await close_step("the IVF shard pool", asyncio.to_thread(self._shard_pool.close))
 
     def _close_conns(self) -> None:
         # under db_lock: a write transaction that already holds db_lock on self.db (a
@@ -1218,14 +1270,16 @@ class Collection:
             "SELECT COUNT(*) FROM jobs WHERE status IN ('pending','processing')"
         ).fetchone()[0]
 
-    def _claim_next(self) -> tuple[int, dict | None, str | None] | None:
-        """Claim the lowest open job. Returns (job_id, payload, None), or
+    def _claim_next(self, after: int = 0) -> tuple[int, dict | None, str | None] | None:
+        """Claim the lowest open job with an id above `after` (0: the lowest open job,
+        as on boot; the batched worker passes the last id it claimed, because a claimed
+        job stays 'processing' until its batch syncs). Returns (job_id, payload, None), or
         (job_id, None, "bad job payload: ...") when its payload cannot be decoded, or
         None when no job is open. The claim is one short transaction under db_lock;
         the decode runs after the lock is released, still in this worker thread, so
         neither the loop nor the other writers wait for it."""
         with self.db_lock:
-            row = self.db.execute(_CLAIM_SQL).fetchone()
+            row = self.db.execute(_CLAIM_SQL, (after,)).fetchone()
             if row is None:
                 return None
             job_id, text = row
@@ -1295,29 +1349,141 @@ class Collection:
             self.db.execute(f"PRAGMA incremental_vacuum({n})").fetchall()
 
     async def _run_worker(self) -> None:
+        # claim cursor: a claimed job stays 'processing' until its batch's sync, so each
+        # claim starts above the last job this worker claimed. It is 0 on every start,
+        # so the jobs a crash or a stop() left 'processing' replay first, in id order
+        after = 0
         while True:
             # clear BEFORE claiming: an enqueue landing during the claim either becomes
             # visible to the claim itself or re-sets the event, so no wakeup is lost
             self._wake.clear()
-            row = await asyncio.to_thread(self._claim_next)
+            row = await asyncio.to_thread(self._claim_next, after)
             if row is None:
+                if self._unsynced:
+                    # the queue is idle: close the open batch now, not at a cap
+                    await self._flush_unsynced()
+                    continue
                 await self._wake.wait()
                 continue
             # decoded in the claim's thread; an undecodable row comes back as
             # (job_id, None, reason) and finishes as 'error' like any failed job
             job_id, payload, bad = row
+            after = job_id
+            if bad is None and payload.get("op") in ("attach_index", "detach_index"):
+                # an index job is a barrier: it rebuilds the index and writes the new
+                # one itself. The open batch syncs and finishes first, then the index
+                # job runs alone and finishes at once
+                if self._unsynced:
+                    await self._flush_unsynced()
+                try:
+                    await self._process_job(payload)
+                    status, error = "done", None
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    status, error = "error", str(e)
+                await asyncio.to_thread(self._finish_job, job_id, status, error)
+                continue
             try:
                 if bad is not None:
                     raise ValueError(bad)
-                await self._process_job(payload)
+                # sync=False: the job commits its rows and updates the in-memory index.
+                # The batch's one sync writes the file, and only then does the job finish
+                await self._process_job(payload, sync=False)
                 status, error = "done", None
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 status, error = "error", str(e)
-            await asyncio.to_thread(self._finish_job, job_id, status, error)
+            # a failed job joins the batch too: finishes stay in claim order, and one
+            # finish path covers every job
+            if not self._unsynced:
+                self._batch_t0 = time.monotonic()
+            self._unsynced.append((job_id, status, error))
+            if (
+                len(self._unsynced) >= self.sync_batch_jobs
+                or (time.monotonic() - self._batch_t0) * 1000.0 >= self.sync_batch_ms
+            ):
+                await self._flush_unsynced()
 
-    async def _process_job(self, payload: dict) -> None:
+    async def _flush_unsynced(self) -> None:
+        """Close the worker's open batch: one index sync covers every job in it, then
+        each job finishes, in claim order. None of them is 'done' before that sync
+        returns (the job journal invariant), so a crash before it leaves them all
+        'processing' and the replay redoes them. A crash between the sync and the last
+        finish replays the unfinished rest, which rewrites the same rows.
+
+        A sync that raises is logged and retried, after SYNC_RETRY_MIN_S and then twice
+        as long each time, up to SYNC_RETRY_MAX_S. Until one lands the batch stays
+        'processing' and the worker claims nothing new. The wait runs outside the write
+        lock, so searches, deletes and stop() go on; stop() cancels the wait and
+        finishes the batch itself (_sync_and_finish)."""
+        delay = SYNC_RETRY_MIN_S
+        while True:
+            try:
+                async with self.lock.write():  # the per-job sync ran under it too
+                    await asyncio.to_thread(self._sync_index)
+                break
+            except Exception:
+                # nothing is finished and the index keeps its in-memory rows; an IVF
+                # shard whose write failed stays dirty (Plan F), so the retry writes it
+                _log.exception(
+                    "collection %s: index sync failed, %d jobs stay 'processing';"
+                    " retrying in %.2f s",
+                    self.cfg.name, len(self._unsynced), delay,
+                )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, SYNC_RETRY_MAX_S)
+        self._batch_t0 = None  # the batch closed at its sync
+        while self._unsynced:
+            # pop BEFORE the await: a stop() that cancels the worker mid-finish leaves
+            # this job to the orphaned thread, and nothing finishes it twice
+            job = self._unsynced.pop(0)
+            await asyncio.to_thread(self._finish_job, *job)
+
+    def _sync_and_finish(self) -> None:
+        """stop()'s flush, run in a thread while stop() holds lock.write() and the
+        worker is already cancelled or dead: sync the index, then finish every job of
+        the open batch in claim order. A sync that raises an Exception is logged, and
+        nothing is finished: the jobs keep 'processing' and their payloads, and the next
+        open replays them. A finish that raises an Exception after the sync landed is
+        logged too, and no later job is tried; those jobs replay the same way. It then
+        returns normally, so stop() still closes the collection."""
+        try:
+            self._sync_index()
+        except Exception:
+            # never raised to stop()'s caller, so shutdown, eviction and delete complete
+            # (spec 3.1 D2). Only Exception: a KeyboardInterrupt or SystemExit propagates
+            _log.exception(
+                "collection %s: index sync failed in stop(), %d jobs stay 'processing'"
+                " for the replay on the next open",
+                self.cfg.name, len(self._unsynced),
+            )
+            return
+        self._batch_t0 = None
+        while self._unsynced:
+            try:
+                self._finish_job(*self._unsynced[0])
+            except Exception:
+                # spec 3.1 D3: the sync landed, but this job and the rest stay
+                # 'processing' with their payloads; the replay re-applies their rows,
+                # which rewrites the same rows. Only Exception, as above
+                _log.exception(
+                    "collection %s: finishing jobs failed in stop(), %d jobs stay"
+                    " 'processing' for the replay on the next open",
+                    self.cfg.name, len(self._unsynced),
+                )
+                return
+            # popped only once finished, so if a later finish fails, _unsynced holds
+            # that job and every job after it: the ones left for the replay. No worker
+            # runs now, so no other finish can take the same job
+            self._unsynced.pop(0)
+
+    async def _process_job(self, payload: dict, *, sync: bool = True) -> None:
+        """Run one job. An ingest job ends by writing the index file (_sync_index) only
+        when sync is True, the default every direct caller keeps; the batched worker
+        passes False and syncs once per batch. Index jobs (attach/detach) ignore it:
+        their swap writes the new index in full."""
         op = payload.get("op")
         if op in ("attach_index", "detach_index"):
             try:
@@ -1350,6 +1516,22 @@ class Collection:
             # index only after that commit.
             ids, fresh, replaced = await asyncio.to_thread(self._upsert_rows, rows, mat)
             if replaced:
+                if (self._removed_since_sync
+                        and self._removed_since_sync + len(replaced) > SYNC_MAX_REMOVALS):
+                    # write earlier jobs' removals first, so no sync carries more than
+                    # the cap across jobs. A job alone over it is not split (count 0)
+                    try:
+                        await asyncio.to_thread(self._sync_index)
+                    except Exception:
+                        # this job's rows are already committed, so it must go on to
+                        # its removals and adds, or the index would lack them for good.
+                        # The counter keeps the pending removals, and the batch's sync
+                        # (retried until it lands) writes them all
+                        _log.exception(
+                            "collection %s: removal-cap index sync failed; the batch's"
+                            " sync will write these removals",
+                            self.cfg.name,
+                        )
                 await asyncio.to_thread(self._unindex, replaced)
             idarr = np.array(ids, dtype=np.uint64)
             # while the reservoir is armed, add in threshold-sized slices so even one
@@ -1375,8 +1557,10 @@ class Collection:
                         # calibration must never fail the ingest job (an 'error' job is
                         # terminal and would leave committed rows behind)
                         pass
-            # ponytail: sync after every job; batch on an interval if write throughput matters
-            await asyncio.to_thread(self._sync_index)
+            # the batched worker passes sync=False and writes the index once per batch
+            # (Settings.sync_batch_jobs / sync_batch_ms); a direct call syncs here
+            if sync:
+                await asyncio.to_thread(self._sync_index)
 
     def _feed_calibration(self, mat: np.ndarray) -> np.ndarray | None:
         """Reservoir-sample ingested vectors (Algorithm R); once the one-shot
@@ -1471,7 +1655,14 @@ class Collection:
     def _unindex(self, rids: list[int]) -> None:
         """Remove records whose rows a committed transaction replaced or deleted from
         the vector index (the .tvim drops them at the next _sync_index). The caller
-        holds lock.write(), so no search runs meanwhile; db_lock is not needed."""
+        holds lock.write() (the delete path also holds db_lock); the index needs
+        neither db_lock nor any other lock here."""
+        # counted from the list, never from remove()'s return (None on _IvfIndex), and
+        # before the loop: a remove that raises midway leaves the count high, which
+        # only brings the next pre-sync early
+        # not atomic: an orphaned delete thread may race _sync_index's reset, and a
+        # lost count only mis-times a pre-sync
+        self._removed_since_sync += len(rids)
         for rid in rids:
             self.index.remove(rid)
 
@@ -1482,6 +1673,9 @@ class Collection:
             self.index.sync(self.ivf_dir)
         else:
             self.index.sync(str(self.index_path))
+        # the file now holds every pending removal. A sync that raises skips this, so
+        # the count stays, and the next attempt still sees what it carries
+        self._removed_since_sync = 0
 
     def _save_index_config(self, ic: dict | None) -> None:
         self._set_index_config_cb(ic)  # catalog first: it decides what load() trusts
@@ -2353,6 +2547,8 @@ class CollectionManager:
         self._catalog_lock = threading.Lock()
         self.resident: dict[str, Collection] = {}
         self._load_lock = asyncio.Lock()
+        # stop() tasks of evictions whose caller was cancelled; shutdown() waits for them
+        self._stopping: set[asyncio.Future] = set()
 
     def _default_embedder(self, cfg: CollectionConfig) -> Embedder:
         s = self.settings
@@ -2476,6 +2672,8 @@ class CollectionManager:
             lambda ic, name=name: self.set_index_config(name, ic),
             native_bm25=self.settings.native_bm25 == "auto",
             ivf_search_threads=self.settings.ivf_search_threads,
+            sync_batch_jobs=self.settings.sync_batch_jobs,
+            sync_batch_ms=self.settings.sync_batch_ms,
         ))
         try:
             c = await asyncio.shield(build)
@@ -2500,7 +2698,25 @@ class CollectionManager:
     async def _evict(self, name: str) -> None:
         c = self.resident.pop(name, None)
         if c:
-            await c.stop()
+            # out of resident from here, so no later shutdown() or touch() can find c.
+            # A cancel of this coroutine (housekeeping cancelled at shutdown, a request
+            # dropped mid-touch) must not cut stop() short, which left c's connections
+            # open (issue #3). stop() runs as its own task, shutdown() waits for any
+            # still running, and the caller sees its cancel only once stop() ends, so
+            # its _load_lock covers the whole close: no touch() reopens the directory
+            # beside a collection still closing
+            stop = asyncio.ensure_future(c.stop())
+            self._stopping.add(stop)
+            stop.add_done_callback(self._stopping.discard)
+            try:
+                await asyncio.shield(stop)
+            except asyncio.CancelledError:
+                while not stop.done():
+                    try:
+                        await asyncio.wait({stop})
+                    except asyncio.CancelledError:
+                        pass  # cancelled again: still must not leave stop() half done
+                raise
 
     async def delete_collection(self, name: str) -> None:
         # evict + catalog delete under _load_lock, like touch() and housekeeping's
@@ -2542,5 +2758,9 @@ class CollectionManager:
     async def shutdown(self) -> None:
         for name in list(self.resident):
             await self._evict(name)
+        # an eviction whose caller was cancelled (housekeeping, just before this runs)
+        # may still be stopping its collection
+        while self._stopping:
+            await asyncio.wait(self._stopping)
         with self._catalog_lock:  # a threadpool get_config may still be mid-query
             self.catalog.close()

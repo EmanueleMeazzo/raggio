@@ -70,6 +70,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="parent dir of the throwaway collection (default: the system temp"
                         " dir); put it on the disk under test")
     p.add_argument("--out", default=None, help="also write the result JSON to this file")
+    p.add_argument("--batch-jobs", type=int, default=None,
+                   help="SYNC_BATCH_JOBS for the collection (default: Collection's own)")
+    p.add_argument("--batch-ms", type=float, default=None,
+                   help="SYNC_BATCH_MS for the collection (default: Collection's own)")
     return p
 
 
@@ -183,7 +187,16 @@ def final_state(col: Collection) -> dict:
 
 async def run(args: argparse.Namespace, work: Path) -> dict:
     """Prefill, optionally attach IVF, then the timed drain; the result without args."""
-    col = Collection(CollectionConfig("probe", args.dim, 4, None, None, None), work, lambda: None)
+    # forwarded only when given: without the flags the probe builds the collection as
+    # before, so this file still runs on a tree whose Collection has no such keywords
+    batch = {}
+    if args.batch_jobs is not None:
+        batch["sync_batch_jobs"] = args.batch_jobs
+    if args.batch_ms is not None:
+        batch["sync_batch_ms"] = args.batch_ms
+    col = Collection(
+        CollectionConfig("probe", args.dim, 4, None, None, None), work, lambda: None, **batch
+    )
     try:
         col._cal_rng = np.random.default_rng([args.seed, 3])  # seeded calibration sample
         t = time.perf_counter()
@@ -222,6 +235,9 @@ async def run(args: argparse.Namespace, work: Path) -> dict:
         "machine": platform.machine(),
         "openblas_num_threads": os.environ.get("OPENBLAS_NUM_THREADS"),
         "regime": "host-warm, uncapped host process",
+        # the batch bounds the collection ran with (None on a tree without them)
+        "sync_batch_jobs": getattr(col, "sync_batch_jobs", None),
+        "sync_batch_ms": getattr(col, "sync_batch_ms", None),
     }
 
 
@@ -241,6 +257,10 @@ def main(argv: list[str] | None = None) -> dict:
     for name in ("prefill", "reupsert_every", "ivf", "seed"):
         if getattr(args, name) < 0:
             parser.error(f"--{name.replace('_', '-')} must be >= 0")
+    if args.batch_jobs is not None and args.batch_jobs < 1:
+        parser.error("--batch-jobs must be >= 1")
+    if args.batch_ms is not None and not args.batch_ms >= 0:
+        parser.error("--batch-ms must be >= 0")
     if args.reupsert_every:
         blocks = -(-args.jobs // args.reupsert_every)  # re-upsert jobs 0, k, 2k, ...
         if blocks * args.job_rows > args.prefill:

@@ -37,6 +37,8 @@ All configuration is via environment variables:
 | `COLLECTION_IDLE_TTL` | `900` | Seconds before an idle collection is offloaded to disk |
 | `NATIVE_BM25` | `auto` | Stage-2 BM25 scorer: `auto` runs the native `raggio_native` extension when it is installed (the container image builds it), `0` forces the pure-Python scorer. Both return the same results; `GET /healthz` reports which one runs |
 | `IVF_SEARCH_THREADS` | `min(12, CPUs)` | Threads per indexed collection that scan IVF shards in parallel; `1` restores the serial loop |
+| `SYNC_BATCH_JOBS` | `8` | Ingest jobs covered by one vector-index sync; each job turns `done` only after the sync that covers it. `1` syncs after every job |
+| `SYNC_BATCH_MS` | `1000` | Milliseconds after a batch's first job at which the batch syncs even if it holds fewer jobs (checked as each job joins); `0` closes each batch at its first job |
 
 ## Authentication
 

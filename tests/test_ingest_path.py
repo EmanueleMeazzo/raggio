@@ -4,6 +4,8 @@ One `# ---- <topic>` section per plan task, in task order."""
 import asyncio
 import copy
 import json
+import logging
+import shutil
 import sqlite3
 import struct
 import sys
@@ -16,7 +18,8 @@ import pytest
 
 sys.path.insert(0, "src")
 import raggio.store as store  # noqa: E402
-from raggio.store import Collection, CollectionConfig, open_meta_db  # noqa: E402
+from raggio.config import Settings  # noqa: E402
+from raggio.store import Collection, CollectionConfig, CollectionManager, open_meta_db  # noqa: E402
 
 
 def make_collection(tmp_path, dim=8, **kw):
@@ -812,7 +815,7 @@ def test_ingest_probe_runs_flat_and_reports(tmp_path, monkeypatch):
 
 def test_ingest_probe_runs_ivf(tmp_path, monkeypatch):
     # bench.py never ingests into an IVF collection; the probe attaches one (nlist 4)
-    # before the clock starts, so every timed job syncs the IVF shards
+    # before the clock starts, so the timed jobs' syncs write the IVF shards
     monkeypatch.setattr(store, "IVF_MIN_ROWS", 100)
     probe = load_probe(monkeypatch)
     out = probe.main(probe_args(tmp_path, prefill=400, ivf=4, seed=3))
@@ -915,3 +918,1530 @@ def test_adr_ingest_path_d1_results_record_the_gates():
     for gate in ("D1-run", "D1-fingerprints", "D1-jobs", "D1-labels"):
         assert f"- PASS: {gate}\n" in section, gate
     assert [line for line in section.splitlines() if line.startswith("- FAIL:")] == ["- FAIL: D1-ivf256"]
+
+
+# ---- batched sync: plumbing
+
+
+def test_settings_sync_batch_knobs(monkeypatch):
+    monkeypatch.delenv("SYNC_BATCH_JOBS", raising=False)
+    monkeypatch.delenv("SYNC_BATCH_MS", raising=False)
+    s = Settings()
+    assert (s.sync_batch_jobs, s.sync_batch_ms) == (8, 1000.0)
+    assert type(s.sync_batch_jobs) is int and type(s.sync_batch_ms) is float
+    monkeypatch.setenv("SYNC_BATCH_JOBS", "3")
+    monkeypatch.setenv("SYNC_BATCH_MS", "250.5")
+    s = Settings()
+    assert (s.sync_batch_jobs, s.sync_batch_ms) == (3, 250.5)
+
+
+@pytest.mark.parametrize("name, value", [("SYNC_BATCH_JOBS", "0"), ("SYNC_BATCH_MS", "-1")])
+def test_settings_rejects_bad_sync_batch_knobs(monkeypatch, name, value):
+    # a batch of zero jobs could never close, and a negative wait is a typo: refuse to boot
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=name):
+        Settings()
+
+
+def test_manager_passes_sync_batch_knobs_to_collection(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("SYNC_BATCH_JOBS", "3")
+    monkeypatch.setenv("SYNC_BATCH_MS", "250")
+
+    async def go():
+        mgr = CollectionManager(Settings(), embedder_factory=lambda cfg: None)
+        try:
+            await mgr.create_collection("m", 8, 4, None, None, None)
+            col = await mgr.touch("m")
+            return col.sync_batch_jobs, col.sync_batch_ms
+        finally:
+            await mgr.shutdown()
+
+    assert asyncio.run(go()) == (3, 250.0)
+
+
+def test_claim_cursor_skips_already_claimed_jobs(tmp_path):
+    # the batched worker claims job k+1 while job k is still 'processing' (a job is
+    # finished only after its batch's sync), so the cursor, not the status, moves on
+    col = make_collection(tmp_path)
+    try:
+        assert [col._enqueue_row(docs_payload([i])) for i in (1, 2, 3)] == [1, 2, 3]
+        assert col._claim_next()[0] == 1  # no cursor: the lowest open job, as before
+        assert col._claim_next(1)[0] == 2
+        job_id, payload, error = col._claim_next(2)
+        assert (job_id, payload["documents"][0]["doc_id"], error) == (3, "d3", None)
+        assert col._claim_next(3) is None  # nothing open above the cursor
+        assert fetch(col, "SELECT id, status FROM jobs ORDER BY id") == [
+            (1, "processing"), (2, "processing"), (3, "processing")]
+        # cursor 0 (a worker's first claim, as on boot): 'processing' jobs replay first
+        assert col._claim_next()[0] == 1
+    finally:
+        asyncio.run(col.stop())
+
+
+def test_claim_query_never_scans_the_journal(tmp_path):
+    # the journal keeps every done job. The INDEXED BY hint is there so a planner change
+    # cannot silently turn the claim into a walk over all the done rows (cursor 0): the
+    # walk Plan C's partial index idx_jobs_open exists to avoid
+    col = make_collection(tmp_path)
+    try:
+        with col.db_lock:
+            col.db.executemany(LEGACY_JOB, [(i, "{}", "done") for i in range(1, 51)]
+                               + [(51, "{}", "processing"), (52, "{}", "pending")])
+            col.db.commit()
+        assert store._CLAIM_SQL.count("?") == 1  # the cursor
+        plan = " | ".join(r[3] for r in fetch(col, "EXPLAIN QUERY PLAN " + store._CLAIM_SQL, 0))
+        # one range search on the open-jobs index, in id order: no rowid range, no sort
+        assert plan.startswith("SEARCH") and "USING INDEX idx_jobs_open" in plan, plan
+        assert "PRIMARY KEY" not in plan and "TEMP B-TREE" not in plan, plan
+        assert col._claim_next(51)[0] == 52
+        assert col._claim_next()[0] == 51
+    finally:
+        asyncio.run(col.stop())
+
+
+def spy_sync(col):
+    """Wrap col._sync_index. Each call first appends the removal count it found (None
+    before Task 7 added the counter), then runs the real sync. Returns that list."""
+    seen, real = [], col._sync_index
+
+    def spy():
+        seen.append(getattr(col, "_removed_since_sync", None))
+        real()
+
+    col._sync_index = spy
+    return seen
+
+
+def test_process_job_sync_flag(tmp_path):
+    # sync=False is the batched worker's call: the job commits and updates the index in
+    # memory, and leaves writing the index file to its batch's one sync
+    col = make_collection(tmp_path)
+
+    async def run():
+        try:
+            seen = spy_sync(col)
+            await col._process_job(docs_payload([1, 2]))  # records 1, 2
+            calls = [len(seen)]
+            await col._process_job(docs_payload([3]), sync=False)  # record 3
+            calls.append(len(seen))
+            return calls, index_ids(col), fetch(col, "SELECT id FROM vecs ORDER BY id")
+        finally:
+            await col.stop()
+
+    calls, ids, vecs = asyncio.run(run())
+    assert calls == [1, 1]  # the default still syncs after every job; sync=False never
+    assert ids == [1, 2, 3]  # searchable at once: the in-memory index has record 3
+    assert vecs == [(1,), (2,), (3,)]  # and its rows are committed
+
+
+def test_removal_cap_syncs_before_crossing_the_cap(tmp_path, monkeypatch):
+    # turbovec keeps each removal as a redo op in the index file's header and rewrites
+    # the whole file past 1024 of them, so one sync must not carry more than
+    # SYNC_MAX_REMOVALS removals piled up across a batch's jobs. A lone job over the
+    # cap is not split: it syncs with everything it removed, as every job does today
+    monkeypatch.setattr(store, "SYNC_MAX_REMOVALS", 10)
+    col = make_collection(tmp_path)
+
+    async def run():
+        try:
+            await col._process_job(docs_payload(range(1, 13)))  # records 1-12, synced
+            seen = spy_sync(col)
+            for _ in range(3):  # each re-upsert replaces docs 1-6: 6 removals per job
+                await col._process_job(docs_payload(range(1, 7)), sync=False)
+            steps = [list(seen), col._removed_since_sync]
+            await asyncio.to_thread(col._sync_index)  # what the batch's flush will do
+            steps += [list(seen), col._removed_since_sync]
+            # one job replacing all 12 rows (docs 1-6's current rows, docs 7-12's first)
+            await col._process_job(docs_payload(range(1, 13)), sync=False)
+            steps += [list(seen), col._removed_since_sync]
+            await col._process_job(docs_payload([13]))  # the default sync=True
+            steps += [list(seen), col._removed_since_sync]
+            return steps, index_ids(col), fetch(col, "SELECT id FROM records ORDER BY id")
+        finally:
+            await col.stop()
+
+    steps, ids, records = asyncio.run(run())
+    assert steps == [
+        [6, 6], 6,  # jobs 2 and 3 each synced the 6 pending removals first: 6 + 6 > 10
+        [6, 6, 6], 0,  # the flush wrote job 3's 6 and reset the count
+        [6, 6, 6], 12,  # the count was 0, so no pre-sync: the lone job keeps all 12
+        [6, 6, 6, 12], 0,  # the next sync writes them in one go
+    ]
+    assert ids == [r[0] for r in records] and len(ids) == 13  # nothing lost, no ghost
+
+
+def test_removal_cap_lets_a_sync_carry_exactly_the_cap(tmp_path, monkeypatch):
+    # the check is "would pass the cap" (>): pending plus this job's removals may equal
+    # SYNC_MAX_REMOVALS, and that sync still carries them all in one go
+    monkeypatch.setattr(store, "SYNC_MAX_REMOVALS", 10)
+    col = make_collection(tmp_path)
+
+    async def run():
+        try:
+            await col._process_job(docs_payload(range(1, 11)))  # records 1-10, synced
+            seen = spy_sync(col)
+            await col._process_job(docs_payload(range(1, 5)), sync=False)  # 4 removals
+            await col._process_job(docs_payload(range(5, 11)), sync=False)  # 4 + 6 == 10
+            return list(seen), col._removed_since_sync
+        finally:
+            await col.stop()
+
+    assert asyncio.run(run()) == ([], 10)  # no pre-sync: the batch's sync takes all 10
+
+
+def test_sync_resets_the_removal_counter(tmp_path):
+    # every sync writes the pending removals, whoever runs it (the worker, the cap,
+    # delete_document, stop()), so every sync resets the count
+    col = make_collection(tmp_path)
+
+    async def run():
+        try:
+            await col._process_job(docs_payload([1, 2, 3]))  # records 1-3, synced
+            counts = [col._removed_since_sync]
+            await col._process_job(docs_payload([1, 2]), sync=False)  # replaces 2 rows
+            counts.append(col._removed_since_sync)
+            await asyncio.to_thread(col._sync_index)
+            counts.append(col._removed_since_sync)
+            seen = spy_sync(col)
+            await col.delete_document("d3")  # removes record 3's id, then syncs
+            counts.append(col._removed_since_sync)
+            return counts, list(seen)
+        finally:
+            await col.stop()
+
+    counts, seen = asyncio.run(run())
+    assert counts == [0, 2, 0, 0]
+    assert seen == [1]  # delete_document's _unindex counted its removal before the sync
+
+
+def test_ingest_probe_accepts_batch_flags(tmp_path, monkeypatch):
+    # Task 10 tunes N and T with the probe. Without the flags it builds the collection
+    # exactly as before, so the same file still runs on a tree without the knobs
+    probe = load_probe(monkeypatch)
+    made, real = [], probe.Collection
+
+    def spy(*args, **kw):
+        made.append(kw)
+        return real(*args, **kw)
+
+    monkeypatch.setattr(probe, "Collection", spy)
+    out = probe.main(probe_args(tmp_path, batch_jobs=3, batch_ms=250))
+    assert made == [{"sync_batch_jobs": 3, "sync_batch_ms": 250.0}]
+    assert (out["sync_batch_jobs"], out["sync_batch_ms"]) == (3, 250.0)
+    assert (out["args"]["batch_jobs"], out["args"]["batch_ms"]) == (3, 250.0)
+    assert out["jobs"] == {"done": 4}
+    made.clear()
+    out = probe.main(probe_args(tmp_path))
+    assert made == [{}]
+    assert (out["sync_batch_jobs"], out["sync_batch_ms"]) == (8, 1000.0)
+    assert out["args"]["batch_jobs"] is None and out["args"]["batch_ms"] is None
+    for bad in ({"batch_jobs": 0}, {"batch_ms": -1}):
+        with pytest.raises(SystemExit):
+            probe.main(probe_args(tmp_path, **bad))
+
+
+# ---- batched sync: worker
+
+
+def fingerprint(col):
+    """What a run leaves behind, keyed by external id so that two collections whose
+    internal ids differ still compare: every record row, every stored vector, the
+    published indexed_counts and the vector index size. Call it before stop()."""
+    return (
+        fetch(col, "SELECT external_id, doc_id, type, position, text, metadata, indexed"
+                   " FROM records ORDER BY external_id"),
+        fetch(col, "SELECT r.external_id, v.vec FROM records r JOIN vecs v ON v.id = r.id"
+                   " ORDER BY r.external_id"),
+        dict(col.indexed_counts),
+        len(col.index),
+    )
+
+
+def snapshot(col, dst):
+    """Copy the collection's directory as a crash at this instant would leave it.
+    Under db_lock no transaction is half-written. The -shm file is skipped: Windows
+    holds byte-range locks on it, and SQLite rebuilds it from the -wal on open."""
+    with col.db_lock:
+        shutil.copytree(col.dir, dst, ignore=shutil.ignore_patterns("*-shm"))
+
+
+async def run_batched(col, payloads, timeout=30):
+    """Journal every payload, then start the worker and wait until no job is open."""
+    for p in payloads:
+        await asyncio.to_thread(col._enqueue_row, p)
+    col.start_worker()
+    await drain(col, timeout)
+
+
+def reference(tmp_path, payloads, **kw):
+    """The fingerprint the same jobs leave when every job syncs on its own
+    (sync_batch_jobs=1), in a fresh collection under tmp_path / "reference"."""
+    d = tmp_path / "reference"
+    d.mkdir()
+    col = make_collection(d, sync_batch_jobs=1, **kw)
+
+    async def go():
+        try:
+            await run_batched(col, payloads)
+            return fingerprint(col)
+        finally:
+            await col.stop()
+
+    return asyncio.run(go())
+
+
+def track(col, after_job=None):
+    """Record the worker's steps, in order, in the returned list:
+    ("job", label) when a job's _process_job ends (label: the job's first doc_id,
+    or its op for an index job); ("sync", labels) when an index sync starts, with the
+    labels of the ingest jobs begun since the previous sync; ("synced",) when that
+    sync returns; ("finish", job_id, status) when a job is finished.
+    after_job(label, kw), if given, is awaited after each job that did not raise."""
+    events, since = [], []
+    real_process, real_sync, real_finish = col._process_job, col._sync_index, col._finish_job
+
+    async def process(payload, **kw):
+        docs = payload.get("documents")
+        label = docs[0]["doc_id"] if docs else payload["op"]
+        if docs:
+            since.append(label)
+        try:
+            await real_process(payload, **kw)
+        finally:
+            events.append(("job", label))
+        if after_job is not None:
+            await after_job(label, kw)
+
+    def sync():
+        events.append(("sync", list(since)))
+        since.clear()
+        real_sync()
+        events.append(("synced",))
+
+    def finish(job_id, status, error):
+        events.append(("finish", job_id, status))
+        real_finish(job_id, status, error)
+
+    col._process_job, col._sync_index, col._finish_job = process, sync, finish
+    return events
+
+
+def batches(events):
+    """The labels each index sync covered, one list per sync."""
+    return [e[1] for e in events if e[0] == "sync"]
+
+
+def late_finishes(events):
+    """Job ids finished before their data reached the index file, for runs whose job n
+    is doc "dn". Job n is on time only if a sync starts after its ("job", ...) event,
+    that sync returns, and only then is job n finished."""
+    late = []
+    for i, e in enumerate(events):
+        if e[0] != "job":
+            continue
+        n = int(e[1][1:])
+        start = next((k for k in range(i + 1, len(events)) if events[k][0] == "sync"), None)
+        end = None if start is None else next(
+            (k for k in range(start + 1, len(events)) if events[k][0] == "synced"), None)
+        fin = next((k for k, f in enumerate(events) if f[0] == "finish" and f[1] == n), None)
+        if end is None or fin is None or fin < end:
+            late.append(n)
+    return late
+
+
+def test_batch_syncs_once_for_many_jobs(tmp_path):
+    # before: every job wrote the whole index file. Now the 8 jobs of one batch share
+    # one sync, and every one of them ends 'done'
+    col = make_collection(tmp_path, sync_batch_jobs=8, sync_batch_ms=60_000)
+    events = track(col)
+
+    async def go():
+        try:
+            await run_batched(col, [docs_payload([j]) for j in range(1, 9)])
+            return list(events), fetch(col, "SELECT id, status FROM jobs ORDER BY id"), index_ids(col)
+        finally:
+            await col.stop()
+
+    events, jobs, ids = asyncio.run(go())
+    assert batches(events) == [[f"d{j}" for j in range(1, 9)]]
+    assert jobs == [(j, "done") for j in range(1, 9)]
+    assert ids == list(range(1, 9))
+
+
+def test_no_job_is_done_before_its_covering_sync(tmp_path):
+    # D8: 'done' promises that the job's rows are in the index file, so they survive a
+    # crash. Each job may finish only after a sync that began after its _process_job
+    # ended has returned
+    col = make_collection(tmp_path, sync_batch_jobs=3, sync_batch_ms=60_000)
+    events = track(col)
+
+    async def go():
+        try:
+            await run_batched(col, [docs_payload([j, j + 100]) for j in range(1, 9)])
+            return list(events), fetch(col, "SELECT status FROM jobs ORDER BY id")
+        finally:
+            await col.stop()
+
+    events, statuses = asyncio.run(go())
+    assert late_finishes(events) == []
+    assert [len(b) for b in batches(events)] == [3, 3, 2]  # two count-capped, one idle
+    assert statuses == [("done",)] * 8
+
+
+def test_idle_queue_flushes_the_open_batch(tmp_path):
+    # both caps are far away, so only the claim finding nothing can close the batch:
+    # a trickle of jobs must still reach the index file and 'done' promptly
+    col = make_collection(tmp_path, sync_batch_jobs=100, sync_batch_ms=60_000)
+    seen = spy_sync(col)
+
+    async def go():
+        try:
+            await run_batched(col, [docs_payload([j]) for j in (1, 2, 3)], timeout=10)
+            first = len(seen)
+            await col.enqueue(docs_payload([4]))  # the worker is idle: this wakes it
+            await drain(col, timeout=10)
+            return first, len(seen), fetch(col, "SELECT status FROM jobs ORDER BY id")
+        finally:
+            await col.stop()
+
+    first, second, statuses = asyncio.run(go())
+    assert (first, second) == (1, 2)  # one sync per idle flush, not one per job
+    assert statuses == [("done",)] * 4
+
+
+def test_batch_closes_at_the_time_cap(tmp_path):
+    # a batch closes once sync_batch_ms have passed since its first job joined, even
+    # with more jobs queued. Waiting out a real cap would make the test slow and
+    # timing-dependent, so after_job ages the open batch instead, as if 60 s had passed
+    aged, zero = tmp_path / "aged", tmp_path / "zero"
+    aged.mkdir()
+    zero.mkdir()
+    col = make_collection(aged, sync_batch_jobs=100, sync_batch_ms=5_000)
+
+    async def age(label, kw):
+        if label in ("d2", "d4") and getattr(col, "_batch_t0", None) is not None:
+            col._batch_t0 -= 60.0
+
+    events = track(col, after_job=age)
+    col0 = make_collection(zero, sync_batch_jobs=100, sync_batch_ms=0)
+    events0 = track(col0)
+
+    async def go():
+        try:
+            await run_batched(col, [docs_payload([j]) for j in range(1, 6)])
+            await run_batched(col0, [docs_payload([j]) for j in (1, 2, 3)])
+            return batches(events), batches(events0)
+        finally:
+            await col.stop()
+            await col0.stop()
+
+    got, got0 = asyncio.run(go())
+    assert got == [["d1", "d2"], ["d3", "d4"], ["d5"]]  # aged twice, then the idle flush
+    assert got0 == [["d1"], ["d2"], ["d3"]]  # sync_batch_ms=0: each batch closes at once
+
+
+def test_claim_cursor_processes_each_job_once(tmp_path):
+    # a batch's jobs stay 'processing' until its sync, so a claim on status alone would
+    # hand the worker its own open jobs again. The worker's cursor moves past them
+    col = make_collection(tmp_path, sync_batch_jobs=8, sync_batch_ms=60_000)
+    events = track(col)
+    claims, real_claim = [], col._claim_next
+
+    def claim(*args):
+        claims.append(args)
+        return real_claim(*args)
+
+    col._claim_next = claim
+
+    async def go():
+        try:
+            await run_batched(col, [docs_payload([j]) for j in range(1, 21)])
+            return list(claims), list(events), fetch(col, "SELECT COUNT(*) FROM records")
+        finally:
+            await col.stop()
+
+    claims, events, records = asyncio.run(go())
+    # a fresh worker starts at cursor 0, then claims above the last job it claimed
+    assert claims[:21] == [(k,) for k in range(21)]
+    assert set(claims[21:]) <= {(20,)}  # idle: nothing is open above job 20
+    assert [e[1] for e in events if e[0] == "job"] == [f"d{j}" for j in range(1, 21)]
+    assert [e[1] for e in events if e[0] == "finish"] == list(range(1, 21))
+    assert [len(b) for b in batches(events)] == [8, 8, 4]
+    assert records == [(20,)]
+
+
+def test_error_job_in_a_batch_is_isolated(tmp_path):
+    # a failing job joins the batch as 'error'. It neither aborts the batch nor
+    # finishes ahead of it, and the good jobs around it all land
+    col = make_collection(tmp_path, sync_batch_jobs=6, sync_batch_ms=60_000)
+    zero = docs_payload([3])
+    zero["documents"][0]["chunks"][0]["vector"] = [0.0] * 8  # fails in _process_job
+    for p in (docs_payload([1]), docs_payload([2]), zero):
+        col._enqueue_row(p)
+    with col.db_lock:  # job 4: a pre-2026-09 row that decodes to a list, not an object
+        col.db.execute(LEGACY_JOB, (4, "[]", "pending"))
+        col.db.commit()
+    for p in (docs_payload([5]), docs_payload([6])):
+        col._enqueue_row(p)
+    events = track(col)
+
+    async def go():
+        col.start_worker()
+        try:
+            await drain(col)
+            return (list(events), fetch(col, "SELECT id, status, error FROM jobs ORDER BY id"),
+                    fetch(col, "SELECT external_id FROM records ORDER BY external_id"))
+        finally:
+            await col.stop()
+
+    events, jobs, records = asyncio.run(go())
+    assert [e for e in events if e[0] != "job"] == [
+        ("sync", ["d1", "d2", "d3", "d5", "d6"]), ("synced",),
+        ("finish", 1, "done"), ("finish", 2, "done"), ("finish", 3, "error"),
+        ("finish", 4, "error"), ("finish", 5, "done"), ("finish", 6, "done"),
+    ]
+    assert jobs == [
+        (1, "done", None), (2, "done", None),
+        (3, "error", "zero vector cannot be normalized"),
+        (4, "error", "bad job payload: payload is a JSON list, not an object"),
+        (5, "done", None), (6, "done", None),
+    ]
+    assert records == [("c1",), ("c2",), ("c5",), ("c6",)]
+
+
+def test_index_jobs_are_batch_barriers(tmp_path, monkeypatch):
+    # attach and detach rebuild the index and write it themselves. The open batch is
+    # flushed before them, and the index job runs alone and finishes at once
+    monkeypatch.setattr(store, "IVF_MIN_ROWS", 32)
+    col = make_collection(tmp_path, sync_batch_jobs=100, sync_batch_ms=60_000)
+    payloads = [docs_payload([101]), docs_payload([102]),
+                {"op": "attach_index", "nlist": 4, "nprobe": None},
+                docs_payload([103]), {"op": "detach_index"}, docs_payload([104])]
+
+    async def go():
+        try:
+            await col._process_job(docs_payload(range(1, 65)))  # nlist 4 needs >= 32 rows
+            events = track(col)
+            await run_batched(col, payloads)
+            return (list(events), col.index_info(),
+                    fetch(col, "SELECT COUNT(*) FROM records"), len(col.index))
+        finally:
+            await col.stop()
+
+    events, info, records, size = asyncio.run(go())
+    assert events == [
+        ("job", "d101"), ("job", "d102"),
+        ("sync", ["d101", "d102"]), ("synced",), ("finish", 1, "done"), ("finish", 2, "done"),
+        ("job", "attach_index"), ("finish", 3, "done"),
+        ("job", "d103"),
+        ("sync", ["d103"]), ("synced",), ("finish", 4, "done"),
+        ("job", "detach_index"), ("finish", 5, "done"),
+        ("job", "d104"),
+        ("sync", ["d104"]), ("synced",), ("finish", 6, "done"),
+    ]
+    assert (info, records, size) == ({"type": "flat"}, [(68,)], 68)
+
+
+def test_calibration_crossing_inside_one_batch_matches_per_job(tmp_path, monkeypatch):
+    # the job that crosses CAL_THRESHOLD re-encodes the index in memory. Batched, the
+    # re-encoded index reaches the file at the batch's one sync instead of at that
+    # job's own sync, and a reopen finds the same state either way
+    monkeypatch.setattr(store, "CAL_THRESHOLD", 6)
+    monkeypatch.setattr(store, "CAL_SAMPLE", 4)
+    payloads = [docs_payload([2 * j - 1, 2 * j]) for j in range(1, 6)]  # 5 jobs, 10 rows
+
+    def run(name, n):
+        d = tmp_path / name
+        d.mkdir()
+        col = make_collection(d, sync_batch_jobs=n, sync_batch_ms=60_000)
+        col._cal_rng = np.random.default_rng(7)
+        seen = spy_sync(col)
+
+        async def go():
+            try:
+                await run_batched(col, payloads)
+                return len(seen), col.index.calibration_state
+            finally:
+                await col.stop()
+
+        syncs, live = asyncio.run(go())
+        col = make_collection(d)  # reopen: what the files hold
+        try:
+            return (syncs, live, col.index.calibration_state, col._cal_reservoir is None,
+                    fingerprint(col), index_ids(col))
+        finally:
+            asyncio.run(col.stop())
+
+    per_job, batched = run("per_job", 1), run("batched", 5)
+    assert (per_job[0], batched[0]) == (5, 1)  # the crossing (job 3) sits inside the batch
+    assert batched[1:] == per_job[1:]
+    assert batched[1:4] == ("calibrated", "calibrated", True)
+    assert batched[5] == list(range(1, 11))
+
+
+def versioned(ids, v):
+    """docs_payload(ids) with per-version text and vectors, so a replay that left an
+    older version where a newer one belongs would show in the fingerprint."""
+    p = docs_payload(ids)
+    for d, i in zip(p["documents"], ids):
+        chunk = d["chunks"][0]
+        chunk["text"], chunk["vector"] = f"text {i} v{v}", vec(1000 * v + i)
+    return p
+
+
+def crash_jobs():
+    # at cap 4, jobs 1-4 make the first batch and jobs 5-6 the second. Jobs 3, 5 and 6
+    # replace records that earlier jobs wrote, and job 6 replaces one of job 5's
+    return [versioned([1, 2, 3, 4], 1), versioned([5, 6, 7, 8], 1), versioned([2, 9], 2),
+            versioned([10, 11], 1), versioned([1, 5, 12], 2), versioned([5, 13], 3)]
+
+
+@pytest.mark.parametrize("point", ["mid_batch", "before_sync", "after_sync_before_finish"])
+def test_crash_window_replays_without_loss(tmp_path, point):
+    # wherever a crash lands inside a batch, reopening must replay the batch to the
+    # state that the same jobs leave when each one syncs on its own
+    live, image = tmp_path / "live", tmp_path / "crash"
+    live.mkdir()
+    ref = reference(tmp_path, crash_jobs())
+    col = make_collection(live, sync_batch_jobs=4, sync_batch_ms=60_000)
+    processed, finished, taken = [], [], []
+    real_process, real_sync, real_finish = col._process_job, col._sync_index, col._finish_job
+
+    def crash_here(at):
+        if at == point and not taken:
+            snapshot(col, image)
+            taken.append(at)
+
+    async def process(payload, **kw):
+        await real_process(payload, **kw)
+        processed.append(len(processed) + 1)  # job n is the n-th one processed
+        if processed[-1] == 5 and kw.get("sync") is False:
+            crash_here("mid_batch")  # job 5 committed, not synced; job 6 still pending
+
+    def sync():
+        if 6 in processed and 5 not in finished:
+            crash_here("before_sync")  # jobs 5 and 6 committed, the index file older
+        real_sync()
+
+    def finish(job_id, status, error):
+        if job_id == 5 and 6 in processed:
+            crash_here("after_sync_before_finish")  # synced, 5 and 6 still 'processing'
+        real_finish(job_id, status, error)
+        finished.append(job_id)
+
+    col._process_job, col._sync_index, col._finish_job = process, sync, finish
+
+    async def go():
+        try:
+            await run_batched(col, crash_jobs())
+            return fingerprint(col)
+        finally:
+            await col.stop()
+
+    got_live = asyncio.run(go())
+    assert taken == [point], f"the {point} crash point never occurred"
+    assert got_live == ref  # the spies change nothing
+
+    col = make_collection(image, sync_batch_jobs=4, sync_batch_ms=60_000)
+
+    async def replay():
+        try:
+            jobs = fetch(col, "SELECT id, status FROM jobs ORDER BY id")
+            col.start_worker()
+            await drain(col)
+            return (jobs, fingerprint(col), index_ids(col),
+                    fetch(col, "SELECT id FROM records WHERE indexed=1 ORDER BY id"),
+                    fetch(col, "SELECT DISTINCT status FROM jobs"),
+                    fetch(col, "SELECT COUNT(*) FROM job_payloads"))
+        finally:
+            await col.stop()
+
+    jobs, got, ids, indexed, statuses, payload_rows = asyncio.run(replay())
+    six = "pending" if point == "mid_batch" else "processing"
+    assert jobs == [(j, "done") for j in range(1, 5)] + [(5, "processing"), (6, six)]
+    assert got == ref  # no lost row, no stale version, same counts, same index size
+    assert ids == [r[0] for r in indexed]  # no ghost left in the index, none missing
+    assert statuses == [("done",)]
+    assert payload_rows == [(0,)]
+
+
+class ShardWrites:
+    """Delegating proxy for one IVF shard that logs its number j each time the shard
+    file is written (Plan F's SyncSpy pattern in tests/test_ivf_fanout.py)."""
+
+    def __init__(self, inner, log, j):
+        self.inner, self.log, self.j = inner, log, j
+
+    def __len__(self):
+        return len(self.inner)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def sync(self, path):
+        self.log.append(self.j)
+        return self.inner.sync(path)
+
+
+def shards_holding(ivf, ids):
+    """The numbers of the shards whose id maps hold any of ids."""
+    return {j for j, sh in enumerate(ivf.shards) for i in ids if sh.contains(i)}
+
+
+@pytest.mark.skipif(not hasattr(store._IvfIndex, "dirty_shards"),
+                    reason="needs Plan F's dirty-shard tracking")
+def test_batched_ivf_sync_writes_each_dirty_shard_once(tmp_path, monkeypatch):
+    # an IVF sync writes only the shards changed since the last one (Plan F). A batch
+    # of four jobs is then one sync, which writes each shard any of them touched once
+    monkeypatch.setattr(store, "IVF_MIN_ROWS", 32)
+    col = make_collection(tmp_path, sync_batch_jobs=4, sync_batch_ms=60_000)
+    payloads = [docs_payload([1, 101, 102]), docs_payload([2, 103, 104]),
+                docs_payload([105, 106, 107]), docs_payload([108, 109, 110])]
+
+    async def go():
+        try:
+            await col._process_job(docs_payload(range(1, 65)))
+            await col._process_job({"op": "attach_index", "nlist": 4, "nprobe": None})
+            ivf = col.index
+            assert isinstance(ivf, store._IvfIndex) and ivf.dirty_shards == frozenset()
+            old = [r[0] for r in fetch(
+                col, "SELECT id FROM records WHERE external_id IN ('c1', 'c2')")]
+            touched = shards_holding(ivf, old)  # re-upserting c1 and c2 removes these ids
+            wrote, flushes, real_sync = [], [], col._sync_index
+            ivf.shards = [ShardWrites(sh, wrote, j) for j, sh in enumerate(ivf.shards)]
+
+            def sync():
+                dirty, start = ivf.dirty_shards, len(wrote)
+                real_sync()
+                flushes.append((dirty, wrote[start:], ivf.dirty_shards))
+
+            col._sync_index = sync
+            await run_batched(col, payloads)
+            new = [r[0] for r in fetch(col, "SELECT id FROM records WHERE id > 64")]
+            return list(flushes), touched | shards_holding(ivf, new)
+        finally:
+            await col.stop()
+
+    flushes, touched = asyncio.run(go())
+    assert len(flushes) == 1  # four jobs, one sync
+    dirty, wrote, after = flushes[0]
+    assert dirty == frozenset(touched)  # every shard a job touched, and only those
+    assert sorted(wrote) == sorted(dirty)  # each one written exactly once
+    assert after == frozenset()
+
+
+# ---- batched sync: failure and shutdown
+
+
+class LogRecords(logging.Handler):
+    """Keeps every ERROR record logged on the logger it is added to. It sits on that
+    logger itself, so it sees them whatever propagation the logging config set."""
+
+    def __init__(self):
+        super().__init__(logging.ERROR)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+def failing_sync(col, failures):
+    """Make col._sync_index raise OSError on its first `failures` calls; later calls
+    run the real sync. Each failing call first records the jobs table as it stands
+    while the batch waits. Returns (calls, states): one entry per call, and one
+    table per failed call."""
+    calls, states, real = [], [], col._sync_index
+
+    def sync():
+        calls.append(len(calls) + 1)
+        if len(calls) <= failures:
+            states.append(fetch(col, "SELECT id, status FROM jobs ORDER BY id"))
+            raise OSError(f"disk full (sync {len(calls)})")
+        real()
+
+    col._sync_index = sync
+    return calls, states
+
+
+async def wait_for_retries(col, logs, n, timeout=10):
+    """Wait until the worker has logged n failed syncs. If the worker ended instead,
+    re-raise what ended it."""
+    deadline = time.monotonic() + timeout
+    while len(logs.records) < n:
+        if col._worker is not None and col._worker.done():
+            col._worker.result()  # re-raises the worker's exception, if any
+            pytest.fail(f"the worker exited after {len(logs.records)} logged failures")
+        assert time.monotonic() < deadline, f"{len(logs.records)} failures logged after {timeout} s"
+        await asyncio.sleep(0.01)
+
+
+def job_states(directory):
+    """The jobs table as a stopped collection left it on disk."""
+    db = sqlite3.connect(Path(directory) / "meta.db")
+    try:
+        return db.execute("SELECT id, status FROM jobs ORDER BY id").fetchall()
+    finally:
+        db.close()
+
+
+def test_sync_failure_keeps_batch_processing_and_retries(tmp_path, monkeypatch):
+    # before: a sync that raised in the flush ended the worker, and its batch sat in
+    # 'processing' until the next open. Now the batch waits in 'processing' while the
+    # worker retries with a doubling, capped delay and claims nothing new, then lands
+    monkeypatch.setattr(store, "SYNC_RETRY_MIN_S", 0.01, raising=False)
+    monkeypatch.setattr(store, "SYNC_RETRY_MAX_S", 0.04, raising=False)
+    col = make_collection(tmp_path, sync_batch_jobs=3, sync_batch_ms=60_000)
+    calls, states = failing_sync(col, 4)
+    logs = LogRecords()
+    store._log.addHandler(logs)
+
+    async def go():
+        try:
+            await run_batched(col, [docs_payload([j]) for j in range(1, 5)])
+            return (len(calls), fetch(col, "SELECT id, status FROM jobs ORDER BY id"),
+                    index_ids(col))
+        finally:
+            await col.stop()
+
+    try:
+        n_calls, jobs, ids = asyncio.run(go())
+    finally:
+        store._log.removeHandler(logs)
+    # the batch [1, 2, 3] closes at the count cap: four failed syncs, then the one that
+    # lands. Job 4 is claimed only after that, and its idle flush is the sixth sync
+    assert n_calls == 6
+    waiting = [(1, "processing"), (2, "processing"), (3, "processing"), (4, "pending")]
+    assert states == [waiting] * 4
+    assert len(logs.records) == 4
+    for r in logs.records:
+        assert r.exc_info[0] is OSError and "index sync failed" in r.getMessage()
+    assert [r.args[1] for r in logs.records] == [3] * 4  # the jobs left 'processing'
+    assert [r.args[2] for r in logs.records] == pytest.approx([0.01, 0.02, 0.04, 0.04])
+    assert jobs == [(j, "done") for j in range(1, 5)]
+    assert ids == [1, 2, 3, 4]
+
+
+def test_stop_during_sync_backoff_finishes_the_batch(tmp_path, monkeypatch):
+    # the retry waits outside the write lock: stop() takes the lock at once, cancels
+    # the wait, and syncs and finishes the batch itself instead of sitting out 30 s
+    monkeypatch.setattr(store, "SYNC_RETRY_MIN_S", 30.0, raising=False)
+    monkeypatch.setattr(store, "SYNC_RETRY_MAX_S", 30.0, raising=False)
+    col = make_collection(tmp_path, sync_batch_jobs=3, sync_batch_ms=60_000)
+    calls, states = failing_sync(col, 1)
+    logs = LogRecords()
+    store._log.addHandler(logs)
+
+    async def go():
+        for j in (1, 2, 3):
+            await asyncio.to_thread(col._enqueue_row, docs_payload([j]))
+        col.start_worker()
+        await wait_for_retries(col, logs, 1)  # the worker now waits 30 s to retry
+        t0 = time.monotonic()
+        await col.stop()
+        return time.monotonic() - t0
+
+    try:
+        took = asyncio.run(go())
+    finally:
+        store._log.removeHandler(logs)
+    assert took < 5.0
+    assert states == [[(1, "processing"), (2, "processing"), (3, "processing")]]
+    assert len(calls) == 2  # the failed flush, then stop()'s own sync
+    assert job_states(tmp_path) == [(1, "done"), (2, "done"), (3, "done")]
+    reopened = make_collection(tmp_path)
+    try:
+        assert index_ids(reopened) == [1, 2, 3]  # stop()'s sync wrote the batch's rows
+        assert reopened.pending_jobs() == 0  # nothing is left to replay
+    finally:
+        asyncio.run(reopened.stop())
+
+
+def test_a_cancel_inside_a_sync_retry_ends_the_worker(tmp_path, monkeypatch):
+    # the retry catches Exception, never BaseException: a cancel that lands while the
+    # retry waits for the write lock ends the worker. It is not logged as one more
+    # failed sync and retried. The retry's first wait is the window in which the test
+    # must take the read lock, so it is long enough for a loaded runner
+    monkeypatch.setattr(store, "SYNC_RETRY_MIN_S", 2.0, raising=False)
+    col = make_collection(tmp_path)
+    failing_sync(col, 1)
+    logs = LogRecords()
+    store._log.addHandler(logs)
+
+    async def go():
+        try:
+            await asyncio.to_thread(col._enqueue_row, docs_payload([1]))
+            col.start_worker()
+            await wait_for_retries(col, logs, 1)  # the first sync failed; the retry waits
+            async with col.lock.read():  # so the retry's lock.write() has to wait
+                deadline = time.monotonic() + 10
+                while not col.lock._writers_waiting:
+                    assert time.monotonic() < deadline, "the retry never asked for the lock"
+                    await asyncio.sleep(0.01)
+                col._worker.cancel()
+                await asyncio.wait({col._worker}, timeout=5)
+                return col._worker.cancelled(), len(logs.records)
+        finally:
+            await col.stop()
+
+    try:
+        ended, failures = asyncio.run(go())
+    finally:
+        store._log.removeHandler(logs)
+    assert (ended, failures) == (True, 1)
+    assert job_states(tmp_path) == [(1, "done")]  # stop() synced and finished the batch
+
+
+def test_stop_flushes_the_open_batch(tmp_path):
+    # RF4: stop() finishes the open batch inside B's write-locked section, after the
+    # worker's cancel and before the connections close. Jobs 1-3 are processed and
+    # wait for their batch's sync; job 4 is claimed and parked before its write section
+    live = tmp_path / "live"
+    live.mkdir()
+    payloads = [docs_payload([j]) for j in range(1, 5)]
+    col = make_collection(live, sync_batch_jobs=100, sync_batch_ms=60_000)
+    real_process, real_finish = col._process_job, col._finish_job
+    finishes = []
+
+    def finish(job_id, status, error):
+        finishes.append((job_id, col.lock._writing, col._closed))
+        real_finish(job_id, status, error)
+
+    col._finish_job = finish
+
+    async def go():
+        parked, gate = asyncio.Event(), asyncio.Event()
+
+        async def process(payload, **kw):
+            if payload["documents"][0]["doc_id"] == "d4":
+                parked.set()
+                await gate.wait()  # never set: stop() cancels the worker here
+            await real_process(payload, **kw)
+
+        col._process_job = process
+        for p in payloads:
+            await asyncio.to_thread(col._enqueue_row, p)
+        col.start_worker()
+        try:
+            await asyncio.wait_for(parked.wait(), 10)
+            return [job[0] for job in col._unsynced]
+        finally:
+            await col.stop()
+
+    assert asyncio.run(go()) == [1, 2, 3]
+    # before: jobs 1-3 stayed 'processing', and the next open ran them again
+    assert job_states(live) == [(1, "done"), (2, "done"), (3, "done"), (4, "processing")]
+    # each finish ran write-locked and before _closed (so before _close_conns)
+    assert finishes == [(1, True, False), (2, True, False), (3, True, False)]
+
+    again = make_collection(live, sync_batch_jobs=100, sync_batch_ms=60_000)
+
+    async def replay():
+        try:
+            before = index_ids(again)  # what stop()'s sync wrote
+            again.start_worker()
+            await drain(again)
+            return (before, fetch(again, "SELECT id, status FROM jobs ORDER BY id"),
+                    fingerprint(again))
+        finally:
+            await again.stop()
+
+    before, jobs, got = asyncio.run(replay())
+    assert before == [1, 2, 3]
+    assert jobs == [(j, "done") for j in range(1, 5)]  # job 4 replayed
+    assert got == reference(tmp_path, payloads)
+
+
+def test_failed_removal_cap_presync_does_not_fail_the_job(tmp_path, monkeypatch):
+    # the cap's pre-sync runs after the job's commit and before its removals and adds.
+    # Raising out of the job left it 'error' (never replayed) with committed rows the
+    # index lacked and the replaced ids still in it. Now the job goes on, and the
+    # batch's own sync writes everything
+    monkeypatch.setattr(store, "SYNC_MAX_REMOVALS", 1)
+    col = make_collection(tmp_path, sync_batch_jobs=10, sync_batch_ms=60_000)
+    calls, _ = failing_sync(col, 1)
+    seen = spy_sync(col)  # the count each sync started with, failed or not
+    logs = LogRecords()
+    store._log.addHandler(logs)
+
+    async def go():
+        try:
+            # job 2 replaces c1 (count 0, no pre-sync; then 1). Job 3 replaces c2:
+            # 1 + 1 > 1, so it pre-syncs, and that first sync fails
+            await run_batched(col, [docs_payload([1, 2]), docs_payload([1]), docs_payload([2])])
+            return (len(calls), fetch(col, "SELECT id, status, error FROM jobs ORDER BY id"),
+                    index_ids(col), fetch(col, "SELECT id FROM records ORDER BY id"),
+                    list(seen))  # before stop()'s own sync adds a third entry
+        finally:
+            await col.stop()
+
+    try:
+        n_calls, jobs, ids, records, seen = asyncio.run(go())
+    finally:
+        store._log.removeHandler(logs)
+    assert n_calls == 2  # the failed pre-sync, then the batch's idle flush
+    assert seen == [1, 2]  # the failed pre-sync left the count alone: the flush carried both
+    assert jobs == [(1, "done", None), (2, "done", None), (3, "done", None)]
+    assert ids == [r[0] for r in records] and len(ids) == 2  # no ghost, none missing
+    assert len(logs.records) == 1 and logs.records[0].exc_info[0] is OSError
+
+
+def closed_state(col):
+    """What a completed stop() leaves: the closed flag, whether the writer connection
+    still answers, how many read connections stay registered, and whether Plan F's
+    shard pool is closed (True on a tree without Plan F, which has no pool)."""
+    try:
+        col.db.execute("SELECT 1")
+        writer_open = True
+    except sqlite3.ProgrammingError:  # Cannot operate on a closed database.
+        writer_open = False
+    pool = getattr(col, "_shard_pool", None)
+    return col._closed, writer_open, len(col._read_conns), pool is None or pool._closed
+
+
+def disk_rows(directory, sql):
+    """Rows of a stopped collection's meta.db, read on a fresh connection."""
+    db = sqlite3.connect(Path(directory) / "meta.db")
+    try:
+        return db.execute(sql).fetchall()
+    finally:
+        db.close()
+
+
+def stop_with_open_batch(directory, fail):
+    """Jobs 1-3 wait in the open batch for their sync, and job 4 is claimed and parked
+    before its write section, as in test_stop_flushes_the_open_batch. Then fail(col)
+    installs a failure and returns its call list, and stop() runs. Returns those calls,
+    the open batch's job ids as stop() began, the ERROR records logged and the stopped
+    collection. A stop() that raises leaves this function."""
+    col = make_collection(directory, sync_batch_jobs=100, sync_batch_ms=60_000)
+    real_process = col._process_job
+    logs = LogRecords()
+
+    async def go():
+        parked, gate = asyncio.Event(), asyncio.Event()
+
+        async def process(payload, **kw):
+            if payload["documents"][0]["doc_id"] == "d4":
+                parked.set()
+                await gate.wait()  # never set: stop() cancels the worker here
+            await real_process(payload, **kw)
+
+        col._process_job = process
+        for j in range(1, 5):
+            await asyncio.to_thread(col._enqueue_row, docs_payload([j]))
+        col.start_worker()
+        await asyncio.wait_for(parked.wait(), 10)
+        batch = [job[0] for job in col._unsynced]
+        calls = fail(col)  # from here on only stop() syncs and finishes
+        await col.stop()
+        return calls, batch
+
+    store._log.addHandler(logs)
+    try:
+        calls, batch = asyncio.run(go())
+    finally:
+        store._log.removeHandler(logs)
+    return calls, batch, logs.records, col
+
+
+def stop_with_failing_sync(directory):
+    """stop_with_open_batch where stop()'s own index sync (the first since the open)
+    fails. The calls returned are the sync calls."""
+    return stop_with_open_batch(directory, lambda col: failing_sync(col, 1)[0])
+
+
+def test_stop_with_a_failing_sync_logs_it_and_still_closes(tmp_path):
+    # spec 3.1 D2: when stop()'s own index sync fails, stop() logs it once, completes
+    # the shutdown and raises nothing. It finishes no job: the open batch keeps
+    # 'processing' and its payloads, so the next open replays it
+    live, normal = tmp_path / "live", tmp_path / "normal"
+    live.mkdir()
+    normal.mkdir()
+    calls, batch, records, col = stop_with_failing_sync(live)  # before: OSError here
+    stopped = make_collection(normal)
+    asyncio.run(stopped.stop())  # a normal stop, to compare with
+    assert batch == [1, 2, 3]
+    assert calls == [1]  # stop()'s one sync, and it failed
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.levelno == logging.ERROR and "index sync failed in stop()" in rec.getMessage()
+    assert rec.exc_info[0] is OSError and rec.exc_info[2] is not None  # with its traceback
+    assert rec.args == ("t", 3)  # the collection, and the batch's jobs left 'processing'
+    # closed as a normal stop() closes: _closed set, the writer connection and every
+    # read connection closed, Plan F's shard pool closed
+    assert closed_state(col) == closed_state(stopped) == (True, False, 0, True)
+    assert job_states(live) == [(j, "processing") for j in range(1, 5)]
+    assert disk_rows(live, "SELECT job_id FROM job_payloads ORDER BY job_id") == [
+        (1,), (2,), (3,), (4,)]
+
+
+def test_a_failed_stop_sync_replays_on_the_next_open(tmp_path):
+    # the jobs a failed stop() sync left 'processing' replay on the next open (D8) and
+    # end 'done', with their rows in the index: none lost, no ghost
+    live = tmp_path / "live"
+    live.mkdir()
+    stop_with_failing_sync(live)  # before: OSError here
+    again = make_collection(live, sync_batch_jobs=100, sync_batch_ms=60_000)
+
+    async def replay():
+        try:
+            before = index_ids(again)  # the failed sync wrote none of the batch's rows
+            again.start_worker()
+            await drain(again)
+            return (before, fetch(again, "SELECT id, status FROM jobs ORDER BY id"),
+                    fetch(again, "SELECT COUNT(*) FROM job_payloads"), index_ids(again),
+                    fetch(again, "SELECT id FROM records WHERE indexed=1 ORDER BY id"),
+                    fingerprint(again))
+        finally:
+            await again.stop()
+
+    before, jobs, payload_rows, ids, indexed, got = asyncio.run(replay())
+    assert before == []
+    assert jobs == [(j, "done") for j in range(1, 5)]
+    assert payload_rows == [(0,)]
+    assert ids == [r[0] for r in indexed] and len(ids) == 4  # no ghost, none missing
+    assert got == reference(tmp_path, [docs_payload([j]) for j in range(1, 5)])
+
+
+def flaky_finish(col, fail_on):
+    """Make col._finish_job raise sqlite3.OperationalError (meta.db full) on the calls
+    numbered in fail_on, counting from 1, before the real finish runs; every other call
+    runs it. Returns the calls, one job id per call."""
+    calls, real = [], col._finish_job
+
+    def finish(job_id, status, error):
+        calls.append(job_id)
+        if len(calls) in fail_on:
+            raise sqlite3.OperationalError(f"database or disk is full (finish {len(calls)})")
+        real(job_id, status, error)
+
+    col._finish_job = finish
+    return calls
+
+
+def test_stop_logs_a_dead_workers_exception_and_still_closes(tmp_path):
+    # spec 3.1 D3: the batch [1, 2, 3] syncs, then the worker's finish of job 1 raises,
+    # which ends the worker (as at base). stop() logs that exception once instead of
+    # re-raising it, still flushes the rest of the batch and closes as usual. Job 1
+    # stays 'processing' with its payload, and the next open replays it
+    live = tmp_path / "live"
+    live.mkdir()
+    payloads = [docs_payload([j]) for j in range(1, 4)]
+    col = make_collection(live, sync_batch_jobs=3, sync_batch_ms=60_000)
+    calls = flaky_finish(col, {1})
+    logs = LogRecords()
+
+    async def go():
+        for p in payloads:
+            await asyncio.to_thread(col._enqueue_row, p)
+        col.start_worker()
+        done, _ = await asyncio.wait({col._worker}, timeout=10)  # never re-raises
+        assert done, "the worker is still running after 10 s"
+        left = [job[0] for job in col._unsynced]
+        await col.stop()  # before: sqlite3.OperationalError here
+        return left
+
+    store._log.addHandler(logs)
+    try:
+        left = asyncio.run(go())
+    finally:
+        store._log.removeHandler(logs)
+    assert left == [2, 3]  # job 1 was popped for its finish, which raised
+    assert calls == [1, 2, 3]  # the worker's failed finish, then stop()'s two
+    assert len(logs.records) == 1
+    rec = logs.records[0]
+    assert rec.levelno == logging.ERROR and "ingest worker had died" in rec.getMessage()
+    assert rec.exc_info[0] is sqlite3.OperationalError and rec.exc_info[2] is not None
+    assert rec.args == ("t", 2)  # the collection, and the open batch stop() flushes
+    assert closed_state(col) == (True, False, 0, True)  # what a normal stop() leaves
+    assert job_states(live) == [(1, "processing"), (2, "done"), (3, "done")]
+    assert disk_rows(live, "SELECT job_id FROM job_payloads ORDER BY job_id") == [(1,)]
+    again = make_collection(live)
+
+    async def replay():
+        try:
+            before = index_ids(again)  # the worker's sync wrote the whole batch
+            again.start_worker()
+            await drain(again)
+            return (before, fetch(again, "SELECT id, status FROM jobs ORDER BY id"),
+                    fetch(again, "SELECT COUNT(*) FROM job_payloads"), index_ids(again),
+                    fetch(again, "SELECT id FROM records WHERE indexed=1 ORDER BY id"),
+                    fingerprint(again))
+        finally:
+            await again.stop()
+
+    before, jobs, payload_rows, ids, indexed, got = asyncio.run(replay())
+    assert before == [1, 2, 3]
+    assert jobs == [(j, "done") for j in range(1, 4)]  # job 1 replayed
+    assert payload_rows == [(0,)]
+    assert ids == [r[0] for r in indexed] and len(ids) == 3  # no ghost, none missing
+    assert got == reference(tmp_path, payloads)
+
+
+def test_a_failed_finish_in_stop_is_logged_and_replays(tmp_path):
+    # spec 3.1 D3: stop()'s own sync lands, then its finish of job 1 raises (meta.db
+    # full). stop() logs it once, tries no later finish, closes as usual and raises
+    # nothing. Jobs 1-3 keep 'processing' and their payloads although the index file
+    # holds their rows, so the next open re-applies them: the same rows, no ghost
+    live = tmp_path / "live"
+    live.mkdir()
+    calls, batch, records, col = stop_with_open_batch(live, lambda c: flaky_finish(c, {1}))
+    assert batch == [1, 2, 3]
+    assert calls == [1]  # job 1's finish raised, and no later job was tried
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.levelno == logging.ERROR and "finishing jobs failed in stop()" in rec.getMessage()
+    assert rec.exc_info[0] is sqlite3.OperationalError and rec.exc_info[2] is not None
+    assert rec.args == ("t", 3)  # the collection, and the batch's jobs left 'processing'
+    assert closed_state(col) == (True, False, 0, True)  # what a normal stop() leaves
+    assert job_states(live) == [(j, "processing") for j in range(1, 5)]
+    assert disk_rows(live, "SELECT job_id FROM job_payloads ORDER BY job_id") == [
+        (1,), (2,), (3,), (4,)]
+    again = make_collection(live, sync_batch_jobs=100, sync_batch_ms=60_000)
+
+    async def replay():
+        try:
+            before = index_ids(again)  # stop()'s sync wrote the batch's rows
+            again.start_worker()
+            await drain(again)
+            return (before, fetch(again, "SELECT id, status FROM jobs ORDER BY id"),
+                    fetch(again, "SELECT COUNT(*) FROM job_payloads"), index_ids(again),
+                    fetch(again, "SELECT id FROM records WHERE indexed=1 ORDER BY id"),
+                    fingerprint(again))
+        finally:
+            await again.stop()
+
+    before, jobs, payload_rows, ids, indexed, got = asyncio.run(replay())
+    assert before == [1, 2, 3]
+    assert jobs == [(j, "done") for j in range(1, 5)]  # 1-3 re-applied, 4 replayed
+    assert payload_rows == [(0,)]
+    assert ids == [r[0] for r in indexed] and len(ids) == 4  # no ghost, none missing
+    assert got == reference(tmp_path, [docs_payload([j]) for j in range(1, 5)])
+
+
+class EmbedderStub:
+    """Stands in for a collection's embedder in stop(), which only calls aclose().
+    Records each call, one number per call; with fail=True the call then raises
+    OSError, as an HTTP client whose transport fails to close does."""
+
+    def __init__(self, fail):
+        self.fail, self.calls = fail, []
+
+    async def aclose(self):
+        self.calls.append(len(self.calls) + 1)
+        if self.fail:
+            raise OSError(f"embedder transport close failed (close {len(self.calls)})")
+
+
+def test_a_failing_embedder_close_is_logged_and_stop_goes_on(tmp_path, monkeypatch):
+    # spec 3.1 D4: the embedder's HTTP client raises as it closes. stop() logs it once
+    # and still closes F's shard pool after it; the flush and the connections before
+    # it ran as in a normal stop()
+    live = tmp_path / "live"
+    live.mkdir()
+    client = EmbedderStub(fail=True)
+
+    def fail(col):
+        monkeypatch.setattr(col, "_embedder", client)
+        return client.calls
+
+    calls, batch, records, col = stop_with_open_batch(live, fail)  # before: OSError here
+    assert batch == [1, 2, 3]
+    assert calls == [1]  # stop() closed the client once, and that raised
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.levelno == logging.ERROR
+    assert rec.getMessage() == (
+        "collection t: closing the embedder's HTTP client failed in stop(); the shutdown goes on")
+    assert rec.exc_info[0] is OSError and rec.exc_info[2] is not None  # with its traceback
+    assert rec.args == ("t", "the embedder's HTTP client")
+    assert closed_state(col) == (True, False, 0, True)  # connections and shard pool closed
+    assert job_states(live) == [(1, "done"), (2, "done"), (3, "done"), (4, "processing")]
+
+
+def test_a_failing_close_conns_is_logged_and_the_later_steps_run(tmp_path, monkeypatch):
+    # spec 3.1 D4: closing the SQLite connections raises. stop() logs it once, has set
+    # _closed before it, and still closes the embedder's client and F's shard pool
+    live = tmp_path / "live"
+    live.mkdir()
+    client = EmbedderStub(fail=False)
+
+    def fail(col):
+        calls = []
+
+        def close_conns():
+            calls.append(col.lock._writing)
+            raise sqlite3.OperationalError(
+                "unable to close due to unfinalized statements or unfinished backups")
+
+        monkeypatch.setattr(col, "_close_conns", close_conns)
+        monkeypatch.setattr(col, "_embedder", client)
+        return calls
+
+    calls, batch, records, col = stop_with_open_batch(live, fail)  # before: OperationalError here
+    try:
+        assert batch == [1, 2, 3]
+        assert calls == [True]  # called once, inside stop()'s write lock as at B
+        assert len(records) == 1
+        rec = records[0]
+        assert rec.levelno == logging.ERROR and "failed in stop()" in rec.getMessage()
+        assert rec.exc_info[0] is sqlite3.OperationalError and rec.exc_info[2] is not None
+        assert rec.args == ("t", "the SQLite connections")
+        assert client.calls == [1]  # the next step ran: the embedder's client closed
+        closed, writer_open, _, pool_closed = closed_state(col)
+        assert (closed, writer_open, pool_closed) == (True, True, True)  # meta.db still open
+    finally:
+        Collection._close_conns(col)  # B's real close
+    assert closed_state(col) == (True, False, 0, True)
+    assert job_states(live) == [(1, "done"), (2, "done"), (3, "done"), (4, "processing")]
+
+
+@pytest.mark.skipif(not hasattr(store, "_ShardPool"),
+                    reason="needs Plan F's shard pool")
+def test_a_failing_shard_pool_close_is_logged(tmp_path, monkeypatch):
+    # spec 3.1 D4: F's shard pool, the last close step, raises as it closes. stop()
+    # logs it once and returns; every earlier step ran as in a normal stop()
+    live = tmp_path / "live"
+    live.mkdir()
+    client = EmbedderStub(fail=False)
+
+    def fail(col):
+        calls = []
+
+        def close():
+            calls.append(col._closed)
+            raise RuntimeError("cannot join current thread")
+
+        monkeypatch.setattr(col._shard_pool, "close", close)
+        monkeypatch.setattr(col, "_embedder", client)
+        return calls
+
+    calls, batch, records, col = stop_with_open_batch(live, fail)  # before: RuntimeError here
+    assert batch == [1, 2, 3]
+    assert calls == [True]  # called once, after _closed, as F requires
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.levelno == logging.ERROR and "failed in stop()" in rec.getMessage()
+    assert rec.exc_info[0] is RuntimeError and rec.exc_info[2] is not None
+    assert rec.args == ("t", "the IVF shard pool")
+    assert client.calls == [1]  # the steps before it ran
+    # the pool stays open (its close raised); a flat collection's pool starts no thread
+    assert closed_state(col) == (True, False, 0, False)
+    assert job_states(live) == [(1, "done"), (2, "done"), (3, "done"), (4, "processing")]
+
+
+def test_shutdown_closes_every_collection_after_a_failed_stop(tmp_path, monkeypatch):
+    # spec 3.1 D3 and D4: no Exception leaves stop(), so shutdown() goes on past a
+    # collection whose worker died and whose embedder client fails to close, and it
+    # closes the next one and the catalog. Before, a's stop() re-raised the worker's
+    # exception, and b and the catalog stayed open
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    logs = LogRecords()
+    client = EmbedderStub(fail=True)
+
+    async def go():
+        mgr = CollectionManager(Settings(), embedder_factory=lambda cfg: None)
+        await mgr.create_collection("a", 8, 4, None, None, None)
+        await mgr.create_collection("b", 8, 4, None, None, None)
+        a, b = await mgr.touch("a"), await mgr.touch("b")  # resident, and shut, in this order
+        flaky_finish(a, {1})
+        monkeypatch.setattr(a, "_embedder", client)  # a's second close step raises
+        await a.enqueue(docs_payload([1]))  # its flush syncs, then the finish raises
+        done, _ = await asyncio.wait({a._worker}, timeout=10)
+        assert done, "a's worker is still running after 10 s"
+        await mgr.shutdown()  # before: sqlite3.OperationalError here
+        return mgr, a, b
+
+    store._log.addHandler(logs)
+    try:
+        mgr, a, b = asyncio.run(go())
+    finally:
+        store._log.removeHandler(logs)
+    assert closed_state(a) == closed_state(b) == (True, False, 0, True)
+    assert mgr.resident == {}
+    with pytest.raises(sqlite3.ProgrammingError):  # the catalog is closed too
+        mgr.catalog.execute("SELECT 1")
+    assert client.calls == [1]
+    assert len(logs.records) == 2  # a's dead worker, then a's embedder; b stopped cleanly
+    died, closing = logs.records
+    assert died.exc_info[0] is sqlite3.OperationalError and "worker had died" in died.getMessage()
+    assert died.args == ("a", 0)  # the worker had popped job 1, the batch's only job
+    assert closing.exc_info[0] is OSError and "failed in stop()" in closing.getMessage()
+    assert closing.args == ("a", "the embedder's HTTP client")  # then a's pool closed
+
+
+# ---- eviction cancelled mid-stop (issue #3)
+
+
+def test_shutdown_stops_a_collection_whose_eviction_was_cancelled(tmp_path, monkeypatch):
+    # _evict pops the collection before it awaits stop(): a cancel landing there (the
+    # app cancels housekeeping just before shutdown()) must not leave it open with
+    # nothing left to close it. shutdown() waits for that stop() before the catalog
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+
+    async def go():
+        mgr = CollectionManager(Settings(), embedder_factory=lambda cfg: None)
+        await mgr.create_collection("m", 8, 4, None, None, None)
+        col = await mgr.touch("m")
+        async with col.lock.read():  # so stop()'s lock.write() has to wait
+            ev = asyncio.create_task(mgr._evict("m"))
+            deadline = time.monotonic() + 10
+            while not col.lock._writers_waiting:
+                assert time.monotonic() < deadline, "stop() never asked for the lock"
+                await asyncio.sleep(0.01)
+            ev.cancel()
+            sh = asyncio.create_task(mgr.shutdown())
+            await asyncio.sleep(0.05)
+            early = (sh.done(), col._closed)
+        await asyncio.wait({ev, sh}, timeout=10)
+        sh.result()  # shutdown() finished and raised nothing
+        with pytest.raises(sqlite3.ProgrammingError):
+            mgr.catalog.execute("SELECT 1")
+        return early, ev.cancelled(), closed_state(col), mgr.resident
+
+    early, cancelled, state, resident = asyncio.run(go())
+    assert early == (False, False)  # shutdown() waits for the stop() still running
+    assert cancelled  # the eviction's caller still sees its cancel
+    assert state == (True, False, 0, True)
+    assert resident == {}
+
+
+def test_a_cancelled_eviction_keeps_the_load_lock_until_stop_ends(tmp_path, monkeypatch):
+    # the cancelled caller re-raises only once stop() ends, even when cancelled twice,
+    # so its _load_lock covers the whole close: a touch() queued behind it cannot
+    # reopen the directory beside a collection still closing
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+
+    async def go():
+        mgr = CollectionManager(Settings(), embedder_factory=lambda cfg: None)
+        try:
+            await mgr.create_collection("m", 8, 4, None, None, None)
+            col = await mgr.touch("m")
+
+            async def evict():  # as housekeeping evicts: under _load_lock
+                async with mgr._load_lock:
+                    await mgr._evict("m")
+
+            async with col.lock.read():  # so stop()'s lock.write() has to wait
+                ev = asyncio.create_task(evict())
+                deadline = time.monotonic() + 10
+                while not col.lock._writers_waiting:
+                    assert time.monotonic() < deadline, "stop() never asked for the lock"
+                    await asyncio.sleep(0.01)
+                ev.cancel()
+                await asyncio.sleep(0.01)  # into _evict's wait loop
+                ev.cancel()  # a second cancel must not end that wait either
+                again = asyncio.create_task(mgr.touch("m"))
+                await asyncio.sleep(0.05)
+                early = (ev.done(), again.done(), col._closed)
+            col2 = await asyncio.wait_for(again, 10)
+            await asyncio.wait({ev}, timeout=10)
+            return early, ev.cancelled(), col2 is not col, closed_state(col)
+        finally:
+            await mgr.shutdown()
+
+    early, cancelled, reloaded, state = asyncio.run(go())
+    assert early == (False, False, False)  # the cancelled eviction still holds the lock
+    assert cancelled
+    assert reloaded  # touch() loaded the collection anew, once the old one had closed
+    assert state == (True, False, 0, True)
+
+
+# ---- ADR 0001 addendum: D2 DGX results
+
+D2_RESULTS = "### Results " + chr(0x2014) + " DGX A/B (D2)"
+
+
+def adr_d2_results():
+    """(the D2 results subsection with \\r\\n normalized, its Measurements JSON or {}).
+    The subsection ends at the next ### or ## heading, or at the end of the file."""
+    adr = Path(__file__).resolve().parents[1] / "docs" / "adr" / "0001-performance-optimization-decisions.md"
+    text = adr.read_text(encoding="utf-8").replace("\r\n", "\n")
+    start = text.index(D2_RESULTS)
+    ends = [i for i in (text.find("\n### ", start + 1), text.find("\n## ", start + 1)) if i != -1]
+    section = text[start:min(ends, default=len(text))]
+    fence = "`" * 3
+    if "#### Measurements (D2)" not in section or fence + "json\n" not in section:
+        return section, {}
+    raw = section.split(fence + "json\n", 1)[1].split("\n" + fence, 1)[0]
+    return section, json.loads(raw)
+
+
+def test_adr_ingest_path_d2_results_pass_the_gates(monkeypatch):
+    """Spec sections 6 and 7 D for D2 on gn100: N and T chosen on seed 7; on seed 42, ingest
+    vec/s beyond the band on IVF nlist 256 and not worse on flat, every job done with no
+    payload row left, one final state across arms; and the shipped defaults are the choice."""
+    import inspect
+    import statistics
+
+    section, m = adr_d2_results()
+    assert "Pending:" not in section
+    assert "#### Measurements (D2)" in section and m, "no Measurements (D2) JSON block"
+    assert sorted(m) == ["base_sha", "bench", "cand_sha", "date", "gates", "labels", "probe", "tuning"]
+    assert m["base_sha"] != m["cand_sha"]
+
+    def gain_band(base, cand, floor=1.0):  # Plan A's rule: band = max(both spreads, resolution)
+        band = max(max(base) - min(base), max(cand) - min(cand), floor)
+        return statistics.median(cand) - statistics.median(base), band
+
+    def labelled(lab):  # spec section 6: each row names its regime, cap, sqlite and BLAS threads
+        return (lab["regime"] == ["host-warm, uncapped host process"] and bool(lab["cap"])
+                and lab["openblas_num_threads"] == ["1"] and len(lab["sqlite_version"]) == 1)
+
+    # seed 7: four pairs x 3 runs per mode, and a batched choice that beats (1, 0) on ivf256
+    t = m["tuning"]
+    assert t["seed"] == 7 and t["complete"] and t["fingerprints_equal"] and t["labels_ok"]
+    assert sorted(t["pairs"]) == ["n1-t0", "n32-t1000", "n32-t4000", "n8-t1000"]
+    assert all(len(p[mode]) == 3 for p in t["pairs"].values() for mode in ("flat", "ivf256"))
+    n, ms = t["choice"]
+    assert (n, ms) != (1, 0), "the choice must batch"
+    ref, pick = t["pairs"]["n1-t0"], t["pairs"][f"n{n}-t{ms}"]
+    gain, band = gain_band(ref["ivf256"], pick["ivf256"])
+    assert gain > band and pick["ivf256_vs_ref"] == "better", "seed 7: the ivf256 gain is within the band"
+    gain, band = gain_band(ref["flat"], pick["flat"])
+    assert -gain <= band and pick["flat_vs_ref"] in ("better", "within band"), "seed 7: flat is worse"
+    assert f"Chosen: SYNC_BATCH_JOBS={n}, SYNC_BATCH_MS={ms}.\n" in section
+    assert labelled(m["labels"]["tune"])
+
+    # seed 42: base (main after D1, E and F) against D2 at the chosen defaults
+    for mode in ("flat", "ivf256"):
+        p = m["probe"][mode]
+        assert len(p["base"]) == 3 and len(p["cand"]) == 3, mode
+        assert p["fingerprints_equal"] and p["jobs_all_done"], mode
+        assert set(p["payload_rows"]["base"]) == {0} and set(p["payload_rows"]["cand"]) == {0}, mode
+        assert f"- PASS: D2-{mode}\n" in section
+    ivf, flat = m["probe"]["ivf256"], m["probe"]["flat"]
+    gain, band = gain_band(ivf["base"], ivf["cand"])
+    assert gain > band and ivf["verdict"] == "better", "probe ivf256: the gain is within the band"
+    gain, band = gain_band(flat["base"], flat["cand"])
+    assert -gain <= band and flat["verdict"] in ("better", "within band"), "probe flat: worse"
+    assert labelled(m["labels"]["probe"])
+    b = m["bench"]
+    if b is None:  # probe-only window, or not enough time left for the reingests
+        assert "Not run: the bench reingest" in section and "- SKIP: D2-bench\n" in section
+    else:
+        assert len(b["base"]) == 2 and len(b["cand"]) == 2 and len(b["runs"]) == 4
+        gain, band = gain_band(b["base"], b["cand"])
+        assert -gain <= band and b["verdict"] in ("better", "within band"), "bench reingest: worse"
+        for name, run in b["runs"].items():
+            assert set(run["jobs"]) == {"done"} and run["payload_rows"] == 0, name  # no error job
+        lb = m["labels"]["bench"]
+        assert lb["regime"] == ["host-warm"] and lb["cap"] == ["4g"] and lb["openblas_num_threads"] == ["1"]
+        assert all(len(v) == 1 for v in lb["sqlite_version"].values())
+        assert "- PASS: D2-bench\n" in section
+    for gate in ("D2-run", "D2-tuning", "D2-fingerprints", "D2-jobs", "D2-labels"):
+        assert f"- PASS: {gate}\n" in section, gate
+    assert "- FAIL:" not in section
+
+    # what ships is what was measured: the defaults and the documented rows are the choice
+    monkeypatch.delenv("SYNC_BATCH_JOBS", raising=False)
+    monkeypatch.delenv("SYNC_BATCH_MS", raising=False)
+    s = Settings()
+    assert (s.sync_batch_jobs, s.sync_batch_ms) == (n, float(ms))
+    params = inspect.signature(Collection).parameters
+    assert (params["sync_batch_jobs"].default, params["sync_batch_ms"].default) == (n, float(ms))
+    root = Path(__file__).resolve().parents[1]
+    for doc in ("README.md", "docs/getting-started.md"):
+        text = (root / doc).read_text(encoding="utf-8")
+        assert f"| `SYNC_BATCH_JOBS` | `{n}` |" in text and f"| `SYNC_BATCH_MS` | `{ms}` |" in text, doc

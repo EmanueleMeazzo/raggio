@@ -47,7 +47,7 @@ Probe tooling referenced here is committed under `bench/`.
 
 - turbovec is an external dependency — kernel changes (SIMD, ANN, multi-partition search) are out of scope; everything layers on `IdMapIndex`. *Partly superseded by ADR 0005: upstream turbovec proposals are in scope; raggio still carries no turbovec kernel code and never forks it (first-party native code: ADR 0004).*
 - Remaining known headroom needs one of: an ANN index in the kernel, more CPUs, or free-threaded Python. Application-level paths are exhausted as of this ADR. *Withdrawn by ADR 0005: parallel IVF shard fan-out was an untried application-level path.*
-- Ingest throughput has a known lever if it ever matters: batch index syncs / vacuum every N jobs instead of per job (`ponytail:` comment in `store.py`).
+- Ingest index syncs are batched: one sync covers up to `SYNC_BATCH_JOBS` jobs or `SYNC_BATCH_MS` ms, and a job turns `done` only after that sync. The full vacuum waits for an idle queue. See "Addendum 2026-09 — ingest path" below.
 
 ## Addendum 2026-09 — concurrency correctness
 
@@ -150,7 +150,7 @@ Date: 2026-09-30 · Plan D, phase D1, of the 2026-09-28 performance program (`do
 | A failure after the commit (`add_with_ids`, calibration) | **Unchanged (known gap)** | It still leaves an `error` job whose committed rows are missing from the index. `_reconcile_ghosts` only evicts; it never re-adds |
 | Vacuum policy: a full `incremental_vacuum` only when no job is open. While jobs are open, a finish that sees `VACUUM_FREELIST_PAGES` (16,384 pages, 64 MB at 4 KiB) or more trims the freelist back to `VACUUM_FREELIST_PAGES − VACUUM_CHUNK_PAGES` (`VACUUM_CHUNK_PAGES` = 2,048, so 14,336 pages). Both pragmas are drained with `.fetchall()` | **Accepted** | Per-job vacuum with the side table cost 38–54 ms; idle-only, 7–20 ms. A fixed-size chunk would let the freelist grow whenever a job frees more than one chunk |
 | `bench/ingest_probe.py`, an in-process drain benchmark (flat and IVF) that also runs in the base tree | **Accepted (tooling)** | `bench.py` never ingests into an IVF collection: `--engine raggio-ivf --reingest` only rebuilds the index. Probe rows are labelled host-warm, uncapped host process |
-| Batched index syncs (the lever in the standing constraints above) | **Deferred to D2** | D1 keeps one sync per job. Prototype, laptop: base 468–483 → + binary journal 810–849 → + set-based upsert 815–955 → + vacuum policy 995–1046 vec/s (flat); IVF nlist 64: 254 → 408 vec/s. Every variant's final state was identical to base |
+| Batched index syncs (the lever in the standing constraints above) | **Deferred to D2** | D1 keeps one sync per job. Prototype, laptop: base 468–483 → + binary journal 810–849 → + set-based upsert 815–955 → + vacuum policy 995–1046 vec/s (flat); IVF nlist 64: 254 → 408 vec/s. Every variant's final state was identical to base; done in D2, see "Batched sync (D2)" below |
 
 ### Results — DGX A/B (D1)
 
@@ -395,6 +395,415 @@ Run 2026-09-30 on gn100 (NVIDIA DGX Spark, GB10 Grace, 20 aarch64 cores), base `
   },
   "overrides": {
     "D1-ivf256": "by the maintainer on 2026-10-01. The gate fails as written: the gain (78.5 vec/s) is within the band (98.7). Every cand run beat every base run (611.7, 612.0, 710.4 against 505.0, 533.5, 535.2), and the fast third cand run alone sets the band. D1 ships on that evidence; the gate is not loosened, and the session was not rerun."
+  }
+}
+```
+
+### Batched sync (D2)
+
+Date: 2026-10-02 · Plan D, phase D2. It replaces the "Deferred to D2" row above: D1 kept one index sync per job. Direction from the item2a research (laptop): turbovec v7 writes appends whole and keeps each removal as a header redo op until the next sync, which rewrites the 32-row unit; past 1024 ops a sync rewrites the whole file through a temp file and a rename (about 7 µs per row). A flat sync costs 7–9 ms (laptop), about 15 % of a flat job on gn100 after D1 (about 0.05 s per 250-row job). An IVF sync writes only the shards a job dirtied (Plan F), at about 8 ms per shard (laptop, nlist 64). One 250-row job of evenly spread rows dirties about 160 of 256 shards and a batch of 8 jobs nearly all 256, so one batched sync writes about a fifth of the shards that 8 per-job syncs write (an estimate, not measured; a whole IVF probe job took 0.35–0.41 s on gn100 after D1). The knob defaults are chosen on seed 7 and published on seed 42 (spec §6), under "Results — DGX A/B (D2)" below. Every row is pinned by `tests/test_ingest_path.py`.
+
+| Decision | Verdict | Evidence / rationale |
+|---|---|---|
+| One index sync per batch of ingest jobs. A batch closes when it holds `SYNC_BATCH_JOBS` jobs (default 8), when `SYNC_BATCH_MS` ms (default 1000) have passed since its first job joined, when the queue goes idle, before an attach or detach job (which then runs alone), and in `stop()`. `SYNC_BATCH_JOBS=1` syncs after every job, as D1 did | **Accepted** | Per-job syncs are a large part of IVF ingest: in the laptop prototype (nlist 64) batching doubled IVF ingest, 404 → 802 vec/s. The seed-7 grid (1, 0), (8, 1000), (32, 1000), (32, 4000) in the results below picks the defaults. On the probe's job mix every fifth job replaces 250 rows, so the removal cap adds a sync about every 10 jobs (the batch stays open, and its jobs still finish together), and the (32, *) pairs sync at least that often |
+| Done-after-sync: a job's rows are committed and indexed in memory, and the job stays `processing` until the sync that covers it returns. The batch's jobs then finish in order, `error` jobs included | **Accepted** | No job reads `done` before its vectors are on disk. A crash before the batch's sync returns leaves all of its jobs `processing`, and a crash during its finishes leaves the unfinished rest `processing`. The idempotent replay redoes them. A document deleted or patched after a job that wrote it ran, but before that job is `done`, comes back or reverts if the job replays (a crash, or a shutdown whose sync fails): the replay re-runs the job (spec §3 D8). Batching widens this window from one finish to up to `SYNC_BATCH_MS` plus one job. |
+| Claim cursor: the claim adds `AND id > ?` to its `INDEXED BY idx_jobs_open` query, so the worker never re-claims its own `processing` jobs | **Accepted** | A batch's jobs stay `processing` until its sync |
+| Removal cap: no sync carries more than `SYNC_MAX_REMOVALS` (512) removals accumulated across a batch's jobs. The job that would pass it syncs first, after its own commit. A lone job over the cap is not split | **Accepted** | Removals pile up as header ops; past 1024 ops the sync becomes a full-file rewrite, extrapolated at about 20 s under the collection's write lock at 2.55M rows |
+| A failed sync is logged and retried after `SYNC_RETRY_MIN_S` (1 s), doubling up to `SYNC_RETRY_MAX_S` (30 s). Meanwhile the batch's jobs stay `processing` and the worker claims nothing new; the wait holds no lock. A failed removal-cap pre-sync is logged, and the job goes on | **Accepted (bug fix)** | Before, a sync that raised failed its job as `error`: terminal, never replayed, with committed rows missing from the index file |
+| `stop()` syncs the open batch and finishes its jobs. If that sync fails, `stop()` logs it and completes the shutdown without raising: it finishes nothing, the jobs stay `processing` with their payloads, and the next open replays them. A dead worker's exception is logged the same way, and `stop()` still syncs and finishes its open batch; only a job the worker was finishing when it died stays `processing` and replays. A finish that fails after `stop()`'s sync landed is logged too, and no later finish is tried: that job and the rest of the batch stay `processing` and replay. A failure to close the SQLite connections, the embedding client or the IVF shard pool is logged, and the next close step still runs | **Accepted** | A clean shutdown finishes what it synced; a failing index file, meta.db or close step never stops a shutdown half-way, so every collection and the catalog close, and the journal carries the unfinished jobs to the next open |
+| Several jobs per SQLite transaction | **Still rejected** | Each job keeps its own transaction and its own finish; only the index sync is shared |
+
+### Results — DGX A/B (D2)
+
+#### Measurements (D2)
+
+Tuning run 2026-10-02 on gn100 (NVIDIA DGX Spark, GB10 Grace, 20 aarch64 cores), D2 tree `8976da3ea121` only: `bench/ingest_probe.py --seed 7 --prefill 100000 --jobs 200 --job-rows 250 --batch-jobs N --batch-ms T` with `--ivf 0` and `--ivf 256`, one discarded (8, 1000) run0 and then 3 rounds per mode, each running the four pairs, the order rotating by round (round r starts at pair r mod 4). Values are ingest vec/s. (1, 0) syncs after every job, as D1 did. Band = max(max - min of each side, 1 vec/s); a claim needs gain > band.
+
+| SYNC_BATCH_JOBS | SYNC_BATCH_MS | Regime | Cap | sqlite_version | python | OPENBLAS_NUM_THREADS | flat (3 runs) | flat median | flat vs (1, 0) | ivf256 (3 runs) | ivf256 median | ivf256 vs (1, 0) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 0 | host-warm, uncapped host process | none (uncapped host process) | 3.53.1 | 3.12.14 | 1 | 4765.7, 4855.0, 4678.4 | 4765.7 | reference | 845.8, 788.8, 839.6 | 839.6 | reference |
+| 8 | 1000 | host-warm, uncapped host process | none (uncapped host process) | 3.53.1 | 3.12.14 | 1 | 4953.9, 5459.1, 5159.8 | 5159.8 | within band | 2237.2, 2342.1, 2265.3 | 2265.3 | better |
+| 32 | 1000 | host-warm, uncapped host process | none (uncapped host process) | 3.53.1 | 3.12.14 | 1 | 4838.2, 5332.2, 5456.0 | 5332.2 | within band | 2104.3, 2263.4, 2219.2 | 2219.2 | better |
+| 32 | 4000 | host-warm, uncapped host process | none (uncapped host process) | 3.53.1 | 3.12.14 | 1 | 5149.2, 5443.9, 5322.4 | 5322.4 | better | 2305.5, 2455.0, 2931.5 | 2455.0 | better |
+
+Chosen: SYNC_BATCH_JOBS=8, SYNC_BATCH_MS=1000.
+
+Publish run 2026-10-02: base `cdfbcbc6baed` (main after D1, E and F) against cand `6d164712cdd6` (D2 at the chosen defaults). Probe rows: `bench/ingest_probe.py --seed 42 --prefill 100000 --jobs 200 --job-rows 250` with `--ivf 0` and `--ivf 256`, each arm running its own tree with D2's probe, one discarded base run0 and then 3 interleaved rounds per mode. Bench row: `bench.py --limit 2549619 --engine raggio --reingest` (2,549,119 x 1024) in the order base, cand, base, cand, each in a fresh 4 GiB container. D2-flat and D2-bench need not worse (better or within band); D2-ivf256 needs better.
+
+| Row | Regime | Cap | sqlite_version | OPENBLAS_NUM_THREADS | base median | cand median | gain | band | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| probe flat | host-warm, uncapped host process | none (uncapped host process) | 3.53.1 | 1 | 4829.7 | 5163.8 | 334.1 | 346.1 | within band |
+| probe ivf256 | host-warm, uncapped host process | none (uncapped host process) | 3.53.1 | 1 | 851.6 | 2235.3 | 1383.7 | 46.0 | better |
+| bench reingest | host-warm | 4g | base 3.53.1, cand 3.53.1 | 1 | 3049.1 | 3114.9 | 65.9 | 32.9 | better |
+
+Interpreters: the probe rows ran in the host venv (CPython 3.12.14, SQLite 3.53.1), the same for both arms and for the tuning. The bench rows ran in the images (CPython 3.12.15, SQLite 3.53.1), the same for both arms.
+
+IVF reference: the base arm's ivf256 probe median is 851.6 vec/s, next to 612.0 vec/s for D1's tree in D1's A/B. The base arm now also carries E and F, so the difference shows whether F's dirty-shard sync moves per-job IVF ingest. Not gated.
+
+Min to max over the runs of each arm (the band is set by one run):
+- probe flat: base 4728.3 to 5074.4, cand 5061.2 to 5254.7 vec/s
+- probe ivf256: base 808.7 to 854.7, cand 2204.4 to 2236.0 vec/s
+- bench reingest: base 3032.8 to 3065.3, cand 3098.5 to 3131.4 vec/s
+- Memory after ingest (MB): base 613.9, 578.0, cand 1524.0, 1649.0
+- Memory under load (MB): base 1554.0, 1546.0, cand 1555.0, 1652.0
+
+Not measured: search latency during batched ingest.
+
+D2 does not re-claim the flat or reingest gains that D1 claimed: D2's flat and bench gates only require not worse (better or within band).
+
+- PASS: D2-run
+- PASS: D2-tuning
+- PASS: D2-flat
+- PASS: D2-ivf256
+- PASS: D2-fingerprints
+- PASS: D2-jobs
+- PASS: D2-bench
+- PASS: D2-labels
+
+```json
+{
+  "date": "2026-10-02",
+  "base_sha": "cdfbcbc6baed",
+  "cand_sha": "6d164712cdd6",
+  "tuning": {
+    "seed": 7,
+    "pairs": {
+      "n1-t0": {
+        "flat": [
+          4765.7,
+          4855.0,
+          4678.4
+        ],
+        "flat_median": 4765.7,
+        "ivf256": [
+          845.8,
+          788.8,
+          839.6
+        ],
+        "ivf256_median": 839.6,
+        "flat_vs_ref": "reference",
+        "ivf256_vs_ref": "reference"
+      },
+      "n8-t1000": {
+        "flat": [
+          4953.9,
+          5459.1,
+          5159.8
+        ],
+        "flat_median": 5159.8,
+        "ivf256": [
+          2237.2,
+          2342.1,
+          2265.3
+        ],
+        "ivf256_median": 2265.3,
+        "flat_vs_ref": "within band",
+        "ivf256_vs_ref": "better"
+      },
+      "n32-t1000": {
+        "flat": [
+          4838.2,
+          5332.2,
+          5456.0
+        ],
+        "flat_median": 5332.2,
+        "ivf256": [
+          2104.3,
+          2263.4,
+          2219.2
+        ],
+        "ivf256_median": 2219.2,
+        "flat_vs_ref": "within band",
+        "ivf256_vs_ref": "better"
+      },
+      "n32-t4000": {
+        "flat": [
+          5149.2,
+          5443.9,
+          5322.4
+        ],
+        "flat_median": 5322.4,
+        "ivf256": [
+          2305.5,
+          2455.0,
+          2931.5
+        ],
+        "ivf256_median": 2455.0,
+        "flat_vs_ref": "better",
+        "ivf256_vs_ref": "better"
+      }
+    },
+    "choice": [
+      8,
+      1000
+    ],
+    "complete": true,
+    "fingerprints_equal": true,
+    "labels_ok": true
+  },
+  "probe": {
+    "flat": {
+      "base": [
+        4829.7,
+        5074.4,
+        4728.3
+      ],
+      "cand": [
+        5254.7,
+        5163.8,
+        5061.2
+      ],
+      "base_median": 4829.7,
+      "cand_median": 5163.8,
+      "gain": 334.1,
+      "band": 346.1,
+      "verdict": "within band",
+      "drain_s": {
+        "base": [
+          10.35,
+          9.85,
+          10.57
+        ],
+        "cand": [
+          9.52,
+          9.68,
+          9.88
+        ]
+      },
+      "loop_stall_s": {
+        "base": [
+          0,
+          0,
+          0
+        ],
+        "cand": [
+          0,
+          0,
+          0
+        ]
+      },
+      "payload_rows": {
+        "base": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "cand": [
+          0,
+          0,
+          0
+        ]
+      },
+      "complete": true,
+      "fingerprints_equal": true,
+      "jobs_all_done": true
+    },
+    "ivf256": {
+      "base": [
+        854.7,
+        851.6,
+        808.7
+      ],
+      "cand": [
+        2204.4,
+        2235.3,
+        2236.0
+      ],
+      "base_median": 851.6,
+      "cand_median": 2235.3,
+      "gain": 1383.7,
+      "band": 46.0,
+      "verdict": "better",
+      "drain_s": {
+        "base": [
+          58.5,
+          58.71,
+          61.83
+        ],
+        "cand": [
+          22.68,
+          22.37,
+          22.36
+        ]
+      },
+      "loop_stall_s": {
+        "base": [
+          0,
+          0,
+          0
+        ],
+        "cand": [
+          0,
+          0,
+          0
+        ]
+      },
+      "payload_rows": {
+        "base": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "cand": [
+          0,
+          0,
+          0
+        ]
+      },
+      "complete": true,
+      "fingerprints_equal": true,
+      "jobs_all_done": true
+    }
+  },
+  "bench": {
+    "base": [
+      3065.3,
+      3032.8
+    ],
+    "cand": [
+      3098.5,
+      3131.4
+    ],
+    "base_median": 3049.1,
+    "cand_median": 3114.9,
+    "gain": 65.9,
+    "band": 32.9,
+    "verdict": "better",
+    "runs": {
+      "base-run1": {
+        "ingest_s": 831.6,
+        "jobs": {
+          "done": 10197
+        },
+        "payload_rows": 0,
+        "freelist": 0
+      },
+      "base-run2": {
+        "ingest_s": 840.5,
+        "jobs": {
+          "done": 10197
+        },
+        "payload_rows": 0,
+        "freelist": 0
+      },
+      "cand-run1": {
+        "ingest_s": 822.7,
+        "jobs": {
+          "done": 10197
+        },
+        "payload_rows": 0,
+        "freelist": 0
+      },
+      "cand-run2": {
+        "ingest_s": 814.1,
+        "jobs": {
+          "done": 10197
+        },
+        "payload_rows": 0,
+        "freelist": 0
+      }
+    },
+    "mem_after_ingest_mb": {
+      "base": [
+        613.9,
+        578.0
+      ],
+      "cand": [
+        1524.0,
+        1649.0
+      ]
+    },
+    "mem_under_load_mb": {
+      "base": [
+        1554.0,
+        1546.0
+      ],
+      "cand": [
+        1555.0,
+        1652.0
+      ]
+    }
+  },
+  "labels": {
+    "tune": {
+      "regime": [
+        "host-warm, uncapped host process"
+      ],
+      "sqlite_version": [
+        "3.53.1"
+      ],
+      "openblas_num_threads": [
+        "1"
+      ],
+      "turbovec": [
+        "1.0.0"
+      ],
+      "python": [
+        "3.12.14"
+      ],
+      "cap": [
+        "none (uncapped host process)"
+      ]
+    },
+    "probe": {
+      "regime": [
+        "host-warm, uncapped host process"
+      ],
+      "sqlite_version": [
+        "3.53.1"
+      ],
+      "openblas_num_threads": [
+        "1"
+      ],
+      "turbovec": [
+        "1.0.0"
+      ],
+      "python": [
+        "3.12.14"
+      ],
+      "cap": [
+        "none (uncapped host process)"
+      ]
+    },
+    "bench": {
+      "regime": [
+        "host-warm"
+      ],
+      "cap": [
+        "4g"
+      ],
+      "openblas_num_threads": [
+        "1"
+      ],
+      "sqlite_version": {
+        "base": [
+          "3.53.1"
+        ],
+        "cand": [
+          "3.53.1"
+        ]
+      },
+      "python": {
+        "base": [
+          "3.12.15"
+        ],
+        "cand": [
+          "3.12.15"
+        ]
+      }
+    }
+  },
+  "gates": {
+    "D2-run": "PASS",
+    "D2-tuning": "PASS",
+    "D2-flat": "PASS",
+    "D2-ivf256": "PASS",
+    "D2-fingerprints": "PASS",
+    "D2-jobs": "PASS",
+    "D2-bench": "PASS",
+    "D2-labels": "PASS"
   }
 }
 ```
