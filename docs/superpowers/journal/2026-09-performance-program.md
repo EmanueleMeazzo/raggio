@@ -1279,6 +1279,65 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
 - **Cleanup.** E's worktree was removed and its branch deleted, after `git merge-base --is-ancestor` showed it in `origin/main`. The deploy worktree was removed after the append. gn100 is idle: `bench-tv` is stopped and no probe container is left. E's ledger is archived, and its hand-offs to F, D2 and G are in a scratch file for their pre-flights.
 - **Still open.** The image and CI pin Rust 1.98.1, because `rust:1.99.0-slim-trixie` still returned 404 at 23:15Z (X8). The two issue drafts from the final review are for the maintainer to post or drop (X9). Plan F is next.
 
+### 2026-10-02
+
+**About 23:20Z (2026-10-01)–00:03Z. Plan F's pre-flight: two stale snippets in Task 1, a deploy that would ship CRLF, and a memory gate that would read the wrong peak.**
+- **The workflow** (wf_a311d9d7-089) ran 7 Sonnet agents with 0 errors and finished at 23:54Z:
+  - a version scan (W-11);
+  - two drift scans, one for Tasks 1–5 and one for Tasks 6–10;
+  - a DGX scan of Tasks 9 and 10;
+  - a consistency scan against the spec, the hand-offs into and out of F, and the decision register;
+  - a replay of Tasks 1–9 on a scratch copy of `main` at fa0fa9f, in two stages.
+- **What the replay found.**
+  - P = 398 with the extension. Every RED and GREEN step behaved as written. The file counts were the plan's 15, 20, 22, 24, 29, 32 and 33, and the suite totals were P+15 to P+33 (413 to 431). Without the extension, the suite after Task 7 gave 363 passed and 68 skipped.
+  - Every anchor in Tasks 2–7 matched exactly once.
+  - Each of the five Review Focus pins failed on its mutation and passed without it. Pin 3, which the plan calls "traced, not re-run", was re-run: with the empty-allowlist check removed, the test fails with turbovec's `ValueError: allowlist is empty`.
+  - Task 8's NEON repro ran in about 4.5 s, not the plan's 30 s. It printed a per-query cost against nq=1 of 0.63, 0.46 and 0.39 at nq = 2, 3 and 4.
+  - Task 9's script check passed on the workstation in 1.9 s.
+- **Two stale snippets in Task 1 (F-R1, F-R2).**
+  - The plan's `train` call draws the training sample inside `build()`. Plan C moved that draw out of `build()` and frees the sample after training. Pasting the plan's block would undo C's memory release. Ruling: append only `pool=self._shard_pool,` to the existing call.
+  - Since plan C, `CollectionManager._construct` builds the `Collection`, not `touch()`. The new keyword goes on the line right after `native_bm25=...`, because D2 anchors on that order.
+- **The deploy would have shipped CRLF (F-R16).**
+  - The workstation checks files out with CRLF (`autocrlf=true`). Task 10's plain `git archive` carries those CRs: 57 in the Dockerfile and 2,387 in `store.py`.
+  - Plan A's `deploy.sh` already archives with `core.autocrlf=false` (section 2, 2026-09-28), but Task 10 bypassed it.
+  - Ruling: deploy both commits with `deploy.sh` from a detached worktree, as plan E did. Then re-sync the host venv on uv-managed CPython 3.12.
+- **The memory gate would have measured a restart (F-R17, section 5.23).**
+- **The A/B script gains the controller's guards (F-R18).**
+  - A start guard refuses to run while any other bench work runs on gn100.
+  - A failure stops only a `bench-tv` this run started.
+  - The waits are bounded.
+  - The run has a `timeout` cap and is stopped through its own process group.
+  - The run fails if the two images differ in SQLite or Python version.
+- **Pre-registered before the run (F-R29).**
+  - **F2:** since plan A, base IVF has served 208–223 q/s at concurrency 8, so 1.5× needs 312–335 q/s. p3's F prototype served 324.7. Expected ratio: 1.45–1.6×. A miss in [1.4, 1.5) with F's minimum above base's maximum is reported to the maintainer as a finding and not chased.
+  - **F3:** base about 49 ms in restarted containers (X6); F about 6.4–7 ms.
+  - **F4:** can fail on a noisy base arm alone, because `beats` uses the larger of the two bands.
+  - **F5:** both arms about 1.8–2.0 GB.
+  - **F7:** run0 builds a new index, so the largest list will differ from p3's 30,443.
+- **Rulings that change wording or small details:**
+  - test counts become P + k, and the test command `uv run --no-sync`;
+  - the new import goes before `from contextlib`;
+  - Task 3 replaces the three `_allow_cache.clear()` calls before adding `_invalidate_allow` (the other order recursed in one scan's first attempt);
+  - B's AST lock test also watches the two new locks;
+  - X6's wording becomes "mostly under 128 KiB";
+  - `BASE_SHA` is `main`'s merge-base;
+  - ADR 0005 is dated at its commit;
+  - three cross-references are added to ADR 0001 and `indexing.md`;
+  - the summary's bands get a floor at display resolution;
+  - the detach runs at 4 GiB;
+  - the run waits for host load before the probes;
+  - `FLAT_CHECK=0`;
+  - the cap is 150 minutes, against an estimate of 55–75;
+  - the volume is left flat afterwards;
+  - `--cpu-container`, and the index config goes into each run's labels.
+- **Kept as known limits:**
+  - `stop()` has no `finally` around the pool close; D2's `close_step` adds one.
+  - A failing shard search does not cancel the others.
+  - The default pool size ignores a container's CPU quota; ADR 0005 says to set the knob.
+- **`grouped_same == 4` stays strict (F-R14).** It may differ on aarch64, where CI's arm64 job runs it only after the merge. So the F tree's suite runs on gn100 right after the deploy, before the A/B.
+- **Versions (W-11).** turbovec 1.0.0 is the latest, and its GitHub `main` equals v1.0.0. uv 0.12.21 is the latest. numpy 2.5.3 exists with no relevant change, so it goes into a maintenance commit after F. CPython 3.12.15 (PBS 20261001, still SQLite 3.53.1) arrives with the next uncached image build. `rust:1.99.0-slim-trixie` still returns 404.
+- **The trailer (F-R8).** The scan agents saw a Sonnet attribution in their own context. F keeps the Opus line that every A–E commit carries.
+
 ## 3. Decision register
 
 ID prefixes:
@@ -1340,6 +1399,7 @@ ID prefixes:
 | X7 | 2026-09-30, about 13:58Z | uv 0.12.21 (released 2026-09-29) lands on `main` as its own commit, after D1's merge and before plan E's branch: the Dockerfile's `ARG UV_VERSION` and the CI's setup-uv `version`. E's Task 7 and Task 8 then carry 0.12.21. Plan G's nine 0.12.20 anchors are fixed at G's pre-flight. | Bump inside E (its Task 11 arms would straddle two uv versions and possibly two CPython builds, and Task 11 needs Task 1 to be E's first commit). Keep 0.12.20 until a later plan (W-11 asks for the latest). | E's version scan. The 0.12.21 image has the same CPython 3.12.14 and SQLite 3.53.1 as 0.12.20's, but a CPython built 29 September, not 24 September. Suite 261 passed on the bump branch. | Controller (W-11, W-14) | Section 2, 13:20Z | Committed on `uv-0.12.21` (56e8e6b); lands after D1 |
 | X8 | 2026-10-01, about 21:30Z | Plan E takes the two releases that came out after its version scan (W-11; ruling E-R14). PyO3 0.29.3: Task 2's `native/Cargo.toml` pins it, and cargo generates `native/Cargo.lock` instead of it being copied from the plan. Rust 1.99.0: the workstation's toolchain is updated. The image and CI pins move to 1.99.0 at Task 7 if `rust:1.99.0-slim-trixie` is on Docker Hub. If it is not, they stay at 1.98.1 and are checked again before the final review. Tasks 7 and 8 always carry the same version. | Keep the plan's PyO3 0.29.2 and Rust 1.98.1 (W-11 asks for the latest). Pin 1.99.0 in the image before its tag exists. | PyO3 0.29.3 (2026-09-30) is a patch release; among its fixes is the Windows `raw-dylib` opt-out. Rust 1.99.0 became stable on 2026-10-01, and `rust:1.99.0-slim-trixie` returned 404 at 21:28Z and 21:44Z. The generated lock differs from the plan's only in the five pyo3 crates. Task 2 built and passed on 1.99.0 with 0.29.3. | Controller (W-11, W-14) | Section 2, 2026-10-01 | PyO3 in Task 2 (d1def25); the image's Rust pin is open until Task 7. (Dated note, 2026-10-01 22:16Z: Tasks 7 and 8 kept 1.98.1, because the 1.99.0 image tag was still missing at 22:10Z; rechecked before the final review.) |
 | X9 | 2026-10-01, about 22:50Z | Plan E ships the D14 prune with a known loss, documented (ruling E-R15, under W-14). D14 folds a query's compatibility forms, so `CO₂`, `m²` or `ℝ³` ask FTS5 for `co2`, `m2` or `r3`, which FTS5's `unicode61` does not index for a document that holds the original form. ADR 0004's D14 row and ADR 0003's addendum say so. Two issue drafts, not posted: this loss with three fixes, and stage 2's df lookup by the unfolded token (pre-existing). | Revert D14's MATCH terms to the raw tokens (gives up D14's gain, and needs a new A/B arm). Match both forms (a more complex query; a ranking change that needs its own hit@10 check). | The final review's I-1, reproduced end to end: a one-term query `CO₂` returned nothing. The bench's queries are ASCII, so the A/B is unaffected. | Assistant (W-14); the maintainer may overrule | Final review; ledger `preflight-rulings.md` | Shipped with plan E |
+| X10 | 2026-10-02, about 00:05Z | Plan F's memory gate (F5) reads the container's cgroup `memory.peak` before bench.py's cold-start restart (ruling F-R17). On gn100, an idempotent patch to the copy of bench.py records `memory_peak_mb` just before `cold_start()`. The script's later read is kept as `memory_peak_restart_mb`. Run0 checks that the restart resets the peak. | Keep the plan's read, which measures the restarted container. Read once more after the c=16 capture, which covers vector load only, not the filtered or hybrid phases. | `bench_engine` ends with `cold_start()`, which runs `podman restart`. The plan's `meta()` ran after it (DGX scan T9-H2, found by reading the code). | Controller (W-14) | Ledger `preflight-rulings.md`; section 5.23 | Ruled; checked on run0 |
 | W-1 | 2026-09-27 23:27Z | "Answer, don't act": a question such as "is it OK to X?" gets an answer and an offer, never an unrequested action. | None. | The gn100 restart incident (section 7). | Maintainer (correction) | Transcript | Standing rule |
 | W-2 | 2026-09-27 23:09Z to 2026-09-28 01:11Z | Offload work to gn100 "when it makes sense". First baseline: "not more than 65m". Later: "no limits" for this program while the PC stays on. The spec keeps a rule that DGX runs over about 5 minutes need a go-ahead with a time cap. | None. | None. | Maintainer | Transcript; spec §6 | Standing |
 | W-3 | 2026-09-28 18:45Z | Every question to the maintainer goes through the structured question tool. | None. | None. | Maintainer | Transcript | Standing |
@@ -2098,6 +2158,10 @@ Task 2's tests hold Unicode goldens and a pool of characters for a seeded fuzz. 
 
 Probe p2 forecast the native scorer's gain at 0.71–0.79× of hybrid p50. gn100 measured 0.60×. The saving itself is what p2 predicted: Python stage 2 took 31.1 ms at p50 and native 1.6 ms, about 29.5 ms, and warm hybrid p50 fell by 30.9 ms. What changed is the total it divides into. p2's estimate implies a hybrid p50 of about 89 ms (63–70 ms after the gain); the reference arms here measured 77.1 ms, on a newer `main` (plans B to D1) and SQLite 3.53.1 instead of Debian's 3.40.1. Which change removed the other 12 ms was not measured. At concurrency 8, native served 2.07× Python's q/s. That matches p2's 2.1× on PBS's SQLite 3.50.4, not its 0.99× on Debian's 3.40.1, so the memstatus mutex did not cap SQLite 3.53.1 either. The prune alone left concurrent q/s where it was (17.5 vs 17.7): it removes a tail, and the tail is a few queries.
 
+### 5.23 The memory gate would have read the peak after a restart
+
+Plan F's item 5 (F5) compares the container's cgroup `memory.peak` between base and F. It is one-sided: only a peak more than 50 MB above base fails (R-F1). The plan's script read the peak after each bench run. But bench.py's `bench_engine` ends with the cold-start measurement, and that measurement runs `podman restart`. A restart very likely starts the container in a fresh cgroup with a new peak. So the gate would have compared the two arms' restart footprints: the collection load and one search. It would have missed the concurrency-8, filtered and hybrid phases, which is where F's pool threads, sorted allowlists and per-thread arenas would show. Both arms would have read about the same, and F5 would have passed without measuring what it exists for. The DGX scan found this by reading the code; nothing had run. The ruling (F-R17, X10) records the peak inside the gn100 copy of bench.py, just before the restart. The later read is kept beside it, and run0 shows whether the restart reset the peak.
+
 ## 6. Method: how we measured
 
 Spec §6 sets one protocol for every plan. Each rule below gives the reason the sources record, or says "reason not recorded".
@@ -2285,6 +2349,7 @@ State as of 2026-09-28, about 19:30Z.
 - Dated note, 2026-10-01 22:16Z: plan E Tasks 3 to 8 are approved (dae62d1, 389 passed), and the pure-Python fallback passes the whole suite without the extension. The image and CI pin Rust 1.98.1 until `rust:1.99.0-slim-trixie` exists (X8). Tasks 9 and 10 are next, then the final review and the A/B on gn100 (DGX Spark).
 - Dated note, 2026-10-01 22:59Z: plan E's ten tasks, the final review and one fix wave are approved (f95b3b8, 397 passed). I-1, D14's compatibility-form loss, is documented under E-R15, with two issue drafts not posted. Task 11's A/B is running on gn100 (22:56Z, cap 110 minutes).
 - Dated note, 2026-10-01 23:22Z: plan E is done. Its A/B passed every gate (section 4.16), and it is merged into `main` and pushed (fa0fa9f). Next: plan F, `ivf-fanout-and-upstream`, after its pre-flight. G's uv quotes need re-anchoring to 0.12.21 at G's pre-flight.
+- Dated note, 2026-10-02 00:03Z: plan F's pre-flight is done and ruled (section 2, 2026-10-02; F-R1 to F-R39 in the ledger). F runs in `.worktrees/ivf-fanout-and-upstream` from `main` at fa0fa9f; Task 1 is next, on Sonnet.
 
 ### 9.2 Open questions in the plans
 
