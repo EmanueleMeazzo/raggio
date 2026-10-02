@@ -1,6 +1,12 @@
 import os
 
 
+def default_ivf_search_threads() -> int:
+    """IVF shard fan-out pool size when IVF_SEARCH_THREADS is unset (ADR 0005). 12 is
+    p3's best on the 20-core DGX, chosen on seed 7 and held on seed 42; 20 lost 14-17 %."""
+    return min(12, os.cpu_count() or 1)
+
+
 class Settings:
     def __init__(self) -> None:
         self.root_api_key = os.environ.get("ROOT_API_KEY", "")
@@ -17,3 +23,6 @@ class Settings:
         self.native_bm25 = os.environ.get("NATIVE_BM25") or "auto"
         if self.native_bm25 not in ("auto", "0"):
             raise ValueError(f"NATIVE_BM25 must be 'auto' or '0', not {self.native_bm25!r}")
+        # per-collection pool for IVF shard searches; 1 = the serial loop, unset/0 = default
+        threads = int(os.environ.get("IVF_SEARCH_THREADS", "0") or 0)
+        self.ivf_search_threads = threads if threads > 0 else default_ivf_search_threads()

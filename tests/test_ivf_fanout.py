@@ -1,0 +1,427 @@
+"""IVF shard fan-out (ADR 0005): pooled per-(query, shard) searches return the serial
+result bit-for-bit (tie order included), the pool's lifecycle follows
+Collection.stop(), and the IVF_SEARCH_THREADS knob reaches every collection."""
+import asyncio
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+import sys
+sys.path.insert(0, "src")
+import raggio.store as store
+from raggio.config import Settings
+from raggio.store import Collection, CollectionConfig, CollectionManager, _IvfIndex
+
+DIM = 8
+
+
+def unit(n, seed):
+    v = np.random.default_rng(seed).standard_normal((n, DIM)).astype(np.float32)
+    return v / np.linalg.norm(v, axis=1, keepdims=True)
+
+
+def build_ivf(n=3000, nlist=8, nprobe=3, threads=1, seed=0):
+    X = unit(n, seed)
+    ivf = _IvfIndex.train(X, nlist, DIM, 4, nprobe, pool=store._ShardPool(threads))
+    ivf.add_with_ids(X, np.arange(1, n + 1, dtype=np.uint64))
+    return ivf, X
+
+
+def shard_ids(sh):
+    probe = np.zeros((1, DIM), dtype=np.float32)
+    probe[0, 0] = 1.0
+    return np.sort(sh.search(probe, k=len(sh))[1][0])
+
+
+def reference_search(ivf, queries, k, allowlist=None, nprobe=None):
+    """Frozen copy of the serial _IvfIndex.search at 19a8a2e (store.py:485-530), with
+    its own shard-id probe so it shares no helper with the code under test."""
+    if allowlist is not None and len(allowlist) <= 128:
+        owners = [
+            j for j in range(ivf.nlist)
+            if len(ivf.shards[j]) and len(np.intersect1d(allowlist, shard_ids(ivf.shards[j])))
+        ]
+        probes = [owners] * len(queries)
+    else:
+        npb = min(nprobe or ivf.nprobe, ivf.nlist)
+        sims = queries @ ivf.centroids.T
+        probes = [np.argpartition(-sims[qi], npb - 1)[:npb] for qi in range(len(queries))]
+    out = []
+    for qi, probe in enumerate(probes):
+        q = np.ascontiguousarray(queries[qi : qi + 1])
+        parts_s, parts_i = [], []
+        for j in probe:
+            sh = ivf.shards[j]
+            if not len(sh):
+                continue
+            allow = allowlist
+            if allow is not None:
+                sids = shard_ids(sh)
+                pos = np.minimum(np.searchsorted(sids, allow), len(sids) - 1)
+                allow = allow[sids[pos] == allow]
+                if not len(allow):
+                    continue
+            s, i = sh.search(q, k=min(k, len(sh)), allowlist=allow)
+            parts_s.append(s[0])
+            parts_i.append(i[0])
+        if parts_s:
+            s, i = np.concatenate(parts_s), np.concatenate(parts_i)
+            top = np.argsort(-s)[:k]
+            out.append((s[top], i[top]))
+        else:
+            out.append((np.empty(0, np.float32), np.empty(0, np.uint64)))
+    width = max(len(s) for s, _ in out)
+    scores = np.full((len(out), width), -np.inf, np.float32)
+    ids = np.zeros((len(out), width), np.uint64)
+    for qi, (s, i) in enumerate(out):
+        scores[qi, : len(s)], ids[qi, : len(i)] = s, i
+    return scores, ids
+
+
+def assert_same(a, b):
+    assert a[0].dtype == b[0].dtype and a[1].dtype == b[1].dtype
+    assert np.array_equal(a[0], b[0]) and np.array_equal(a[1], b[1])
+
+
+class ThreadSpy:
+    """Delegating shard proxy (IdMapIndex is a frozen pyclass: no monkeypatching)."""
+
+    def __init__(self, inner, seen):
+        self.inner, self.seen = inner, seen
+
+    def __len__(self):
+        return len(self.inner)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def search(self, q, k, allowlist=None):
+        self.seen.append(threading.current_thread().name)
+        return self.inner.search(q, k=k, allowlist=allowlist)
+
+
+class Boom(ThreadSpy):
+    def search(self, q, k, allowlist=None):
+        raise RuntimeError("boom")
+
+
+def make_collection(tmp_path, name="t", threads=None):
+    return Collection(
+        CollectionConfig(name, DIM, 4, None, None, None), Path(tmp_path), lambda: None,
+        ivf_search_threads=threads,
+    )
+
+
+def rowvec(i):
+    v = np.random.default_rng(1000 + i).standard_normal(DIM)
+    return (v / np.linalg.norm(v)).tolist()
+
+
+def ingest(col, n):
+    docs = [
+        {"doc_id": f"d{i}", "chunks": [
+            {"id": f"c{i}", "text": f"chunk {i}", "vector": rowvec(i), "metadata": {"g": i % 2}},
+        ]}
+        for i in range(n)
+    ]
+    asyncio.run(col._process_job({"documents": docs}))
+
+
+def attach(col, nlist=8, nprobe=None):
+    asyncio.run(col._process_job({"op": "attach_index", "nlist": nlist, "nprobe": nprobe}))
+
+
+@pytest.fixture(autouse=True)
+def small_min_rows(monkeypatch):
+    monkeypatch.setattr(store, "IVF_MIN_ROWS", 100)
+
+
+def test_settings_ivf_search_threads(monkeypatch):
+    # spec §4.2: default min(12, os.cpu_count()) (D3, p3); 1 = the serial path
+    monkeypatch.delenv("IVF_SEARCH_THREADS", raising=False)
+    assert Settings().ivf_search_threads == min(12, os.cpu_count() or 1)
+    monkeypatch.setenv("IVF_SEARCH_THREADS", "3")
+    assert Settings().ivf_search_threads == 3
+    monkeypatch.setenv("IVF_SEARCH_THREADS", "1")
+    assert Settings().ivf_search_threads == 1
+    monkeypatch.setenv("IVF_SEARCH_THREADS", "0")  # 0 / unset: the default
+    assert Settings().ivf_search_threads == min(12, os.cpu_count() or 1)
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+def test_pooled_search_matches_serial_reference(threads):
+    ivf, X = build_ivf(threads=threads)
+    rng = np.random.default_rng(5)
+    small = np.sort(rng.choice(np.arange(1, 3001, dtype=np.uint64), 40, replace=False))
+    large = np.sort(rng.choice(np.arange(1, 3001, dtype=np.uint64), 900, replace=False))
+    for nq in (1, 3, 8):
+        q = np.ascontiguousarray(X[10 : 10 + nq])
+        for nprobe in (1, 3, 8):
+            for allow in (None, small, large):
+                got = ivf.search(q, 20, allowlist=allow, nprobe=nprobe)
+                assert_same(got, reference_search(ivf, q, 20, allowlist=allow, nprobe=nprobe))
+
+
+def test_tie_order_is_identical_across_pool_sizes():
+    ivf, X = build_ivf(threads=1)
+    v = unit(1, 99)
+    # the same vector under a different id in EVERY shard: identical calibration,
+    # identical codes, identical scores — the merge's tie order is all that differs
+    for j in range(ivf.nlist):
+        ivf.shards[j].add_with_ids(v, np.array([50_000 + j], dtype=np.uint64))
+    ref = reference_search(ivf, v, 30, nprobe=ivf.nlist)
+    tied = ref[0][0][np.isin(ref[1][0], np.arange(50_000, 50_000 + ivf.nlist))]
+    assert len(tied) == ivf.nlist and len(np.unique(tied)) == 1  # the ties are real
+    for threads in (1, 2, 4, 8):
+        ivf._pool = store._ShardPool(threads)
+        assert_same(ivf.search(v, 30, nprobe=ivf.nlist), ref)
+        ivf._pool.close()
+
+
+def test_filtered_tie_order_is_identical_across_pool_sizes():
+    # spec §7 F item 1, filtered: the same cross-shard ties, reached through the
+    # in-task allowlist cut (>128 ids) and through the tiny owners path (<=128 ids)
+    ivf, X = build_ivf(threads=1)
+    v = unit(1, 99)
+    tied_ids = np.arange(50_000, 50_000 + ivf.nlist, dtype=np.uint64)
+    for j in range(ivf.nlist):
+        ivf.shards[j].add_with_ids(v, tied_ids[j : j + 1])
+    others = np.random.default_rng(11).choice(np.arange(1, 3001, dtype=np.uint64), 400, replace=False)
+    large = np.sort(np.concatenate([others, tied_ids]))
+    tiny = np.sort(np.concatenate([others[:60], tied_ids]))
+    assert len(large) > 128 >= len(tiny)
+    for allow in (large, tiny):
+        ref = reference_search(ivf, v, 30, allowlist=allow, nprobe=ivf.nlist)
+        tied = ref[0][0][np.isin(ref[1][0], tied_ids)]
+        assert len(tied) == ivf.nlist and len(np.unique(tied)) == 1  # the ties are real
+        for threads in (1, 2, 4, 8):
+            ivf._pool = store._ShardPool(threads)
+            assert_same(ivf.search(v, 30, allowlist=allow, nprobe=ivf.nlist), ref)
+            ivf._pool.close()
+
+
+def test_shard_calls_run_on_pool_threads():
+    ivf, X = build_ivf(threads=4)
+    seen = []
+    ivf.shards = [ThreadSpy(sh, seen) for sh in ivf.shards]
+    ivf.search(np.ascontiguousarray(X[:2]), 10, nprobe=4)
+    assert len(seen) == 8 and all(n.startswith("raggio-ivf") for n in seen)
+    seen.clear()
+    ivf._pool.close()  # closed pool: the serial loop on the calling thread
+    ivf.search(np.ascontiguousarray(X[:2]), 10, nprobe=4)
+    assert seen == [threading.current_thread().name] * 8
+    serial, _ = build_ivf(threads=1)
+    serial.shards = [ThreadSpy(sh, seen) for sh in serial.shards]
+    seen.clear()
+    serial.search(np.ascontiguousarray(X[:2]), 10, nprobe=4)
+    assert seen == [threading.current_thread().name] * 8
+    assert serial._pool._ex is None  # threads=1 never builds an executor
+
+
+def test_large_shard_concurrent_callers_match_serial():
+    # shards above 32,768 rows leave turbovec's inline nq=1 path for its own rayon
+    # pool (SINGLE_QUERY_PARALLEL_MIN_BLOCKS); concurrent callers must still merge
+    # exactly as the serial loop does
+    ivf, X = build_ivf(n=70_000, nlist=2, nprobe=2, threads=4, seed=3)
+    assert max(len(sh) for sh in ivf.shards) > 32_768
+    q = np.ascontiguousarray(X[:8])
+    ref = reference_search(ivf, q, 50, nprobe=2)
+    errors, results = [], []
+
+    def caller():
+        try:
+            for _ in range(5):
+                results.append(ivf.search(q, 50, nprobe=2))
+        except Exception as e:  # surfaced below
+            errors.append(e)
+
+    threads = [threading.Thread(target=caller) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    assert not errors and len(results) == 20
+    for got in results:
+        assert_same(got, ref)
+    ivf._pool.close()
+
+
+def test_shard_error_reaches_every_waiter(tmp_path):
+    col = make_collection(tmp_path, threads=4)
+    ingest(col, 300)
+    attach(col, nlist=8, nprobe=8)
+    col.index.shards[3] = Boom(col.index.shards[3], [])
+
+    async def go():
+        qs = [np.array([rowvec(i)], dtype=np.float32) for i in range(3)]
+        return await asyncio.gather(
+            *[col._scan_batched(q, 5) for q in qs], return_exceptions=True
+        )
+
+    res = asyncio.run(go())
+    assert all(isinstance(r, RuntimeError) and str(r) == "boom" for r in res)
+    asyncio.run(col.stop())
+
+
+def test_single_worker_default_executor_does_not_deadlock(tmp_path):
+    col = make_collection(tmp_path, threads=4)
+    ingest(col, 300)
+    attach(col, nlist=8, nprobe=8)
+
+    async def go():
+        asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(1))
+        q = lambda i: np.array([rowvec(i)], dtype=np.float32)
+        searches = [
+            col.search("vector", q(i), None, 5, "chunks", {"g": i % 2} if i % 2 else None, None)
+            for i in range(16)
+        ]
+        return await asyncio.wait_for(asyncio.gather(*searches), 10)
+
+    hits = asyncio.run(go())
+    assert all(hits) and hits[0][0]["id"] == "c0"
+    asyncio.run(col.stop())
+
+
+def test_stop_closes_pool_and_late_search_runs_serially(tmp_path):
+    col = make_collection(tmp_path, name="stopme", threads=4)
+    ingest(col, 300)
+    attach(col, nlist=8, nprobe=8)
+    q = np.array([rowvec(7)], dtype=np.float32)
+    before = col.index.search(q, 5, nprobe=8)
+    ex = col._shard_pool._ex
+    assert ex is not None  # a multi-shard search built the pool lazily
+    asyncio.run(col.stop())
+    assert col._shard_pool._ex is None
+    assert not [t for t in threading.enumerate() if t.name.startswith("raggio-ivf-stopme")]
+    # an orphaned search (its task was cancelled, so it holds no lock) finishing
+    # after stop() runs serially instead of raising from a shut-down executor
+    assert_same(col.index.search(q, 5, nprobe=8), before)
+    assert col._shard_pool._ex is None
+
+
+def test_threads_one_is_the_serial_path(tmp_path):
+    col = make_collection(tmp_path, threads=1)
+    ingest(col, 300)
+    attach(col, nlist=8, nprobe=4)
+    q = np.array([rowvec(i) for i in range(6)], dtype=np.float32)
+    assert_same(col.index.search(q, 10), reference_search(col.index, q, 10))
+    assert col._shard_pool.threads == 1 and col._shard_pool._ex is None
+    asyncio.run(col.stop())
+
+
+# ---- Review Focus pins (Task 1) ----
+
+
+class Held(ThreadSpy):
+    """Delegating shard proxy: every search waits until the test releases it."""
+
+    def __init__(self, inner):
+        super().__init__(inner, [])
+        self.entered, self.release = threading.Event(), threading.Event()
+
+    def search(self, q, k, allowlist=None):
+        self.entered.set()
+        assert self.release.wait(5)
+        return self.inner.search(q, k=k, allowlist=allowlist)
+
+
+def test_close_during_a_fanned_out_search_lets_it_finish():
+    # RF1: stop() closes the pool while a search orphaned by a cancelled request still
+    # has shard tasks queued behind busy threads; they must run, not be cancelled
+    ivf, X = build_ivf(threads=2)
+    q = np.ascontiguousarray(X[:4])
+    ref = reference_search(ivf, q, 10, nprobe=8)
+    held = Held(ivf.shards[0])
+    ivf.shards[0] = held
+    got, errors = [], []
+
+    def search():
+        try:
+            got.append(ivf.search(q, 10, nprobe=8))
+        except BaseException as e:  # CancelledError is a BaseException
+            errors.append(e)
+
+    t = threading.Thread(target=search)
+    t.start()
+    assert held.entered.wait(5)  # a pool thread sits in shard 0; the rest of the 32 queue
+    closer = threading.Thread(target=ivf._pool.close)
+    closer.start()
+    closer.join(0.1)  # close() is now blocked waiting on the pool
+    held.release.set()
+    t.join(10)
+    closer.join(10)
+    assert not t.is_alive() and not closer.is_alive() and not errors
+    assert_same(got[0], ref)
+
+
+def test_queries_without_shard_tasks_keep_their_rows():
+    # RF2: a query whose probed shard is empty contributes no task; its neighbours'
+    # results must land on their own rows and its row must be pure padding
+    ivf, X = build_ivf(threads=4)
+    empty = 5
+    gone = {int(r) for r in ivf._shard_ids(empty)}
+    for rid in gone:
+        ivf.remove(rid)
+    assert len(ivf.shards[empty]) == 0
+    a, b = [i for i in range(len(X)) if i + 1 not in gone][:2]
+    q = np.ascontiguousarray(np.vstack([X[a : a + 1], ivf.centroids[empty : empty + 1], X[b : b + 1]]))
+    got = ivf.search(q, 10, nprobe=1)
+    assert_same(got, reference_search(ivf, q, 10, nprobe=1))
+    assert got[1][0][0] == a + 1 and got[1][2][0] == b + 1  # each query finds itself
+    assert (got[0][1] == -np.inf).all() and (got[1][1] == 0).all()
+    ivf._pool.close()
+
+
+def pool_threads(name):
+    return [t for t in threading.enumerate() if t.name.startswith(f"raggio-ivf-{name}")]
+
+
+def test_flat_collections_start_no_threads_and_eviction_joins_them(tmp_path, monkeypatch):
+    # RF5: the pool exists per Collection but only IVF searches start threads, and a
+    # collection evicted by MAX_RESIDENT_COLLECTIONS takes its threads down with it
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MAX_RESIDENT_COLLECTIONS", "1")
+    monkeypatch.setenv("IVF_SEARCH_THREADS", "4")
+    docs = [
+        {"doc_id": f"d{i}", "chunks": [{"id": f"c{i}", "text": f"chunk {i}", "vector": rowvec(i)}]}
+        for i in range(300)
+    ]
+    q = np.array([rowvec(4)], dtype=np.float32)
+
+    async def go():
+        mgr = CollectionManager(Settings(), embedder_factory=lambda cfg: None)
+        for name in ("flatc", "ivfc"):
+            await mgr.create_collection(name, DIM, 4, None, None, None)
+        flat = await mgr.touch("flatc")
+        await flat._process_job({"documents": docs})
+        assert (await flat.search("vector", q, None, 5, "chunks", None, None))[0]["id"] == "c4"
+        assert flat._shard_pool._ex is None and not pool_threads("flatc")
+        ivf = await mgr.touch("ivfc")  # cap 1: evicts flatc
+        await ivf._process_job({"documents": docs})
+        await ivf._process_job({"op": "attach_index", "nlist": 8, "nprobe": 8})
+        assert (await ivf.search("vector", q, None, 5, "chunks", None, None))[0]["id"] == "c4"
+        assert pool_threads("ivfc")
+        await mgr.touch("flatc")  # evicts ivfc: its stop() joins the pool
+        assert "ivfc" not in mgr.resident and not pool_threads("ivfc")
+        await mgr.shutdown()
+
+    asyncio.run(go())
+
+
+def test_manager_passes_setting_to_collection(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("IVF_SEARCH_THREADS", "3")
+
+    async def go():
+        mgr = CollectionManager(Settings(), embedder_factory=lambda cfg: None)
+        await mgr.create_collection("m", DIM, 4, None, None, None)
+        col = await mgr.touch("m")
+        threads = col._shard_pool.threads
+        await mgr.shutdown()
+        return threads
+
+    assert asyncio.run(go()) == 3
