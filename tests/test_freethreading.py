@@ -239,3 +239,106 @@ def test_stop_really_closes_meta_db_after_reads_on_many_threads(tmp_path, monkey
         return sorted(p.name for p in m._dir("x").glob("meta.db*"))
 
     assert asyncio.run(run()) == ["meta.db"]
+
+
+# ---- the build-time image check ----
+
+CHECK_IMAGE = ROOT / "docker" / "check_image.py"
+THIS_PYTHON = f"{sys.version_info.major}.{sys.version_info.minor}{'t' if FT else ''}"
+
+
+def load_check_image():
+    spec = importlib.util.spec_from_file_location("check_image", CHECK_IMAGE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def child(args, env=None):
+    """A fresh interpreter without the caller's warning filter or GIL override."""
+    clean = {k: v for k, v in os.environ.items() if k not in ("PYTHONWARNINGS", "PYTHON_GIL")}
+    return subprocess.run([sys.executable, *args], capture_output=True, text=True, cwd=ROOT,
+                          env={**clean, **(env or {})}, timeout=300)
+
+
+def test_check_image_passes_on_this_interpreter():
+    native = ["--require-native"] if os.environ.get("REQUIRE_NATIVE") == "1" else []
+    r = child([str(CHECK_IMAGE), "--python", THIS_PYTHON, *native])
+    assert r.returncode == 0, r.stderr
+    assert f"GIL {'disabled' if FT else 'enabled'}," in r.stdout
+    assert "extension modules imported" in r.stdout
+
+
+@pytest.mark.parametrize("python", [
+    f"3.{sys.version_info.minor}{'' if FT else 't'}",  # the other flavour
+    f"3.{sys.version_info.minor - 1}{'t' if FT else ''}",  # another minor
+])
+def test_check_image_rejects_an_interpreter_the_build_arg_did_not_ask_for(python):
+    r = child([str(CHECK_IMAGE), "--python", python])
+    assert r.returncode == 1 and f"check_image: FAILED: PYTHON={python}, but" in r.stderr
+
+
+def test_check_image_refuses_python_gil_0():
+    r = child([str(CHECK_IMAGE), "--python", THIS_PYTHON], env={"PYTHON_GIL": "0"})
+    assert r.returncode == 1 and "PYTHON_GIL=0 / -X gil=0 hides" in r.stderr
+
+
+@needs_ft
+def test_check_image_fails_when_the_gil_is_on():
+    # the guard's red run: the same interpreter with the GIL forced on
+    r = child(["-X", "gil=1", str(CHECK_IMAGE), "--python", THIS_PYTHON])
+    assert r.returncode == 1 and "the GIL is enabled before any import" in r.stderr
+
+
+def test_check_image_finds_every_compiled_module_it_can_import(tmp_path):
+    check_image = load_check_image()
+    suffixes = (".cpython-314t-x86_64-linux-gnu.so", ".so")
+    for rel in ("numpy/_core/_multiarray_umath.cpython-314t-x86_64-linux-gnu.so",
+                "raggio_native/raggio_native.cpython-314t-x86_64-linux-gnu.so",
+                "yaml/_yaml.so",
+                "numpy.libs/libscipy_openblas64_-6bb31eeb.so",  # a vendored lib, not a module
+                "numpy/_core/multiarray.py"):
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_bytes(b"")
+    assert check_image.extension_modules(tmp_path, suffixes) == [
+        "numpy._core._multiarray_umath", "raggio_native.raggio_native", "yaml._yaml"]
+    # spec §4.2: raggio_native is rebuilt per interpreter; an abi3 or bare .so build is refused
+    assert check_image.built_for_this_interpreter(
+        "raggio_native/raggio_native.cpython-314t-x86_64-linux-gnu.so", suffixes)
+    assert not check_image.built_for_this_interpreter("raggio_native/raggio_native.abi3.so", suffixes)
+    assert not check_image.built_for_this_interpreter("raggio_native/raggio_native.so", suffixes)
+
+
+@pytest.fixture
+def gil_needing_extension(tmp_path):
+    """CPython's own _testmultiphase test extension, copied under the name of the one
+    module in it that declares no free-threading support: importing that really
+    re-enables the GIL. Returns the code that puts the copy on sys.path."""
+    spec = importlib.util.find_spec("_testmultiphase")
+    if spec is None:
+        pytest.skip("this CPython build ships no _testmultiphase test extension")
+    suffix = next(s for s in importlib.machinery.EXTENSION_SUFFIXES if spec.origin.endswith(s))
+    shutil.copy(spec.origin, tmp_path / f"_testmultiphase_nonmodule{suffix}")
+    return f"import sys; sys.path.insert(0, {str(tmp_path)!r}); "
+
+
+@needs_ft
+def test_the_image_warning_filter_fails_a_real_gil_re_enable(gil_needing_extension):
+    probe = gil_needing_extension + "import _testmultiphase_nonmodule; print(sys._is_gil_enabled())"
+    unguarded = child(["-c", probe])
+    assert unguarded.returncode == 0 and unguarded.stdout.strip() == "True"  # the GIL came back
+    # the string the Dockerfile's runtime ENV and the CI job put in PYTHONWARNINGS
+    guarded = child(["-c", probe], env={"PYTHONWARNINGS": load_check_image().GIL_WARNING_FILTER})
+    assert guarded.returncode == 1
+    assert "RuntimeWarning: The global interpreter lock (GIL) has been enabled" in guarded.stderr
+
+
+@needs_ft
+def test_check_image_names_the_module_that_enabled_the_gil(gil_needing_extension):
+    # even with the warning swallowed, the GIL state check after each import catches it
+    probe = gil_needing_extension + (
+        f"sys.path.insert(0, {str(CHECK_IMAGE.parent)!r}); import check_image, warnings; "
+        "warnings.simplefilter('ignore'); check_image.import_all(['_testmultiphase_nonmodule'])")
+    r = child(["-c", probe])
+    assert r.returncode == 1
+    assert "CheckFailed: importing _testmultiphase_nonmodule enabled the GIL" in r.stderr
