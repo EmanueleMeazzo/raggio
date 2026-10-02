@@ -69,3 +69,110 @@ def test_healthz_reads_the_gil_state_on_every_request(make_app, monkeypatch):
         assert client.get("/healthz").json()["gil_enabled"] is False
         state["enabled"] = True
         assert client.get("/healthz").json()["gil_enabled"] is True
+
+
+# ---- GC_FREEZE ----
+
+
+def test_gc_freeze_defaults_off_and_rejects_other_values(monkeypatch):
+    from raggio.config import Settings
+
+    monkeypatch.delenv("GC_FREEZE", raising=False)
+    assert Settings().gc_freeze is False
+    monkeypatch.setenv("GC_FREEZE", "1")
+    assert Settings().gc_freeze is True
+    for bad in ("true", "yes", "2"):
+        monkeypatch.setenv("GC_FREEZE", bad)
+        with pytest.raises(ValueError, match="GC_FREEZE"):
+            Settings()
+
+
+@pytest.mark.parametrize("knob, expected", [
+    ("1", ["resume_pending", "collect", "freeze", "shutdown", "unfreeze"]),
+    ("0", ["resume_pending", "shutdown"]),
+    ("", ["resume_pending", "shutdown"]),
+])
+def test_gc_freeze_runs_after_resume_pending_and_unfreezes_after_shutdown(
+    make_app, monkeypatch, knob, expected
+):
+    import gc
+
+    from raggio.store import CollectionManager
+
+    calls = []
+    real_resume, real_shutdown = CollectionManager.resume_pending, CollectionManager.shutdown
+
+    async def resume_pending(self):
+        calls.append("resume_pending")
+        await real_resume(self)
+
+    async def shutdown(self):
+        await real_shutdown(self)
+        calls.append("shutdown")
+
+    monkeypatch.setattr(CollectionManager, "resume_pending", resume_pending)
+    monkeypatch.setattr(CollectionManager, "shutdown", shutdown)
+    for name in ("collect", "freeze", "unfreeze"):
+        monkeypatch.setattr(gc, name, lambda *a, _n=name, **k: calls.append(_n) or 0)
+    monkeypatch.setenv("GC_FREEZE", knob)
+    with TestClient(make_app()):
+        pass
+    assert calls == expected
+
+
+def test_gc_freeze_freezes_the_startup_heap_but_still_collects_new_cycles(
+    make_app, monkeypatch
+):
+    import gc
+    import weakref
+
+    class Node:
+        pass
+
+    monkeypatch.setenv("GC_FREEZE", "1")
+    gc.unfreeze()
+    with TestClient(make_app()) as client:
+        assert gc.get_freeze_count() > 0
+        assert client.get("/healthz").status_code == 200
+        a, b = Node(), Node()
+        a.other, b.other = b, a
+        alive = weakref.ref(a)
+        del a, b
+        gc.collect()
+        assert alive() is None  # a cycle allocated after the freeze is still collected
+    assert gc.get_freeze_count() == 0  # unfrozen on shutdown
+
+
+def test_gc_freeze_still_frees_a_collection_loaded_before_the_freeze(make_app, monkeypatch):
+    # the freeze runs after resume_pending, so a collection a replayed job loaded is part
+    # of the frozen heap. Deleting it must still free it and its index: reference counting
+    # does that, and the collector, which skips frozen objects, is never needed
+    import gc
+    import time
+    import weakref
+
+    from raggio.store import CollectionManager
+
+    root = {"x-api-key": "root-key"}
+    unit = (np.ones(DIM) / np.sqrt(DIM)).tolist()
+    with TestClient(make_app()) as client:
+        assert client.post("/collections", headers=root, json={"name": "kb", "dim": DIM}).status_code == 201
+        job = client.post("/collections/kb/documents", headers=root, json={"documents": [
+            {"doc_id": "d", "chunks": [{"id": "c", "text": "t", "vector": unit}]}]}).json()["job_id"]
+        while client.get(f"/collections/kb/jobs/{job}", headers=root).json()["status"] != "done":
+            time.sleep(0.01)
+    loaded = []
+    real_resume = CollectionManager.resume_pending
+
+    async def resume_pending(self):
+        await real_resume(self)
+        loaded.append(weakref.ref(await self.touch("kb")))  # as a replayed job's load does
+
+    monkeypatch.setattr(CollectionManager, "resume_pending", resume_pending)
+    monkeypatch.setenv("GC_FREEZE", "1")
+    gc.unfreeze()
+    with TestClient(make_app()) as client:
+        assert gc.get_freeze_count() > 0 and loaded[0]() is not None
+        assert client.delete("/collections/kb", headers=root).status_code == 200
+        gc.collect()
+        assert loaded[0]() is None

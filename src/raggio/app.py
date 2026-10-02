@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import hmac
 import json
 import sys
@@ -92,10 +93,17 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await manager.resume_pending()
+        if settings.gc_freeze:
+            # after resume_pending: what it loaded is startup heap too. A frozen
+            # collection that is evicted or deleted is still freed, by reference counting
+            gc.collect()
+            gc.freeze()
         housekeeping = asyncio.create_task(manager.housekeeping())
         yield
         housekeeping.cancel()
         await manager.shutdown()
+        if settings.gc_freeze:
+            gc.unfreeze()
 
     app = FastAPI(title="raggio", lifespan=lifespan)
 
