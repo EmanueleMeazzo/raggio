@@ -34,7 +34,9 @@ records which one is current).
    written its vectors to disk. One sync covers a batch of up to
    `SYNC_BATCH_JOBS` jobs, or the jobs of `SYNC_BATCH_MS` milliseconds (see
    [Configuration](getting-started.md#configuration)), so a finished job can
-   stay `processing` that long.
+   stay `processing` that long plus the time the batch's next job takes (the
+   time cap is checked as each job joins), and for as long as a failing sync
+   is retried.
    A successful job's payload row is deleted so vector-heavy jobs don't
    accumulate; a failed job keeps it for diagnosis. A payload that cannot
    be read fails its job with a `bad job payload: ...` error. Freed pages
@@ -47,13 +49,17 @@ crash before a batch's sync lands leaves all of the batch's jobs
 `processing`, so the whole batch replays; a crash while its jobs finish
 replays only the ones not yet `done`. A shutdown whose last index sync
 fails (a full disk, say) logs the error and still closes; that batch's
-jobs stay `processing` and replay the same way. The same holds when the
-shutdown finds the ingest worker stopped by an error, or cannot mark
-synced jobs `done`: the error is logged, every collection still closes,
-and the unfinished jobs replay. A collection whose database connections,
-embedding client or IVF thread pool fail to close logs the error, and
-the shutdown goes on to its next close step and the next collection.
-Replays are idempotent: records are upserted by id. Jobs journaled by a
+jobs stay `processing` and replay the same way. When the shutdown finds
+the ingest worker stopped by an error, it logs the error and still syncs
+and finishes the worker's open batch; only a job the worker was finishing
+when it failed stays `processing` and replays. When the shutdown cannot
+mark synced jobs `done`, it logs the error, and that job and the rest of
+its batch replay. Either way every collection still closes. A collection
+whose database connections, embedding client or IVF thread pool fail to
+close logs the error, and the shutdown goes on to its next close step and
+the next collection. Replays are idempotent: records are upserted by id.
+A document deleted or patched while a job that wrote it is still
+`processing` comes back or reverts if that job replays. Jobs journaled by a
 release from before the binary job journal, whose JSON payload sits in
 `jobs.payload`, still replay after an upgrade. The reverse does not hold: an
 older release cannot read `job_payloads`, so drain the ingest queue
