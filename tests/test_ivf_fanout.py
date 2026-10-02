@@ -825,6 +825,8 @@ def test_adr0005_records_the_dgx_verification():
     adr = Path("docs/adr/0005-ivf-fanout-and-upstream-stance.md").read_text(encoding="utf-8")
     ver = adr.split("## Verification", 1)[1]
     assert "Pending:" not in ver
+    # the repo is public: no local or remote home paths in the record
+    assert "D:/" not in ver and "/home/" not in ver
     # spec §7 F items 1-7, the §6 row labels, the guard, the after-F note, and the
     # record-only c=16 cores-busy table (p4)
     for needle in ("IVF_SEARCH_THREADS=1", "QPS concurrent", "Filtered p50", "Recall@10",

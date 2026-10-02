@@ -170,10 +170,15 @@ arm (median, band = max − min; spec §6). The row-label table gives each arm's
 - FAIL: F6 IVF_SEARCH_THREADS=1 reproduces the serial path within the band: serial p50 7.66 vs 8.84: diff -1.19, band 1.05; concurrent QPS 183.15 vs 203.08: diff -19.94, band 10.77
 - PASS: F7 largest IVF list 24,123 rows, 74% of the 32,768-row pooled-path cliff [30,443]
 - PASS: labels: every measured IVF run is host-warm, cap 4g, swap host-default, OPENBLAS_NUM_THREADS=1, index {"nlist": 256, "nprobe": 16, "type": "ivf"}, one sqlite_version per arm (base 3.53.1; f 3.53.1; f1 3.53.1)
-- OVERRIDE: F6, recorded as failed under the maintainer's standing ruling on failed gates (first given for plan D1's ivf256 gate, 2026-10-01); nothing was re-run to replace it. The `IVF_SEARCH_THREADS=1` path makes base's per-(query, shard) calls in base's order, and in-process it matches the serial loop (seed 7, `fanout` T=1: 29.49/29.58 ms against serial 28.82/29.75 ms). In this A/B the T=1 arm always ran right after F's c=16 capture. A follow-up on gn100 the same day (base against T=1 only, a discarded run0, then 4 rounds in ABBA order, no c=16 captures) put T=1 level with base: serial p50 8.53 [8.34..11.72] against 8.62 [8.53..8.91] ms, concurrent QPS 197.5 [163.4..204.0] against 188.2 [178.0..199.4]. The gap tracks fresh-container variance on gn100, which three runs per arm did not capture, rather than the code path.
+- OVERRIDE: F6, recorded as failed under the maintainer's standing ruling on failed gates (first given for plan D1's ivf256 gate, 2026-10-01); nothing was re-run to replace it. For unfiltered searches the `IVF_SEARCH_THREADS=1` path makes base's per-(query, shard) turbovec calls in base's order. In this A/B the T=1 arm always ran right after F's c=16 capture. A follow-up on gn100 the same day (base against T=1 only, a discarded run0, then 4 rounds in ABBA order, no c=16 captures) did not reproduce the gap: its medians put T=1 within 0.1 ms and 10 QPS of base, ahead on both (serial p50 8.53 [8.34..11.72] against 8.62 [8.53..8.91] ms, concurrent QPS 197.5 [163.4..204.0] against 188.2 [178.0..199.4]). But the A/B's two fast T=1 serial runs (7.65 and 7.66 ms) were faster than any follow-up run, and its slowest T=1 QPS run (175.3) was below every follow-up base run. We attribute the gap to variance between fresh containers on gn100; four runs per arm, in a different order and without the c=16 captures, cannot rule out a smaller difference.
 
 Filtered p50: base measures 48.98 ms in restarted containers (plan C's
 `MALLOC_TRIM_THRESHOLD_`), and F brings it to 6.16 ms.
+
+Memory peak before the restart: base run 1, the first measured container after the
+discarded run0, reached 4,096 MB, the cap (run0 did too). Every other measured run peaked
+between 1,527 and 1,562 MB, so the medians are unaffected; base's 2,566 MB band is that one
+run. It was not investigated.
 
 Batching guard: **REVISIT** at T=12: grouped beat plain beyond its run1/run2 band on seed 7. Nothing ships on it; it is reported to the maintainer as a reason to reopen spec D3. The default pool on gn100 (T=12) is the smallest within noise of the fastest on seed 7.
 
@@ -243,6 +248,11 @@ per-query cost vs nq=1: nq=2 2.32, nq=3 2.14, nq=4 1.66. Measured on GB10 NEON: 
 
 The output's last sentence is the repro's built-in quote of p3's 8,192-row run; this run's figures
 are the first sentence. The same day, pinned to one Cortex-X925 core (`taskset -c 5`), the repro
-printed nq=2 1.02, nq=3 1.01, nq=4 0.65: the 2-3-query tail shares no work, and the rest of the
-unpinned cost is the pool handoff that every multi-query search takes and a one-query search skips
-(turbovec-python/src/lib.rs:1211). The repro and its upstream draft were updated to say so.
+printed nq=2 1.02, nq=3 1.01, nq=4 0.65: the 2-3-query tail shares no work. The rest of the
+unpinned cost depends on which core runs the search. Every multi-query search runs on turbovec's
+pool, while a one-query search on a part under 32,768 rows runs inline on the caller
+(turbovec-python/src/lib.rs:1211). With the caller pinned to core 5 and the pool's one worker
+pinned on its own, nq=2 cost 1.01–1.02 per query with the worker on the same core, 1.48–1.49 on
+another X925 in the same L3, 1.69–2.80 on an X925 in the other L3, and 3.74–5.14 on a
+Cortex-A725, which runs this kernel about 3.2× slower (two runs each). The handoff itself costs
+nothing measurable on one core. The repro and its upstream draft were updated to say so.
