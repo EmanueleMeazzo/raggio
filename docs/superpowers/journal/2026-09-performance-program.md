@@ -1667,6 +1667,40 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
 - The ABAB chain started at 11:04:48Z on one boot: 8 sessions, each capped at 90 minutes, A1 B1 A2 B2 at concurrency 8 and 16, all from `e3f558e`. The first session is `g-a1-py312`. The early check at 11:08Z found its health log and container logs growing, and the session in its concurrent hybrid phase.
 - **The plan's move-aside step.** Before the chain, Task 12 moves any earlier ABAB's files into a dated folder. It lists them with `shopt -s nullglob; old=(g-[abcd][12]-* g-boot-*.txt g-abab.log g-verification.md)`. `nullglob` drops only patterns that match nothing, and the last two names have no wildcard, so the list keeps them even when the files do not exist. On a first ABAB there was nothing to move, yet the step made an empty folder and `mv` failed. The controller removed the empty folder and went on. A later rerun should write those two names as `g-abab.lo[g]` and `g-verification.m[d]` (section 7.6).
 
+**11:10Z–12:15Z. G-R40's loop: two failures in 16, traced to the free-threaded lock spin.**
+- **The loop.** G-R40 ran `tests/test_concurrency.py` 16 times on 3.14.8t at `e3f558e`, under 6 busy loops on the 6-core laptop, from an archive copy of the commit. 14 runs passed, in 194–338 s each, against about 20 s unloaded. Two failed, and each failure was a fixed 5 s wait running out:
+  - Run 11, `test_stop_waits_for_a_write_transaction_its_cancelled_worker_left_running`: `inside.wait(5)` returned False.
+  - Run 12, `test_stop_does_not_cancel_the_worker_inside_its_write_section`: `asyncio.wait_for(stopper, 5)` raised `TimeoutError`.
+  - Neither failure was the BM25 bug (I1) or the stop-under-load race (M1).
+- **A stage-timing probe.** The controller timed the run-11 test's path, from enqueuing a job to the point the test waits for, with a 60 s wait instead of 5 s and 150 runs per row:
+  - 3.14.8t, unloaded: p50 0.016 s, p99 0.031 s, max 0.179 s.
+  - 3.12, under 6 busy loops: p50 0.096 s, p99 0.205 s, max 0.283 s.
+  - 3.14.8t, under 6 busy loops: p50 2.901 s, p99 4.957 s, max 5.756 s. 125 of the 150 runs took over 2 s.
+  - No run stalled, so the two failures were budgets, not hangs. The time sat in the hand-offs between the worker threads and the event loop, 0.3–1.3 s each, while the thread bodies took milliseconds.
+- **A repro with no raggio code.** `handoff-repro.py` times `asyncio.to_thread(noop)` round trips and a two-thread `threading.Event` ping-pong. Unloaded, every interpreter is under 0.6 ms. Under 6 busy loops:
+  - 3.12.15: ping-pong max 33 ms. 3.14.7, the GIL build: max 13.7 ms.
+  - 3.14.8t: ping-pong p50 599 ms and p99 1,192 ms, only 71 round trips in 40 s. `to_thread`: p50 0.13 ms, but p90 645 ms.
+  - 3.14.8t with `PYTHON_GIL=1`: ping-pong p50 1,163 ms. With the garbage collector off: p50 630 ms.
+  - Varying the busy loops on the 6 CPUs, 3.14.8t's ping-pong p99 was 0.05–1.7 ms with up to 5 loops, then 925 ms with 6, 1,818 ms with 8 and 3,789 ms with 12. The GIL build's max stayed at 15 ms or less at every count.
+- **The mechanism, read from CPython 3.14.8's `Python/lock.c` and `Modules/_threadmodule.c`.**
+  - In 3.14, `threading.Lock.acquire` calls `_PyMutex_LockTimed`, so `Condition.wait` and `Event.wait` block there too.
+  - On a free-threaded build, a blocking acquire of a held lock spins up to 40 times before it parks the thread. A GIL build parks at once: `MAX_SPIN_COUNT` is 0 there.
+  - Each spin calls `_Py_yield()`: `SwitchToThread()` on Windows, `sched_yield()` on POSIX. The loop does not reload the lock word, so a wake during the spin is seen only after all 40 yields.
+  - With an idle CPU, a yield costs microseconds. With a busy loop on every CPU, each yield costs a scheduler time slice, about 15 ms on Windows, and 40 × 15 ms is the measured 600 ms.
+  - `PYTHON_GIL=1` does not help, because the spin count is fixed when CPython is compiled.
+  - Upstream: gh-135871 reported the missing reload. Its fix, in 3.15, was reverted after it cut throughput up to 6× (gh-157914, closed 2026-09-30). gh-144586, still open, proposes replacing the yield with a CPU pause instruction. On a linked PR, a maintainer wrote that realistic programs showing a change are lacking.
+  - The mechanism fits all the data. A rebuild or an interposed `sched_yield` would prove it (G-R45).
+- **The rulings, 12:00Z–12:12Z.**
+  - G-R42: every wait in `tests/test_concurrency.py` for something that must happen gets one 60 s deadline, `WAIT_SECONDS` (X23).
+  - G-R43: after the ABAB, the hand-off repro runs on gn100 inside both of G's images, on 4 CPUs with 0–12 busy loops. Reported, not gated.
+  - G-R44: a draft comment for gh-144586, with the repro and both platforms' numbers. The maintainer posts it, or not.
+  - G-R45: in the same gn100 run, an `LD_PRELOAD` shim counts the `sched_yield` calls, or makes them return at once. If the free-threaded build shows the cliff on Linux and the shim removes it, the mechanism is proven there.
+  - G-R40's closure is revised: the failure at `05c2731` stays unexplained (section 9.4).
+- **G-R42's commit.** A Sonnet implementer committed `d94bd21`, which touches `tests/test_concurrency.py` only. `WAIT_SECONDS = 60` replaces 18 budgets, and the four 500 × 10 ms polls became deadline loops. Short sleeps that prove something did not happen, and the stress harness, were left alone. Unloaded counts were unchanged.
+  - A Sonnet reviewer approved it. Its one note: a failing test now takes up to 60 s to report, not 5 s. Passing runs are no slower.
+  - The images contain no tests, so the ABAB's `e3f558e` images stay valid.
+  - The loop restarted on `d94bd21` at 12:07Z.
+
 ## 3. Decision register
 
 ID prefixes:
@@ -1741,6 +1775,7 @@ ID prefixes:
 | X20 | 2026-10-02, 10:03Z | The BM25 stale-df fix (final review I1) lands on plan G's branch as its own commit, before Task 11 builds, not on `main` first. | Land it on `main` first: Task 12's arms come from one SHA either way, and G merges right after Task 12. Leave it for later: G's 3.14t CI job and stress step would hit it, and a red job would read as a free-threading failure. | A deterministic repro on 3.12 and 3.14.8t; 8 of 24 loaded 3.14.8t stress executions failed. Task 12's static corpus never makes a cached df stale, so the ABAB is unaffected. | Controller (W-14) | G rulings G-R33; section 5.29 | Adopted (`6551f75`) |
 | X21 | 2026-10-02, 10:03Z | On Linux, where uv's interpreters ship no `_testmultiphase`, the two GIL-guard proof tests compile a minimal single-phase C extension instead of skipping. With no compiler they skip, and under `REQUIRE_NATIVE=1` they fail. Windows keeps the copy of `_testmultiphase`. | Accept the skip: CI's `freethreaded` job, on both architectures, would never run the only tests that prove the guard works. macOS: it needs other link flags, and nothing runs 3.14t there. | On gn100, importing the compiled module re-enabled the GIL, and with the guard on the import failed. At `e3f558e`, Linux 3.14.8t ran 483 passed with 4 skipped, against 480 with 6 skipped before. | The controller's proposal, refined by the final review; controller ruling (W-14) | G rulings G-R34 | Adopted (`725c12a`) |
 | X22 | 2026-10-02, 10:03Z | Task 12's report does not attribute a B deficit under about 1 % to free threading. | Report every B deficit as free threading's cost: B also re-prepares every SQL statement (X18's defence), which the final review put at about 0.5 % of a flat vector search. | Final review M5. | Controller (W-14) | G rulings G-R38 | Adopted |
+| X23 | 2026-10-02, 12:00Z | Every wait in `tests/test_concurrency.py` for something that must happen gets one 60 s deadline, `WAIT_SECONDS`. Short waits that prove something did not happen keep their budgets. | Keep 5 s and call the tests flaky: the failures were budgets, not hangs, and would recur on any CPU-saturated runner. Raise only the two failing waits: every 5 s budget in the module sits behind the same hand-offs. | G-R40's loop: 2 failures in 16 under 6 busy loops. The probe: 3.14.8t's p99 of 4.96 s against a 5 s budget. | Controller (W-14) | G rulings G-R42 | Adopted (`d94bd21`) |
 | W-1 | 2026-09-27 23:27Z | "Answer, don't act": a question such as "is it OK to X?" gets an answer and an offer, never an unrequested action. | None. | The gn100 restart incident (section 7). | Maintainer (correction) | Transcript | Standing rule |
 | W-2 | 2026-09-27 23:09Z to 2026-09-28 01:11Z | Offload work to gn100 "when it makes sense". First baseline: "not more than 65m". Later: "no limits" for this program while the PC stays on. The spec keeps a rule that DGX runs over about 5 minutes need a go-ahead with a time cap. | None. | None. | Maintainer | Transcript; spec §6 | Standing |
 | W-3 | 2026-09-28 18:45Z | Every question to the maintainer goes through the structured question tool. | None. | None. | Maintainer | Transcript | Standing |
@@ -2939,7 +2974,7 @@ State as of 2026-09-28, about 19:30Z.
 - **F6's gap** (section 5.24): the A/B's T=1 serial runs read 8.70, 7.65 and 7.66 ms, and no follow-up run went below 8.34. What made two runs fast, and one QPS run slow, is not known.
 - **F doubles CPU per query** (5.19 to 10.09 ms at c=8) and the summed kernel time of a batch (27.34 to 63.46 ms in process). Pool-thread placement is a candidate for part of it (section 5.25), measured only in a microbenchmark; neither was profiled in the server.
 - **The grouped-call guard's REVISIT** at 12 threads only, in one probe run (both of its repetitions), with 2.39 queries per probed shard on the rebuilt index against p3's 1.40. Whether it holds is a question for reopening spec D3.
-- **One 3.14.8t suite failure at plan G's `05c2731`** (Task 2, 2026-10-02): 1 failed and 460 passed, once, in the controller's check. The next 15 runs were green, 8 of them in concurrent pairs. The summary line lost the test's name, so it is not known which test failed, or whether Task 2's change is involved. (Dated note, 2026-10-02 09:25Z: no failure since, in about 20 more 3.14.8t runs on the laptop through `cdf8ab9`, and 3 on Linux on gn100. The tally is 1 in about 36 laptop runs. The final review is asked for candidates.)
+- **One 3.14.8t suite failure at plan G's `05c2731`** (Task 2, 2026-10-02): 1 failed and 460 passed, once, in the controller's check. The next 15 runs were green, 8 of them in concurrent pairs. The summary line lost the test's name, so it is not known which test failed, or whether Task 2's change is involved. (Dated note, 2026-10-02 09:25Z: no failure since, in about 20 more 3.14.8t runs on the laptop through `cdf8ab9`, and 3 on Linux on gn100. The tally is 1 in about 36 laptop runs. The final review is asked for candidates.) (Dated note, 2026-10-02 12:15Z: G-R40's loop at `e3f558e` failed twice in 16 runs, and both failures were 5 s waits running out on the free-threaded build's slow hand-offs under load (section 2, 11:10Z). A short budget is now a third candidate, next to I1 and M1. That failure's output was lost, so it stays unexplained.)
 
 ### 9.5 Disputed, unaddressed, and limits
 
