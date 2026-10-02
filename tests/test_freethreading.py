@@ -342,3 +342,55 @@ def test_check_image_names_the_module_that_enabled_the_gil(gil_needing_extension
     r = child(["-c", probe])
     assert r.returncode == 1
     assert "CheckFailed: importing _testmultiphase_nonmodule enabled the GIL" in r.stderr
+
+
+# ---- the unified Dockerfile's 3.14t path (spec D2) ----
+
+TURBOVEC_MIN_RUST = (1, 89)  # turbovec 1.0.0's rust-version: 3.14t builds it from its sdist
+
+
+def _stages():
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    stages = re.split(r"^FROM ", dockerfile, flags=re.M)[1:]
+    (builder,) = [s for s in stages if s.split("\n", 1)[0].endswith(" AS builder")]
+    return dockerfile, builder, stages[-1]
+
+
+def test_the_builder_checks_the_venv_it_built():
+    _, builder, _ = _stages()
+    sync = builder.index("RUN uv sync --frozen --no-dev --extra native")
+    copy = builder.index("COPY docker/check_image.py /tmp/check_image.py")
+    run = builder.index('RUN /app/.venv/bin/python /tmp/check_image.py --python "${PYTHON}" '
+                        "--require-native")
+    assert sync < copy < run  # the full venv exists, and the script stays out of /app
+
+
+def test_the_runtime_image_fails_loudly_on_a_gil_re_enable():
+    dockerfile, _, runtime = _stages()
+    check_image = load_check_image()
+    assert f'ENV PYTHONWARNINGS="{check_image.GIL_WARNING_FILTER}"' in runtime.splitlines()
+    # nothing but comments may mention the override that would hide a re-enable
+    code = [ln for ln in dockerfile.splitlines() if not ln.lstrip().startswith("#")]
+    assert not [ln for ln in code if "PYTHON_GIL" in ln or "gil=" in ln.lower()]
+    # the ABAB arms differ in the interpreter only (spec §6): every PYTHON gets A's single
+    # OpenBLAS thread (D16), set once and by nothing else, and C's trim threshold (D13)
+    assert [ln for ln in code if "OPENBLAS_NUM_THREADS" in ln] == ["ENV OPENBLAS_NUM_THREADS=1"]
+    assert "ENV OPENBLAS_NUM_THREADS=1" in runtime.splitlines()
+    assert "ENV MALLOC_TRIM_THRESHOLD_=134217728" in runtime.splitlines()
+
+
+def test_the_builder_can_build_turbovec_from_its_sdist():
+    dockerfile, builder, _ = _stages()
+    rust = re.search(r"^ARG RUST_VERSION=(\d+)\.(\d+)\.\d+$", dockerfile, re.M)
+    assert (int(rust[1]), int(rust[2])) >= TURBOVEC_MIN_RUST
+    # --build-arg UV_NO_BINARY_PACKAGE=turbovec: a local sdist build on a GIL interpreter too
+    # (C1), still abi3 (the sdist enables abi3-py39), so not 3.14t's cp314t build; unset, uv
+    # installs PyPI's abi3 wheel as before, and 3.14t falls back to the sdist on its own
+    assert re.search(r"^ARG UV_NO_BINARY_PACKAGE$", builder, re.M)
+    assert builder.index("ARG UV_NO_BINARY_PACKAGE") < builder.index("RUN uv sync --frozen")
+    # raggio_native is rebuilt for each image's own interpreter, never abi3 (spec §4.2):
+    # PyO3 builds for the /python that uv installed for PYTHON (Plan E's builder)
+    assert 'uv python find "${PYTHON}"' in builder
+    assert "ENV PYO3_PYTHON=/usr/local/bin/python3" in builder.splitlines()
+    syncs = re.findall(r"^RUN uv sync (.*)$", builder, re.M)
+    assert len(syncs) == 2 and all("--extra native" in s for s in syncs)
