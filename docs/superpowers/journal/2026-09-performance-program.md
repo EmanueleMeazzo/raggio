@@ -1606,6 +1606,49 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
 - **A fallback, checked on gn100.** When `_testmultiphase` is absent, the fixture can compile a minimal single-phase C module, with no `Py_mod_gil` slot, under the same name, with the interpreter's own C compiler. On 3.14.8t, importing that module re-enabled the GIL with the RuntimeWarning, and with the guard on, the import failed. The fallback went to the final review to rule on.
 - The first launch ran an empty script. A backgrounded `cat >` in an `&&` chain reads its input from /dev/null. The script was uploaded in a separate call, then launched.
 
+**09:03Z–10:03Z. The final review on Opus: a BM25 bug from the initial release, and rulings G-R33 to G-R40.**
+- The final review of `bc00ded..cdf8ab9` took 59 minutes. Its verdict: ready with fixes, with 0 critical, 2 important and 5 medium findings. It answered the brief's 8 questions. No race in G's diff raises, nor in the code G now runs truly in parallel. The `GC_FREEZE` lifecycle is sound. The warning filter's copies are byte-identical.
+- **I1: a bug from the initial release (section 5.29).** BM25's stage-2 rescoring computes `log((total - df + 0.5) / (df + 0.5))`. `total` is the live row count, but `df` comes from a cache that is refreshed only after 1,000 rows of write churn. After deletes, a cached df can exceed the live total. The log's argument then goes negative, and `math.log` raises.
+  - Over HTTP, that is a 500 on every text or hybrid search with a near-universal term, until 1,000 more rows are written.
+  - It dates from the initial release (`7612dc7`). It reproduces deterministically on 3.12 and 3.14.8t: ingest 50 documents, search, delete 3, and search again.
+  - On 3.14.8t, the concurrency stress tests hit it under load. In one loaded stretch on the laptop, 8 of 24 executions failed, against 0 of 46 unloaded and 0 of 34 on 3.12.
+  - The reviewer ranked it first among the candidates for the unexplained failure at `05c2731` (section 9.4).
+- **I2: the Linux skips.** The reviewer agreed to compile a test extension for the two GIL-guard proof tests on Linux, and refined the controller's proposal. The fallback uses the interpreter's own `CC`, falling back to `cc`, and it fails instead of skipping under `REQUIRE_NATIVE=1`.
+- **The five medium findings.**
+  - M1: the stop-under-load test assumed that `stop()` lands inside the storm. On 3.14.8t under 6 busy loops, the storm ran 28–40 s instead of 11 s. The test then failed with "no operation ran against the stopped collection".
+  - M2: two polls in the free-threading tests had no deadline.
+  - M3: the `GC_FREEZE` tests' single `gc.collect()` can return 0 while another thread collects.
+  - M4: the decision script never replaced ADR 0006's "report theirs at Task 11 Step 7", and nothing checked that it did.
+  - M5: the disabled statement cache costs B about 0.5 % of a flat vector search.
+- **The rulings, 10:03Z (G-R33 to G-R40).**
+  - I1 is fixed on G's branch in its own commit, before Task 11 builds (X20).
+  - I2's fallback runs on Linux only (X21).
+  - The stop-under-load clients keep running until each has started one operation after `stop()` returned.
+  - The polls get deadlines, and the collects are retried up to a deadline.
+  - The controller fixes M4 in the scripts outside the branch.
+  - Task 12's report does not attribute a B deficit under about 1 % to free threading (X22).
+  - A flake check (G-R40): the concurrency tests loop on 3.14.8t under 6 busy loops, and CI's stress step runs on gn100 in a 4-CPU container.
+
+**10:03Z–10:46Z. The fix wave, a gap in the decision script's own checks, and Linux again.**
+- **Four commits by a Sonnet implementer.**
+  - `6551f75` clamps the cached df to the live row count. Its unit test is the review's repro, and it went red on both interpreters first.
+  - `725c12a` compiles the GIL-needing test extension where CPython ships none.
+  - `5b3f1c7` keeps the stop-under-load clients running past the stop.
+  - `e3f558e` bounds the waits.
+  - On the laptop: 497 passed with 4 skipped on 3.12, and 483 with 4 skipped on 3.14.8t.
+- **M4, by the controller (G-R37).** The decision script now replaces both occurrences of the phrase with the measured SQLite versions. Task 12's test asserts that the ADR no longer says "Task 11".
+  - The controller then mutated the decision script, removing the replacement or limiting it to the first occurrence. `g-check` should fail every scenario; it failed 23 of 26.
+  - The three survivors expect Task 12's test to fail for another reason, and their failure text was not pinned, so any failure passed (section 5.30).
+  - G-R37a pins their text, and an unpinned scenario of that kind now stops `g-check`. After that, both mutations failed all 26 scenarios.
+- **The fix-wave review (Sonnet): approved, with 0 critical, 0 important and 4 minor findings.** The reviewer reverted the clamp and watched the new test go red on both interpreters.
+  - Its m1: the new ADR sentence named the arms "(A)" and "(B)" in the Context section, before the ADR defines them.
+  - G-R41 rewords it: "G's images (uv 0.12.22: 3.12.15, 3.14.8t) both bundle SQLite 3.53.1, as Verification records". When the two differ, it says "bundle SQLite <a> and <b> respectively".
+  - The other three minor findings are accepted.
+- **Linux again, on gn100 (DGX Spark), at `e3f558e`.** Each suite ran three times. 3.12: 497 passed, 4 skipped. 3.14.8t: **483 passed, 4 skipped**, where `cdf8ab9` had 480 with 6 skipped.
+  - The two proof tests now run, because the fixture compiled the extension.
+  - Each test fails under a mutation. The first mutation set the warning filters to "ignore", and only one test failed (section 5.30). A second mutation disabled `check_image`'s post-import GIL check, and the other test failed too.
+- **The first Linux run's tree had CRLF line endings.** `git archive` on the laptop applies `core.autocrlf`. That run passed anyway. The re-run used `git -c core.autocrlf=false archive`, so it had LF endings, as CI's checkout does.
+
 ## 3. Decision register
 
 ID prefixes:
@@ -1677,6 +1720,9 @@ ID prefixes:
 | X17 | 2026-10-02, 05:41Z | D2's seed-42 publish measures the tree with the final review's doc fixes (`6d16471`), not the tuned tree (`8976da3`), so the ADR's candidate is the code that merges. | Publish `8976da3` and merge the fixes after it: the ADR would record a candidate that is not the merged tree. Rerun the tuning on `6d16471`: the trees differ only in four doc files, and the image is identical. | The deploy for `6d16471` produced the tuning's image (`378214d02e47`); no gate compares the tuning's tree with the publish's. | Controller (W-14) | Ledger, 05:36Z and 05:41Z | Adopted |
 | X18 | 2026-10-02, 06:52Z | Plan G keeps Task 4 (no SQLite statement cache on the free-threaded build) as a defence, although CPython 3.14.8 fixed the connection leak it was written for; its RED step runs on 3.14.7t. | Drop Task 4: Linux was not checked, and 3.14.7t and older still keep the connection open. Keep the RED step on 3.14.8t: it does not go red there. | On Windows, without Task 4: 25 of 25 green on 3.14.8t, 5 of 5 red on 3.14.7t; with it, 3 of 3 green on 3.14.7t. gh-157838 is in 3.14.8's changelog. The change costs only the 3.14t arm, so it biases G's A/B against free threading, not for it. | Controller (W-14) | G pre-flight rulings G-R3; section 5.28 | Adopted |
 | X19 | 2026-10-02, 06:52Z | Plan G runs on the frozen `uv.lock`; refreshing the lock is a separate bump on `main` after G. | Refresh the lock inside G: its A/B would mix free threading with dependency moves. | The pre-flight's replay ran green on the frozen lock with 3.14.8t. | Controller (W-14) | G pre-flight rulings G-R30 | Adopted |
+| X20 | 2026-10-02, 10:03Z | The BM25 stale-df fix (final review I1) lands on plan G's branch as its own commit, before Task 11 builds, not on `main` first. | Land it on `main` first: Task 12's arms come from one SHA either way, and G merges right after Task 12. Leave it for later: G's 3.14t CI job and stress step would hit it, and a red job would read as a free-threading failure. | A deterministic repro on 3.12 and 3.14.8t; 8 of 24 loaded 3.14.8t stress executions failed. Task 12's static corpus never makes a cached df stale, so the ABAB is unaffected. | Controller (W-14) | G rulings G-R33; section 5.29 | Adopted (`6551f75`) |
+| X21 | 2026-10-02, 10:03Z | On Linux, where uv's interpreters ship no `_testmultiphase`, the two GIL-guard proof tests compile a minimal single-phase C extension instead of skipping. With no compiler they skip, and under `REQUIRE_NATIVE=1` they fail. Windows keeps the copy of `_testmultiphase`. | Accept the skip: CI's `freethreaded` job, on both architectures, would never run the only tests that prove the guard works. macOS: it needs other link flags, and nothing runs 3.14t there. | On gn100, importing the compiled module re-enabled the GIL, and with the guard on the import failed. At `e3f558e`, Linux 3.14.8t ran 483 passed with 4 skipped, against 480 with 6 skipped before. | The controller's proposal, refined by the final review; controller ruling (W-14) | G rulings G-R34 | Adopted (`725c12a`) |
+| X22 | 2026-10-02, 10:03Z | Task 12's report does not attribute a B deficit under about 1 % to free threading. | Report every B deficit as free threading's cost: B also re-prepares every SQL statement (X18's defence), which the final review put at about 0.5 % of a flat vector search. | Final review M5. | Controller (W-14) | G rulings G-R38 | Adopted |
 | W-1 | 2026-09-27 23:27Z | "Answer, don't act": a question such as "is it OK to X?" gets an answer and an offer, never an unrequested action. | None. | The gn100 restart incident (section 7). | Maintainer (correction) | Transcript | Standing rule |
 | W-2 | 2026-09-27 23:09Z to 2026-09-28 01:11Z | Offload work to gn100 "when it makes sense". First baseline: "not more than 65m". Later: "no limits" for this program while the PC stays on. The spec keeps a rule that DGX runs over about 5 minutes need a go-ahead with a time cap. | None. | None. | Maintainer | Transcript; spec §6 | Standing |
 | W-3 | 2026-09-28 18:45Z | Every question to the maintainer goes through the structured question tool. | None. | None. | Maintainer | Transcript | Standing |
@@ -2602,6 +2648,24 @@ In G's pre-flight, on 3.14.8t, the RED step did not go red. CPython 3.14.8, rele
 
 Task 4 stays as a defence for older interpreters and for Linux, and its RED step runs on 3.14.7t (X18). A RED step is a claim about the interpreter as well as the code, and a patch release can turn it green.
 
+### 5.29 The free-threaded stress tests found a bug from the initial release
+
+Plan G added a CI job that runs the concurrency stress tests on CPython 3.14t. During Task 2, one 3.14.8t suite run failed one test, and the test's name was lost (section 9.4). The final review traced a likely cause to code that G never touched.
+
+BM25's idf used a df cached before some deletes against the live row count after them. When the cached df exceeded the count, `math.log` got a negative argument and raised. Over HTTP, that is a 500 on any text or hybrid search with a near-universal term. The bug dates from the initial release, and it reproduces deterministically on 3.12 with three deletes.
+
+On 3.12, the stress tests never hit it: 0 of 34 runs failed, 12 of them under load. On 3.14.8t under load, 8 of 24 failed. Why free threading exposes it so much more often was not established; the runs show only that it does. The fix is one line, `df = min(df, total)`, the same bound FTS5 itself guarantees.
+
+A red 3.14t job would have read as "free threading failed". A new runtime's first failures can be old bugs it makes easier to hit, so trace them before blaming the runtime.
+
+### 5.30 Two mutation checks that proved less than they seemed
+
+The first check was on plan G's decision script. With the script's SQLite replacement removed, every `g-check` scenario should fail. Three passed. Each expects Task 12's test to fail for a different reason, and its failure text was not pinned. The mutation also made the test fail, so the scenario was satisfied. Pinning the text of every expected failure closed the gap.
+
+The second check was on the GIL-guard proof tests on Linux. The controller set the image's warning filter, and `check_image`'s own filter, to "ignore", and expected both tests to fail. Only one did. The other test turns warnings off itself and relies on `check_image`'s post-import GIL check, which the mutation left alone. A second mutation disabled that check, and the test failed.
+
+A mutation proves a test only if it removes what that test actually relies on, and only if the expected failure is pinned to its text.
+
 ## 6. Method: how we measured
 
 Spec §6 sets one protocol for every plan. Each rule below gives the reason the sources record, or says "reason not recorded".
@@ -2804,6 +2868,7 @@ State as of 2026-09-28, about 19:30Z.
 - Dated note, 2026-10-02 07:10Z: D2's publish passed all eight gates (section 4.18). Its results are in ADR 0001 (`17bc0fa`, 471 passed), and D2 is merged into `main` as `bc00ded` and pushed, with CI green. The push closed issue #3. Plan G's pre-flight is ruled (G-R1 to G-R31; X18, X19; section 5.28). G runs in `.worktrees/free-threaded-python` from `bc00ded`: the baselines, then Task 1 on Sonnet.
 - Dated note, 2026-10-02 07:52Z: plan G's Tasks 1 and 2 are approved (`05c2731`; 479 passed on 3.12, 461 with 4 skipped on 3.14.8t). One 3.14.8t suite run failed one unnamed test (section 9.4). Task 3 is running.
 - Dated note, 2026-10-02 09:25Z: plan G's Tasks 1–10 are done. The branch is at `cdf8ab9`, with 496 passed on 3.12 and 482 with 4 skipped on 3.14.8t, and the DGX scripts pass 26 scenarios outside the repo. A Linux run on gn100 found that the GIL guard's two proof tests skip on uv's Linux interpreters (section 2, 09:03Z). The final review on Opus is running; then the fix wave, and Tasks 11–12 on gn100 (DGX Spark).
+- Dated note, 2026-10-02 10:55Z: plan G's final review and fix wave are done. The branch is at `e3f558e`, with 497 passed on 3.12 and 483 with 4 skipped on 3.14.8t, on the laptop and on Linux on gn100. The fix wave includes a pre-existing BM25 bug fixed on the branch (section 5.29). DGX Task 11 is running on gn100 (DGX Spark); Task 12's ABAB is next.
 
 ### 9.2 Open questions in the plans
 
