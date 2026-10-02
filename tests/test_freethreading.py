@@ -24,6 +24,11 @@ from raggio.app import create_app
 DIM = 8
 ROOT = Path(__file__).resolve().parent.parent
 
+# the deadline of each wait for something that must happen. Generous on purpose: with
+# every CPU busy, a thread hand-off on the free-threaded build can take a second or more
+# (a contended PyMutex yields the CPU up to 40 times before it parks)
+WAIT_SECONDS = 360
+
 
 def gil_enabled() -> bool:
     # sys._is_gil_enabled exists from 3.13 on; every older build runs with the GIL
@@ -128,7 +133,8 @@ def _collect_until_dead(ref):
     # cycle is never collected, however often this runs
     import gc
 
-    for _ in range(100):
+    deadline = time.monotonic() + WAIT_SECONDS
+    while time.monotonic() < deadline:
         gc.collect()
         if ref() is None:
             break
@@ -173,7 +179,7 @@ def test_gc_freeze_still_frees_a_collection_loaded_before_the_freeze(make_app, m
         assert client.post("/collections", headers=root, json={"name": "kb", "dim": DIM}).status_code == 201
         job = client.post("/collections/kb/documents", headers=root, json={"documents": [
             {"doc_id": "d", "chunks": [{"id": "c", "text": "t", "vector": unit}]}]}).json()["job_id"]
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + WAIT_SECONDS
         while client.get(f"/collections/kb/jobs/{job}", headers=root).json()["status"] != "done":
             assert time.monotonic() < deadline, "the ingest job did not finish"
             time.sleep(0.01)
@@ -245,7 +251,7 @@ def test_stop_really_closes_meta_db_after_reads_on_many_threads(tmp_path, monkey
         c = await m.touch("x")
         await c.enqueue({"documents": [
             {"doc_id": "d", "chunks": [{"id": "c", "text": "t", "vector": unit.tolist()}]}]})
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + WAIT_SECONDS
         while c.pending_jobs():
             assert time.monotonic() < deadline, "the ingest job did not drain"
             await asyncio.sleep(0.01)

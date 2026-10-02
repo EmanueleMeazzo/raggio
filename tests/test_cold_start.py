@@ -8,6 +8,7 @@ import ctypes
 import logging
 import sqlite3
 import threading
+import time
 import zlib
 from pathlib import Path
 
@@ -30,6 +31,11 @@ from raggio.store import (
 DIM = 8
 ROOT = {"x-api-key": "root-key"}
 LOG = "uvicorn.error"  # the logger plan C logs through (uvicorn's handler in the container)
+
+# the deadline of each wait for something that must happen. Generous on purpose: with
+# every CPU busy, a thread hand-off on the free-threaded build can take a second or more
+# (a contended PyMutex yields the CPU up to 40 times before it parks)
+WAIT_SECONDS = 360
 
 
 class FakeEmbedder:
@@ -372,7 +378,7 @@ def test_rows_deleted_during_a_build_are_diffed_out(tmp_path):
 
 # ---- Task 4: off-loop, cancel-safe construction (§5.1) ----
 
-GATE_TIMEOUT = 3.0
+GATE_TIMEOUT = WAIT_SECONDS
 
 
 class Gate:
@@ -426,9 +432,9 @@ def test_off_loop_built_collection_serves_ingest_and_search(tmp_path, monkeypatc
         await c.enqueue({"documents": [
             {"doc_id": "d1", "chunks": [{"id": "c1", "text": "one", "vector": rowvec(1)}]},
         ]})
-        for _ in range(500):
-            if c.pending_jobs() == 0:
-                break
+        deadline = time.monotonic() + WAIT_SECONDS
+        while c.pending_jobs():
+            assert time.monotonic() < deadline, f"{c.pending_jobs()} jobs open after {WAIT_SECONDS} s"
             await asyncio.sleep(0.01)
         q = np.array([rowvec(1)], dtype=np.float32)
         hits = await c.search("vector", q, None, 5, "chunks", None, None)
@@ -551,7 +557,8 @@ def api_app(tmp_path, monkeypatch):
 
 
 async def wait_job(c, name, job_id):
-    for _ in range(500):
+    deadline = time.monotonic() + WAIT_SECONDS
+    while time.monotonic() < deadline:
         r = await c.get(f"/collections/{name}/jobs/{job_id}", headers=ROOT)
         if r.json()["status"] in ("done", "error"):
             return r.json()

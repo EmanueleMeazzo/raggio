@@ -21,6 +21,12 @@ import raggio.store as store  # noqa: E402
 from raggio.config import Settings  # noqa: E402
 from raggio.store import Collection, CollectionConfig, CollectionManager, open_meta_db  # noqa: E402
 
+# the deadline of each wait for something that must happen. Generous on purpose: with
+# every CPU busy, a thread hand-off on the free-threaded build can take a second or more
+# (a contended PyMutex yields the CPU up to 40 times before it parks); one claim-cursor
+# test took 20.7-37.1 s under 6 busy loops on a 6-core laptop (0.37 s unloaded)
+WAIT_SECONDS = 360
+
 
 def make_collection(tmp_path, dim=8, **kw):
     """A collection without an embedder: every ingest payload must carry vectors.
@@ -48,7 +54,7 @@ def docs_payload(ids, dim=8, with_vectors=True):
     ]}
 
 
-async def drain(col, timeout=30):
+async def drain(col, timeout=WAIT_SECONDS):
     """Wait until no job is open. Re-raises whatever killed the worker, and fails the
     test after `timeout` seconds."""
     deadline = time.monotonic() + timeout
@@ -1166,7 +1172,7 @@ def snapshot(col, dst):
         shutil.copytree(col.dir, dst, ignore=shutil.ignore_patterns("*-shm"))
 
 
-async def run_batched(col, payloads, timeout=30):
+async def run_batched(col, payloads, timeout=WAIT_SECONDS):
     """Journal every payload, then start the worker and wait until no job is open."""
     for p in payloads:
         await asyncio.to_thread(col._enqueue_row, p)
@@ -1297,10 +1303,10 @@ def test_idle_queue_flushes_the_open_batch(tmp_path):
 
     async def go():
         try:
-            await run_batched(col, [docs_payload([j]) for j in (1, 2, 3)], timeout=10)
+            await run_batched(col, [docs_payload([j]) for j in (1, 2, 3)])
             first = len(seen)
             await col.enqueue(docs_payload([4]))  # the worker is idle: this wakes it
-            await drain(col, timeout=10)
+            await drain(col)
             return first, len(seen), fetch(col, "SELECT status FROM jobs ORDER BY id")
         finally:
             await col.stop()
@@ -1664,7 +1670,7 @@ def failing_sync(col, failures):
     return calls, states
 
 
-async def wait_for_retries(col, logs, n, timeout=10):
+async def wait_for_retries(col, logs, n, timeout=WAIT_SECONDS):
     """Wait until the worker has logged n failed syncs. If the worker ended instead,
     re-raise what ended it."""
     deadline = time.monotonic() + timeout
@@ -1774,12 +1780,12 @@ def test_a_cancel_inside_a_sync_retry_ends_the_worker(tmp_path, monkeypatch):
             col.start_worker()
             await wait_for_retries(col, logs, 1)  # the first sync failed; the retry waits
             async with col.lock.read():  # so the retry's lock.write() has to wait
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + WAIT_SECONDS
                 while not col.lock._writers_waiting:
                     assert time.monotonic() < deadline, "the retry never asked for the lock"
                     await asyncio.sleep(0.01)
                 col._worker.cancel()
-                await asyncio.wait({col._worker}, timeout=5)
+                await asyncio.wait({col._worker}, timeout=WAIT_SECONDS)
                 return col._worker.cancelled(), len(logs.records)
         finally:
             await col.stop()
@@ -1823,7 +1829,7 @@ def test_stop_flushes_the_open_batch(tmp_path):
             await asyncio.to_thread(col._enqueue_row, p)
         col.start_worker()
         try:
-            await asyncio.wait_for(parked.wait(), 10)
+            await asyncio.wait_for(parked.wait(), WAIT_SECONDS)
             return [job[0] for job in col._unsynced]
         finally:
             await col.stop()
@@ -1931,7 +1937,7 @@ def stop_with_open_batch(directory, fail):
         for j in range(1, 5):
             await asyncio.to_thread(col._enqueue_row, docs_payload([j]))
         col.start_worker()
-        await asyncio.wait_for(parked.wait(), 10)
+        await asyncio.wait_for(parked.wait(), WAIT_SECONDS)
         batch = [job[0] for job in col._unsynced]
         calls = fail(col)  # from here on only stop() syncs and finishes
         await col.stop()
@@ -2036,8 +2042,8 @@ def test_stop_logs_a_dead_workers_exception_and_still_closes(tmp_path):
         for p in payloads:
             await asyncio.to_thread(col._enqueue_row, p)
         col.start_worker()
-        done, _ = await asyncio.wait({col._worker}, timeout=10)  # never re-raises
-        assert done, "the worker is still running after 10 s"
+        done, _ = await asyncio.wait({col._worker}, timeout=WAIT_SECONDS)  # never re-raises
+        assert done, f"the worker is still running after {WAIT_SECONDS} s"
         left = [job[0] for job in col._unsynced]
         await col.stop()  # before: sqlite3.OperationalError here
         return left
@@ -2248,8 +2254,8 @@ def test_shutdown_closes_every_collection_after_a_failed_stop(tmp_path, monkeypa
         flaky_finish(a, {1})
         monkeypatch.setattr(a, "_embedder", client)  # a's second close step raises
         await a.enqueue(docs_payload([1]))  # its flush syncs, then the finish raises
-        done, _ = await asyncio.wait({a._worker}, timeout=10)
-        assert done, "a's worker is still running after 10 s"
+        done, _ = await asyncio.wait({a._worker}, timeout=WAIT_SECONDS)
+        assert done, f"a's worker is still running after {WAIT_SECONDS} s"
         await mgr.shutdown()  # before: sqlite3.OperationalError here
         return mgr, a, b
 
@@ -2286,7 +2292,7 @@ def test_shutdown_stops_a_collection_whose_eviction_was_cancelled(tmp_path, monk
         col = await mgr.touch("m")
         async with col.lock.read():  # so stop()'s lock.write() has to wait
             ev = asyncio.create_task(mgr._evict("m"))
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + WAIT_SECONDS
             while not col.lock._writers_waiting:
                 assert time.monotonic() < deadline, "stop() never asked for the lock"
                 await asyncio.sleep(0.01)
@@ -2294,7 +2300,7 @@ def test_shutdown_stops_a_collection_whose_eviction_was_cancelled(tmp_path, monk
             sh = asyncio.create_task(mgr.shutdown())
             await asyncio.sleep(0.05)
             early = (sh.done(), col._closed)
-        await asyncio.wait({ev, sh}, timeout=10)
+        await asyncio.wait({ev, sh}, timeout=WAIT_SECONDS)
         sh.result()  # shutdown() finished and raised nothing
         with pytest.raises(sqlite3.ProgrammingError):
             mgr.catalog.execute("SELECT 1")
@@ -2325,7 +2331,7 @@ def test_a_cancelled_eviction_keeps_the_load_lock_until_stop_ends(tmp_path, monk
 
             async with col.lock.read():  # so stop()'s lock.write() has to wait
                 ev = asyncio.create_task(evict())
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + WAIT_SECONDS
                 while not col.lock._writers_waiting:
                     assert time.monotonic() < deadline, "stop() never asked for the lock"
                     await asyncio.sleep(0.01)
@@ -2335,8 +2341,8 @@ def test_a_cancelled_eviction_keeps_the_load_lock_until_stop_ends(tmp_path, monk
                 again = asyncio.create_task(mgr.touch("m"))
                 await asyncio.sleep(0.05)
                 early = (ev.done(), again.done(), col._closed)
-            col2 = await asyncio.wait_for(again, 10)
-            await asyncio.wait({ev}, timeout=10)
+            col2 = await asyncio.wait_for(again, WAIT_SECONDS)
+            await asyncio.wait({ev}, timeout=WAIT_SECONDS)
             return early, ev.cancelled(), col2 is not col, closed_state(col)
         finally:
             await mgr.shutdown()
