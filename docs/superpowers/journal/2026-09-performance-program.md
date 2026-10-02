@@ -1727,6 +1727,26 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
   - It also asked for: a statement that the app never ran under the shim; the traced hand-offs' real spread (typically 0.5–1 s, up to 2.2 s); the slowdown in pytest time on both sides (13–24×, not 10–17× against an estimated 20 s); the disagreement between the two Windows sweeps; and the exact upstream history (PR 146064 merged for 3.15, reverted by PRs 158082 and 158290; 3.14 never had the reload).
 - After the rewrite, a second Sonnet check said "minor fixes". The call counts fit about 80 yields per ping-pong round trip (200 × 80 = 16,000, against 16,160–16,360 measured), not "one to two spins", and three wording points remained. All are applied.
 - Posting is the maintainer's call (G-R44).
+**13:30Z–14:36Z. G-R42's loaded full suites: two more short budgets.** The full suite ran twice on 3.14.8t at `d94bd21`, under 6 busy loops on the 6-core laptop. Run 1 failed 2 tests (481 passed, 4 skipped) in 2,099 s. Run 2 passed all 483 in 1,882 s. Unloaded, the suite takes about 80 s.
+- `test_ingest_path.py::test_claim_cursor_processes_each_job_once` ran out of `drain`'s 30 s with "4 jobs open". The test syncs 20 jobs in batches of 8, so the open count can only read 20, 12, 4 or 0: the last batch had not synced yet.
+- `test_store_optimizations.py::test_concurrent_enqueue_with_worker_loses_nothing` ran out of a 300 × 0.05 s poll with 25 of 30 jobs done. Its next assert, 250 records against 300, read like lost jobs.
+
+**14:38Z–14:54Z. G-R46: slow, not stuck, and not on 3.12.** Each test ran 6 times on each interpreter under the same load, from a copy of the commit with its budget raised to 900 s.
+- The claim-cursor test passed every time on 3.14.8t, in 20.7–37.1 s. On 3.12 under the same load it took 0.9–1.1 s. Unloaded on 3.14.8t, the two tests take 0.37–0.51 s.
+- The enqueue test's patch missed on the first try. The copy came from `git archive`, which wrote CRLF line endings, so the two-line search pattern found nothing, and the script went on. With its old 15 s poll, the test failed 3 runs in 6. A second try, CRLF-safe and set to stop if the patch is missing, passed 6 of 6 in 51.7–83.4 s, with all 300 records each time. On 3.12: 1.3–1.6 s.
+- So both failures were budgets, and no job was lost. Under 6 busy loops, raggio's ingest worker path ran 20–60 times slower on 3.14.8t than on 3.12. That fits section 5.31's mechanism, now on raggio's own code rather than a stdlib repro; the lock spin was not traced in these runs.
+
+**14:54Z–16:34Z. The fix, `7bcf077`, and its loaded check.** X28: every test wait outside `test_concurrency.py` for something that must happen gets `WAIT_SECONDS = 360`, 4 times the slowest loaded run, rounded up.
+- A read-only Sonnet inventory found about 41 such waits in 7 modules, at 2–30 s. A Sonnet implementer changed them, and the controller read every hunk. Three poll loops that fell through to a later assert now fail with a message.
+- Kept: `test_cold_start`'s three 1 s "not blocked" checks (the gate's own timeout rose to 360 s, which only makes them stricter), `test_ingest_path`'s `took < 5.0` (it must stay below a 30 s retry delay), and `test_ivf_fanout`'s 0.1 s window and fixed sleeps.
+- Unloaded: 498 passed on 3.12 and 484 on 3.14.8t, 4 skipped each.
+- Under 6 busy loops on 3.14.8t: the two tests passed 16 runs in 16 (enqueue 42.5–88.3 s, claim cursor 24.8–53.6 s), and the full suite passed twice, 484 each time, in 2,213 s and 1,936 s.
+- The slowest enqueue run, 88.3 s, was above the 83.4 s the deadline was sized on. 4 × 88.3 s is 353 s, still under 360.
+
+**16:35Z–16:43Z. Plan G merged and pushed.** `5dc4607`, "Merge plan G: the free-threaded build, on hold", no fast-forward. Its tree is identical to `7bcf077`'s.
+- On the merged tree: 498 passed on 3.12 and 484 on 3.14.8t, 4 skipped each.
+- `main` was pushed at 16:39Z. CI passed: `test` 430 passed with 72 skipped; `native`, x86 and arm, 498 each; `freethreaded`, x86 and arm, 484 each, with the stress step's 2 passed and the image check reporting the GIL off; docs green. The `freethreaded` job is `continue-on-error`, so its counts were read from the log, not from the job's status.
+- gn100's two plan G test images were removed, by name.
 
 ## 3. Decision register
 
@@ -1807,6 +1827,7 @@ ID prefixes:
 | X25 | 2026-10-02, 12:12Z | The upstream write-up is a draft comment on gh-144586, the open issue on `_Py_yield()`, with a stdlib repro and the shim. The maintainer posts it, or not. | A new issue: gh-144586 already holds the discussion, and a CPython maintainer had asked for realistic programs. No write-up: the cost is not raggio's alone. | Fact-checked twice by Sonnet; the first check found two errors in the controller's arithmetic (section 2, 13:14Z). | Controller (W-14); posting is the maintainer's | G rulings G-R44 | Draft, not posted |
 | X26 | 2026-10-02, 13:05Z | The hand-off repro also runs with its busy loops as threads inside the measured process (G-R45b). | Processes only: a free-threaded app oversubscribes itself with its own threads, which a process sweep does not show. | The same cliff at busy threads = CPUs (111 ms at 4, 225 ms at 6); the shim's skip gives 2.00 ms. | Controller (W-14) | Ledger 13:11Z | Adopted |
 | X27 | 2026-10-02, 13:30Z | Plan G's outcome is Hold: the 3.14t build arg and CI job stay, nothing ships on 3.14t, and the ABAB is re-run when turbovec ships a cp314t wheel. | Continue: needs a turbovec cp314t wheel, and an own build never becomes the default (D6). Park: B won. | B won `Hybrid QPS concurrent` in both pairs with a `better` hybrid p99; flat `QPS concurrent` was not won (one uneven split). | Plan G's decision rule, applied by its script | ADR 0006 | Adopted (`93fdfe9`) |
+| X28 | 2026-10-02, 14:54Z | Every test wait outside `test_concurrency.py` for something that must happen gets `WAIT_SECONDS = 360`, one constant per module. Poll loops that fell through to a later assert fail with a message. Waits that prove something did not happen keep their budgets. | 60 s, as in X23: the enqueue test took up to 83.4 s under load. Fix only the two failing tests: the inventory found about 41 waits of the same kind, at 2–30 s. | Under 6 busy loops, 3.14.8t took 20.7–83.4 s where 3.12 took 0.9–1.6 s. At `7bcf077` under load: 16 of 16, and the full suite 2 of 2. | Controller (W-14) | G rulings G-R46 | Adopted (`7bcf077`) |
 | W-1 | 2026-09-27 23:27Z | "Answer, don't act": a question such as "is it OK to X?" gets an answer and an offer, never an unrequested action. | None. | The gn100 restart incident (section 7). | Maintainer (correction) | Transcript | Standing rule |
 | W-2 | 2026-09-27 23:09Z to 2026-09-28 01:11Z | Offload work to gn100 "when it makes sense". First baseline: "not more than 65m". Later: "no limits" for this program while the PC stays on. The spec keeps a rule that DGX runs over about 5 minutes need a go-ahead with a time cap. | None. | None. | Maintainer | Transcript; spec §6 | Standing |
 | W-3 | 2026-09-28 18:45Z | Every question to the maintainer goes through the structured question tool. | None. | None. | Maintainer | Transcript | Standing |
@@ -2834,6 +2855,8 @@ Upstream knows the loop. A reload was added for 3.15 and reverted after throughp
 
 The controller's first arithmetic, 40 yields of about 15 ms making the 600 ms, matched the data and was still wrong: a ping-pong round trip has two blocked waits. A fact-check that recomputed from the shim's call counts caught it (section 2, 13:14Z). An unloaded run cannot show this cost. A busy-loop load at exactly the CPU count is the cheapest way to find it, and counting failures alone would have filed it under "flaky".
 
+(Dated note, 2026-10-02 16:43Z: raggio's own ingest worker path slows down the same way. Under the same 6 busy loops, two ingest tests that take about 0.5 s unloaded ran 20–60 times slower on 3.14.8t than on 3.12, at 20.7–88.3 s against 0.9–1.6 s (section 2, 14:38Z). The runs did not trace the lock spin, but the shape matches. A free-threaded deployment on a host with every CPU busy would meet it on ingest. The tests' answer is X28. ADR 0006's Hold did not rest on it, and no image ships on 3.14t.)
+
 ## 6. Method: how we measured
 
 Spec §6 sets one protocol for every plan. Each rule below gives the reason the sources record, or says "reason not recorded".
@@ -2952,6 +2975,7 @@ Recorded subagent tokens for the completed workflows sum to 10,021,309. That tot
 - Over ssh, `cd X && nohup cmd > log 2>&1 &` puts the whole AND-list in the background, and ssh stays open until it ends. Launch with `cd X; setsid nohup bash script > log 2>&1 < /dev/null &` (section 2, 2026-10-02 12:53Z).
 - Rootless podman on gn100 has no cpuset controller, so `--cpuset-cpus` fails. `taskset -c` inside the container restricts the process tree. `nproc` follows it; `os.cpu_count()` still reports all 20 CPUs (section 2, 2026-10-02 12:53Z).
 - `uv run --no-sync --group docs` does not install a missing docs group. The strict docs build needs `uv run --group docs` the first time.
+- `git archive` applies `core.autocrlf`: with it on, the copy of a commit has CRLF line endings, and a search pattern that spans lines needs `\r?\n`. A script that patches such a copy should stop when the patch misses; the first G-R46 timing ran on with one test unpatched (section 2, 2026-10-02 14:38Z).
 
 ### 7.7 Working agreements with the maintainer
 
@@ -3042,6 +3066,7 @@ State as of 2026-09-28, about 19:30Z.
 - Dated note, 2026-10-02 09:25Z: plan G's Tasks 1–10 are done. The branch is at `cdf8ab9`, with 496 passed on 3.12 and 482 with 4 skipped on 3.14.8t, and the DGX scripts pass 26 scenarios outside the repo. A Linux run on gn100 found that the GIL guard's two proof tests skip on uv's Linux interpreters (section 2, 09:03Z). The final review on Opus is running; then the fix wave, and Tasks 11–12 on gn100 (DGX Spark).
 - Dated note, 2026-10-02 10:55Z: plan G's final review and fix wave are done. The branch is at `e3f558e`, with 497 passed on 3.12 and 483 with 4 skipped on 3.14.8t, on the laptop and on Linux on gn100. The fix wave includes a pre-existing BM25 bug fixed on the branch (section 5.29). DGX Task 11 is running on gn100 (DGX Spark); Task 12's ABAB is next.
 - Dated note, 2026-10-02 13:39Z: plan G's Task 12 is done, and the verdict is Hold (ADR 0006, `93fdfe9`; 498 passed on 3.12, 484 with 4 skipped on 3.14.8t; section 2, 12:48Z). On gn100 (DGX Spark), the hand-off repro and a `sched_yield` shim showed on Linux what made G-R40's loop fail (section 5.31). G-R42's loop passed 16 of 16, and its loaded full suites are running on the laptop. Next: merge G into `main` and push. The CPython comment draft (G-R44) waits for the maintainer.
+- Dated note, 2026-10-02 16:43Z: plan G is merged and pushed (`5dc4607`), and CI is green. The loaded full suites found two more short budgets, which X28 fixed in `7bcf077` (section 2, 13:30Z–16:43Z). Plans A–G are done. Open: the `uv.lock` refresh (G-R30), `docs.yml`'s `setup-uv@v5`, and the CPython comment draft (G-R44), which waits for the maintainer.
 
 ### 9.2 Open questions in the plans
 
