@@ -889,7 +889,7 @@ class _IvfIndex:
         on the caller), so the intersections run in parallel too."""
         if allowlist is not None:  # sorted, unique: the form _intersect binary-searches
             allowlist = _sorted_ids(allowlist)
-        tiny =allowlist is not None and len(allowlist) <= 128
+        tiny = allowlist is not None and len(allowlist) <= 128
         owned: dict[int, np.ndarray] = {}  # tiny allowlists only: shard j -> its slice
         if tiny:
             # tiny allowlists (metadata filters, sibling expansion) must not lose
