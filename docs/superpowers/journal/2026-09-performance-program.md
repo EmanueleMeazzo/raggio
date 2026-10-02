@@ -1524,6 +1524,25 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
   - Two more fixes. The flat-index check after a reingest no longer pipes curl into `grep -q`, which under `pipefail` can fail a good run when grep exits before curl has finished writing. And an override now needs a non-empty reason.
 - **The host venv's versions are checked by hand.** The driver records the host's Python and SQLite but never asserts 3.12.14 and 3.53.1, so a venv that is wrong in both windows would pass every gate. The controller runs the version check after every sync on gn100 and stops unless it prints `3.12.14 3.53.1`.
 
+**04:55Z–05:15Z. Task 9 needs one test fix, issue #3 is fixed, the docs land, and the tuning starts on gn100.**
+- **Task 9, `54aeab1`**: the sync retry, and `stop()` finishing the open batch. 468 passed. Of 645 added lines, 5 are not verbatim, all in the failed-pre-sync test.
+  - **Both pre-flight pins work.** A retry that catches `BaseException` makes the cancel test hang (a 60 s timeout ended it), and a failed pre-sync that resets the removal count fails `[1, 1] == [1, 2]`.
+  - **One deviation, confirmed by the review.** As written, the ruled `seen == [1, 2]` would read `[1, 2, 0]`, because the test's own `finally` calls `stop()`, whose sync appends a 0. The implementer reads the list before the `finally`, at the same point as the test's other counts, and the pin still catches the mutant.
+  - **Of the review's three minor points, one was real.** The cancel test had to take a read lock within the retry's first wait of 0.5 s, and a loaded runner could miss that window and fail a correct build. The controller widened the wait to 2 s (`8aec22b`, test only).
+- **Task 9b, `9c96cec`, closes issue #3.** 470 passed.
+  - **Each new test fails when its half of the fix is removed.** Without `shutdown()`'s wait, the collection is still open when the catalog closes. Without the caller's wait, a queued `touch()` takes `_load_lock` while the old collection is still closing.
+  - **The review found no deadlock.** `stop()` never takes `_load_lock`, and `shutdown()` takes no lock.
+  - **One of its four minor points was a gap.** No test sent a second cancel into the caller's wait loop, so a version that let that cancel end the wait passed. The controller's `8976da3` cancels twice, and that version now fails.
+  - **A trade-off worth stating.** While `stop()` runs, nothing can interrupt a cancelled caller. A dropped request or a shutdown takes as long as the slowest `stop()`, which is now one sync plus the batch's finishes.
+- **Task 10's documentation step, `2a816e5`.** It adds the ADR's D2 section, with its results `Pending:`, the storage notes, and the two knob rows in the README and the getting-started guide. Four ADR lines differ from the plan, all by ruling: sourced figures and no stale premise.
+  - The review approved it with two minor points. One misread the ADR's "Every row is pinned" convention, which since plans B and C has meant that each row's behaviour is tested.
+  - The other is real: the wording says a dead worker's jobs replay. In fact `stop()` still syncs and finishes a dead worker's open batch, and only the job the worker held replays. That goes to the final review.
+- **The final review on Opus** started at 05:12Z on `cdfbcbc..8976da3`. It rules again on the 14 minor points from the task reviews. The tuning runs at the same time; a fix to the worker, the sync path or the probe would mean running it again.
+- **gn100, 05:13–05:14Z.**
+  - The preflight found the host idle. D1's `~/planD` was moved aside, not deleted.
+  - The repo's deploy script shipped the D2 tree. After the venv was re-synced, the version check printed `3.12.14 3.53.1`.
+  - The seed-7 tuning started at 05:14Z under a 150-minute cap. Its first flat runs at (8, 1000) gave 4,929 and 4,954 vec/s, with every job done and no payload row left.
+
 ## 3. Decision register
 
 ID prefixes:
@@ -2648,6 +2667,7 @@ State as of 2026-09-28, about 19:30Z.
 - Dated note, 2026-10-02 03:26Z: `main` is at `cdfbcbc` after three version bumps (uv 0.12.22, numpy 2.5.3, Rust 1.99.0; section 2, 03:20–03:25Z). The next image installs CPython 3.12.15. D2's base arm should be `cdfbcbc` or later, so that both arms run the same Python.
 - Dated note, 2026-10-02 04:25Z: plan D2's pre-flight is done and ruled (section 2, 03:27Z; D2-R1 to D2-R23 in the ledger). D2 runs in `.worktrees/ingest-path-d2` from `main` at `cdfbcbc` (432 passed). Task 9b, issue #3, is added (X13). Task 7 is next, on Sonnet; the gn100 scripts are prepared in parallel.
 - Dated note, 2026-10-02 04:58Z: D2's Tasks 7 and 8 are approved (`4786777`, 455 passed), and the gn100 scripts are reviewed and ready (section 2, 04:26Z). Task 9 is running; then Task 9b, Task 10's documentation step, and the tuning and A/B on gn100.
+- Dated note, 2026-10-02 05:16Z: D2's code and docs are done and checked at `8976da3` (470 passed). Issue #3 is fixed in `9c96cec`, and the push to `main` will close it. The final review on Opus and the seed-7 tuning on gn100 (DGX Spark) run in parallel (section 2, 04:55Z). Then the fix wave, the seed-42 publish, the gate test, and the merge.
 
 ### 9.2 Open questions in the plans
 
