@@ -394,3 +394,49 @@ def test_the_builder_can_build_turbovec_from_its_sdist():
     assert "ENV PYO3_PYTHON=/usr/local/bin/python3" in builder.splitlines()
     syncs = re.findall(r"^RUN uv sync (.*)$", builder, re.M)
     assert len(syncs) == 2 and all("--extra native" in s for s in syncs)
+
+
+# ---- the non-blocking 3.14t CI job (spec D11) ----
+
+
+def _jobs():
+    import yaml  # uvicorn[standard] installs PyYAML
+
+    ci = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
+    return ci, yaml.safe_load(ci)["jobs"]
+
+
+def _runs(job):
+    return {s["run"].strip(): s.get("env", {}) for s in job["steps"] if "run" in s}
+
+
+def test_ci_runs_the_suite_on_314t_without_blocking_the_workflow():
+    ci, jobs = _jobs()
+    ft = jobs["freethreaded"]
+    assert ft["continue-on-error"] is True  # experimental until 3.14t is the default
+    assert ft["timeout-minutes"] <= 30
+    # x86_64 and aarch64 (the DGX), the same runners as the native job
+    assert ft["runs-on"] == "${{ matrix.runner }}"
+    assert ft["strategy"]["matrix"]["runner"] == jobs["native"]["strategy"]["matrix"]["runner"]
+    # the same uv action, pin and uv version as the blocking job; only the interpreter differs
+    (setup,) = [s for s in ft["steps"] if s.get("uses", "").startswith("astral-sh/setup-uv@")]
+    (base,) = [s for s in jobs["test"]["steps"] if s.get("uses", "").startswith("astral-sh/setup-uv@")]
+    assert setup["uses"] == base["uses"]
+    assert setup["with"] == {**base["with"], "python-version": "3.14t"}
+    # turbovec builds from its sdist and raggio-native from native/: the image's Rust pin
+    rust = [s["run"] for s in jobs["native"]["steps"] if s.get("name", "").startswith("Install Rust")]
+    assert rust and rust[0] in [s.get("run") for s in ft["steps"]]
+
+
+def test_ci_314t_job_turns_a_gil_re_enable_into_a_failure():
+    ci, jobs = _jobs()
+    ft = jobs["freethreaded"]
+    assert ft["env"]["PYTHONWARNINGS"] == load_check_image().GIL_WARNING_FILTER
+    runs = _runs(ft)
+    # no --group bench: orjson has no free-threaded wheel
+    assert "uv sync --frozen --extra native" in runs
+    assert runs["uv run --no-sync pytest -q"] == {"REQUIRE_NATIVE": "1"}
+    assert "uv run --no-sync python docker/check_image.py --python 3.14t --require-native" in runs
+    stress = runs['uv run --no-sync pytest -q tests/test_concurrency.py -k "mixed_workload or stop_under_load"']
+    assert float(stress["RAGGIO_STRESS_SECONDS"]) >= 30
+    assert "PYTHON_GIL" not in ci and "gil=0" not in ci.lower()

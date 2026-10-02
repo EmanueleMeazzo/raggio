@@ -60,3 +60,44 @@ jobs:
         run: uv run --no-sync pytest -q
         env:
           REQUIRE_NATIVE: "1"
+
+  # experimental free-threaded CPython (ADR 0006), on x86_64 and aarch64 like the native
+  # job: the suite on 3.14t with the extension required and a GIL re-enable turned into an
+  # error, the image build's check, then the concurrency stress tests for longer.
+  # Non-blocking until 3.14t is the default image.
+  freethreaded:
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    continue-on-error: true
+    env:
+      PYTHONWARNINGS: "error:The global interpreter lock (GIL) has been enabled:RuntimeWarning"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.22"  # same pin as ARG UV_VERSION in the Dockerfile
+          python-version: "3.14t"
+      - name: Install Rust (same pin as ARG RUST_VERSION in the Dockerfile)
+        run: |
+          if ! command -v rustup; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup default 1.99.0
+      - name: Build turbovec (sdist, no cp314t wheel) and raggio-native
+        run: uv sync --frozen --extra native
+      - name: Test with the extension required
+        run: uv run --no-sync pytest -q
+        env:
+          REQUIRE_NATIVE: "1"
+      - name: Check the environment as the image build does
+        run: uv run --no-sync python docker/check_image.py --python 3.14t --require-native
+      - name: Stress the concurrency paths
+        run: uv run --no-sync pytest -q tests/test_concurrency.py -k "mixed_workload or stop_under_load"
+        env:
+          RAGGIO_STRESS_SECONDS: "30"
