@@ -1,6 +1,7 @@
 import asyncio
 import hmac
 import json
+import sys
 from contextlib import asynccontextmanager
 from typing import Any, Literal
 
@@ -10,6 +11,11 @@ from pydantic import BaseModel, Field
 
 from .config import Settings
 from .store import CollectionDeletedError, CollectionManager, _normalize, hash_key
+
+
+def _gil_enabled() -> bool:
+    """False only on a free-threaded build (3.13t+) that is really running without the GIL."""
+    return getattr(sys, "_is_gil_enabled", lambda: True)()
 
 
 # ---- request models ----
@@ -297,6 +303,7 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
             "status": "ok",
             "resident_collections": list(manager.resident),
             "bm25": manager.bm25_backend(),
+            "gil_enabled": _gil_enabled(),
         }
 
     return app
