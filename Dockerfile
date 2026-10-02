@@ -6,7 +6,7 @@
 # (native/Cargo.lock, built --locked). The wheel is not manylinux-audited, so the builder
 # runs trixie like the runtime; the runtime stage copies no toolchain. RUST_VERSION is the
 # same pin as the native job in .github/workflows/tests.yml.
-ARG UV_VERSION=0.12.21
+ARG UV_VERSION=0.12.22
 ARG PYTHON=3.12
 ARG RUST_VERSION=1.98.1
 

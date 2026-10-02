@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
-          version: "0.12.21"  # same pin as ARG UV_VERSION in the Dockerfile
+          version: "0.12.22"  # same pin as ARG UV_VERSION in the Dockerfile
           python-version: "3.12"
       - run: uv lock --check
       - run: uv sync --frozen --group bench
@@ -43,7 +43,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
-          version: "0.12.21"  # same pin as ARG UV_VERSION in the Dockerfile
+          version: "0.12.22"  # same pin as ARG UV_VERSION in the Dockerfile
           python-version: "3.12"
       - name: Install Rust (same pin as ARG RUST_VERSION in the Dockerfile)
         run: |
