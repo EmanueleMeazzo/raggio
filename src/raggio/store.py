@@ -717,7 +717,9 @@ class _ShardPool:
 
     def map(self, fn, tasks: list) -> list:
         # 1 thread, 1 task, or closed: the plain loop on the calling thread (a pool of 1
-        # measured 0.89x of serial). IVF_SEARCH_THREADS=1 is the pre-0005 path bit-for-bit.
+        # measured 0.89x of serial). IVF_SEARCH_THREADS=1 is the pre-0005 path bit-for-bit
+        # for distinct allowlists, which every caller passes (duplicate ids count once
+        # toward the 128-id tiny cut).
         if self.threads <= 1 or len(tasks) <= 1 or self._closed:
             return [fn(t) for t in tasks]
         with self._lock:
