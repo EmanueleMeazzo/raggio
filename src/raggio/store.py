@@ -2547,6 +2547,8 @@ class CollectionManager:
         self._catalog_lock = threading.Lock()
         self.resident: dict[str, Collection] = {}
         self._load_lock = asyncio.Lock()
+        # stop() tasks of evictions whose caller was cancelled; shutdown() waits for them
+        self._stopping: set[asyncio.Future] = set()
 
     def _default_embedder(self, cfg: CollectionConfig) -> Embedder:
         s = self.settings
@@ -2696,7 +2698,25 @@ class CollectionManager:
     async def _evict(self, name: str) -> None:
         c = self.resident.pop(name, None)
         if c:
-            await c.stop()
+            # out of resident from here, so no later shutdown() or touch() can find c.
+            # A cancel of this coroutine (housekeeping cancelled at shutdown, a request
+            # dropped mid-touch) must not cut stop() short, which left c's connections
+            # open (issue #3). stop() runs as its own task, shutdown() waits for any
+            # still running, and the caller sees its cancel only once stop() ends, so
+            # its _load_lock covers the whole close: no touch() reopens the directory
+            # beside a collection still closing
+            stop = asyncio.ensure_future(c.stop())
+            self._stopping.add(stop)
+            stop.add_done_callback(self._stopping.discard)
+            try:
+                await asyncio.shield(stop)
+            except asyncio.CancelledError:
+                while not stop.done():
+                    try:
+                        await asyncio.wait({stop})
+                    except asyncio.CancelledError:
+                        pass  # cancelled again: still must not leave stop() half done
+                raise
 
     async def delete_collection(self, name: str) -> None:
         # evict + catalog delete under _load_lock, like touch() and housekeeping's
@@ -2738,5 +2758,9 @@ class CollectionManager:
     async def shutdown(self) -> None:
         for name in list(self.resident):
             await self._evict(name)
+        # an eviction whose caller was cancelled (housekeeping, just before this runs)
+        # may still be stopping its collection
+        while self._stopping:
+            await asyncio.wait(self._stopping)
         with self._catalog_lock:  # a threadpool get_config may still be mid-query
             self.catalog.close()

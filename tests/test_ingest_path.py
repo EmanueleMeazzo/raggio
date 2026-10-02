@@ -2269,3 +2269,78 @@ def test_shutdown_closes_every_collection_after_a_failed_stop(tmp_path, monkeypa
     assert died.args == ("a", 0)  # the worker had popped job 1, the batch's only job
     assert closing.exc_info[0] is OSError and "failed in stop()" in closing.getMessage()
     assert closing.args == ("a", "the embedder's HTTP client")  # then a's pool closed
+
+
+# ---- eviction cancelled mid-stop (issue #3)
+
+
+def test_shutdown_stops_a_collection_whose_eviction_was_cancelled(tmp_path, monkeypatch):
+    # _evict pops the collection before it awaits stop(): a cancel landing there (the
+    # app cancels housekeeping just before shutdown()) must not leave it open with
+    # nothing left to close it. shutdown() waits for that stop() before the catalog
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+
+    async def go():
+        mgr = CollectionManager(Settings(), embedder_factory=lambda cfg: None)
+        await mgr.create_collection("m", 8, 4, None, None, None)
+        col = await mgr.touch("m")
+        async with col.lock.read():  # so stop()'s lock.write() has to wait
+            ev = asyncio.create_task(mgr._evict("m"))
+            deadline = time.monotonic() + 10
+            while not col.lock._writers_waiting:
+                assert time.monotonic() < deadline, "stop() never asked for the lock"
+                await asyncio.sleep(0.01)
+            ev.cancel()
+            sh = asyncio.create_task(mgr.shutdown())
+            await asyncio.sleep(0.05)
+            early = (sh.done(), col._closed)
+        await asyncio.wait({ev, sh}, timeout=10)
+        sh.result()  # shutdown() finished and raised nothing
+        with pytest.raises(sqlite3.ProgrammingError):
+            mgr.catalog.execute("SELECT 1")
+        return early, ev.cancelled(), closed_state(col), mgr.resident
+
+    early, cancelled, state, resident = asyncio.run(go())
+    assert early == (False, False)  # shutdown() waits for the stop() still running
+    assert cancelled  # the eviction's caller still sees its cancel
+    assert state == (True, False, 0, True)
+    assert resident == {}
+
+
+def test_a_cancelled_eviction_keeps_the_load_lock_until_stop_ends(tmp_path, monkeypatch):
+    # the cancelled caller re-raises only once stop() ends, so its _load_lock covers
+    # the whole close: a touch() queued behind it cannot reopen the directory beside
+    # a collection still closing
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+
+    async def go():
+        mgr = CollectionManager(Settings(), embedder_factory=lambda cfg: None)
+        try:
+            await mgr.create_collection("m", 8, 4, None, None, None)
+            col = await mgr.touch("m")
+
+            async def evict():  # as housekeeping evicts: under _load_lock
+                async with mgr._load_lock:
+                    await mgr._evict("m")
+
+            async with col.lock.read():  # so stop()'s lock.write() has to wait
+                ev = asyncio.create_task(evict())
+                deadline = time.monotonic() + 10
+                while not col.lock._writers_waiting:
+                    assert time.monotonic() < deadline, "stop() never asked for the lock"
+                    await asyncio.sleep(0.01)
+                ev.cancel()
+                again = asyncio.create_task(mgr.touch("m"))
+                await asyncio.sleep(0.05)
+                early = (ev.done(), again.done(), col._closed)
+            col2 = await asyncio.wait_for(again, 10)
+            await asyncio.wait({ev}, timeout=10)
+            return early, ev.cancelled(), col2 is not col, closed_state(col)
+        finally:
+            await mgr.shutdown()
+
+    early, cancelled, reloaded, state = asyncio.run(go())
+    assert early == (False, False, False)  # the cancelled eviction still holds the lock
+    assert cancelled
+    assert reloaded  # touch() loaded the collection anew, once the old one had closed
+    assert state == (True, False, 0, True)
