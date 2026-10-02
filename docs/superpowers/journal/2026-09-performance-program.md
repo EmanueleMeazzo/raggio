@@ -1668,7 +1668,7 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
 - **The plan's move-aside step.** Before the chain, Task 12 moves any earlier ABAB's files into a dated folder. It lists them with `shopt -s nullglob; old=(g-[abcd][12]-* g-boot-*.txt g-abab.log g-verification.md)`. `nullglob` drops only patterns that match nothing, and the last two names have no wildcard, so the list keeps them even when the files do not exist. On a first ABAB there was nothing to move, yet the step made an empty folder and `mv` failed. The controller removed the empty folder and went on. A later rerun should write those two names as `g-abab.lo[g]` and `g-verification.m[d]` (section 7.6).
 
 **11:10Z–12:15Z. G-R40's loop: two failures in 16, traced to the free-threaded lock spin.**
-- **The loop.** G-R40 ran `tests/test_concurrency.py` 16 times on 3.14.8t at `e3f558e`, under 6 busy loops on the 6-core laptop, from an archive copy of the commit. 14 runs passed, in 194–338 s each, against about 20 s unloaded. Two failed, and each failure was a fixed 5 s wait running out:
+- **The loop.** G-R40 ran `tests/test_concurrency.py` 16 times on 3.14.8t at `e3f558e`, under 6 busy loops on the 6-core laptop, from an archive copy of the commit. 14 runs passed, in 194–338 s each, against about 20 s unloaded. (Dated note, 2026-10-02 13:39Z: measured unloaded, the module takes 14.5 s on 3.12 and 14.7 s on 3.14.8t, so the loaded runs were 13–23 times slower.) Two failed, and each failure was a fixed 5 s wait running out:
   - Run 11, `test_stop_waits_for_a_write_transaction_its_cancelled_worker_left_running`: `inside.wait(5)` returned False.
   - Run 12, `test_stop_does_not_cancel_the_worker_inside_its_write_section`: `asyncio.wait_for(stopper, 5)` raised `TimeoutError`.
   - Neither failure was the BM25 bug (I1) or the stop-under-load race (M1).
@@ -1676,7 +1676,7 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
   - 3.14.8t, unloaded: p50 0.016 s, p99 0.031 s, max 0.179 s.
   - 3.12, under 6 busy loops: p50 0.096 s, p99 0.205 s, max 0.283 s.
   - 3.14.8t, under 6 busy loops: p50 2.901 s, p99 4.957 s, max 5.756 s. 125 of the 150 runs took over 2 s.
-  - No run stalled, so the two failures were budgets, not hangs. The time sat in the hand-offs between the worker threads and the event loop, 0.3–1.3 s each, while the thread bodies took milliseconds.
+  - No run stalled, so the two failures were budgets, not hangs. The time sat in the hand-offs between the worker threads and the event loop, 0.3–1.3 s each, while the thread bodies took milliseconds. (Dated note, 2026-10-02 13:39Z: across all traced runs, the hand-offs of 0.1 s or more had a median of 0.67 s, quartiles of 0.53 and 0.95 s, and a maximum of 2.16 s.)
 - **A repro with no raggio code.** `handoff-repro.py` times `asyncio.to_thread(noop)` round trips and a two-thread `threading.Event` ping-pong. Unloaded, every interpreter is under 0.6 ms. Under 6 busy loops:
   - 3.12.15: ping-pong max 33 ms. 3.14.7, the GIL build: max 13.7 ms.
   - 3.14.8t: ping-pong p50 599 ms and p99 1,192 ms, only 71 round trips in 40 s. `to_thread`: p50 0.13 ms, but p90 645 ms.
@@ -1686,7 +1686,7 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
   - In 3.14, `threading.Lock.acquire` calls `_PyMutex_LockTimed`, so `Condition.wait` and `Event.wait` block there too.
   - On a free-threaded build, a blocking acquire of a held lock spins up to 40 times before it parks the thread. A GIL build parks at once: `MAX_SPIN_COUNT` is 0 there.
   - Each spin calls `_Py_yield()`: `SwitchToThread()` on Windows, `sched_yield()` on POSIX. The loop does not reload the lock word, so a wake during the spin is seen only after all 40 yields.
-  - With an idle CPU, a yield costs microseconds. With a busy loop on every CPU, each yield costs a scheduler time slice, about 15 ms on Windows, and 40 × 15 ms is the measured 600 ms.
+  - With an idle CPU, a yield costs microseconds. With a busy loop on every CPU, each yield costs a scheduler time slice, about 15 ms on Windows, and 40 × 15 ms is the measured 600 ms. (Dated note, 2026-10-02 13:39Z: the arithmetic is wrong. A ping-pong round trip has two blocked waits, so up to 80 yields, and 599 ms is then 7.5–15 ms per yield, an estimate; see the 13:14Z block.)
   - `PYTHON_GIL=1` does not help, because the spin count is fixed when CPython is compiled.
   - Upstream: gh-135871 reported the missing reload. Its fix, in 3.15, was reverted after it cut throughput up to 6× (gh-157914, closed 2026-09-30). gh-144586, still open, proposes replacing the yield with a CPU pause instruction. On a linked PR, a maintainer wrote that realistic programs showing a change are lacking.
   - The mechanism fits all the data. A rebuild or an interposed `sched_yield` would prove it (G-R45).
@@ -1700,6 +1700,33 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
   - A Sonnet reviewer approved it. Its one note: a failing test now takes up to 60 s to report, not 5 s. Passing runs are no slower.
   - The images contain no tests, so the ABAB's `e3f558e` images stay valid.
   - The loop restarted on `d94bd21` at 12:07Z.
+
+**12:07Z–13:25Z. G-R42's loop at `d94bd21`: 16 of 16.** The same loop as G-R40 (`tests/test_concurrency.py` on 3.14.8t, 6 busy loops on the 6-core laptop) ran 16 times on the commit with the 60 s deadlines. All 16 passed, in 229–353 s each by pytest's clock, and no busy-loop process was left. Unloaded, the module takes 14.5 s on 3.12 and 14.7 s on 3.14.8t, so across both loops the load made it 13–24 times slower. The loaded full suites run next.
+
+**12:48Z–13:30Z. Task 12's verdict: Hold.**
+- **The ABAB.** The chain ended at 12:48:08Z on the boot it started on. Its 8 sessions took about 13 minutes each, against a cap of 90. Every B session reported the GIL off at every `/healthz` (12, 14, 12 and 13 answers), every A session reported it on, and no container log held a traceback or a GIL line.
+- **The decision script's verdict: Hold.** B beat A beyond the noise band on `Hybrid QPS concurrent` in both pairs, 36.2 → 40.4 and 36.3 → 40.1. Its hybrid p99 under concurrency was `better` in both (465.5 → 356.5 and 433.8 → 351.7 ms), so R-G5's guard passed. Both arms run SQLite 3.53.1, so the hybrid row may count (D15). turbovec 1.0.0 still ships no cp314t wheel, and spec D6 never makes an own build the default. Hold keeps the build arg and the CI job; the ABAB is re-run when a wheel exists.
+- **Not won: flat `QPS concurrent`.** 127 → 124 and 151 → 126, both inside the band. In A2 → B2 the runs' fast and slow states split unevenly (A2 0 high and 3 low, B2 1 high and 2 low; B2's 119.0 ms CPU per query sits 0.05 ms over the 1.5× line), so that pair counts as neither a win nor a miss (spec §3.1 G5).
+- **Costs, which do not gate.** Memory rose 20–34 MB on about 1.5 GB, in both engines. Serial flat search rose too: p50 18.5 → 18.8 ms and p95 19.7 → 20.0 ms. That is about 1.6 %, above X22's 1 % line, but the runs are serial and unpinned, so it is not attributed to free threading (D16).
+- **c=16, reported only.** B's hybrid gain holds there too, 34.3 → 36.5 and 34.3 → 36.2, with p99 988.7 → 794.9 and 982.6 → 804.3 ms. This answers p4's c=8 question (section 9.2).
+- **Other checks.** The fan-out guard passed on both arms (A ran 8 pool threads, B 16). The Unicode 15 → 16 drift touched 0 corpus rows. C1 and D1 did not run, so the ADR makes no cold-start claim. Section 4.7 has the tables.
+- **Steps 12 and 13.** Unloaded: the focused tests gave 26 passed with 4 skipped on 3.12, and 30 passed on 3.14.8t. The full suites gave 498 passed with 4 skipped, and 484 passed with 4 skipped. The strict docs build passed. The ADR and its test are `93fdfe9` (13:30:06Z).
+
+**12:53Z–13:11Z. The hand-off repro on gn100 (DGX Spark): the cliff on Linux, and a shim that removes it.**
+- **Setup.** G-R43 and G-R45 ran `handoff-repro.py` inside both of G's images, restricted to 4 of gn100's Cortex-A725 cores. Rootless podman has no cpuset controller, so `--cpuset-cpus` failed; `taskset -c 0-3` inside the container worked (section 7.6). Every container was `podman run --rm`.
+- **G-R43.** With 0–3 busy loops, every interpreter's ping-pong stayed under 0.1 ms. From 4 busy loops, as many as the CPUs, 3.14.8t's ping-pong p50 jumped to 111 ms, and to 225 ms with 12. 3.12.15 stayed at 2 ms or less. `PYTHON_GIL=1` doubled the cliff (222 ms, from 5 loops) instead of removing it. `to_thread` showed it only in the tail.
+- **G-R45 met.** An `LD_PRELOAD` shim for `sched_yield` counted the calls, or made them return at once. 3.12 made none. 3.14.8t made 14,480–20,200 per run, idle or busy. With the yields skipped, the calls stayed and the cliff went: 111 → 2.00 ms at 6 busy loops, and 225 → 0.01 ms at 12. On Linux the mechanism is now shown, not inferred.
+- **G-R45b, the load inside the process** (13:05Z–13:11Z). A free-threaded app oversubscribes itself with its own threads, so the controller added `busy=K` to the repro: K threads spinning inside the measured process. The same cliff came at busy threads = CPUs: 111 ms at 4 and 225 ms at 6, and 2.00 ms with the shim's skip. 3.12 paid its own known cost instead, the GIL hand-over: ping-pong about 10.4 ms, and `to_thread` p50 36–67 ms, from 2 busy threads on.
+- Section 4.7 has the tables, and section 5.31 the reading.
+
+**13:14Z–13:39Z. The CPython draft (G-R44): two fact-checks.**
+- The draft is a comment for gh-144586, with the repro, the shim, both platforms' tables and an AI-assistance disclosure. It sits in the maintainer's drafts folder, not posted.
+- A first Sonnet fact-check said "do not post as is". Two errors were the controller's:
+  - The draft said that with the yields skipped the hand-off "costs what it costs on 3.12". That holds with busy processes. With busy threads, skip gives 2.00 ms and 3.12 gives 10.4 ms.
+  - "111 ms over 40 yields is about 2.8 ms per yield" counted one spin per round trip. A ping-pong round trip has two blocked waits, so up to 80 yields. The per-yield cost is then 1.4–2.8 ms on Linux and 7.5–15 ms on Windows, estimates either way. The 11:10Z block's "40 × 15 ms is the measured 600 ms" has the same error.
+  - It also asked for: a statement that the app never ran under the shim; the traced hand-offs' real spread (typically 0.5–1 s, up to 2.2 s); the slowdown in pytest time on both sides (13–24×, not 10–17× against an estimated 20 s); the disagreement between the two Windows sweeps; and the exact upstream history (PR 146064 merged for 3.15, reverted by PRs 158082 and 158290; 3.14 never had the reload).
+- After the rewrite, a second Sonnet check said "minor fixes". The call counts fit about 80 yields per ping-pong round trip (200 × 80 = 16,000, against 16,160–16,360 measured), not "one to two spins", and three wording points remained. All are applied.
+- Posting is the maintainer's call (G-R44).
 
 ## 3. Decision register
 
@@ -1776,6 +1803,10 @@ ID prefixes:
 | X21 | 2026-10-02, 10:03Z | On Linux, where uv's interpreters ship no `_testmultiphase`, the two GIL-guard proof tests compile a minimal single-phase C extension instead of skipping. With no compiler they skip, and under `REQUIRE_NATIVE=1` they fail. Windows keeps the copy of `_testmultiphase`. | Accept the skip: CI's `freethreaded` job, on both architectures, would never run the only tests that prove the guard works. macOS: it needs other link flags, and nothing runs 3.14t there. | On gn100, importing the compiled module re-enabled the GIL, and with the guard on the import failed. At `e3f558e`, Linux 3.14.8t ran 483 passed with 4 skipped, against 480 with 6 skipped before. | The controller's proposal, refined by the final review; controller ruling (W-14) | G rulings G-R34 | Adopted (`725c12a`) |
 | X22 | 2026-10-02, 10:03Z | Task 12's report does not attribute a B deficit under about 1 % to free threading. | Report every B deficit as free threading's cost: B also re-prepares every SQL statement (X18's defence), which the final review put at about 0.5 % of a flat vector search. | Final review M5. | Controller (W-14) | G rulings G-R38 | Adopted |
 | X23 | 2026-10-02, 12:00Z | Every wait in `tests/test_concurrency.py` for something that must happen gets one 60 s deadline, `WAIT_SECONDS`. Short waits that prove something did not happen keep their budgets. | Keep 5 s and call the tests flaky: the failures were budgets, not hangs, and would recur on any CPU-saturated runner. Raise only the two failing waits: every 5 s budget in the module sits behind the same hand-offs. | G-R40's loop: 2 failures in 16 under 6 busy loops. The probe: 3.14.8t's p99 of 4.96 s against a 5 s budget. | Controller (W-14) | G rulings G-R42 | Adopted (`d94bd21`) |
+| X24 | 2026-10-02, 12:12Z | The Linux test of the lock-spin mechanism uses an `LD_PRELOAD` shim for `sched_yield` (count the calls, or return at once) in G's own images, not a CPython rebuild. | Rebuild 3.14.8t with no spin or a reloading spin: hours of building on gn100, and a custom interpreter is not the one users run. Stop at the Windows evidence: the mechanism fitted the data, but nothing had tested it. | The shim kept the call count (16,160 against 16,360 at 6 busy loops) and removed the cliff (ping-pong p50 111 → 2.00 ms). | Controller (W-14) | G rulings G-R45; section 5.31 | Adopted |
+| X25 | 2026-10-02, 12:12Z | The upstream write-up is a draft comment on gh-144586, the open issue on `_Py_yield()`, with a stdlib repro and the shim. The maintainer posts it, or not. | A new issue: gh-144586 already holds the discussion, and a CPython maintainer had asked for realistic programs. No write-up: the cost is not raggio's alone. | Fact-checked twice by Sonnet; the first check found two errors in the controller's arithmetic (section 2, 13:14Z). | Controller (W-14); posting is the maintainer's | G rulings G-R44 | Draft, not posted |
+| X26 | 2026-10-02, 13:05Z | The hand-off repro also runs with its busy loops as threads inside the measured process (G-R45b). | Processes only: a free-threaded app oversubscribes itself with its own threads, which a process sweep does not show. | The same cliff at busy threads = CPUs (111 ms at 4, 225 ms at 6); the shim's skip gives 2.00 ms. | Controller (W-14) | Ledger 13:11Z | Adopted |
+| X27 | 2026-10-02, 13:30Z | Plan G's outcome is Hold: the 3.14t build arg and CI job stay, nothing ships on 3.14t, and the ABAB is re-run when turbovec ships a cp314t wheel. | Continue: needs a turbovec cp314t wheel, and an own build never becomes the default (D6). Park: B won. | B won `Hybrid QPS concurrent` in both pairs with a `better` hybrid p99; flat `QPS concurrent` was not won (one uneven split). | Plan G's decision rule, applied by its script | ADR 0006 | Adopted (`93fdfe9`) |
 | W-1 | 2026-09-27 23:27Z | "Answer, don't act": a question such as "is it OK to X?" gets an answer and an offer, never an unrequested action. | None. | The gn100 restart incident (section 7). | Maintainer (correction) | Transcript | Standing rule |
 | W-2 | 2026-09-27 23:09Z to 2026-09-28 01:11Z | Offload work to gn100 "when it makes sense". First baseline: "not more than 65m". Later: "no limits" for this program while the PC stays on. The spec keeps a rule that DGX runs over about 5 minutes need a go-ahead with a time cap. | None. | None. | Maintainer | Transcript; spec §6 | Standing |
 | W-3 | 2026-09-28 18:45Z | Every question to the maintainer goes through the structured question tool. | None. | None. | Maintainer | Transcript | Standing |
@@ -2057,6 +2088,54 @@ Plain fan-out speedup over serial, by pool threads (the mean of two repetitions)
 - B's plain fan-out is faster than A's at every pool size.
 - The grouped call (sections 4.17 and 5.25) beat plain only on A, at 12, 16 and 32 threads, by 1.06–1.08×, inside the noise. On B it never won (0.54–0.97×).
 - Plain results equalled serial ones everywhere, and grouped ones gave the same top-k in 40 of 40 checks. The guard passed on both arms.
+
+**gn100, plan G's Task 12 ABAB at `e3f558e`** (2026-10-02, 11:04:48Z–12:48:08Z; one boot; A1 B1 A2 B2 at c=8, each session followed by one at c=16). A is 3.12.15 and B is 3.14.8t. Both bundle SQLite 3.53.1 and run `OPENBLAS_NUM_THREADS=1`. B's turbovec is built from the sdist (`cp314-cp314t`), A's is the abi3 wheel. Medians, base → candidate. Bold is `better` beyond the noise band; "within" is inside it.
+
+| Row | A1 → B1 | A2 → B2 | A1 → B1, c=16 | A2 → B2, c=16 |
+|---|---|---|---|---|
+| Flat QPS concurrent | 127 → 124, within | 151 → 126, within | 212 → 210, within | 203 → 205, within |
+| Flat hybrid QPS concurrent | **36.2 → 40.4** | **36.3 → 40.1** | **34.3 → 36.5** | **34.3 → 36.2** |
+| Flat hybrid p99 under concurrency (ms) | **465.5 → 356.5** | **433.8 → 351.7** | **988.7 → 794.9** | **982.6 → 804.3** |
+| Flat hybrid CPU per query (ms) | **336.0 → 314.3** | 334.3 → 316.7, within | **483.5 → 454.5** | **480.4 → 457.8** |
+| IVF QPS concurrent | **330 → 412** | **335 → 413** | **371 → 469** | **375 → 482** |
+| IVF p95 under concurrency (ms) | **31.3 → 25.5** | **29.8 → 25.2** | 67.5 → 55.0, within | 63.5 → 59.2, within |
+| IVF CPU per query (ms) | 10.1 → 11.8, worse | 10.1 → 10.9, worse | 10.2 → 10.9, within | 10.1 → 10.9, worse |
+| IVF hybrid QPS concurrent | **37.3 → 42.7** | **37.3 → 42.1** | **37.4 → 39.6** | 37.9 → 39.0, within |
+| IVF hybrid p99 under concurrency (ms) | **441.1 → 335.5** | **413.3 → 345.6** | **897.5 → 743.3** | **925.7 → 748.1** |
+| Flat memory under query load (MB) | 1505 → 1530, worse | 1505 → 1530, worse | 1505 → 1531, worse | 1506 → 1530, worse |
+| Flat search p50, serial (ms) | 18.5 → 18.8, worse | 18.5 → 18.8, worse | 18.5 → 18.7, within | 18.5 → 18.6, within |
+
+- **The flat concurrent row's two states** (section 5.8) showed again, on A only. Flat CPU per query was A1 118.7, 86.3 and 118.0 ms against B1 119.4, 118.5 and 117.9, and A2 79.3, 95.0 and 117.3 against B2 118.5, 118.1 and 119.0. B's six runs all sat where A's slow runs sit. So B's flat `QPS concurrent` was steady (124±1 and 126±2) and A's was wide (127±36 and 151±46).
+- **Hybrid CPU per query** was lower on B in every pair, by 2–11 %, and `better` beyond the band in 6 of 8. Every hybrid p99 under concurrency was lower on B too. This is the reverse of p4 (section 5.11).
+- **IVF vector** traded CPU for throughput: CPU per query rose 7–17 % (`worse` in 3 of 4), and concurrent QPS rose 23–29 %.
+- **Same-arm pairs** (A1 → A2 and B1 → B2, at both concurrencies) stayed inside the band on every gate row, except B's flat `QPS concurrent`, 124 → 126, `better` on a band of 1–2. IVF recall moved by 0.001–0.003 in both arms. Its band is 0.000, and each IVF build trains on a random sample.
+
+**gn100, the hand-off repro** (2026-10-02, 12:53Z–13:11Z; G-R43, G-R45 and G-R45b; section 5.31). `handoff-repro.py` ran in A's and B's images under `taskset -c 0-3` (4 Cortex-A725 cores), for 200 round trips or 40 s. Ping-pong p50 / p99 in ms, by busy-loop processes started in the same container:
+
+| Busy loops | 3.12.15 | 3.14.8t | 3.14.8t, `PYTHON_GIL=1` |
+|---|---|---|---|
+| 0 | 0.01 / 0.02 | 0.02 / 0.03 | 0.05 / 0.14 |
+| 2 | 0.01 / 0.02 | 0.02 / 0.03 | 0.05 / 0.06 |
+| 3 | 0.02 / 0.02 | 0.06 / 0.06 | 0.05 / 0.06 |
+| 4 | 0.02 / 0.02 | 111 / 114 | 0.05 / 0.06 |
+| 5 | 2.00 / 2.00 | 111 / 114 | 222 / 225 |
+| 6 | 2.00 / 2.00 | 111 / 114 | 222 / 224 |
+| 8 | 2.00 / 2.00 | 111 / 114 | 217 / 219 |
+| 12 | 0.01 / 2.00 | 225 / 225 (179 round trips) | 432 / 435 (93 round trips) |
+
+`to_thread` p99 on 3.14.8t was about 2 ms at 4–6 busy loops, 111 ms at 8 and 228 ms at 12; on 3.12.15 it was at most 2.04 ms.
+
+With the `sched_yield` shim (ping-pong p50, then calls per run of 200 `to_thread` and 200 ping-pong round trips):
+
+| Load | 3.12.15, count | 3.14.8t, count | 3.14.8t, skip |
+|---|---|---|---|
+| Idle | 0.01 ms, 0 | 0.02 ms, 20,200 | 0.01 ms, 20,200 |
+| 6 busy processes | 2.00 ms, 0 | 111 ms, 16,360 | 2.00 ms, 16,160 |
+| 12 busy processes | 2.00 ms, 0 | 225 ms, 14,480 | 0.01 ms, 16,800 |
+| 4 busy threads, in-process | 10.4 ms, 0 | 111 ms, 19,920 | 2.00 ms, 21,480 |
+| 6 busy threads, in-process | 10.4 ms, 0 | 225 ms, 16,160 | 2.00 ms, 16,960 |
+
+The Windows runs of the same repro are in section 2 (2026-10-02, 11:10Z).
 
 **Laptop numbers, from before p4.** All numbers below are from a laptop.
 
@@ -2622,6 +2701,8 @@ Dated note, 20:40Z. p4 found the flat `QPS concurrent` row bimodal on **every** 
 
 At c=16 on gn100, 3.14t ran hybrid at 22.4 QPS against 14.8 for both GIL arms on the same SQLite 3.53.1 (+51 %), and its minimum cleared their maximum. But CPU per query rose 77–79 % (647.2 against 361.9–365.1 ms), and p99 went from 1.9–2.0 s to 7.6 s. At c=8, where `bench.py` runs by default, there was no free-threading gain at all: 18.1 against 17.9 and 18.2 QPS. Under plan G's original rule the c=16 result could have counted as a win, with its costs only listed. The maintainer added a p99 guard (R-G5). p4 measured hybrid on the IVF data; G's gate reads the flat engine's rows, which p4 did not measure for hybrid ([p4](../research/2026-09-28-dgx-probe-p4-freethreaded.md)).
 
+(Dated note, 2026-10-02 13:39Z: plan G's ABAB at `e3f558e`, with plans B–F in and on the flat engine as well as IVF, did not repeat this. B's concurrent hybrid gain showed at c=8 as well as c=16, and B's hybrid CPU per query and hybrid p99 under concurrency were lower than A's in every pair (section 4.7).)
+
 ### 5.12 At 19a8a2e the IVF ceiling is `_drain_scans`, not the GIL
 
 3.14t gave +14–31 % concurrent IVF QPS, beyond the band. Yet `top -H` at c=16 showed only about 1.1 cores busy on base312 and 1.25 on 3.14t, with no thread saturated. The event loop was at 22.8–24.7 %, and the workers each at 10–18 %. A split client did not raise the aggregate, so the client is not the limit. This matches p3: the single `_drain_scans` batch pipeline serialises IVF work. Free threading's gain sits on top of the pipeline plan F replaces, so G's verdict only means something after F, which is where the merge order puts it.
@@ -2732,6 +2813,26 @@ The first check was on plan G's decision script. With the script's SQLite replac
 The second check was on the GIL-guard proof tests on Linux. The controller set the image's warning filter, and `check_image`'s own filter, to "ignore", and expected both tests to fail. Only one did. The other test turns warnings off itself and relies on `check_image`'s post-import GIL check, which the mutation left alone. A second mutation disabled that check, and the test failed.
 
 A mutation proves a test only if it removes what that test actually relies on, and only if the expected failure is pinned to its text.
+
+### 5.31 On the free-threaded build, a busy machine made every blocked thread hand-off cost a run of time slices
+
+On CPython 3.14.8t, a blocking `threading.Lock` acquire on a held lock spins up to 40 times before it parks, and calls `_Py_yield()` on each turn. The spin never rereads the lock, so a release during the spin is noticed only after all 40 yields. A GIL build parks at once. On an idle machine, each yield returns in microseconds. When every CPU has a runnable thread, each yield can hand the CPU away for a time slice, so one blocked hand-off costs tens of slices. `Event.wait`, `Condition.wait` and everything built on them block this way.
+
+raggio met it as two test failures: under 6 busy loops on the 6-core laptop, its concurrency module ran 13–24 times slower, and two 5 s budgets ran out (G-R40). The repo's answer was a 60 s deadline (X23); no raggio code changed.
+
+The evidence, in four steps:
+- A stdlib repro, with no raggio code: ping-pong p50 599 ms on Windows and 111 ms on Linux, while 3.12 and 3.14's GIL build stayed within milliseconds.
+- The cliff starts where the busy loops reach the CPU count, on both platforms: at 6 on the laptop, and at 4 under `taskset` on gn100.
+- An `LD_PRELOAD` shim made `sched_yield` return at once. The calls stayed, about 16,000 per run under load, and the cliff went: 111 → 2 ms (X24).
+- With the load as threads inside the process, the cliff was the same (X26). That is what a free-threaded program that keeps every core busy does to itself.
+
+Two turns in the data:
+- Under in-process load, the free-threaded build removes 3.12's own cost, the GIL hand-over (ping-pong 10.4 ms, `to_thread` p50 36–67 ms). It keeps that gain while busy threads stay below the CPU count. At the CPU count it falls off a cliff 10–20 times deeper than the cost it removed.
+- `PYTHON_GIL=1` doubles the cost instead of removing it. The spin count is fixed when CPython is compiled, and the spinning thread holds the GIL through its 40 yields.
+
+Upstream knows the loop. A reload was added for 3.15 and reverted after throughput regressions of up to 6× (gh-157914), and gh-144586, on replacing the yield, is open. raggio's part is the draft comment (X25).
+
+The controller's first arithmetic, 40 yields of about 15 ms making the 600 ms, matched the data and was still wrong: a ping-pong round trip has two blocked waits. A fact-check that recomputed from the shim's call counts caught it (section 2, 13:14Z). An unloaded run cannot show this cost. A busy-loop load at exactly the CPU count is the cheapest way to find it, and counting failures alone would have filed it under "flaky".
 
 ## 6. Method: how we measured
 
@@ -2848,6 +2949,9 @@ Recorded subagent tokens for the completed workflows sum to 10,021,309. That tot
 - Verify claims of having told the user against the transcript. A compaction summary said the maintainer had been told about the removed `bench-wv` container; the transcript showed no such message (section 7.5).
 - Read every ledger stamp from the clock (`date -u`); do not advance it by estimate. In plan F the implementers finished a task in two to four minutes, much faster than earlier plans. The controller's estimated stamps drifted up to 12 minutes ahead: one ledger line put Task 6's dispatch at 01:08Z, after its 01:01Z commit. The transcript's own timestamps and the commit times fixed them (section 2, 2026-10-02).
 - `shopt -s nullglob` drops only the patterns that match nothing. A plain file name in the same list stays, whether or not the file exists. To make a name optional, give it a one-character bracket, such as `g-abab.lo[g]` (section 2, 2026-10-02 11:04Z).
+- Over ssh, `cd X && nohup cmd > log 2>&1 &` puts the whole AND-list in the background, and ssh stays open until it ends. Launch with `cd X; setsid nohup bash script > log 2>&1 < /dev/null &` (section 2, 2026-10-02 12:53Z).
+- Rootless podman on gn100 has no cpuset controller, so `--cpuset-cpus` fails. `taskset -c` inside the container restricts the process tree. `nproc` follows it; `os.cpu_count()` still reports all 20 CPUs (section 2, 2026-10-02 12:53Z).
+- `uv run --no-sync --group docs` does not install a missing docs group. The strict docs build needs `uv run --group docs` the first time.
 
 ### 7.7 Working agreements with the maintainer
 
@@ -2937,12 +3041,13 @@ State as of 2026-09-28, about 19:30Z.
 - Dated note, 2026-10-02 07:52Z: plan G's Tasks 1 and 2 are approved (`05c2731`; 479 passed on 3.12, 461 with 4 skipped on 3.14.8t). One 3.14.8t suite run failed one unnamed test (section 9.4). Task 3 is running.
 - Dated note, 2026-10-02 09:25Z: plan G's Tasks 1–10 are done. The branch is at `cdf8ab9`, with 496 passed on 3.12 and 482 with 4 skipped on 3.14.8t, and the DGX scripts pass 26 scenarios outside the repo. A Linux run on gn100 found that the GIL guard's two proof tests skip on uv's Linux interpreters (section 2, 09:03Z). The final review on Opus is running; then the fix wave, and Tasks 11–12 on gn100 (DGX Spark).
 - Dated note, 2026-10-02 10:55Z: plan G's final review and fix wave are done. The branch is at `e3f558e`, with 497 passed on 3.12 and 483 with 4 skipped on 3.14.8t, on the laptop and on Linux on gn100. The fix wave includes a pre-existing BM25 bug fixed on the branch (section 5.29). DGX Task 11 is running on gn100 (DGX Spark); Task 12's ABAB is next.
+- Dated note, 2026-10-02 13:39Z: plan G's Task 12 is done, and the verdict is Hold (ADR 0006, `93fdfe9`; 498 passed on 3.12, 484 with 4 skipped on 3.14.8t; section 2, 12:48Z). On gn100 (DGX Spark), the hand-off repro and a `sched_yield` shim showed on Linux what made G-R40's loop fail (section 5.31). G-R42's loop passed 16 of 16, and its loaded full suites are running on the laptop. Next: merge G into `main` and push. The CPython comment draft (G-R44) waits for the maintainer.
 
 ### 9.2 Open questions in the plans
 
 - **D2 flat gate.** Plan D reads spec §7 D as allowing `D2-flat` to be `better` or `within band`; requiring `better` on flat "would likely leave D2's results unpublishable". This is open item 1 for the maintainer.
 - **D1 probe-only option.** A probe-only D1 run (about 90 min instead of about 4 h) records `D1-bench` as SKIP. Whether a probe-only D1 result is acceptable is an open question in the plan.
-- **G gates at c=8, but p4 saw the 3.14t hybrid gain only at c=16** (dated 21:15Z). At c=8 the three PBS arms tied on hybrid QPS (about 18); 3.14t pulled ahead only at c=16 (22.4 against 14.8), and at a cost (section 5.11). `bench.py`'s default concurrency is 8, and plan G's ABAB runs it. So G's `Hybrid QPS concurrent` row may show no free-threading win even where one exists at higher load. Whether G should add a c=16 pass is open. The orchestrator has not changed the plan. (Dated note, 21:20Z: answered. The maintainer chose a c=16 session after each ABAB arm session, reported and not gated (R-G7).)
+- **G gates at c=8, but p4 saw the 3.14t hybrid gain only at c=16** (dated 21:15Z). At c=8 the three PBS arms tied on hybrid QPS (about 18); 3.14t pulled ahead only at c=16 (22.4 against 14.8), and at a cost (section 5.11). `bench.py`'s default concurrency is 8, and plan G's ABAB runs it. So G's `Hybrid QPS concurrent` row may show no free-threading win even where one exists at higher load. Whether G should add a c=16 pass is open. The orchestrator has not changed the plan. (Dated note, 21:20Z: answered. The maintainer chose a c=16 session after each ABAB arm session, reported and not gated (R-G7).) (Dated note, 2026-10-02 13:39Z: at `e3f558e`, B won concurrent hybrid at c=8 too, on the flat engine and on IVF, so the gate row did not need c=16 (section 4.7).)
 - **D's close steps and F's Step 3j** (dated 21:15Z): if D2 ever merged before F, F's pool-close line would bypass D's `close_step`. The spec order runs F first, so this is recorded, not fixed.
 - **The ssh config path in the plans** (dated 22:45Z, W-8): it stays for now and is decided again before any push or PR. (Dated note, 2026-09-29 08:30Z: resolved by W-10; the earlier local commits still carry the path, so the publish is a squash or a rewrite.)
 - **C detach headroom stays unscaled.** p1's swapless run passed with a need of 1,372 MiB (final VmHWM 3,646 MiB), but p1 did not measure the detach's own growth, so there is nothing to scale by. A refused or OOM-killed swapless detach on gn100 is to be reported as an open finding.
