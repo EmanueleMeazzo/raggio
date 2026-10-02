@@ -1402,6 +1402,43 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
   - The same check fixed this journal's previous entry: its header now reads 00:58Z, not 01:08Z, and the dated note in 9.1 reads 00:59Z, not 01:10Z.
   - Every stamp since comes from `date -u` (section 7.6).
 
+**01:24Z–01:57Z. The final review finds nothing blocking. A wording fix lands, both arms deploy, and the A/B's expectations are written down before the launch.**
+- **Final review: ready for the A/B.** Opus took 26 minutes and 155 tool calls. It found nothing Critical or Important, and four Minor points.
+  - **M1. `IVF_SEARCH_THREADS=1` reproduces the old path bit-for-bit only for allowlists without duplicates.**
+    - The fan-out removes duplicate ids before its 128-id small-list test; the old loop counted raw entries.
+    - So 200 entries that hold 100 distinct ids take different paths. In the reviewer's edge probe, 23 of 48 combinations returned different results.
+    - No caller passes duplicates: the cached allowlists are sorted and distinct, and sibling expansion selects primary keys.
+    - The code stays. The comment and ADR 0005 now say "for distinct allowlists".
+  - **M2. The NEON draft says more than it measured.**
+    - It says 2 or 3 queries cost "at least" 2× or 3× one query, but its own x86 numbers give 1.87×.
+    - It says the repro checks the batched rows, but the repro compares ids only.
+    - It says the repro takes "about 30 s"; it takes 4 s on the workstation.
+    - The fix waits until after the A/B, so it can quote gn100's time.
+  - **M3. ADR 0005 named the maintainer's local drafts folder,** and the verify script would have written the local results folder into it. Neither is a credential, but both would expose a private folder layout in a public repo. Both now say "outside the repo", and so will Task 10's commit message.
+  - **M4. Task 10's procedure:** `--no-sync` on every `uv run`, and every step runs in the worktree.
+  - **The edge probe.** The reviewer compared F's search, serial and with a pool of 4, against the base's search on the same shards. The inputs covered 10 allowlist shapes, 3 query sets (one with an empty probed shard), 4 values of k and 4 of nprobe.
+    - Serial and pooled agreed everywhere.
+    - F agreed with the base everywhere except the duplicate case.
+  - Of the 13 deferred minor notes, the reviewer accepted 12 and asked for one fix, the "about 30 s" text.
+- **Fix wave (fd98580): wording only, applied by the controller.** A Sonnet review approved it and made two optional wording notes; both were taken. 431 passed.
+- **Deploy.** Both arms went through the repo's deploy script, from a detached checkout, so the trees arrive with Unix line endings (F-R16).
+  - The base image was fully cached. fa0fa9f's tree is plan E's last arm, with the same image id.
+  - F built in about 8 s.
+  - The host venv was re-synced to CPython 3.12.14 and SQLite 3.53.1, the images' pair.
+  - Dockerfile and store.py have no carriage returns.
+- **The aarch64 suite: 363 passed, 68 skipped,** in 21 s. The skips are the native-extension tests; the host venv has no extension. The probe's smoke test checks strictly that grouped and plain searches return the same results. It passes on NEON, so it stays strict (F-R14).
+- **Pre-registration (F-R29), written before the launch.** The run compares base fa0fa9f (main after A–E) with F's head fd98580, under the maintainer's standing go-ahead for gn100 time (W-2, W-14).
+  - The cap is 150 min; the estimate is 55–75 min.
+  - The flat check is off (F-R27).
+  - **F2, concurrent QPS.**
+    - Base IVF at c=8 has measured 208–223 QPS since plan A (p3's 189 is older than A). So 1.5× needs 312–335 QPS, against p3's F median of 324.7.
+    - The expected ratio is 1.45–1.6×.
+    - A ratio in [1.4, 1.5) with F's minimum above base's maximum is a finding for the maintainer, not a script fault, and there is no re-run to chase a pass.
+  - **F3, filtered p50.** Base is about 49 ms in restarted containers (X6). F is expected at about 6.4–7 ms.
+  - **F4, serial p50.** The check uses the larger of the two arms' noise bands. A noisy base arm (a-ref saw a 5.1 ms band) can fail F4 even if F is faster; that would be reported as a finding.
+  - **F5, memory peak.** Both arms about 1.8–2.0 GB, read before bench's cold-start restart (F-R17).
+  - **F7, largest list.** Run0 builds a new index (plan C's rowid sampling), so the largest list will differ from p3's 30,443 rows. A list at or above 32,768 rows is reported, and F7 still passes.
+
 ## 3. Decision register
 
 ID prefixes:
