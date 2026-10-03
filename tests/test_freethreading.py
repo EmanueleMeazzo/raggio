@@ -281,6 +281,9 @@ def load_check_image():
 def child(args, env=None):
     """A fresh interpreter without the caller's warning filter or GIL override."""
     clean = {k: v for k, v in os.environ.items() if k not in ("PYTHONWARNINGS", "PYTHON_GIL")}
+    # plain tracebacks: under FORCE_COLOR, 3.13+ puts ANSI codes inside the messages the
+    # tests look for. PYTHON_COLORS takes precedence over FORCE_COLOR and NO_COLOR
+    clean["PYTHON_COLORS"] = "0"
     return subprocess.run([sys.executable, *args], capture_output=True, text=True, cwd=ROOT,
                           env={**clean, **(env or {})}, timeout=300)
 
