@@ -69,6 +69,14 @@ At 22:53:49Z the maintainer replied "Plan for items 1,2,3,4". Item 5 stayed guid
   - Dated note, 20:40Z: p4 finished (19:00–20:10Z). The 3.14t image builds with no fixes and the GIL stays off. Free threading gives +14–31 % IVF vector QPS at 19a8a2e, but the ceiling there is the single `_drain_scans` pipeline, not the GIL. Its hybrid gain at c=16 costs +77–79 % CPU per query and 3.8–4.0× the p99. It also found that the PBS interpreters bundle SQLite 3.53.1, not 3.50.4, and that plan B's bugs show up over HTTP on every build (section 4.7).
 - No plan has been executed. `main` is still at `19a8a2e`. Execution will be subagent-driven, starting with plan A's bench tasks.
 
+**Where things ended (dated note, 2026-10-03).** All seven plans are merged; G's verdict is Hold. One end-to-end A/B on gn100 compared the original baseline, `19a8a2e`, with the final `main`, `19c3293`. It used the same bench, each arm ran on its own freshly ingested data, and serving was capped at 4 GiB (section 4.20).
+- Ingest was 2.33× faster: 31 → 13 minutes for 2.55M vectors.
+- A true-cold start to the first answer fell from 155 to 4.6 s, and `/healthz` answers during the load.
+- IVF vector search doubled its concurrent QPS (191 → 380) at a fifth of the CPU per query.
+- IVF filtered search was 6.3× faster (37.2 → 5.9 ms p50).
+- Hybrid search ran 2.0–2.8× the QPS, with a p99 under concurrency 7.5–8.9× lower (3,545 → 471 ms on flat).
+- Flat vector search, flat filtered search, recall, serving memory and disk did not move beyond the noise bands.
+
 ## 2. Timeline
 
 Times are UTC unless marked CEST (UTC+2). The maintainer's messages are quoted verbatim, typos included. Source: the session transcript; DGX run windows are from the research notes.
@@ -1789,6 +1797,25 @@ Two snags:
 - C's malloc knob slowed filtered IVF from 36 to 49 ms, and F then took it to 6.2 ms;
 - baseline3 ran a patched bench at 8 GiB, on Debian's Python and SQLite 3.40.1.
 The maintainer chose one end-to-end A/B, baseline `19a8a2e` against the final `main`, after the current work (X33).
+**00:53Z–01:40Z. The end-to-end A/B, phase 1: design and smoke.** A Sonnet agent confirmed that today's bench drives the `19a8a2e` server unchanged. It ran short smokes (60,000 vectors) on both images in a throwaway volume, built `localhost/raggio:19c3293`, and wrote the protocol.
+- The images differ beyond the code:
+  - Debian 12 against 13 (glibc 2.36 and 2.41);
+  - CPython 3.12.12 against 3.12.15;
+  - SQLite 3.40.1 against 3.53.1;
+  - no BLAS thread cap against `OPENBLAS_NUM_THREADS=1`;
+  - no malloc trim threshold against 128 MiB;
+  - no native BM25 against `raggio_native`;
+  - C's covering index only in the final `main`.
+- The comparison keeps all of these, because the question is what a user gets.
+- The rulings at 01:40Z:
+  - env-var patches let the client target the A/B's own volumes, identical for both arms;
+  - the host's default swap, as in every earlier A/B, with swap and OOM kills logged;
+  - one labelled 8 GiB retry for any baseline step killed at its cap, and a stop for any OOM on the final `main`;
+  - gn100 exclusive.
+
+**01:40Z–07:15Z. The end-to-end A/B, phase 2.** Section 4.20 has the results. All sessions ended `exit 0`, with no OOM kill and no 8 GiB retry. One deviation: the first baseline session ran 2 measured flat runs instead of 3, because `lib.sh`'s default reached it through the environment. It was fixed from the next session on.
+
+**07:15Z–07:19Z. The analysis, checked.** The agent's summary called filtered search "not improved". That holds only for flat: IVF filtered p50 went from 37.2 to 5.9 ms. The controller corrected it and checked raw run files against the tables; in IVF run 1, for example, serial QPS was 90 against 184 and filtered p50 37.6 against 6.0 ms. gn100 keeps the two A/B volumes (16 GB each) and the two images until the maintainer decides.
 
 ## 3. Decision register
 
@@ -1874,7 +1901,7 @@ ID prefixes:
 | X30 | 2026-10-02, 22:57Z | Spec D3's REVISIT is re-tested against a criterion fixed before any data: at T=12, on seeds 7 and 42, over 5 repetitions each, grouped's median at most 0.95× plain's and its slowest run faster than plain's fastest. A win would ship audience batching behind a setting, after its own A/B. | Re-run once, as F did. Implement without a re-test. | Seed 7 ratio 1.016, seed 42 0.955; neither seed had grouped's slowest run beat plain's fastest. | Maintainer (scope), controller (criterion) | AskUserQuestion, 2026-10-02 | Closed: D3 stands (`1937d8c`) |
 | X31 | 2026-10-02, 23:01Z | turbovec's unreleased `main` (`c6cf0ba`) gets one gn100 A/B against v1.0.0. Both are built from source with the same toolchain, in images that differ only in that wheel, under plan G's ABAB protocol. | PyPI's 1.0.0 against a source build of `main`: the build would confound the code. Skip it because the changelog says 4-bit is unchanged: the diff refactors gn100's 4-bit NEON kernel. | No change beyond noise on any speed metric; flat memory −43 MB (section 4.19). | Maintainer (the bench), controller (design) | Section 2, 22:58Z | Done |
 | X32 | 2026-10-02, 23:31Z | Every read on a per-thread read connection runs inside a per-connection lock. The closer interrupts each reader and waits for its lock without holding `db_lock`, for up to 5 s, then leaves the close to the reader. | A reader count per collection: contended on every `_hydrate`. The owner closing alone: `stop()` would return with handles open, and `DELETE`'s `rmtree` fails on Windows. A cursor proxy: it hides the lock's scope. | Before: a deterministic repro crashed 20 of 20 runs on each build. After: none in the repro loops, plus an independent review (section 5.32). | Controller | — | Adopted (`c4a93d6`) |
-| X33 | 2026-10-03, 00:31Z | One end-to-end A/B on gn100: `localhost/raggio:baseline` (`19a8a2e`) against the final `main` (`19c3293`). Each arm runs on its own freshly ingested volume, with the same bench client, serving at 4 GiB. | Per-plan numbers only: they do not multiply (section 2, 00:29Z). | — | Maintainer | AskUserQuestion, 2026-10-03 | In progress |
+| X33 | 2026-10-03, 00:31Z | One end-to-end A/B on gn100: `localhost/raggio:baseline` (`19a8a2e`) against the final `main` (`19c3293`). Each arm runs on its own freshly ingested volume, with the same bench client, serving at 4 GiB. | Per-plan numbers only: they do not multiply (section 2, 00:29Z). | — | Maintainer | AskUserQuestion, 2026-10-03 | In progress. Dated note, 2026-10-03: done (section 4.20). |
 | W-1 | 2026-09-27 23:27Z | "Answer, don't act": a question such as "is it OK to X?" gets an answer and an offer, never an unrequested action. | None. | The gn100 restart incident (section 7). | Maintainer (correction) | Transcript | Standing rule |
 | W-2 | 2026-09-27 23:09Z to 2026-09-28 01:11Z | Offload work to gn100 "when it makes sense". First baseline: "not more than 65m". Later: "no limits" for this program while the PC stays on. The spec keeps a rule that DGX runs over about 5 minutes need a go-ahead with a time cap. | None. | None. | Maintainer | Transcript; spec §6 | Standing |
 | W-3 | 2026-09-28 18:45Z | Every question to the maintainer goes through the structured question tool. | None. | None. | Maintainer | Transcript | Standing |
@@ -2732,6 +2759,59 @@ Medians of 6 measured runs per arm, with the two sessions pooled; B/A in bracket
 - **The verdict:** no change beyond noise on any speed metric. Bumping to turbovec's next release is safe for raggio's 4-bit default. #549's gains are for 2-bit indexes on x86 with AVX-512 VNNI, and gn100 is neither.
 - **A gap in the record:** the first agent's printouts of the wheels, the images and the identity check were lost with the session (section 2, 2026-10-03 00:20Z). The second agent re-derived them from the saved files and from fresh checks on the images.
 
+### 4.20 The end-to-end A/B on gn100: the baseline against the final main
+
+Run on 2026-10-03, 01:40Z–07:15Z, in one boot, with nothing else on the host (X33).
+- **Arms.** A is `localhost/raggio:baseline` (`19a8a2e`, the image behind baseline3); B is `19c3293`, the final `main`.
+- **Images.** Each arm runs as built; section 2, 2026-10-03 00:53Z lists how the two images differ.
+- **Client and data.** Both arms used the same bench client, `19c3293`'s, with env-var patches that point it at the A/B's volumes. Each arm ingested the corpus into its own fresh volume.
+
+The protocol:
+- 4 reingests, in the order A, B, A, B, each in a 4 GiB container.
+- Flat true-cold starts, alternating, by plan C's method: the volume's files evicted with fadvise, in a fresh 4 GiB container.
+- 8 ABAB sessions as in section 4.19, at c=8 and c=16. Each session:
+  - builds IVF at 4 GiB;
+  - takes an IVF true-cold start;
+  - runs IVF run0 plus 3 measured runs;
+  - detaches IVF (A at 8 GiB, B at 4 GiB);
+  - runs flat run0 plus 3;
+  - takes a flat true-cold start.
+  All with seed 42, 500 queries, 200 filtered and k=10.
+- A 1 Hz cgroup sampler logged memory, swap and OOM events.
+
+Medians, A → B, with B's gain. Every difference exceeds both arms' bands unless marked.
+
+| Area | Metric | Baseline | Final main | Gain |
+|---|---|---|---|---|
+| Ingest | Reingest of 2.55M vectors at 4 GiB (vec/s) | 1,362 (31 min) | 3,174 (13 min) | 2.33× |
+| Cold start | True-cold start → first GET, flat / IVF (s) | 155.0 / 154.5 | 4.6 / 5.2 | 34× / 30× |
+| | Slowest `/healthz` during the load | none answered within 5 s | 0.01 s | |
+| | Slowest later GET (s) | 52.0 | 0.50 | 104× |
+| IVF vector | QPS serial (c=8 sessions) | 90 | 161 | 1.78× |
+| | Search p50 (ms) | 10.9 | 6.1 | 1.78× |
+| | QPS concurrent, c=8 / c=16 | 191 / 198 | 380 / 395 | 1.99× / 2.00× |
+| | CPU per query under concurrency, c=8 (ms) | 50.0 | 9.7 | 5.1× less |
+| | Filtered p50 (ms) | 37.2 | 5.9 | 6.3× |
+| Hybrid | QPS serial, flat / IVF | 10.0 / 9.8 | 20.5 / 22.0 | 2.05× / 2.24× |
+| | QPS concurrent at c=8, flat / IVF | 14.0 / 13.4 | 36.1 / 38.1 | 2.58× / 2.84× |
+| | p99 serial, flat (ms) | 570 | 100 | 5.7× |
+| | p99 under concurrency at c=8, flat / IVF (ms) | 3,545 / 3,884 | 471 / 437 | 7.5× / 8.9× |
+| | CPU per query under concurrency at c=8, IVF (ms) | 955 | 203 | 4.7× less |
+| IVF index | Build at 4 GiB (s) | 391 | 178 | 2.2× |
+| | Detach (s) | 295, at 8 GiB | 102, at 4 GiB | not like for like |
+
+- **Not moved beyond the bands:**
+  - flat vector search: serial p50 19.5 against 18.5 ms, and concurrent QPS 111 against 137, which is bimodal as in section 5.8;
+  - flat filtered search: 25.7 against 24.7 ms;
+  - recall@10: flat 1.000, and IVF 0.993 against 0.994;
+  - memory after a restart and under load: about 1.5 GB on both;
+  - disk: 16.5 GB.
+- **Swap.** No measured search run swapped on either arm. At 4 GiB the baseline swapped 1.36–1.50 GiB during its ingests and up to 2,902 MiB during its IVF builds; the final `main` swapped 2–6 MiB and 58 MiB. The final `main`'s detach at 4 GiB swapped up to 774 MiB; the baseline's, at 8 GiB, none. The baseline's ingest and build times include that swapping.
+- **Cold-start spread.** The baseline's first two starts, right after the ingests, took 114–115 s, and the later ones 155 s. Baseline3's 128 s falls between.
+- **Memory right after a fresh ingest, without a restart.** The baseline read 574 and 451 MB, the final `main` 1,608 and 1,614 MB (section 9.4).
+- **What it is not:** a measure of any one plan. Each row mixes code, Python, SQLite and image settings; the per-plan A/Bs are in sections 4.9–4.18.
+- **One gap:** the first baseline session gives 5 flat c=8 runs to the pool instead of 6 (section 2, 2026-10-03 01:40Z).
+
 ## 5. Negative results and surprises
 
 ### 5.1 Audience batching lost on NEON
@@ -3171,6 +3251,10 @@ State as of 2026-09-28, about 19:30Z.
 - Dated note, 2026-10-02 13:39Z: plan G's Task 12 is done, and the verdict is Hold (ADR 0006, `93fdfe9`; 498 passed on 3.12, 484 with 4 skipped on 3.14.8t; section 2, 12:48Z). On gn100 (DGX Spark), the hand-off repro and a `sched_yield` shim showed on Linux what made G-R40's loop fail (section 5.31). G-R42's loop passed 16 of 16, and its loaded full suites are running on the laptop. Next: merge G into `main` and push. The CPython comment draft (G-R44) waits for the maintainer.
 - Dated note, 2026-10-02 16:43Z: plan G is merged and pushed (`5dc4607`), and CI is green. The loaded full suites found two more short budgets, which X28 fixed in `7bcf077` (section 2, 13:30Z–16:43Z). Plans A–G are done. Open: the `uv.lock` refresh (G-R30), `docs.yml`'s `setup-uv@v5`, and the CPython comment draft (G-R44), which waits for the maintainer.
 - Dated note, 2026-10-03 00:55Z: the follow-ups are done except the end-to-end A/B (X33). `main` is at `19c3293` and CI is green; since plan G it gained the lock refresh, `docs.yml`'s pins, ADR 0005's D3 re-run and the close-race fix (section 5.32). D3 stands (X30). turbovec's unreleased `main` changes nothing beyond noise for raggio (section 4.19). There is no history rewrite (X29). Two CPython drafts wait for the maintainer: the comment (G-R44) and a new issue on the `sqlite3` close race.
+- Dated note, 2026-10-03 07:19Z: the end-to-end A/B is done (X33, section 4.20). The follow-up batch is complete. Still open, and the maintainer's call:
+  - the two CPython drafts;
+  - gn100's A/B volumes `bench-e2e-a` and `bench-e2e-b`, and the images `:19c3293`, `:09caa85`, `:09caa85-tvA`, `:09caa85-tvB` and `:5dc4607`;
+  - a bump to turbovec's next release, which section 4.19 found safe.
 
 ### 9.2 Open questions in the plans
 
@@ -3188,7 +3272,7 @@ State as of 2026-09-28, about 19:30Z.
 - **Plan F's own filtered design** (intersect up front) was measured only in process; the server prototype intersected inside each task. (Dated note, 2026-10-02: F ships the cut inside each task, and its A/B measured it in the server: filtered p50 6.16 ms against base's 48.98 (section 4.17).)
 - **R2b** (IVF id cache) rests on reasoning only; no repro was built.
 - **Ingest on gn100.** The published 1,357 vec/s was not re-measured.
-- **Combined effects** (critic): native BM25 on 3.14t, the fan-out pool on 3.14t, and batched ingest together with fan-out under concurrent ingest plus search.
+- **Combined effects** (critic): native BM25 on 3.14t, the fan-out pool on 3.14t, and batched ingest together with fan-out under concurrent ingest plus search. (Dated note, 2026-10-03: the end-to-end A/B measured plans A–F together against `19a8a2e` on 3.12 (section 4.20). The 3.14t combinations, and ingest concurrent with search, are still not measured.)
 - **ADR 0003's perturbed-query column** is still missing. No spec or plan adopts it.
 - **From p4 (20:40Z):** `raggio_native` built for cp314t (19a8a2e has no crate); G's real `check_image.py` on G's real Dockerfile; p2's SQLite scaling figures and E's native speedup on SQLite 3.53.1; the flat engine's hybrid rows on 3.14t; plan G's Unicode drift probe.
 
@@ -3201,7 +3285,7 @@ State as of 2026-09-28, about 19:30Z.
 - **a-equiv's flat memory** (2026-09-29): 1528–1529 MB in runs 2 and 3, against 1547–1551 MB in baseline3, control1 and a-equiv2. It is not the run order, because control1 ran in the same order, and not the bench, because a-equiv2 ran the same bench.
 - **From p4 (20:40Z):** the two states of the flat concurrent row (section 5.8); the multi-second hybrid p99 tails on every arm at c=8 and c=16; why R1 fails 12–15× less often on 3.14t (section 5.15).
 - p3 attributes the server gap (203–408 QPS against an in-process ceiling of 610–662) to "serial drain plus event-loop pipeline", inferred from per-thread CPU sampling, not a per-stage trace.
-- **Memory right after a reingest** (D1's A/B, 2026-09-30). The base measured 388 and 533 MB after its reingests, against 1,617–1,623 MB for D1's candidate and 1,502–1,551 MB in every adopt session. Under load both arms reach about 1.6 GB. `bench.py` reads `podman stats`, which leaves inactive file pages out. Why the base's index looks non-resident right after its reingest was not investigated. (Dated note, 2026-10-02: D2's A/B repeated it. The base read 613.9 and 578.0 MB after its reingests, against 1,524 and 1,649 MB for D2, and under load both reached 1,546–1,652 MB. D2's base carries D1's code, which read high as D1's candidate, so the low reading follows the base arm, the first of each pair, more than any one change. Not tested.)
+- **Memory right after a reingest** (D1's A/B, 2026-09-30). The base measured 388 and 533 MB after its reingests, against 1,617–1,623 MB for D1's candidate and 1,502–1,551 MB in every adopt session. Under load both arms reach about 1.6 GB. `bench.py` reads `podman stats`, which leaves inactive file pages out. Why the base's index looks non-resident right after its reingest was not investigated. (Dated note, 2026-10-02: D2's A/B repeated it. The base read 613.9 and 578.0 MB after its reingests, against 1,524 and 1,649 MB for D2, and under load both reached 1,546–1,652 MB. D2's base carries D1's code, which read high as D1's candidate, so the low reading follows the base arm, the first of each pair, more than any one change. Not tested.) (Dated note, 2026-10-03: the end-to-end A/B repeated it. The baseline read 574 and 451 MB after its ingests and the final `main` 1,608 and 1,614 MB; under query load, right after the ingests, they read 1,772 against 1,618 MB. The baseline was again the first of each pair, so order and code are still confounded.)
 - **D1's third IVF candidate run** drained in 70.4 s, against 81.7 s for the other two and 93–99 s for the base. It was the last probe run. Nothing in the log explains it. (Dated note, 2026-10-02: D2's A/B had no such outlier; its IVF drains were 22.36–22.68 s.)
 - **D2's A/B search rows** (2026-10-02). On the flat reingest sessions, concurrent QPS read 100 for the base against 128 for D2, and p95 under concurrency 88.0 against 67.5 ms, although D2 does not touch search. Hybrid serial QPS moved the other way, 11.0 against 10.6. Two runs per side; not investigated.
 - **Base run 1's memory peak** (plan F's A/B, 2026-10-02): 4,096 MB before the restart, the cap, in the first measured container after run0's index build. Every other measured run peaked at 1,527–1,562 MB. Not investigated.
