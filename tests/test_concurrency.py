@@ -444,6 +444,27 @@ def test_stop_closes_connections_inside_the_write_lock_and_under_db_lock(tmp_pat
     assert {(k, w, d) for k, w, d in seen} == {("write", True, True), ("read", True, False)}
 
 
+def test_read_sections_never_nest():
+    # _ReadConn.lock is a plain Lock: a `with ..._reading()` inside another one, in the
+    # same function or through a call to a method that opens its own, would deadlock
+    root = Path(store.__file__).parent
+    tree = {f: ast.parse((root / f).read_text(encoding="utf-8")) for f in ("store.py", "app.py")}
+    opens = {fn.name for t in tree.values() for fn in ast.walk(t)
+             if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+             and any(isinstance(w, ast.With) and "_reading" in ast.unparse(w.items[0].context_expr)
+                     for w in ast.walk(fn))}
+    assert {"_hydrate", "list_records", "get_document", "job_status"} <= opens  # the scan finds them
+    for t in tree.values():
+        for w in ast.walk(t):
+            if isinstance(w, ast.With) and "_reading" in ast.unparse(w.items[0].context_expr):
+                for n in (n for b in w.body for n in ast.walk(b)):
+                    if isinstance(n, ast.With):
+                        assert "_reading" not in ast.unparse(n.items[0].context_expr), n.lineno
+                    if isinstance(n, ast.Call):
+                        called = ast.unparse(n.func).split(".")[-1]
+                        assert called not in opens, f"line {n.lineno}: {called} opens its own section"
+
+
 def test_deleted_collection_leaves_no_files_and_its_name_can_be_reused(tmp_path, monkeypatch):
     # stop() must close every connection the collection opened (the write connection
     # and one read connection per thread that served it): on Windows one leaked handle

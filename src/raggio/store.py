@@ -578,41 +578,42 @@ class _ReadConn:
     Only the owning thread enters; the closer only acquires, sets `closed` and `closing`.
     A guarded section never takes db_lock, never awaits and never yields (a generator or
     a live cursor must not escape it), so the closer can wait on `lock` without a cycle.
-    `depth` is touched by the owner only (the lock is re-entrant: list_records calls
-    _hydrate inside its own section)."""
+    Sections never nest (list_records takes three in a row, and _hydrate is called
+    between them, not inside one), so `lock` is a plain Lock; a nested section would
+    deadlock on it, and test_read_sections_never_nest pins that none exists."""
 
-    __slots__ = ("col", "db", "lock", "closed", "closing", "depth")
+    __slots__ = ("col", "db", "lock", "state", "closed", "closing")
 
     def __init__(self, col: "Collection", db: sqlite3.Connection) -> None:
         self.col, self.db = col, db
-        self.lock = threading.RLock()
+        self.lock = threading.Lock()
+        self.state = threading.Lock()  # orders `closing` against the owner's exit, below
         self.closed = False   # set by whoever closes db, under lock
         self.closing = False  # the sweep gave up waiting: the owner closes on leaving
-        self.depth = 0
 
     def __enter__(self) -> sqlite3.Connection:
         self.lock.acquire()
         if self.closed:
             self.lock.release()
             raise RuntimeError(f"collection '{self.col.cfg.name}' is closed")
-        self.depth += 1
         return self.db
 
     def __exit__(self, exc_type, exc, tb) -> bool:
-        self.depth -= 1
-        outer = self.depth == 0
-        try:
-            if outer and self.closing and not self.closed:
-                self.closed = True  # the sweep's deadline passed while this thread read
-                self.db.close()
-        finally:
-            self.lock.release()
-        if outer and self.closing and not self.closed and self.lock.acquire(blocking=False):
-            # the sweep set `closing` just after the check above, and found the lock
-            # held: nobody else will close this one
+        self.lock.release()
+        # Hand-off with the sweep's deadline path (close_when_idle), a store-then-load
+        # pair on each side: the sweep stores `closing` then tries `lock`; this thread
+        # releases `lock` then loads `closing`. Without ordering both could miss the
+        # other (a plain load after a release is not sequentially consistent on
+        # weakly ordered CPUs without the GIL) and the connection would stay open until
+        # exit. Both sides take `state` around their access, so the two critical
+        # sections are totally ordered: either this load sees `closing` and closes, or
+        # the sweep's store came later and so did its try-acquire, after our release.
+        with self.state:
+            closing = self.closing
+        if closing and self.lock.acquire(blocking=False):
             try:
                 if not self.closed:
-                    self.closed = True
+                    self.closed = True  # the sweep's deadline passed while this thread read
                     self.db.close()
             finally:
                 self.lock.release()
@@ -628,15 +629,15 @@ class _ReadConn:
         owner to leave its section; False if it still has not by `deadline`."""
         while not self.lock.acquire(timeout=0.05):
             if time.monotonic() >= deadline:
-                self.closing = True
-                # the owner may have left between the failed acquire and the flag
+                with self.state:  # see __exit__: orders this store against the owner's load
+                    self.closing = True
+                # the owner may have left between the failed acquire and the store
                 if self.lock.acquire(blocking=False):
                     break
                 return False
-            try:
-                self.db.interrupt()  # a long statement ends with "interrupted"
-            except sqlite3.ProgrammingError:
-                pass  # closed by its owner meanwhile
+            # nothing else closes this connection while the sweep is still interrupting
+            # it (the owner closes only once `closing` is set), so this cannot fail
+            self.db.interrupt()  # a long statement ends with "interrupted"
         try:
             if not self.closed:
                 self.closed = True
