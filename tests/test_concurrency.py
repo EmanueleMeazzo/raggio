@@ -828,11 +828,19 @@ def _run_close_race(tmp_path, mode):
     return json.loads(line[6:])
 
 
-def test_close_waits_for_a_read_parked_in_prepare_and_the_read_fails_closed(tmp_path):
+# How the parked read ends depends on the SQLite build, not on raggio: 3.53.1 keeps the
+# sweep's interrupt pending across the prepare, so the statement fails "interrupted" and
+# the read fails closed; 3.47.1 clears it, so the read finishes with its rows. Either is
+# a correct answer for a read that started before the close; a crash or an open
+# connection is not. The translation itself is pinned in process, below.
+_PARKED_READ_ENDS = ("ok", "RuntimeError: collection 't' is closed")
+
+
+def test_close_waits_for_a_read_parked_in_prepare(tmp_path):
     out = _run_close_race(tmp_path, "close")
     # _close_conns had to wait for the reader: it can't free the statement cache under it
     assert out["closer_done_while_reader_parked"] is False
-    assert out["reader"] == "RuntimeError: collection 't' is closed"
+    assert out["reader"] in _PARKED_READ_ENDS, out["reader"]
     assert out["still_open"] == 0  # the write connection and the reader's connection
     assert out["warnings"] == []
 
@@ -842,9 +850,35 @@ def test_close_past_its_deadline_leaves_the_connection_to_its_reader(tmp_path):
     # the sweep gave up on the parked reader and returned; the reader closed its own
     # connection on leaving the read, so nothing is open once it is done
     assert out["closer_done_while_reader_parked"] is True
-    assert out["reader"] == "RuntimeError: collection 't' is closed"
+    assert out["reader"] in _PARKED_READ_ENDS, out["reader"]
     assert out["still_open"] == 0
     assert any("still reading" in w for w in out["warnings"]), out["warnings"]
+
+
+def test_a_read_that_loses_the_race_fails_closed_and_others_pass_through(tmp_path):
+    col = make_collection(tmp_path)  # no worker: only the guard runs
+    # not closed: an SQLite error inside a read section is the caller's, unchanged
+    with pytest.raises(sqlite3.OperationalError, match="interrupted"):
+        with col._reading():
+            raise sqlite3.OperationalError("interrupted")
+    # closed meanwhile: the sweep's interrupt and a closed database read as a closed
+    # collection, the error every request racing a close gets
+    for err in (sqlite3.OperationalError("interrupted"),
+                sqlite3.ProgrammingError("Cannot operate on a closed database.")):
+        rc = col._reading()
+        with pytest.raises(RuntimeError, match="collection .* is closed") as info:
+            with rc:
+                col._closed = True
+                raise err
+        assert info.value.__cause__ is err
+        col._closed = False
+    # anything else passes through even when closed
+    with pytest.raises(ValueError):
+        with col._reading():
+            col._closed = True
+            raise ValueError("not sqlite")
+    col._closed = False
+    asyncio.run(col.stop())
 
 
 # ---- B1/B2: searches over HTTP at c=16, and racing DELETE /collections/{name} ----
