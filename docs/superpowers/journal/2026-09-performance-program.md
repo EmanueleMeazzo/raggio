@@ -1747,6 +1747,48 @@ The other 16 are rulings on wording and tests, not on design. The ADR states onl
 - On the merged tree: 498 passed on 3.12 and 484 on 3.14.8t, 4 skipped each.
 - `main` was pushed at 16:39Z. CI passed: `test` 430 passed with 72 skipped; `native`, x86 and arm, 498 each; `freethreaded`, x86 and arm, 484 each, with the stress step's 2 passed and the image check reporting the GIL off; docs green. The `freethreaded` job is `continue-on-error`, so its counts were read from the log, not from the job's status.
 - gn100's two plan G test images were removed, by name.
+**22:47Z–22:57Z. The follow-ups, with every question asked first.** The maintainer asked for every open follow-up except the CPython comment (G-R44), and for all questions up front. Before asking, the controller scanned the public history: in `origin/main`'s 106 commits, the gn100 home path appears three times, in two bench probes, and the local drafts path once, in ADR 0005. Both date from the initial commit, `7612dc7`, and neither is at the tip. A rewrite would therefore have given all 106 commits new SHAs, and 32 SHA references on `main` and 543 on the docs branch would have needed remapping. The answers came at 22:55Z:
+- No history rewrite (X29).
+- Spec D3's REVISIT: investigate, and implement audience batching only if it wins beyond noise (X30).
+- gn100: remove only `bench-tv` (exited) and the two `e3f558e` images. Done at 22:56Z, and no volume was touched.
+- The lock refresh and `docs.yml` needed no question: the precedent, the uv, numpy and Rust bumps, is tests plus CI.
+
+**22:58Z–23:05Z. turbovec's new commits, and the maintenance bump.** Mid-turn, the maintainer reported performance commits in turbovec's repository and asked for only the final bench to be re-run. A read-only Sonnet agent read every commit since v1.0.0. There are four, all dated 2026-10-02, and one is performance work: #549, a faster 2-bit search on x86 with AVX-512 VNNI and an opt-in two-stage 2-bit search. None is released (PyPI is still at 1.0.0), and there is still no cp314t wheel, so plan G's Hold reason stands. The changelog says 4-bit is unchanged. The controller's own read of the diff found gn100's 4-bit NEON kernel refactored into a generic inline function, so its machine code could differ (X31). None of the drafted upstream asks is addressed.
+- The bump was done by a Sonnet implementer and reviewed by the controller. `02ceaa7` pins `docs.yml`'s four actions by SHA at their latest releases: checkout v7.0.1, setup-uv v10.2.0 with uv 0.12.22, upload-pages-artifact v5.0.0 and deploy-pages v5.0.1.
+- `09caa85` refreshes `uv.lock`. 17 packages move, among them fastapi 0.142.2, starlette 1.7.0, uvicorn 0.54.0, pydantic 2.13.5 and pymdown-extensions 12.1; numpy and turbovec do not. It adds opentelemetry-api 1.45.0, which fastapi 0.142 now requires and raggio does not use.
+- 498 passed on 3.12 and 484 on 3.14.8t, and `mkdocs build --strict` passed. `main` was fast-forwarded and pushed.
+
+**23:01Z–23:09Z. D3's REVISIT, re-run: no win.** The bench volume had been detached to flat after plan G, so F's index was gone. The agent rebuilt IVF with an image of `5dc4607`, in 68 s at 4 GiB: 256 shards of 3,274–25,306 rows. The mean audience came back at 2.39 on seed 7 (F: 2.39) and 2.48 on seed 42. It then ran 5 repetitions per seed, interleaved, at T=8, 12 and 16. The criterion was fixed at 22:57Z, before any data. At T=12, on both seeds, grouped's median had to be at most 0.95× plain's, and its slowest run faster than plain's fastest.
+- Seed 7: 1.016 (7.47 against 7.35 ms). Seed 42: 0.955 (7.29 against 7.63 ms).
+- On both seeds grouped's slowest run (7.64 and 7.55 ms) was slower than plain's fastest (6.85 and 6.86 ms).
+- At T=16 grouped was 4–5 % slower, and at T=8 even. Top-k was identical in all 200 batches of every cell.
+- Spec D3 stands, and ADR 0005 records the re-run (`1937d8c`). F's single winning run reads as noise: plain matched F's figures, grouped did not.
+
+**23:07Z–23:11Z. A segfault in CI.** On `09caa85` the `native` x86 job died with "Fatal Python error: Segmentation fault" in `test_stop_under_load_fails_closed_and_closes_every_connection` (CPython 3.12.15, GIL build). The faulthandler showed `_close_conns` closing the read connections in one thread while `list_records` iterated a cursor in another. The lock refresh does not touch that path, and a re-run of the failed jobs passed. Section 5.32 has the cause and the fix.
+
+**23:12Z–00:44Z (2026-10-03). The turbovec-only A/B: no change beyond noise.** Section 4.19.
+
+**23:31Z–00:20Z. The close race: cause, fix and review.** A Sonnet agent found the cause in CPython's `sqlite3` module, built a deterministic repro and offered three designs. The controller ruled for a per-connection lock (X32). The implementer's `3a68660` passed both suites. An independent Sonnet review found nothing blocking and five nits; the controller ruled four of them to be fixed. A second agent searched CPython's tracker, found no issue covering this, and drafted one, which is not posted.
+
+### 2026-10-03
+
+**00:20Z–00:23Z. The session ended mid-run.** The Claude Code process exited, and both running agents with it: the implementer of the review's nits, its work uncommitted, and the turbovec A/B's agent. The A/B's driver was detached on gn100 and kept going; it was in session 6 of 8 at 00:23Z. The maintainer asked what the batch was waiting for. A new agent took over the A/B's collection, and the controller verified and committed the nits.
+
+**00:24Z–00:56Z. The fix merged.** The nits went into `11c5da5`:
+- a small state lock now orders the deadline hand-off on weakly ordered CPUs without the GIL;
+- read sections take a plain Lock, since they never nest, which an AST test pins;
+- a dead `except` is gone;
+- the ADR note is its own sentence.
+Two snags:
+- This shell sets `FORCE_COLOR=3`, and under it CPython 3.13+ colours its tracebacks. Two `test_freethreading` checks look for plain text in a child interpreter's stderr, and they failed. The child now runs with `PYTHON_COLORS=0` (`43f8197`). The failure was pre-existing and environment-only.
+- On the merged tree, the long-lived `main` worktree's venv (CPython 3.12.8 with SQLite 3.47.1) failed both new subprocess tests. The parked read finished with its rows instead of failing closed: SQLite 3.53.1 keeps the sweep's interrupt pending across the prepare, and 3.47.1 clears it. Both endings are correct for a read that started before the close. The tests now accept either, and a new in-process test pins the error translation (`19c3293`). The review had named this dependence as a nit.
+- Merge `c4a93d6`: 502 passed on 3.12.8 and on 3.12.15, and 488 on 3.14.8t, 4 skipped each. `main` was pushed at 00:48Z. CI was green: `test` 434 passed, `native` 502 on x86 and on arm, and `freethreaded` 488 on x86 and on arm, with the stress step passing.
+
+**00:29Z–00:31Z. "How much have we improved, compared to baseline?"** Per plan, a lot; end to end, it has not been measured. Every A/B compared a plan against the `main` just before it, and the ratios do not multiply:
+- the bases differ;
+- C's malloc knob slowed filtered IVF from 36 to 49 ms, and F then took it to 6.2 ms;
+- baseline3 ran a patched bench at 8 GiB, on Debian's Python and SQLite 3.40.1.
+The maintainer chose one end-to-end A/B, baseline `19a8a2e` against the final `main`, after the current work (X33).
 
 ## 3. Decision register
 
@@ -1828,6 +1870,11 @@ ID prefixes:
 | X26 | 2026-10-02, 13:05Z | The hand-off repro also runs with its busy loops as threads inside the measured process (G-R45b). | Processes only: a free-threaded app oversubscribes itself with its own threads, which a process sweep does not show. | The same cliff at busy threads = CPUs (111 ms at 4, 225 ms at 6); the shim's skip gives 2.00 ms. | Controller (W-14) | Ledger 13:11Z | Adopted |
 | X27 | 2026-10-02, 13:30Z | Plan G's outcome is Hold: the 3.14t build arg and CI job stay, nothing ships on 3.14t, and the ABAB is re-run when turbovec ships a cp314t wheel. | Continue: needs a turbovec cp314t wheel, and an own build never becomes the default (D6). Park: B won. | B won `Hybrid QPS concurrent` in both pairs with a `better` hybrid p99; flat `QPS concurrent` was not won (one uneven split). | Plan G's decision rule, applied by its script | ADR 0006 | Adopted (`93fdfe9`) |
 | X28 | 2026-10-02, 14:54Z | Every test wait outside `test_concurrency.py` for something that must happen gets `WAIT_SECONDS = 360`, one constant per module. Poll loops that fell through to a later assert fail with a message. Waits that prove something did not happen keep their budgets. | 60 s, as in X23: the enqueue test took up to 83.4 s under load. Fix only the two failing tests: the inventory found about 41 waits of the same kind, at 2–30 s. | Under 6 busy loops, 3.14.8t took 20.7–83.4 s where 3.12 took 0.9–1.6 s. At `7bcf077` under load: 16 of 16, and the full suite 2 of 2. | Controller (W-14) | G rulings G-R46 | Adopted (`7bcf077`) |
+| X29 | 2026-10-02, 22:55Z | No history rewrite. The gn100 home path (two bench probes) and the local drafts path (ADR 0005) stay in the public history; the tip is clean. | A filter-repo rewrite and a force-push: the strings date from the initial commit, so all 106 SHAs on `main` would change, 32 SHA references on `main` and 543 on the docs branch would need remapping, and issue #3's link to its closing commit would break. | A scan of every blob and message in `origin/main`. | Maintainer | AskUserQuestion, 2026-10-02 | Adopted |
+| X30 | 2026-10-02, 22:57Z | Spec D3's REVISIT is re-tested against a criterion fixed before any data: at T=12, on seeds 7 and 42, over 5 repetitions each, grouped's median at most 0.95× plain's and its slowest run faster than plain's fastest. A win would ship audience batching behind a setting, after its own A/B. | Re-run once, as F did. Implement without a re-test. | Seed 7 ratio 1.016, seed 42 0.955; neither seed had grouped's slowest run beat plain's fastest. | Maintainer (scope), controller (criterion) | AskUserQuestion, 2026-10-02 | Closed: D3 stands (`1937d8c`) |
+| X31 | 2026-10-02, 23:01Z | turbovec's unreleased `main` (`c6cf0ba`) gets one gn100 A/B against v1.0.0. Both are built from source with the same toolchain, in images that differ only in that wheel, under plan G's ABAB protocol. | PyPI's 1.0.0 against a source build of `main`: the build would confound the code. Skip it because the changelog says 4-bit is unchanged: the diff refactors gn100's 4-bit NEON kernel. | No change beyond noise on any speed metric; flat memory −43 MB (section 4.19). | Maintainer (the bench), controller (design) | Section 2, 22:58Z | Done |
+| X32 | 2026-10-02, 23:31Z | Every read on a per-thread read connection runs inside a per-connection lock. The closer interrupts each reader and waits for its lock without holding `db_lock`, for up to 5 s, then leaves the close to the reader. | A reader count per collection: contended on every `_hydrate`. The owner closing alone: `stop()` would return with handles open, and `DELETE`'s `rmtree` fails on Windows. A cursor proxy: it hides the lock's scope. | Before: a deterministic repro crashed 20 of 20 runs on each build. After: none in the repro loops, plus an independent review (section 5.32). | Controller | — | Adopted (`c4a93d6`) |
+| X33 | 2026-10-03, 00:31Z | One end-to-end A/B on gn100: `localhost/raggio:baseline` (`19a8a2e`) against the final `main` (`19c3293`). Each arm runs on its own freshly ingested volume, with the same bench client, serving at 4 GiB. | Per-plan numbers only: they do not multiply (section 2, 00:29Z). | — | Maintainer | AskUserQuestion, 2026-10-03 | In progress |
 | W-1 | 2026-09-27 23:27Z | "Answer, don't act": a question such as "is it OK to X?" gets an answer and an offer, never an unrequested action. | None. | The gn100 restart incident (section 7). | Maintainer (correction) | Transcript | Standing rule |
 | W-2 | 2026-09-27 23:09Z to 2026-09-28 01:11Z | Offload work to gn100 "when it makes sense". First baseline: "not more than 65m". Later: "no limits" for this program while the PC stays on. The spec keeps a rule that DGX runs over about 5 minutes need a go-ahead with a time cap. | None. | None. | Maintainer | Transcript; spec §6 | Standing |
 | W-3 | 2026-09-28 18:45Z | Every question to the maintainer goes through the structured question tool. | None. | None. | Maintainer | Transcript | Standing |
@@ -2649,6 +2696,42 @@ Reading it:
 - **Memory:** section 9.4.
 - **The outcome:** ADR 0001 records all eight PASS lines (`17bc0fa`). D2 is merged into `main` (`bc00ded`) and pushed, which closed issue #3.
 
+### 4.19 turbovec's unreleased main against 1.0.0, on gn100
+
+Run from 2026-10-02 23:12Z to 2026-10-03 00:44Z (X31). Both arms are `09caa85`, each with turbovec built from source on gn100:
+- A is v1.0.0 (`ccab9f3`) and B is upstream `main` (`c6cf0ba`).
+- The build command was the same for both: `maturin build --release --locked --compatibility linux`, with maturin 1.15.0, Rust 1.99.0 and CPython 3.12.15, default features and no RUSTFLAGS.
+- Both wheels call themselves 1.0.0; only the extension's sha256 tells them apart.
+- The two images' package lists, 27 entries each, were identical.
+
+Results identity, checked before timing, on IVF and on flat: nq=8 batches, single queries, a filtered set of 212,331 ids, and a tiny allowlist. Ids and float32 score bits were identical, with 0 differing cells.
+
+Protocol: plan G's ABAB machinery, in the order A1, A1-c16, B1, B1-c16, A2, A2-c16, B2, B2-c16.
+- Each session ran IVF run0 plus 3 measured runs, then flat run0 plus 3.
+- Seed 42, 500 queries, 200 filtered, k=10.
+- 4 GiB, host-warm, `OPENBLAS_NUM_THREADS=1`.
+- All 8 sessions ended `exit 0`.
+
+Medians of 6 measured runs per arm, with the two sessions pooled; B/A in brackets. None of these differences exceeds both arms' bands.
+
+| Metric | Flat, A → B | IVF, A → B |
+|---|---|---|
+| QPS serial | 54 → 54 (1.00) | 161 → 168 (1.04) |
+| Search p50 (ms) | 18.3 → 18.3 | 6.1 → 5.9 |
+| p99 serial (ms) | 20.0 → 19.9 | 7.8 → 7.6 |
+| QPS concurrent, c=8 | 129 → 138 (1.07) | 364 → 386 (1.06) |
+| QPS concurrent, c=16 | 207 → 243 (1.17) | 392 → 406 (1.03) |
+| p95 under concurrency, c=8 (ms) | 69.2 → 68.6 | 24.5 → 24.6 |
+| Hybrid QPS serial | 20.3 → 20.4 | 21.7 → 21.6 |
+| Recall@10 | 1.000 → 1.000 | 0.994 → 0.994 |
+| CPU per query, c=8 (ms) | 115.8 → 106.0 | 9.6 → 9.6 |
+| Cold start (s) | 2.0 → 2.0 | 2.5 → 2.5 |
+
+- **The one difference beyond both bands is flat memory:** 1,502 → 1,459 MB after ingest and 1,506 → 1,465 MB under load, about −43 MB. The ranges were disjoint in both the c=8 and the c=16 sessions. IVF memory did not move (1,506 against 1,508 MB).
+- **Flat hybrid at c=8 reads as noise.** QPS went 35.3 → 43.6 and CPU per query 342 → 306 ms, with disjoint ranges, but neither repeated at c=16 (ratio 1.00). Flat concurrent QPS is bimodal (section 5.8), so its bands are wide.
+- **The verdict:** no change beyond noise on any speed metric. Bumping to turbovec's next release is safe for raggio's 4-bit default. #549's gains are for 2-bit indexes on x86 with AVX-512 VNNI, and gn100 is neither.
+- **A gap in the record:** the first agent's printouts of the wheels, the images and the identity check were lost with the session (section 2, 2026-10-03 00:20Z). The second agent re-derived them from the saved files and from fresh checks on the images.
+
 ## 5. Negative results and surprises
 
 ### 5.1 Audience batching lost on NEON
@@ -2857,6 +2940,23 @@ The controller's first arithmetic, 40 yields of about 15 ms making the 600 ms, m
 
 (Dated note, 2026-10-02 16:43Z: raggio's own ingest worker path slows down the same way. Under the same 6 busy loops, two ingest tests that take about 0.5 s unloaded ran 20–60 times slower on 3.14.8t than on 3.12, at 20.7–88.3 s against 0.9–1.6 s (section 2, 14:38Z). The runs did not trace the lock spin, but the shape matches. A free-threaded deployment on a host with every CPU busy would meet it on ingest. The tests' answer is X28. ADR 0006's Hold did not rest on it, and no image ships on 3.14t.)
 
+### 5.32 Closing a SQLite connection on one thread could crash a read on another
+
+ADR 0001 classed the unlocked reads that race a close as "an error, never a wrong answer". They are `list_records`, `get_document`, job status, `stats` and orphaned search bodies. On 2026-10-02 at 23:05Z, CI's `native` x86 job segfaulted in the stop-under-load test. It was the first crash this program saw in CI.
+- **The cause is in CPython, not SQLite.**
+  - `Connection.close()` clears the connection's statement cache, an `lru_cache`, before it closes the database, and it takes no lock (`Modules/_sqlite/connection.c`, line 637 at v3.12.15, line 724 at v3.14.8).
+  - `execute()` calls that cache through a borrowed pointer (`cursor.c`, lines 505–510 and 518–524).
+  - On a cache miss, the cache's wrapper builds the statement and drops the GIL around `sqlite3_prepare_v2`. A close in that window frees the cache under the reader, which touches it again when the prepare returns.
+  - Closing during `sqlite3_step` is safe. SQLite serialises it, and the reader gets "Cannot operate on a closed database".
+- **The repro.** A version that parks the reader in prepare with an authorizer callback crashed 20 of 20 runs on 3.12.15 and on 3.14.8t, on the laptop. Without the hook, 8 reader threads crashed 3 of 60 runs on 3.12.15 and 46 of 60 on 3.14.8t. With warm caches the counts were 0 of 40 and 7 of 40: the free-threaded build has no GIL between the connection check and the cache call. The existing stop-under-load test never crashed in 140 laptop runs; CI hit it once.
+- **It was reachable while serving.** LRU eviction (past `MAX_RESIDENT_COLLECTIONS`, default 4), the idle TTL and `DELETE /collections/{name}` all call `stop()` while requests run, and `get_document` and job status run on the event-loop thread.
+- **The fix (X32).**
+  - Every read on a per-thread read connection runs inside a per-connection lock.
+  - `_close_conns` swaps out the registry under `db_lock`, releases it, then interrupts each reader and waits for its lock, for up to 5 s. Past that, the reader closes its own connection when it leaves.
+  - It costs 0.35–0.5 µs per read section; a 10-id hydrate query takes about 45 µs.
+  - How a read parked across the close ends depends on the SQLite build. 3.53.1 fails it with the closed error, while 3.47.1 lets it finish with its rows (section 2, 2026-10-03 00:24Z).
+- **Upstream.** No CPython issue covers it, and CPython's `main` had the same code on 2026-10-02. A draft issue with a stdlib-only repro waits for the maintainer; nothing is posted.
+
 ## 6. Method: how we measured
 
 Spec §6 sets one protocol for every plan. Each rule below gives the reason the sources record, or says "reason not recorded".
@@ -2976,6 +3076,9 @@ Recorded subagent tokens for the completed workflows sum to 10,021,309. That tot
 - Rootless podman on gn100 has no cpuset controller, so `--cpuset-cpus` fails. `taskset -c` inside the container restricts the process tree. `nproc` follows it; `os.cpu_count()` still reports all 20 CPUs (section 2, 2026-10-02 12:53Z).
 - `uv run --no-sync --group docs` does not install a missing docs group. The strict docs build needs `uv run --group docs` the first time.
 - `git archive` applies `core.autocrlf`: with it on, the copy of a commit has CRLF line endings, and a search pattern that spans lines needs `\r?\n`. A script that patches such a copy should stop when the patch misses; the first G-R46 timing ran on with one test unpatched (section 2, 2026-10-02 14:38Z).
+- `FORCE_COLOR` in the agent's shell makes CPython 3.13+ colour its tracebacks. That breaks any test that matches text in a child interpreter's stderr. Setting `PYTHON_COLORS=0` in the child's environment overrides it (section 2, 2026-10-03 00:24Z).
+- A worktree's venv is not necessarily the pinned interpreter: the long-lived `main` worktree's venv was CPython 3.12.8 with SQLite 3.47.1. Here that helped, because it exposed a SQLite-version dependence in two new tests. Any check against the pins should still print `sys.version` and `sqlite3.sqlite_version` first.
+- When the Claude Code process exits, its agents die with it, and anything they only printed is lost. Work running detached on gn100 survives. Agents should write each piece of evidence to a file as they go.
 
 ### 7.7 Working agreements with the maintainer
 
@@ -3067,6 +3170,7 @@ State as of 2026-09-28, about 19:30Z.
 - Dated note, 2026-10-02 10:55Z: plan G's final review and fix wave are done. The branch is at `e3f558e`, with 497 passed on 3.12 and 483 with 4 skipped on 3.14.8t, on the laptop and on Linux on gn100. The fix wave includes a pre-existing BM25 bug fixed on the branch (section 5.29). DGX Task 11 is running on gn100 (DGX Spark); Task 12's ABAB is next.
 - Dated note, 2026-10-02 13:39Z: plan G's Task 12 is done, and the verdict is Hold (ADR 0006, `93fdfe9`; 498 passed on 3.12, 484 with 4 skipped on 3.14.8t; section 2, 12:48Z). On gn100 (DGX Spark), the hand-off repro and a `sched_yield` shim showed on Linux what made G-R40's loop fail (section 5.31). G-R42's loop passed 16 of 16, and its loaded full suites are running on the laptop. Next: merge G into `main` and push. The CPython comment draft (G-R44) waits for the maintainer.
 - Dated note, 2026-10-02 16:43Z: plan G is merged and pushed (`5dc4607`), and CI is green. The loaded full suites found two more short budgets, which X28 fixed in `7bcf077` (section 2, 13:30Z–16:43Z). Plans A–G are done. Open: the `uv.lock` refresh (G-R30), `docs.yml`'s `setup-uv@v5`, and the CPython comment draft (G-R44), which waits for the maintainer.
+- Dated note, 2026-10-03 00:55Z: the follow-ups are done except the end-to-end A/B (X33). `main` is at `19c3293` and CI is green; since plan G it gained the lock refresh, `docs.yml`'s pins, ADR 0005's D3 re-run and the close-race fix (section 5.32). D3 stands (X30). turbovec's unreleased `main` changes nothing beyond noise for raggio (section 4.19). There is no history rewrite (X29). Two CPython drafts wait for the maintainer: the comment (G-R44) and a new issue on the `sqlite3` close race.
 
 ### 9.2 Open questions in the plans
 
@@ -3103,7 +3207,7 @@ State as of 2026-09-28, about 19:30Z.
 - **Base run 1's memory peak** (plan F's A/B, 2026-10-02): 4,096 MB before the restart, the cap, in the first measured container after run0's index build. Every other measured run peaked at 1,527–1,562 MB. Not investigated.
 - **F6's gap** (section 5.24): the A/B's T=1 serial runs read 8.70, 7.65 and 7.66 ms, and no follow-up run went below 8.34. What made two runs fast, and one QPS run slow, is not known.
 - **F doubles CPU per query** (5.19 to 10.09 ms at c=8) and the summed kernel time of a batch (27.34 to 63.46 ms in process). Pool-thread placement is a candidate for part of it (section 5.25), measured only in a microbenchmark; neither was profiled in the server.
-- **The grouped-call guard's REVISIT** at 12 threads only, in one probe run (both of its repetitions), with 2.39 queries per probed shard on the rebuilt index against p3's 1.40. Whether it holds is a question for reopening spec D3.
+- **The grouped-call guard's REVISIT** at 12 threads only, in one probe run (both of its repetitions), with 2.39 queries per probed shard on the rebuilt index against p3's 1.40. Whether it holds is a question for reopening spec D3. (Dated note, 2026-10-03: it did not hold. On a rebuilt index with the same audience, 5 repetitions per seed missed the pre-registered criterion on both seeds (X30; section 2, 2026-10-02 23:01Z).)
 - **One 3.14.8t suite failure at plan G's `05c2731`** (Task 2, 2026-10-02): 1 failed and 460 passed, once, in the controller's check. The next 15 runs were green, 8 of them in concurrent pairs. The summary line lost the test's name, so it is not known which test failed, or whether Task 2's change is involved. (Dated note, 2026-10-02 09:25Z: no failure since, in about 20 more 3.14.8t runs on the laptop through `cdf8ab9`, and 3 on Linux on gn100. The tally is 1 in about 36 laptop runs. The final review is asked for candidates.) (Dated note, 2026-10-02 12:15Z: G-R40's loop at `e3f558e` failed twice in 16 runs, and both failures were 5 s waits running out on the free-threaded build's slow hand-offs under load (section 2, 11:10Z). A short budget is now a third candidate, next to I1 and M1. That failure's output was lost, so it stays unexplained.)
 
 ### 9.5 Disputed, unaddressed, and limits
