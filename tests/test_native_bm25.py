@@ -67,15 +67,16 @@ def test_prune_splits_underscore_titles_like_stage_2_and_fts5(tmp_path, monkeypa
     kept, toks = col._prune_common(TITLE)
     assert toks == store._fold_tokens(TITLE)[:100]  # the stage-2 tokens
     assert not any("_" in t for t in kept + toks)
-    db = col._rdb()
-    vocab = {r[0] for r in db.execute("SELECT term FROM records_fts_v")}
+    with col._reading() as db:
+        vocab = {r[0] for r in db.execute("SELECT term FROM records_fts_v")}
     assert not any("_" in t for t in vocab)  # FTS5 unicode61 splits on '_' as well
     assert set(kept) <= vocab  # no df-0 phantom survives: every kept token is indexed
     assert kept == ["superconductivity", "mgb", "sr", "ba", "films", "dft", "study"]
     budget = max(store.FTS_SCAN_BUDGET_MIN_ROWS,
                  int(store.FTS_SCAN_BUDGET * sum(col.indexed_counts.values())))
-    matched = db.execute("SELECT COUNT(*) FROM records_fts WHERE records_fts MATCH ?",
-                         (store._or_query(kept),)).fetchone()[0]
+    with col._reading() as db:
+        matched = db.execute("SELECT COUNT(*) FROM records_fts WHERE records_fts MATCH ?",
+                             (store._or_query(kept),)).fetchone()[0]
     assert matched <= budget
     hits = asyncio.run(col.search("text", None, TITLE, 3, "chunks", None, None))
     assert hits[0]["id"] == "title"
@@ -99,8 +100,9 @@ def test_prune_keys_df_by_the_fts5_term(tmp_path, monkeypatch):
     assert toks == ["x", "1", "AB", "rare"]  # the stage-2 tokens
     assert set(col._df_cache) == {"x", "1", "ab", "rare"}
     assert kept == ["x", "1", "rare"]
-    matched = col._rdb().execute("SELECT COUNT(*) FROM records_fts WHERE records_fts MATCH ?",
-                                 (store._or_query(kept),)).fetchone()[0]
+    with col._reading() as db:
+        matched = db.execute("SELECT COUNT(*) FROM records_fts WHERE records_fts MATCH ?",
+                             (store._or_query(kept),)).fetchone()[0]
     assert matched == 1
 
 
@@ -538,8 +540,9 @@ def test_probe_parity_passes_and_catches_a_one_ulp_drift(tmp_path, monkeypatch, 
     col = _probe_collection(tmp_path, monkeypatch)
     # "ΣΟΦΙΑΣ σοφίας x_1 the" is the one underscore query: its ranked OR, counted directly
     kept, _ = col._prune_common(PROBE_QUERIES[2])
-    under = col._rdb().execute("SELECT COUNT(*) FROM records_fts WHERE records_fts MATCH ?",
-                               (store._or_query(kept),)).fetchone()[0]
+    with col._reading() as db:
+        under = db.execute("SELECT COUNT(*) FROM records_fts WHERE records_fts MATCH ?",
+                           (store._or_query(kept),)).fetchone()[0]
     asyncio.run(col.stop())  # like bench-tv, stopped before the probe opens its meta.db
     queries = tmp_path / "q.json"
     queries.write_text(json.dumps(PROBE_QUERIES * 3), encoding="utf-8")

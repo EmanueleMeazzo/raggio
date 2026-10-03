@@ -484,12 +484,30 @@ def test_large_allowlist_inside_one_shard_skips_the_other_probed_shards():
     ivf._pool.close()
 
 
+class _WrappedRead:
+    """`with col._reading() as db` that hands the body `wrap(db)`: a test seam over the
+    read guard, which still takes and releases the connection's lock."""
+
+    def __init__(self, rc, wrap):
+        self._rc, self._wrap = rc, wrap
+
+    def __enter__(self):
+        return self._wrap(self._rc.__enter__())
+
+    def __exit__(self, *exc):
+        return self._rc.__exit__(*exc)
+
+
+def wrap_reads(col, wrap):
+    real = col._reading
+    col._reading = lambda: _WrappedRead(real(), wrap)
+    return real
+
+
 def test_allow_cache_holds_sorted_arrays(tmp_path):
     col = make_collection(tmp_path, threads=4)
     ingest(col, 300)
     attach(col, nlist=8, nprobe=8)
-    real_rdb = col._rdb
-
     class Reversed:  # a query plan that returns ids out of rowid order
         def __init__(self, db):
             self.db = db
@@ -500,10 +518,10 @@ def test_allow_cache_holds_sorted_arrays(tmp_path):
                 return iter(cur.fetchall()[::-1])
             return cur
 
-    col._rdb = lambda: Reversed(real_rdb())
+    real_reading = wrap_reads(col, Reversed)
     q = np.array([rowvec(1)], dtype=np.float32)
     hits = asyncio.run(col.search("vector", q, None, 5, "chunks", {"g": 1}, None))
-    col._rdb = real_rdb
+    col._reading = real_reading
     assert hits[0]["id"] == "c1"
     (allow,) = col._allow_cache.values()
     assert len(allow) == 150 and bool((allow[1:] > allow[:-1]).all())
@@ -531,11 +549,10 @@ class SlowFilterScan:
 def test_orphaned_filter_scan_cannot_cache_a_stale_allowlist(tmp_path):
     col = make_collection(tmp_path)
     ingest(col, 20)  # metadata g = i % 2: d3 starts in g=1
-    real_rdb = col._rdb
     q = np.array([rowvec(3)], dtype=np.float32)
 
     async def go():
-        col._rdb = lambda: SlowFilterScan(real_rdb())
+        real_reading = wrap_reads(col, SlowFilterScan)
         t = asyncio.create_task(col.search("vector", q, None, 50, "chunks", {"g": 1}, None))
         await asyncio.sleep(0.05)
         t.cancel()  # client timeout: the task drops its read lock, its thread runs on
@@ -543,7 +560,7 @@ def test_orphaned_filter_scan_cannot_cache_a_stale_allowlist(tmp_path):
             await t
         except asyncio.CancelledError:
             pass
-        col._rdb = real_rdb
+        col._reading = real_reading
         assert await col.patch_metadata("d3", {"g": 0}, True) == 1
         await asyncio.sleep(0.5)  # the orphaned scan finishes and offers its allowlist
         return await col.search("vector", q, None, 50, "chunks", {"g": 1}, None)

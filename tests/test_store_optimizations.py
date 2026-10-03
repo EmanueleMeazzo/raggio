@@ -140,7 +140,7 @@ def test_df_cache_serves_repeat_lookups_and_refreshes_on_churn(tmp_path):
     ]}))
     col._df_cache_churn = 0  # the ingest above counted as churn; start clean
     assert col._prune_common("hello world")[0] == ["hello", "world"]
-    col._rdb = lambda: (_ for _ in ()).throw(AssertionError("df must come from cache"))
+    col._reading = lambda: (_ for _ in ()).throw(AssertionError("df must come from cache"))
     assert col._prune_common("hello world")[0] == ["hello", "world"]  # cache hit, no db touch
     # small churn on a large corpus must NOT invalidate (25% relative arm)
     col._df_cache["hello"] = 10**9
@@ -149,7 +149,7 @@ def test_df_cache_serves_repeat_lookups_and_refreshes_on_churn(tmp_path):
     assert col._prune_common("hello world")[0] == ["world"]  # stale huge df still cached -> pruned
     # enough churn invalidates wholesale, even when the row count is unchanged
     col._df_cache_churn = 20_000
-    del col._rdb  # restore the real method for the refreshed lookup
+    del col._reading  # restore the real method for the refreshed lookup
     col._prune_common("hello world")
     assert col._df_cache["hello"] < 10**9
     assert col._df_cache_churn == 0
@@ -262,9 +262,10 @@ def test_concurrent_enqueue_with_worker_loses_nothing(tmp_path):
             assert time.monotonic() < deadline, f"{col.pending_jobs()} jobs open after {WAIT_SECONDS} s"
             await asyncio.sleep(0.05)
         assert not col._worker.done()  # worker alive (a lock error would kill it)
-        assert col._rdb().execute("SELECT COUNT(*) FROM records").fetchone()[0] == 300
-        assert col._rdb().execute(
-            "SELECT COUNT(*) FROM jobs WHERE status='done'").fetchone()[0] == 30
+        with col._reading() as db:
+            assert db.execute("SELECT COUNT(*) FROM records").fetchone()[0] == 300
+            assert db.execute(
+                "SELECT COUNT(*) FROM jobs WHERE status='done'").fetchone()[0] == 30
         await col.stop()
 
     asyncio.run(run())
@@ -301,7 +302,7 @@ def test_closed_collection_fails_closed(tmp_path):
     col = make_collection(tmp_path)
     col._closed = True
     with pytest.raises(RuntimeError):
-        col._rdb()
+        col._reading()
 
 # ---- fp16 rescore + two-stage BM25 (ADR 0003) ----
 
@@ -399,10 +400,11 @@ def test_python_bm25_matches_fts5_ranking(tmp_path, monkeypatch):
             for n, (k, t) in enumerate(texts.items())]
     asyncio.run(col._process_job({"documents": docs}))
     monkeypatch.setattr(store, "SDM_WEIGHT", 0.0)  # FTS5 has no proximity term
-    fts = [r[0] for r in col._rdb().execute(
-        "SELECT rowid FROM records_fts WHERE records_fts MATCH ? ORDER BY rank",
-        ['"alpha" OR "beta"'])]
-    cand = col._rdb().execute("SELECT id, text FROM records").fetchall()
+    with col._reading() as db:
+        fts = [r[0] for r in db.execute(
+            "SELECT rowid FROM records_fts WHERE records_fts MATCH ? ORDER BY rank",
+            ['"alpha" OR "beta"'])]
+        cand = db.execute("SELECT id, text FROM records").fetchall()
     ids, _ = col._bm25_rescore("alpha beta", list(cand), 10)
     assert ids[: len(fts)] == fts
 
