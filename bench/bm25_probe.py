@@ -48,25 +48,27 @@ class TextLeg(Collection):
     def __init__(self, meta_db, native_bm25: bool):  # no super().__init__(): see above
         self.meta_uri = Path(meta_db).resolve().as_uri() + "?mode=ro"
         self._read_local = threading.local()
+        self._closed = False
         self._df_cache, self._df_cache_churn, self._avgdl_cache = {}, 0, None
         self._native_bm25 = native_bm25
         self.stage2_ms: list[float] = []
-        db = self._rdb()
-        # _prune_common branches on the tokenizer (D14): read it from the FTS schema
-        (fts_sql,) = db.execute("SELECT sql FROM sqlite_master WHERE name='records_fts'").fetchone()
-        tokenizer = "trigram" if "trigram" in fts_sql else "unicode61"
-        self.cfg = CollectionConfig("probe", 0, 0, None, None, None, tokenizer=tokenizer)
-        self.indexed_counts = dict(
-            db.execute("SELECT type, COUNT(*) FROM records WHERE indexed=1 GROUP BY type")
-        )
+        self.cfg = CollectionConfig("probe", 0, 0, None, None, None)
+        with self._reading() as db:
+            # _prune_common branches on the tokenizer (D14): read it from the FTS schema
+            (fts_sql,) = db.execute("SELECT sql FROM sqlite_master WHERE name='records_fts'").fetchone()
+            tokenizer = "trigram" if "trigram" in fts_sql else "unicode61"
+            self.cfg = CollectionConfig("probe", 0, 0, None, None, None, tokenizer=tokenizer)
+            self.indexed_counts = dict(
+                db.execute("SELECT type, COUNT(*) FROM records WHERE indexed=1 GROUP BY type")
+            )
 
-    def _rdb(self) -> sqlite3.Connection:
-        db = getattr(self._read_local, "db", None)
-        if db is None:
+    def _reading(self) -> store._ReadConn:
+        rc = getattr(self._read_local, "rc", None)
+        if rc is None:
             db = sqlite3.connect(self.meta_uri, uri=True, check_same_thread=False)
             db.execute("PRAGMA query_only=1")
-            self._read_local.db = db
-        return db
+            rc = self._read_local.rc = store._ReadConn(self, db)
+        return rc
 
     def _bm25_rescore(self, qtext, cand, n):
         t0 = time.perf_counter()
@@ -110,7 +112,8 @@ def or_matches(leg: TextLeg, q: str) -> int:
     if not kept:
         return 0
     sql = "SELECT COUNT(*) FROM records_fts WHERE records_fts MATCH ?"
-    return leg._rdb().execute(sql, [_or_query(kept)]).fetchone()[0]
+    with leg._reading() as db:
+        return db.execute(sql, [_or_query(kept)]).fetchone()[0]
 
 
 def _pct(ms: list[float], p: int) -> float | None:

@@ -210,7 +210,8 @@ LEGACY_JOB = (
 
 def fetch(col, sql, *args):
     """Committed rows, read on the calling thread's read connection (before stop())."""
-    return col._rdb().execute(sql, args).fetchall()
+    with col._reading() as db:
+        return db.execute(sql, args).fetchall()
 
 
 def test_enqueue_writes_job_and_payload_atomically(tmp_path):

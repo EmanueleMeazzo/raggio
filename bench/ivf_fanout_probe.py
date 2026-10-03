@@ -67,6 +67,7 @@ from raggio.store import (
     _filter_sql,
     _IvfIndex,
     _normalize,
+    _ReadConn,
     _rows_by_id,
     _ShardPool,
 )
@@ -99,14 +100,14 @@ def open_collection(data: Path, name: str) -> Collection:
     col.cfg, col.dir, col._closed = cfg, data / "collections" / name, False
     meta, local = col.dir / "meta.db", threading.local()
 
-    def rdb() -> sqlite3.Connection:  # per thread, mode=ro: never modifies the database
-        db = getattr(local, "db", None)
-        if db is None:
+    def reading() -> _ReadConn:  # per thread, mode=ro: never modifies the database
+        rc = getattr(local, "rc", None)
+        if rc is None:
             db = sqlite3.connect(f"file:{meta}?mode=ro", uri=True, check_same_thread=False)
-            local.db = db
-        return db
+            rc = local.rc = _ReadConn(col, db)
+        return rc
 
-    col._rdb = rdb
+    col._reading = reading
     t = time.perf_counter()
     col.index = _IvfIndex.load(
         col.dir / "ivf", cfg.dim, cfg.bit_width, cfg.index_config.get("nprobe", IVF_DEFAULT_NPROBE)
@@ -129,15 +130,17 @@ def open_collection(data: Path, name: str) -> Collection:
 
 def sample_queries(col: Collection, n: int, seed: int) -> np.ndarray:
     """n stored vectors of random rows (fp16 blobs, renormalized), in id order."""
-    db, dim = col._rdb(), col.cfg.dim
-    hi = db.execute("SELECT MAX(id) FROM vecs").fetchone()[0] or 0
+    dim = col.cfg.dim
+    with col._reading() as db:
+        hi = db.execute("SELECT MAX(id) FROM vecs").fetchone()[0] or 0
     ids = np.random.default_rng(seed).permutation(np.arange(1, hi + 1))
     out: list[np.ndarray] = []
     for s in range(0, len(ids), 4 * n):
         chunk = [int(i) for i in ids[s : s + 4 * n]]
-        for _, blob in _rows_by_id(db, "SELECT id, vec FROM vecs WHERE id IN ({})", chunk):
-            if blob is not None and len(blob) == dim * 2:
-                out.append(np.frombuffer(blob, dtype=np.float16).astype(np.float32))
+        with col._reading() as db:
+            for _, blob in _rows_by_id(db, "SELECT id, vec FROM vecs WHERE id IN ({})", chunk):
+                if blob is not None and len(blob) == dim * 2:
+                    out.append(np.frombuffer(blob, dtype=np.float16).astype(np.float32))
         if len(out) >= n:
             break
     if len(out) < n:
@@ -159,14 +162,16 @@ def filter_allowlist(col: Collection, key: str):
     """The key's most common stored value (bench.py filters on the mode of `year`) and
     its allowlist, selected and sorted as _vector_ids does; plus the SELECT+sort ms."""
     where, params = _filter_sql("chunks", None)
-    val = col._rdb().execute(
-        f"SELECT json_extract(metadata, ?) v FROM records WHERE {where} AND v IS NOT NULL"
-        " GROUP BY v ORDER BY COUNT(*) DESC LIMIT 1",
-        ["$." + key, *params],
-    ).fetchone()[0]
+    with col._reading() as db:
+        val = db.execute(
+            f"SELECT json_extract(metadata, ?) v FROM records WHERE {where} AND v IS NOT NULL"
+            " GROUP BY v ORDER BY COUNT(*) DESC LIMIT 1",
+            ["$." + key, *params],
+        ).fetchone()[0]
     where, params = _filter_sql("chunks", {key: val})
     t = time.perf_counter()  # the allow-cache miss, paid once per filter per write
-    ids = [r[0] for r in col._rdb().execute(f"SELECT id FROM records WHERE {where}", params)]
+    with col._reading() as db:
+        ids = [r[0] for r in db.execute(f"SELECT id FROM records WHERE {where}", params)]
     allow = np.sort(np.array(ids, dtype=np.uint64))
     return val, allow, (time.perf_counter() - t) * 1e3
 

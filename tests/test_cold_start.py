@@ -94,10 +94,30 @@ class Recorder:
         return getattr(self._db, name)
 
 
+class _WrappedRead:
+    """`with col._reading() as db` that hands the body `wrap(db)`: a test seam over the
+    read guard, which still takes and releases the connection's lock."""
+
+    def __init__(self, rc, wrap):
+        self._rc, self._wrap = rc, wrap
+
+    def __enter__(self):
+        return self._wrap(self._rc.__enter__())
+
+    def __exit__(self, *exc):
+        return self._rc.__exit__(*exc)
+
+
+def wrap_reads(col, wrap):
+    real = col._reading
+    col._reading = lambda: _WrappedRead(real(), wrap)
+    return real
+
+
 def record_sql(col) -> list:
     """Trace every statement the collection runs on its read connections."""
-    log, real = [], col._rdb
-    col._rdb = lambda: Recorder(real(), log)
+    log = []
+    wrap_reads(col, lambda db: Recorder(db, log))
     return log
 
 
@@ -207,13 +227,13 @@ def test_open_job_queries_use_the_partial_index(tmp_path):
                (53, "{}", "error", "", "")],
         )
         col.db.commit()
-    db = col._rdb()
     # the literal predicate D's claim query, pending_jobs and resume_pending keep (§4.1)
     count = "SELECT COUNT(*) FROM jobs WHERE status IN ('pending','processing')"
     claim = ("SELECT id, payload FROM jobs WHERE status IN ('pending','processing')"
              " ORDER BY id LIMIT 1")
-    assert "idx_jobs_open" in plan(db, count), plan(db, count)
-    assert "idx_jobs_open" in plan(db, claim), plan(db, claim)
+    with col._reading() as db:
+        assert "idx_jobs_open" in plan(db, count), plan(db, count)
+        assert "idx_jobs_open" in plan(db, claim), plan(db, claim)
     assert col.pending_jobs() == 2
     assert col._claim_next()[0] == 51  # lowest open id, 'processing' replays first
 
@@ -760,8 +780,8 @@ def test_dockerfile_sets_the_trim_threshold_in_the_runtime_stage():
 
 
 def count_rdb(col) -> list:
-    calls, real = [], col._rdb
-    col._rdb = lambda: calls.append(1) or real()
+    calls = []
+    wrap_reads(col, lambda db: calls.append(1) or db)
     return calls
 
 

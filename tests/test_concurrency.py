@@ -322,7 +322,8 @@ def test_stop_does_not_cancel_the_worker_inside_its_write_section(tmp_path):
     assert asyncio.run(run()) is False  # stop() waited for upsert -> add -> sync
     reopened = make_collection(tmp_path)  # the row reached the index before the close
     try:
-        n = reopened._rdb().execute("SELECT COUNT(*) FROM records WHERE indexed=1").fetchone()[0]
+        with reopened._reading() as db:
+            n = db.execute("SELECT COUNT(*) FROM records WHERE indexed=1").fetchone()[0]
         assert (n, len(reopened.index)) == (1, 1)
     finally:
         asyncio.run(reopened.stop())
@@ -378,7 +379,7 @@ def test_read_connection_opened_during_stop_is_closed_not_leaked(tmp_path, monke
         conn = real_connect(*args, **kw)
         opened.append(conn)
         if threading.current_thread().name == "late-reader":
-            connecting.set()  # past _rdb's _closed check, not yet registered
+            connecting.set()  # past _reading's _closed check, not yet registered
             release.wait(WAIT_SECONDS)
         return conn
 
@@ -387,7 +388,7 @@ def test_read_connection_opened_during_stop_is_closed_not_leaked(tmp_path, monke
 
     def late_reader():
         try:
-            outcome["conn"] = col._rdb()
+            outcome["conn"] = col._reading()
         except RuntimeError as e:
             outcome["error"] = e
 
@@ -409,34 +410,59 @@ def test_read_connection_opened_during_stop_is_closed_not_leaked(tmp_path, monke
 class _CloseSpy:
     """Stands in for a sqlite3 connection; records the collection's lock state at close()."""
 
-    def __init__(self, inner, col, seen):
-        self._inner, self._col, self._seen = inner, col, seen
+    def __init__(self, inner, col, seen, kind):
+        self._inner, self._col, self._seen, self._kind = inner, col, seen, kind
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
 
     def close(self):
-        self._seen.append((self._col.lock._writing, self._col.db_lock.locked()))
+        self._seen.append((self._kind, self._col.lock._writing, self._col.db_lock.locked()))
         self._inner.close()
 
 
 def test_stop_closes_connections_inside_the_write_lock_and_under_db_lock(tmp_path):
     # the stop() contract plan D2 builds on (its flush goes in the same section, before
     # the close): no search mid-query on a read connection (write lock), no write
-    # transaction mid-flight on self.db (db_lock) when the connections close
+    # transaction mid-flight on self.db (db_lock) when that connection closes
     col = make_collection(tmp_path)
     seen = []
 
     async def run():
         col.start_worker()
         await asyncio.to_thread(col.stats)  # a pool thread registers a read connection
-        col.db = _CloseSpy(col.db, col, seen)
-        col._read_conns[:] = [_CloseSpy(c, col, seen) for c in col._read_conns]
+        col.db = _CloseSpy(col.db, col, seen, "write")
+        for rc in col._read_conns:
+            rc.db = _CloseSpy(rc.db, col, seen, "read")
         await col.stop()
 
     asyncio.run(run())
-    assert len(seen) >= 2
-    assert set(seen) == {(True, True)}
+    assert {k for k, _, _ in seen} == {"write", "read"}
+    # every connection closes inside the write lock; only the write connection also
+    # closes under db_lock: the read sweep waits for readers WITHOUT it (a reader in
+    # its guard may need db_lock to register a connection)
+    assert {(k, w, d) for k, w, d in seen} == {("write", True, True), ("read", True, False)}
+
+
+def test_read_sections_never_nest():
+    # _ReadConn.lock is a plain Lock: a `with ..._reading()` inside another one, in the
+    # same function or through a call to a method that opens its own, would deadlock
+    root = Path(store.__file__).parent
+    tree = {f: ast.parse((root / f).read_text(encoding="utf-8")) for f in ("store.py", "app.py")}
+    opens = {fn.name for t in tree.values() for fn in ast.walk(t)
+             if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+             and any(isinstance(w, ast.With) and "_reading" in ast.unparse(w.items[0].context_expr)
+                     for w in ast.walk(fn))}
+    assert {"_hydrate", "list_records", "get_document", "job_status"} <= opens  # the scan finds them
+    for t in tree.values():
+        for w in ast.walk(t):
+            if isinstance(w, ast.With) and "_reading" in ast.unparse(w.items[0].context_expr):
+                for n in (n for b in w.body for n in ast.walk(b)):
+                    if isinstance(n, ast.With):
+                        assert "_reading" not in ast.unparse(n.items[0].context_expr), n.lineno
+                    if isinstance(n, ast.Call):
+                        called = ast.unparse(n.func).split(".")[-1]
+                        assert called not in opens, f"line {n.lineno}: {called} opens its own section"
 
 
 def test_deleted_collection_leaves_no_files_and_its_name_can_be_reused(tmp_path, monkeypatch):
@@ -666,10 +692,10 @@ def test_mixed_workload_keeps_index_and_counts_consistent(tmp_path):
         errors, ops = await _storm(col, seed=7)
         await _drain(col)
         await asyncio.sleep(0.5)  # orphaned to_thread bodies of cancelled searches land
-        db = col._rdb()
-        indexed = db.execute("SELECT COUNT(*) FROM records WHERE indexed=1").fetchone()[0]
-        by_type = dict(db.execute(
-            "SELECT type, COUNT(*) FROM records WHERE indexed=1 GROUP BY type").fetchall())
+        with col._reading() as db:
+            indexed = db.execute("SELECT COUNT(*) FROM records WHERE indexed=1").fetchone()[0]
+            by_type = dict(db.execute(
+                "SELECT type, COUNT(*) FROM records WHERE indexed=1 GROUP BY type").fetchall())
         state = len(col.index), indexed, {k: v for k, v in col.indexed_counts.items() if v}, by_type
         await col.stop()
         return errors, ops, state
@@ -705,6 +731,120 @@ def test_stop_under_load_fails_closed_and_closes_every_connection(tmp_path, monk
     for conn in opened:  # the write connection and every per-thread read connection
         with pytest.raises(sqlite3.ProgrammingError):
             conn.execute("SELECT 1")
+
+
+# ---- a close racing an unlocked read on a per-thread read connection ----
+#
+# CPython's sqlite3 Connection.close() frees the connection's statement cache (an
+# lru_cache) without any lock, while execute() on another thread calls into it with a
+# borrowed reference and, on a cache miss, drops the GIL inside sqlite3_prepare_v2. A
+# close landing in that window is a use-after-free: a segfault, not an exception. The
+# race can only be forced by parking the reader inside the prepare (an authorizer hook
+# runs there), and the unfixed code kills the interpreter, so the scenario runs in a
+# child process and the test judges its exit code and report.
+
+_CHILD = "import test_concurrency as t, sys; t._child_close_race(sys.argv[1], sys.argv[2])"
+
+
+def _child_close_race(tmp, mode):
+    """Runs in the child. 'close': _close_conns waits for the parked reader, then closes
+    every connection. 'deadline': the wait is cut short (READ_CLOSE_DEADLINE patched),
+    so the reader's own connection is closed by the reader on leaving its read."""
+    import json
+    import logging
+
+    inside, release = threading.Event(), threading.Event()
+    opened = []
+    real_connect = sqlite3.connect
+
+    def authorizer(action, *_):  # runs inside sqlite3_prepare_v2 of the reader's cache-miss execute
+        # not the PRAGMA query_only that _reading() runs while it opens the connection
+        if action != sqlite3.SQLITE_PRAGMA and not inside.is_set():
+            inside.set()
+            release.wait(WAIT_SECONDS)
+        return sqlite3.SQLITE_OK
+
+    def spy_connect(*args, **kw):
+        conn = real_connect(*args, **kw)
+        opened.append(conn)
+        if threading.current_thread().name == "reader":
+            conn.set_authorizer(authorizer)
+        return conn
+
+    warnings = []
+
+    class Catch(logging.Handler):
+        def emit(self, record):
+            if record.levelno >= logging.WARNING:
+                warnings.append(record.getMessage())
+
+    store.sqlite3.connect = spy_connect
+    store._log.addHandler(Catch())
+    if mode == "deadline":
+        store.READ_CLOSE_DEADLINE = 0.3
+    col = make_collection(tmp)
+    out = {}
+
+    def reader():
+        try:
+            col.list_records("both", None, None, 5, 0, False)
+            out["reader"] = "ok"
+        except BaseException as e:
+            out["reader"] = f"{type(e).__name__}: {e}"
+
+    r = threading.Thread(target=reader, name="reader")
+    r.start()
+    assert inside.wait(WAIT_SECONDS), "the reader never reached its prepare"
+    col._closed = True  # what stop() does before the sweep
+    closer = threading.Thread(target=col._close_conns, name="closer")
+    closer.start()
+    closer.join(1.0 if mode == "close" else WAIT_SECONDS)
+    out["closer_done_while_reader_parked"] = not closer.is_alive()
+    release.set()
+    r.join(WAIT_SECONDS)
+    closer.join(WAIT_SECONDS)
+    assert not r.is_alive() and not closer.is_alive()
+    still_open = []
+    for conn in opened:
+        try:
+            conn.execute("SELECT 1")
+            still_open.append(conn)
+        except sqlite3.ProgrammingError:
+            pass
+    out["still_open"] = len(still_open)
+    out["warnings"] = warnings
+    print("CHILD " + json.dumps(out), flush=True)
+
+
+def _run_close_race(tmp_path, mode):
+    import json
+    import subprocess
+
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).parent)}
+    p = subprocess.run([sys.executable, "-c", _CHILD, str(tmp_path), mode],
+                       capture_output=True, text=True, env=env, timeout=WAIT_SECONDS * 2)
+    assert p.returncode == 0, f"child died with exit code {p.returncode}\n{p.stderr[-2000:]}"
+    line = next(ln for ln in p.stdout.splitlines() if ln.startswith("CHILD "))
+    return json.loads(line[6:])
+
+
+def test_close_waits_for_a_read_parked_in_prepare_and_the_read_fails_closed(tmp_path):
+    out = _run_close_race(tmp_path, "close")
+    # _close_conns had to wait for the reader: it can't free the statement cache under it
+    assert out["closer_done_while_reader_parked"] is False
+    assert out["reader"] == "RuntimeError: collection 't' is closed"
+    assert out["still_open"] == 0  # the write connection and the reader's connection
+    assert out["warnings"] == []
+
+
+def test_close_past_its_deadline_leaves_the_connection_to_its_reader(tmp_path):
+    out = _run_close_race(tmp_path, "deadline")
+    # the sweep gave up on the parked reader and returned; the reader closed its own
+    # connection on leaving the read, so nothing is open once it is done
+    assert out["closer_done_while_reader_parked"] is True
+    assert out["reader"] == "RuntimeError: collection 't' is closed"
+    assert out["still_open"] == 0
+    assert any("still reading" in w for w in out["warnings"]), out["warnings"]
 
 
 # ---- B1/B2: searches over HTTP at c=16, and racing DELETE /collections/{name} ----

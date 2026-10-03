@@ -214,7 +214,7 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
 
     @app.get("/collections/{name}/documents/{doc_id}")
     async def get_document(doc_id: str, c=Depends(get_collection)):
-        doc = c.get_document(doc_id)
+        doc = c.get_document(doc_id)  # sync, on the event loop thread: its reads are guarded
         if doc is None:
             raise HTTPException(404, f"document '{doc_id}' not found")
         return doc
@@ -260,9 +260,12 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
 
     @app.get("/collections/{name}/jobs/{job_id}")
     async def job_status(job_id: int, c=Depends(get_collection)):
-        row = c._rdb().execute(
-            "SELECT status, error, created_at, updated_at FROM jobs WHERE id=?", (job_id,)
-        ).fetchone()
+        # runs on the event loop thread (a short point read), so it uses the loop
+        # thread's read connection, through the same guard as every unlocked read
+        with c._reading() as db:
+            row = db.execute(
+                "SELECT status, error, created_at, updated_at FROM jobs WHERE id=?", (job_id,)
+            ).fetchone()
         if row is None:
             raise HTTPException(404, f"job {job_id} not found")
         return {"job_id": job_id, "status": row[0], "error": row[1],

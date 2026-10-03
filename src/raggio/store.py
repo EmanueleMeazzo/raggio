@@ -561,6 +561,91 @@ class CollectionConfig:
 # keeps meta.db, -wal and -shm open: no statement cache there. 128 is sqlite3's own default.
 SQLITE_CACHED_STATEMENTS = 0 if sysconfig.get_config_var("Py_GIL_DISABLED") else 128
 
+# how long _close_conns keeps interrupting and waiting for threads still reading on their
+# connections before it hands each close to the reading thread (seconds, whole sweep)
+READ_CLOSE_DEADLINE = 5.0
+
+
+class _ReadConn:
+    """One thread's read connection and the guard that keeps close() off it.
+
+    CPython's sqlite3 Connection.close() frees the connection's statement cache without a
+    lock, while execute() on another thread calls into that cache through a borrowed
+    reference (and, on a miss, drops the GIL inside sqlite3_prepare_v2): a close landing
+    there is a use-after-free, a segfault. So every use of the connection runs inside
+    `with <this object> as db:`, which holds `lock`, and the closer takes the same lock.
+
+    Only the owning thread enters; the closer only acquires, sets `closed` and `closing`.
+    A guarded section never takes db_lock, never awaits and never yields (a generator or
+    a live cursor must not escape it), so the closer can wait on `lock` without a cycle.
+    Sections never nest (list_records takes three in a row, and _hydrate is called
+    between them, not inside one), so `lock` is a plain Lock; a nested section would
+    deadlock on it, and test_read_sections_never_nest pins that none exists."""
+
+    __slots__ = ("col", "db", "lock", "state", "closed", "closing")
+
+    def __init__(self, col: "Collection", db: sqlite3.Connection) -> None:
+        self.col, self.db = col, db
+        self.lock = threading.Lock()
+        self.state = threading.Lock()  # orders `closing` against the owner's exit, below
+        self.closed = False   # set by whoever closes db, under lock
+        self.closing = False  # the sweep gave up waiting: the owner closes on leaving
+
+    def __enter__(self) -> sqlite3.Connection:
+        self.lock.acquire()
+        if self.closed:
+            self.lock.release()
+            raise RuntimeError(f"collection '{self.col.cfg.name}' is closed")
+        return self.db
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.lock.release()
+        # Hand-off with the sweep's deadline path (close_when_idle), a store-then-load
+        # pair on each side: the sweep stores `closing` then tries `lock`; this thread
+        # releases `lock` then loads `closing`. Without ordering both could miss the
+        # other (a plain load after a release is not sequentially consistent on
+        # weakly ordered CPUs without the GIL) and the connection would stay open until
+        # exit. Both sides take `state` around their access, so the two critical
+        # sections are totally ordered: either this load sees `closing` and closes, or
+        # the sweep's store came later and so did its try-acquire, after our release.
+        with self.state:
+            closing = self.closing
+        if closing and self.lock.acquire(blocking=False):
+            try:
+                if not self.closed:
+                    self.closed = True  # the sweep's deadline passed while this thread read
+                    self.db.close()
+            finally:
+                self.lock.release()
+        if (exc_type is not None and self.col._closed
+                and issubclass(exc_type, (sqlite3.OperationalError, sqlite3.ProgrammingError))):
+            # "interrupted" by the sweep, or "closed database": the collection is
+            # closed, and that is the error a request racing a close has always got
+            raise RuntimeError(f"collection '{self.col.cfg.name}' is closed") from exc
+        return False
+
+    def close_when_idle(self, deadline: float) -> bool:
+        """The sweep's side. Interrupt whatever statement is running and wait for the
+        owner to leave its section; False if it still has not by `deadline`."""
+        while not self.lock.acquire(timeout=0.05):
+            if time.monotonic() >= deadline:
+                with self.state:  # see __exit__: orders this store against the owner's load
+                    self.closing = True
+                # the owner may have left between the failed acquire and the store
+                if self.lock.acquire(blocking=False):
+                    break
+                return False
+            # nothing else closes this connection while the sweep is still interrupting
+            # it (the owner closes only once `closing` is set), so this cannot fail
+            self.db.interrupt()  # a long statement ends with "interrupted"
+        try:
+            if not self.closed:
+                self.closed = True
+                self.db.close()
+        finally:
+            self.lock.release()
+        return True
+
 
 def open_meta_db(path: Path, tokenizer: str = "unicode61") -> sqlite3.Connection:
     db = sqlite3.connect(path, check_same_thread=False,
@@ -1114,7 +1199,7 @@ class Collection:
         # shared self.db raise SQLITE_MISUSE (pysqlite connections aren't concurrency-
         # safe), and WAL makes independent read connections cheap and non-blocking
         self._read_local = threading.local()
-        self._read_conns: list[sqlite3.Connection] = []
+        self._read_conns: list[_ReadConn] = []
         self._closed = False  # set by stop(); makes stale searches fail closed instead
         # of resurrecting connections on a dead collection (leaks the handle and, on
         # Windows, keeps the deleted collection dir undeletable)
@@ -1223,7 +1308,9 @@ class Collection:
             # write-locked: no search holding the read lock is mid-query. Orphaned
             # to_thread bodies of cancelled searches, orphaned index builds and the
             # unlocked reads (list_records, get_document, job status) can still be
-            # (ADR 0001, concurrency addendum, Deferred row)
+            # reading, each inside its connection's guard: _close_conns interrupts and
+            # waits for it, and the read fails with the closed error (ADR 0001,
+            # concurrency addendum, Deferred row, update 2026-10-03)
             await close_step("the SQLite connections", asyncio.to_thread(self._close_conns))
         if self._embedder is not None:
             await close_step("the embedder's HTTP client", self._embedder.aclose())
@@ -1231,15 +1318,29 @@ class Collection:
         await close_step("the IVF shard pool", asyncio.to_thread(self._shard_pool.close))
 
     def _close_conns(self) -> None:
-        # under db_lock: a write transaction that already holds db_lock on self.db (a
-        # request's enqueue, or the worker's claim/finish orphaned by its cancellation)
-        # commits before the close; one still waiting for db_lock finds the connection
-        # closed and fails, and its job keeps its old status and replays on boot.
-        # _rdb re-checks _closed here, so no read connection registers after this sweep
+        # db_lock only around the registry swap and around self.db: a read connection's
+        # owner may hold its guard and need db_lock (a first _reading() on that thread
+        # registers under it), so the wait for readers happens without db_lock
         with self.db_lock:
+            # _closed is set (stop(), under the write lock): _reading() registers
+            # nothing after this swap
             conns, self._read_conns = self._read_conns, []
-            for c in conns:
-                c.close()
+        deadline = time.monotonic() + READ_CLOSE_DEADLINE
+        for rc in conns:
+            if not rc.close_when_idle(deadline):
+                # The one case where stop() returns with a connection open: its owner
+                # is still inside a read that interrupt() cannot end after
+                # READ_CLOSE_DEADLINE. It closes the connection on leaving the read.
+                _log.warning(
+                    "collection %s: a thread was still reading on its connection %.1f s"
+                    " after the close began; that thread closes it when its read ends",
+                    self.cfg.name, READ_CLOSE_DEADLINE,
+                )
+        # a write transaction that already holds db_lock on self.db (a request's
+        # enqueue, or the worker's claim/finish orphaned by its cancellation) commits
+        # before the close; one still waiting for db_lock finds the connection closed
+        # and fails, and its job keeps its old status and replays on boot
+        with self.db_lock:
             self.db.close()
 
     async def enqueue(self, payload: dict) -> int:
@@ -1276,9 +1377,10 @@ class Collection:
         return job_id
 
     def pending_jobs(self) -> int:
-        return self._rdb().execute(
-            "SELECT COUNT(*) FROM jobs WHERE status IN ('pending','processing')"
-        ).fetchone()[0]
+        with self._reading() as db:
+            return db.execute(
+                "SELECT COUNT(*) FROM jobs WHERE status IN ('pending','processing')"
+            ).fetchone()[0]
 
     def _claim_next(self, after: int = 0) -> tuple[int, dict | None, str | None] | None:
         """Claim the lowest open job with an id above `after` (0: the lowest open job,
@@ -1714,13 +1816,16 @@ class Collection:
     def _iter_vec_blocks(self):
         """Stream (ids, f32 matrix) of every indexed record from the retained fp16
         vectors, blockwise so a multi-GB collection never materializes at once."""
-        db, last = self._rdb(), 0
+        last = 0
         while True:
-            rows = db.execute(
-                "SELECT r.id, v.vec FROM records r JOIN vecs v ON v.id=r.id"
-                " WHERE r.indexed=1 AND r.id>? ORDER BY r.id LIMIT ?",
-                (last, IVF_BUILD_BLOCK),
-            ).fetchall()
+            # one guarded section per block: the generator yields between them, and a
+            # yield must never sit inside a section
+            with self._reading() as db:
+                rows = db.execute(
+                    "SELECT r.id, v.vec FROM records r JOIN vecs v ON v.id=r.id"
+                    " WHERE r.indexed=1 AND r.id>? ORDER BY r.id LIMIT ?",
+                    (last, IVF_BUILD_BLOCK),
+                ).fetchall()
             if not rows:
                 return
             last = rows[-1][0]
@@ -1730,15 +1835,19 @@ class Collection:
                 mat.reshape(len(rows), -1).astype(np.float32),
             )
 
+    def _live_ids_read(self) -> np.ndarray:
+        with self._reading() as db:
+            return _live_ids(db)
+
     def _vec_sample(self, k: int) -> np.ndarray:
         """Up to k distinct, uniformly random retained vectors of indexed records.
         ORDER BY RANDOM() reads and sorts every vecs page (p1: 152 s cold at 2.55M rows),
         so while ids are dense, draw random rowids and point-read only those. Every
         live id is equally likely to be drawn, so the pick stays uniform. Too sparse,
         k above n/2, or too few hits after VEC_SAMPLE_ROUNDS falls back to the scan."""
-        db = self._rdb()
         n = sum(self.indexed_counts.values())
-        max_id = db.execute("SELECT MAX(id) FROM records").fetchone()[0] or 0
+        with self._reading() as db:
+            max_id = db.execute("SELECT MAX(id) FROM records").fetchone()[0] or 0
         if n and max_id and n / max_id >= VEC_SAMPLE_MIN_DENSITY and 2 * k <= n:
             rng = np.random.default_rng()
             got: dict[int, bytes] = {}
@@ -1747,22 +1856,24 @@ class Collection:
                 draws = rng.integers(1, max_id + 1, size=int((k - len(got)) * max_id / n * 1.3) + 64)
                 cand = np.setdiff1d(draws, tried)
                 tried = np.union1d(tried, cand)
-                got.update(_rows_by_id(
-                    db,
-                    "SELECT v.id, v.vec FROM vecs v JOIN records r ON r.id=v.id"
-                    " WHERE r.indexed=1 AND v.id IN ({})",
-                    cand.tolist(),
-                ))
+                with self._reading() as db:
+                    got.update(_rows_by_id(
+                        db,
+                        "SELECT v.id, v.vec FROM vecs v JOIN records r ON r.id=v.id"
+                        " WHERE r.indexed=1 AND v.id IN ({})",
+                        cand.tolist(),
+                    ))
                 if len(got) >= k:
                     keys = list(got)
                     pick = rng.choice(len(keys), k, replace=False)
                     blob = b"".join(got[keys[i]] for i in pick)
                     mat = np.frombuffer(blob, dtype=np.float16)
                     return mat.reshape(k, self.cfg.dim).astype(np.float32)
-        rows = db.execute(
-            "SELECT v.vec FROM vecs v JOIN records r ON r.id=v.id WHERE r.indexed=1"
-            " ORDER BY RANDOM() LIMIT ?", (k,),
-        ).fetchall()
+        with self._reading() as db:
+            rows = db.execute(
+                "SELECT v.vec FROM vecs v JOIN records r ON r.id=v.id WHERE r.indexed=1"
+                " ORDER BY RANDOM() LIMIT ?", (k,),
+            ).fetchall()
         if not rows:
             return np.empty((0, self.cfg.dim), np.float32)
         mat = np.frombuffer(b"".join(r[0] for r in rows), dtype=np.float16)
@@ -1779,20 +1890,19 @@ class Collection:
         vectors exist to train on. Otherwise `ids` are the rows the attach stream
         skipped, point-read by id. add(ids, f32 matrix) receives each written batch on
         a worker thread, so the caller never holds them all. Returns rows written."""
-        if ids is None:
-            rows = await asyncio.to_thread(
-                lambda: self._rdb().execute(
-                    "SELECT r.id, r.text FROM records r LEFT JOIN vecs v ON v.id=r.id"
-                    " WHERE r.indexed=1 AND v.id IS NULL"
-                ).fetchall()
-            )
-        else:
-            rows = await asyncio.to_thread(
-                lambda: list(_rows_by_id(
-                    self._rdb(), "SELECT id, text FROM records WHERE indexed=1 AND id IN ({})",
+        def read_rows():
+            with self._reading() as db:
+                if ids is None:
+                    return db.execute(
+                        "SELECT r.id, r.text FROM records r LEFT JOIN vecs v ON v.id=r.id"
+                        " WHERE r.indexed=1 AND v.id IS NULL"
+                    ).fetchall()
+                return list(_rows_by_id(
+                    db, "SELECT id, text FROM records WHERE indexed=1 AND id IN ({})",
                     ids.tolist(),
                 ))
-            )
+
+        rows = await asyncio.to_thread(read_rows)
         if not rows:
             return 0
         no_text = sum(1 for _, t in rows if not t)
@@ -1880,7 +1990,7 @@ class Collection:
             # the indexed rows the stream skipped are exactly those without a retained
             # vector (this worker is the only adder); the live ids come from the covering
             # index, never the records pages
-            missing = np.setdiff1d(_live_ids(self._rdb()), seen, assume_unique=True)
+            missing = np.setdiff1d(self._live_ids_read(), seen, assume_unique=True)
             return ivf, seen, missing, tl - tb, time.monotonic() - tl
 
         ivf, seen, missing, build_s, live_s = await asyncio.to_thread(build)
@@ -1901,7 +2011,7 @@ class Collection:
 
             def swap():
                 # deleted while the build streamed
-                for gone in np.setdiff1d(seen, _live_ids(self._rdb()), assume_unique=True):
+                for gone in np.setdiff1d(seen, self._live_ids_read(), assume_unique=True):
                     ivf.remove(int(gone))
                 if tmp.exists():
                     shutil.rmtree(tmp)
@@ -1954,7 +2064,7 @@ class Collection:
             # rows the stream skipped have no retained vector. Every attach backfills
             # them all, so on an IVF collection this only trips if vecs rows were lost;
             # a stream before the refusal beats an anti-join on every detach
-            missing = len(np.setdiff1d(_live_ids(self._rdb()), seen, assume_unique=True))
+            missing = len(np.setdiff1d(self._live_ids_read(), seen, assume_unique=True))
             if missing:
                 raise ValueError(f"{missing} records lack a retained vector; re-ingest them first")
             return flat, seen
@@ -1964,7 +2074,7 @@ class Collection:
         async with self.lock.write():
 
             def swap():
-                for gone in np.setdiff1d(seen, _live_ids(self._rdb()), assume_unique=True):
+                for gone in np.setdiff1d(seen, self._live_ids_read(), assume_unique=True):
                     flat.remove(int(gone))
                 tmp.unlink(missing_ok=True)
                 flat.sync(str(tmp))
@@ -1978,33 +2088,38 @@ class Collection:
 
     # ---- reads ----
 
-    def _rdb(self) -> sqlite3.Connection:
+    def _reading(self) -> _ReadConn:
+        """This thread's read connection, to be used as `with self._reading() as db:`.
+        Every read of an unlocked path goes through it (see _ReadConn): the section
+        covers the SQLite calls and the materialising of their rows, nothing else."""
         if self._closed:
             raise RuntimeError(f"collection '{self.cfg.name}' is closed")
-        db = getattr(self._read_local, "db", None)
-        if db is None:
+        rc = getattr(self._read_local, "rc", None)
+        if rc is None:
             db = sqlite3.connect(self.dir / "meta.db", check_same_thread=False,
                                  cached_statements=SQLITE_CACHED_STATEMENTS)
             db.execute("PRAGMA query_only=1")
+            rc = _ReadConn(self, db)
             with self.db_lock:
                 if self._closed:  # stop() swept the registry while this one opened
                     db.close()
                     raise RuntimeError(f"collection '{self.cfg.name}' is closed")
-                self._read_conns.append(db)
-            self._read_local.db = db
-        return db
+                self._read_conns.append(rc)
+            self._read_local.rc = rc
+        return rc
 
     def _hydrate(self, ids: list[int], scores: list[float] | None = None) -> list[dict]:
         if not ids:
             return []
         qmarks = ",".join("?" * len(ids))
-        rows = {
-            r[0]: r
-            for r in self._rdb().execute(
-                f"SELECT id, external_id, doc_id, type, position, text, metadata FROM records WHERE id IN ({qmarks})",
-                ids,
-            )
-        }
+        with self._reading() as db:
+            rows = {
+                r[0]: r
+                for r in db.execute(
+                    f"SELECT id, external_id, doc_id, type, position, text, metadata FROM records WHERE id IN ({qmarks})",
+                    ids,
+                )
+            }
         out = []
         for n, rid in enumerate(ids):
             r = rows.get(rid)
@@ -2038,13 +2153,12 @@ class Collection:
         before vector retention) keep their quantized score — merged, never dropped."""
         dim = self.cfg.dim
         union = list({rid for ids, _, _ in rows for rid in ids})
-        blobs = {
-            rid: blob
-            for rid, blob in _rows_by_id(
-                self._rdb(), "SELECT id, vec FROM vecs WHERE id IN ({})", union
-            )
-            if blob is not None and len(blob) == dim * 2
-        }
+        with self._reading() as db:
+            blobs = {
+                rid: blob
+                for rid, blob in _rows_by_id(db, "SELECT id, vec FROM vecs WHERE id IN ({})", union)
+                if blob is not None and len(blob) == dim * 2
+            }
         if blobs:
             mat = np.frombuffer(b"".join(blobs.values()), dtype=np.float16)
             mat = mat.reshape(len(blobs), dim).astype(np.float32)
@@ -2101,7 +2215,8 @@ class Collection:
             if allow is None:
                 gen = self._allow_gen  # read BEFORE the SELECT takes its snapshot
                 where, params = _filter_sql(scope, filt)
-                ids = [r[0] for r in self._rdb().execute(f"SELECT id FROM records WHERE {where}", params)]
+                with self._reading() as db:
+                    ids = [r[0] for r in db.execute(f"SELECT id FROM records WHERE {where}", params)]
                 # sorted once per miss, whatever order the query plan returns: the IVF
                 # path intersects by binary search (flat turbovec ignores the order)
                 allow = np.sort(np.array(ids, dtype=np.uint64))
@@ -2158,7 +2273,8 @@ class Collection:
         the term's whole doclist — ~ms for common terms, cached after warmup)."""
         df = self._df_cache.get(key)
         if df is None:
-            row = self._rdb().execute("SELECT doc FROM records_fts_v WHERE term=?", (key,)).fetchone()
+            with self._reading() as db:
+                row = db.execute("SELECT doc FROM records_fts_v WHERE term=?", (key,)).fetchone()
             df = row[0] if row else 0
             if len(self._df_cache) >= 65536:  # ponytail: Zipf head re-warms instantly
                 self._df_cache.clear()
@@ -2219,20 +2335,21 @@ class Collection:
         cached = self._avgdl_cache
         if cached is not None:
             return cached
-        db = self._rdb()
         nat = self._scorer()
         fold_tokens = nat.fold_tokens if nat else _fold_tokens
-        maxid = db.execute("SELECT MAX(id) FROM records").fetchone()[0] or 0
-        dls = []
-        if maxid:
-            for g in np.random.default_rng(0).integers(1, maxid + 1, size=256):
-                row = db.execute(
-                    "SELECT text FROM records WHERE id>=? AND indexed=1"
-                    " AND text IS NOT NULL AND text!='' LIMIT 1",
-                    (int(g),),
-                ).fetchone()
-                if row:
-                    dls.append(len(fold_tokens(row[0])))
+        texts = []
+        with self._reading() as db:
+            maxid = db.execute("SELECT MAX(id) FROM records").fetchone()[0] or 0
+            if maxid:
+                for g in np.random.default_rng(0).integers(1, maxid + 1, size=256):
+                    row = db.execute(
+                        "SELECT text FROM records WHERE id>=? AND indexed=1"
+                        " AND text IS NOT NULL AND text!='' LIMIT 1",
+                        (int(g),),
+                    ).fetchone()
+                    if row:
+                        texts.append(row[0])
+        dls = [len(fold_tokens(t)) for t in texts]
         avgdl = (sum(dls) / len(dls)) if dls else 1.0
         self._avgdl_cache = avgdl
         return avgdl
@@ -2275,46 +2392,47 @@ class Collection:
             return [], []
         two_stage = len(kept) < len(toks)
         match, limit = _or_query(kept), TEXT_OR_CAND if two_stage else n
-        db = self._rdb()
         other = {"chunks": "summary", "summaries": "chunk"}.get(scope)
         plain = not filt and not (other and self.indexed_counts.get(other, 0))
         if not plain:
             where, params = _filter_sql(scope, filt)
-        if plain:
-            # nothing to exclude: skip the per-match join back to records (~40% of the
-            # query cost). FTS rows mirror live records exactly (trigger-maintained),
-            # and rank IS bm25 in fts5.
-            rows = db.execute(
-                "SELECT rowid, -rank FROM records_fts WHERE records_fts MATCH ?"
-                " ORDER BY rank LIMIT ?",
-                [match, limit],
-            ).fetchall()
-        else:
-            rows = db.execute(
-                "SELECT r.id, -bm25(records_fts) FROM records_fts"
-                " JOIN records r ON r.id = records_fts.rowid"
-                f" WHERE records_fts MATCH ? AND {where}"
-                " ORDER BY bm25(records_fts) LIMIT ?",
-                [match, *params, limit],
-            ).fetchall()
+        m_and = _and_query(toks) if two_stage else None
+        with self._reading() as db:
+            if plain:
+                # nothing to exclude: skip the per-match join back to records (~40% of the
+                # query cost). FTS rows mirror live records exactly (trigger-maintained),
+                # and rank IS bm25 in fts5.
+                rows = db.execute(
+                    "SELECT rowid, -rank FROM records_fts WHERE records_fts MATCH ?"
+                    " ORDER BY rank LIMIT ?",
+                    [match, limit],
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT r.id, -bm25(records_fts) FROM records_fts"
+                    " JOIN records r ON r.id = records_fts.rowid"
+                    f" WHERE records_fts MATCH ? AND {where}"
+                    " ORDER BY bm25(records_fts) LIMIT ?",
+                    [match, *params, limit],
+                ).fetchall()
+            if two_stage:
+                # stage 1b: docs containing EVERY query token — unranked on purpose (rank on
+                # a broad expression walks each phrase's whole posting list for IDF)
+                if plain:
+                    and_rows = db.execute(
+                        "SELECT rowid FROM records_fts WHERE records_fts MATCH ? LIMIT ?",
+                        [m_and, TEXT_AND_CAND],
+                    ).fetchall()
+                else:
+                    and_rows = db.execute(
+                        "SELECT r.id FROM records_fts JOIN records r ON r.id = records_fts.rowid"
+                        f" WHERE records_fts MATCH ? AND {where} LIMIT ?",
+                        [m_and, *params, TEXT_AND_CAND],
+                    ).fetchall()
+                cand_ids = list(dict.fromkeys([r[0] for r in rows] + [r[0] for r in and_rows]))
+                texts = dict(_rows_by_id(db, "SELECT id, text FROM records WHERE id IN ({})", cand_ids))
         if not two_stage:
             return [r[0] for r in rows], [r[1] for r in rows]
-        # stage 1b: docs containing EVERY query token — unranked on purpose (rank on a
-        # broad expression walks each phrase's whole posting list for IDF)
-        m_and = _and_query(toks)
-        if plain:
-            and_rows = db.execute(
-                "SELECT rowid FROM records_fts WHERE records_fts MATCH ? LIMIT ?",
-                [m_and, TEXT_AND_CAND],
-            ).fetchall()
-        else:
-            and_rows = db.execute(
-                "SELECT r.id FROM records_fts JOIN records r ON r.id = records_fts.rowid"
-                f" WHERE records_fts MATCH ? AND {where} LIMIT ?",
-                [m_and, *params, TEXT_AND_CAND],
-            ).fetchall()
-        cand_ids = list(dict.fromkeys([r[0] for r in rows] + [r[0] for r in and_rows]))
-        texts = dict(_rows_by_id(db, "SELECT id, text FROM records WHERE id IN ({})", cand_ids))
         return self._bm25_rescore(qtext, [(rid, texts.get(rid)) for rid in cand_ids], n)
 
     async def search(
@@ -2358,24 +2476,27 @@ class Collection:
             # text mode: rank siblings by BM25 (siblings matching no query term are
             # omitted; pruned matching is fine doc-scoped — the match set is tiny)
             match = _or_query(self._prune_common(qtext or "")[0])
-            rows = await asyncio.to_thread(
-                lambda: self._rdb().execute(
-                    "SELECT r.id, -bm25(records_fts) FROM records_fts"
-                    " JOIN records r ON r.id = records_fts.rowid"
-                    f" WHERE records_fts MATCH ? AND doc_id=? AND type='chunk' AND indexed=1 {self_clause}"
-                    " ORDER BY bm25(records_fts) LIMIT ?",
-                    [match, doc_id, *self_param, expand.siblings_topk],
-                ).fetchall()
-            ) if match else []
+            def sibling_rows():
+                with self._reading() as db:
+                    return db.execute(
+                        "SELECT r.id, -bm25(records_fts) FROM records_fts"
+                        " JOIN records r ON r.id = records_fts.rowid"
+                        f" WHERE records_fts MATCH ? AND doc_id=? AND type='chunk' AND indexed=1 {self_clause}"
+                        " ORDER BY bm25(records_fts) LIMIT ?",
+                        [match, doc_id, *self_param, expand.siblings_topk],
+                    ).fetchall()
+
+            rows = await asyncio.to_thread(sibling_rows) if match else []
             ext["siblings"] = self._hydrate([r[0] for r in rows], [r[1] for r in rows])
         elif expand.siblings_topk:
-            sib = [
-                r[0]
-                for r in self._rdb().execute(
-                    f"SELECT id FROM records WHERE doc_id=? AND type='chunk' AND indexed=1 {self_clause}",
-                    [doc_id, *self_param],
-                )
-            ]
+            with self._reading() as db:
+                sib = [
+                    r[0]
+                    for r in db.execute(
+                        f"SELECT id FROM records WHERE doc_id=? AND type='chunk' AND indexed=1 {self_clause}",
+                        [doc_id, *self_param],
+                    )
+                ]
             if sib:
                 allow = np.array(sib, dtype=np.uint64)
                 rescored = await asyncio.to_thread(
@@ -2385,19 +2506,21 @@ class Collection:
             else:
                 ext["siblings"] = []
         elif expand.siblings_all:
-            sib = [
-                r[0]
-                for r in self._rdb().execute(
-                    f"SELECT id FROM records WHERE doc_id=? AND type='chunk' {self_clause}"
-                    " ORDER BY position, id",
-                    [doc_id, *self_param],
-                )
-            ]
+            with self._reading() as db:
+                sib = [
+                    r[0]
+                    for r in db.execute(
+                        f"SELECT id FROM records WHERE doc_id=? AND type='chunk' {self_clause}"
+                        " ORDER BY position, id",
+                        [doc_id, *self_param],
+                    )
+                ]
             ext["siblings"] = self._hydrate(sib)
         if expand.summary and hit["type"] != "summary":
-            row = self._rdb().execute(
-                "SELECT id FROM records WHERE doc_id=? AND type='summary'", (doc_id,)
-            ).fetchone()
+            with self._reading() as db:
+                row = db.execute(
+                    "SELECT id FROM records WHERE doc_id=? AND type='summary'", (doc_id,)
+                ).fetchone()
             ext["summary"] = self._hydrate([row[0]])[0] if row else None
         if ext:
             hit["expansion"] = ext
@@ -2406,12 +2529,13 @@ class Collection:
         # same read connection as _hydrate: mixing self.db here would see the ingest
         # worker's uncommitted rows and then hydrate them against the committed
         # snapshot, silently dropping chunks mid-upsert
-        ids = [
-            r[0]
-            for r in self._rdb().execute(
-                "SELECT id FROM records WHERE doc_id=? ORDER BY type DESC, position, id", (doc_id,)
-            )
-        ]
+        with self._reading() as db:
+            ids = [
+                r[0]
+                for r in db.execute(
+                    "SELECT id FROM records WHERE doc_id=? ORDER BY type DESC, position, id", (doc_id,)
+                )
+            ]
         if not ids:
             return None
         recs = self._hydrate(ids)
@@ -2472,25 +2596,26 @@ class Collection:
             # an expression index per hot sort key is the follow-up (spec §5.2), not C
             order = f"json_extract(metadata, ?) {'DESC' if sort[0] == '-' else 'ASC'}, id"
             oparams = ["$." + sort.lstrip("-")]
-        db = self._rdb()
-        total = db.execute(f"SELECT COUNT(*) FROM records WHERE {where}", params).fetchone()[0]
-        ids = [
-            r[0]
-            for r in db.execute(
-                # NOT INDEXED (D9): with idx_records_doc_type present the planner walks
-                # the covering index in doc_id order and fetches each row by rowid (p1:
-                # 0.91 -> 2.73 s warm at 2.55M; ANALYZE does not fix it). NOT INDEXED
-                # keeps the rowid-order table scan and still allows rowid lookups, so
-                # the default ORDER BY id page still stops after LIMIT rows.
-                f"SELECT id FROM records NOT INDEXED WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
-                [*params, *oparams, limit, offset],
-            )
-        ]
+        with self._reading() as db:
+            total = db.execute(f"SELECT COUNT(*) FROM records WHERE {where}", params).fetchone()[0]
+            ids = [
+                r[0]
+                for r in db.execute(
+                    # NOT INDEXED (D9): with idx_records_doc_type present the planner walks
+                    # the covering index in doc_id order and fetches each row by rowid (p1:
+                    # 0.91 -> 2.73 s warm at 2.55M; ANALYZE does not fix it). NOT INDEXED
+                    # keeps the rowid-order table scan and still allows rowid lookups, so
+                    # the default ORDER BY id page still stops after LIMIT rows.
+                    f"SELECT id FROM records NOT INDEXED WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
+                    [*params, *oparams, limit, offset],
+                )
+            ]
         recs = self._hydrate(ids)
         if include_vector:  # decoded fp16 originals, keyed by external id (immune to a racing delete)
-            blobs = dict(_rows_by_id(
-                db, "SELECT r.external_id, v.vec FROM records r JOIN vecs v ON v.id = r.id WHERE r.id IN ({})", ids
-            ))
+            with self._reading() as db:
+                blobs = dict(_rows_by_id(
+                    db, "SELECT r.external_id, v.vec FROM records r JOIN vecs v ON v.id = r.id WHERE r.id IN ({})", ids
+                ))
             for rec in recs:
                 blob = blobs.get(rec["id"])
                 rec["vector"] = (
@@ -2517,10 +2642,9 @@ class Collection:
         return cur.rowcount
 
     def stats(self) -> dict:
-        counts = dict(
-            self._rdb().execute("SELECT type, COUNT(*) FROM records GROUP BY type").fetchall()
-        )
-        docs = self._rdb().execute("SELECT COUNT(DISTINCT doc_id) FROM records").fetchone()[0]
+        with self._reading() as db:
+            counts = dict(db.execute("SELECT type, COUNT(*) FROM records GROUP BY type").fetchall())
+            docs = db.execute("SELECT COUNT(DISTINCT doc_id) FROM records").fetchone()[0]
         return {
             "documents": docs,
             "chunks": counts.get("chunk", 0),
