@@ -45,6 +45,13 @@ index gives up the flat scan's query micro-batching), and large filtered searche
 get slower (8.0 → 15.8 ms p50 — big allowlists are intersected per probed shard). *(measured before ADR 0005's shard fan-out)*
 Attach took 40 s, detach 24 s, both online.
 
+End to end on the 2.55M × 1024 arXiv corpus with the current code (REST, 4 GiB
+container, DGX Spark, `nlist=256 nprobe=16`, medians —
+[the A/B](benchmark-arxiv-2026-10.md)): serial p50 18.5 → 6.1 ms and serial QPS
+54 → 161, recall@10 1.000 → 0.994, concurrent QPS (8 clients) 137 → 380, and
+filtered p50 24.7 → 5.9 ms (the baseline's indexed filtered p50 was 37.2 ms,
+slower than its flat 25.7 ms). The index build took 178 s and the detach 102 s.
+
 Rules of thumb:
 
 - ≲ 1M vectors, or recall matters more than milliseconds → **no index**.
@@ -59,8 +66,9 @@ Rules of thumb:
   fp16 copy of every ingested vector in `meta.db` (`dim × 2` bytes per record —
   3 KB/record at 1536 dims). This is always on, disk-only, and also what makes the
   index fully reversible.
-- **Rebuild**: attaching/removing streams the collection through a rebuild — tens of
-  seconds per million vectors, run as a background job. Searches keep serving from the
+- **Rebuild**: attaching/removing streams the collection through a rebuild — 178 s to
+  attach and 102 s to remove at 2.55M × 1024-d in a 4 GiB container on a DGX Spark,
+  run as a background job. Searches keep serving from the
   old representation until the swap; expect transiently ~2x index RAM plus ~0.4 GB
   for the k-means training sample at 1536 dims. The memory check runs first,
   before any pre-work, and reserves the measured growth (about 2.2 GB for 2.55M ×

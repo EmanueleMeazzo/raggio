@@ -1,5 +1,12 @@
 # Benchmarks
 
+!!! note "Earlier version"
+    This email-corpus run was measured on the initial release's build, before the
+    exact-rescoring work ([ADR 0003](adr/0003-recall-rescoring.md)) and the 2026-09
+    performance work, and has not been re-run. Figures for the current code, on
+    the 2.55M-vector arxiv corpus, are in
+    [Benchmark: arxiv abstracts, end-to-end A/B](benchmark-arxiv-2026-10.md).
+
 raggio vs [Weaviate](https://weaviate.io/) on 552,515 real email embeddings,
 measured with the same harness, corpus, queries, and host — an NVIDIA DGX
 Spark. The point of the comparison is what a single 1 GiB Python container

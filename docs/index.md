@@ -70,4 +70,5 @@ curl :8000/collections/docs/search -H "x-api-key: $KEY" --json '{
 - [Storage & durability](storage.md) — what's on disk and what survives a
   crash.
 - [Benchmarks](benchmark.md) — 550k real embeddings in a 1 GiB container,
-  measured against Weaviate.
+  measured against Weaviate (an earlier version; the 2.55M-vector
+  [arxiv benchmark](benchmark-arxiv.md) has the current numbers).

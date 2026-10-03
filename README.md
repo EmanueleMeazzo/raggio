@@ -165,27 +165,46 @@ so total stored data can far exceed container memory.
 **2,549,119 real arXiv abstracts** (title+abstract chunks, 1024-dim Qwen3
 embeddings, k=10), raggio capped at **4 GiB** vs Weaviate at **32 GiB** (HNSW,
 uncompressed float32, defaults), on an NVIDIA DGX Spark (GB10 Grace, 20 arm64
-cores, 122 GB unified LPDDR5x):
+cores, 122 GB unified LPDDR5x). The raggio columns are the current code
+(`19c3293`, 2026-10-03, medians of 6 runs); the Weaviate column is from the
+2026-08-23 run and was not re-measured:
 
 | Metric | raggio (4 GiB) | + IVF index | Weaviate (32 GiB) |
 |---|---|---|---|
-| Vector search p50 / p95 | 23.0 / 28.7 ms | **11.2 / 12.5 ms** | 15.3 / 50.3 ms |
+| Vector search p50 / p95 | 18.5 / 19.6 ms | **6.1 / 7.7 ms** | 15.3 / 50.3 ms |
 | Recall@10 vs exact float32 | **1.000** (4-bit scan + fp16 rescore) | 0.994 | 0.995 |
-| Hybrid search (RRF) p50 | 104.0 ms | 91.4 ms | **35.8 ms** |
+| Hybrid search (RRF) p50 | 48.2 ms | 44.9 ms | **35.8 ms** |
 | Hybrid text-hit@10 | 0.984 | 0.984 | 0.978 |
-| QPS concurrent (8) | 129 | 116 | **1050** |
-| Memory under query load | **1.8 GB** | 3.1 GB | 23.4 GB |
+| QPS concurrent (8) | 137 | 380 | **1050** |
+| Memory under query load | **1.5 GB** | **1.5 GB** | 23.4 GB |
 | Disk footprint | **16.5 GB** | 16.8 GB | 18.4 GB |
-| Ingest 2.55M vectors (journaled + crash-safe) | 31.3 min (1,357 vec/s) | +5.6 min index build | **16.3 min (2,614 vec/s)** |
-| Cold start to first query | 30.4 s | 28.3 s | **12.8 s** |
+| Ingest 2.55M vectors (journaled + crash-safe) | **13 min (3,174 vec/s)** | +3.0 min index build | 16.3 min (2,614 vec/s) |
+| Cold start, evicted page cache, to first answer | 4.6 s | 5.2 s | 12.8 s (not the same measure) |
 
-The trade in one line: raggio serves the same 2.55M vectors in ~13x less memory
+Flat concurrent QPS is bimodal (126 to 174 across runs). The cold-start row times
+a container start to the first answered `GET /collections/bench` after the
+volume's files were evicted from the page cache; Weaviate's 12.8 s is the older
+restart-to-first-query measure, so that row is not a like-for-like comparison.
+
+Against the original baseline (`19a8a2e`), measured the same way on the same
+host, the current code ingests 2.55M vectors at 3,174 vs 1,362 vec/s, serves
+IVF vector queries at 161 vs 90 QPS serial and 380 vs 191 QPS at 8 clients,
+runs hybrid search at 20.5 vs 10.0 QPS serial (flat), and starts from a cold
+page cache in 4.6 s instead of 155 s. Flat vector search, recall and the memory
+footprint are unchanged. The images differ beyond the code (Debian, Python,
+SQLite, BLAS threads), so this is what a user gets, not a single-change
+measurement. Full A/B, protocol and caveats:
+[docs/benchmark-arxiv-2026-10.md](docs/benchmark-arxiv-2026-10.md).
+
+The trade in one line: raggio serves the same 2.55M vectors in ~15x less memory
 with **exact recall** — the quantized scan re-ranks its candidates against the
 stored fp16 originals, so quantization costs no recall — and text-hit parity from
 two-stage BM25 (bounded FTS5 candidate generation + full-query rescoring); the
 optional IVF index then beats HNSW on vector latency at equal recall. Weaviate
-wins concurrent throughput, hybrid latency, ingest speed, and cold start. Full
-table, method, and caveats: [docs/benchmark-arxiv.md](docs/benchmark-arxiv.md).
+still wins concurrent throughput and hybrid latency in these figures; ingest
+and cold start now favour raggio, but those two rows compare against Weaviate
+numbers from the earlier run. Full table, method, and caveats:
+[docs/benchmark-arxiv.md](docs/benchmark-arxiv.md).
 
 An earlier 553k-email run (1 GiB vs 8 GiB, pre-rescoring build) told the same
 memory story at smaller scale — there the flat scan also won every latency row.

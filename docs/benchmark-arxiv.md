@@ -66,7 +66,57 @@ its cap fails loudly rather than getting a quiet upgrade.
 
 ## Results
 
-Measured 2026-08-23 on the DGX Spark (full raw report: `bench/results-arxiv.md`).
+**Current version, measured 2026-10-03** on the same DGX Spark and corpus: the
+raggio columns are commit `19c3293`, each figure the median of 6 runs
+(concurrency 8), from the end-to-end A/B in
+[Benchmark: arxiv abstracts, end-to-end A/B](benchmark-arxiv-2026-10.md), which
+has the protocol, the baseline figures next to these, and the caveats. The
+Weaviate column is carried over from the 2026-08-23 run below and was not
+re-measured, so the two sides were measured about six weeks apart.
+
+| Metric | raggio | raggio-ivf | weaviate |
+|---|---|---|---|
+| Ingest wall time (s) | 803 | — | 975 |
+| Ingest throughput (vec/s) | 3174 | — | 2614 |
+| IVF index build (s) | — | 178 | — |
+| Memory after a restart (MB) | 1502 | 1506 | 22990 |
+| Memory under query load (MB) | 1506 | 1513 | 23380 |
+| Disk footprint (MB) | 16463 | 16751 | 18374 |
+| Search p50 (ms) | 18.5 | 6.1 | 15.3 |
+| Search p95 (ms) | 19.6 | 7.7 | 50.3 |
+| Search p99 (ms) | 20.3 | 8.4 | 82.5 |
+| QPS serial | 54 | 161 | 49 |
+| QPS concurrent | 137 | 380 | 1050 |
+| p95 under concurrency (ms) | 69.4 | 25.0 | 10.8 |
+| Filtered p50 (ms) | 24.7 | 5.9 | 12.8 |
+| Filtered p95 (ms) | 29.6 | 7.0 | 21.1 |
+| Recall@10 vs exact | **1.000** | 0.994 | 0.995 |
+| Hybrid p50 (ms) | 48.2 | 44.9 | 35.8 |
+| Hybrid p95 (ms) | 72.6 | 69.7 | 72.5 |
+| Hybrid p99 (ms) | 100.5 | 95.5 | 114.4 |
+| Hybrid QPS serial | 20.5 | 22.0 | 25.3 |
+| Hybrid QPS concurrent | 36.1 | 38.1 | 169.0 |
+| Hybrid text-hit@10 | **0.984** | **0.984** | 0.978 |
+| Cold start, evicted page cache, to first answer (s) | 4.6 | 5.2 | 12.8 (older measure) |
+
+Notes on the current table:
+
+- **Cold start** is the time from container start to the first answered
+  `GET /collections/bench`, after the volume's files were evicted from the page
+  cache. It is not the measure of the original run's "Cold start to first query"
+  row (restart to first vector search, file cache not evicted), and Weaviate's
+  12.8 s is that older measure, so the row is not like for like.
+- **Memory** rows are read after a container restart, in a 4 GiB container. In the
+  container that just ingested, flat raggio reads 1611 MB right after ingest (the
+  original run read 729 MB, so that row is higher now) and 1618 MB under load
+  (original: 1761 MB). The original run's 3052 MB for raggio-ivf was read in the
+  container that had just built the index, not after a restart.
+- **Flat concurrent QPS** (137) is bimodal across runs (126 to 174) and within noise
+  of the baseline's 111.
+
+### Original run, 2026-08-23
+
+Measured 2026-08-23 on the DGX Spark (full raw report: `bench/results-arxiv.md`), before the 2026-09 performance work; kept as the historical record.
 Search, recall, and hybrid rows were re-measured after the exact-rescoring work
 ([ADR 0003](adr/0003-recall-rescoring.md)) on the same ingested volume. Ingest,
 memory, IVF-build, and cold-start rows are kept from the original matched-conditions
@@ -117,7 +167,9 @@ Config: k=10, 500 held-out corpus queries, concurrency 8, seed 42. raggio contai
 - **Ingest throughput, cold start, disk** are the operating costs: how long
   a 2.55M-vector load takes, how long a container restart leaves you dark
   (at this scale, reloading a large HNSW index is the number to watch —
-  the harness allows up to 600 s), and what the volume costs at rest.
+  the harness allows up to 600 s), and what the volume costs at rest. The
+  current table times cold start from a cold page cache to the first answered
+  collection request; the original run timed a restart to the first search.
 - **Hybrid text-hit@10** asks whether the paper whose title was used as the
   lexical query surfaces in the fused top-10. It is an **exact-title
   known-item task** under vector noise (the paired vector is an unrelated

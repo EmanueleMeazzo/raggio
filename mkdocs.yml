@@ -58,3 +58,4 @@ nav:
   - Storage & durability: storage.md
   - Benchmarks: benchmark.md
   - Benchmark (arxiv abstracts): benchmark-arxiv.md
+  - Benchmark (arxiv, end-to-end A/B 2026-10): benchmark-arxiv-2026-10.md
