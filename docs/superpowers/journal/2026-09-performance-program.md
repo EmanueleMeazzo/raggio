@@ -1816,6 +1816,13 @@ The maintainer chose one end-to-end A/B, baseline `19a8a2e` against the final `m
 **01:40Z–07:15Z. The end-to-end A/B, phase 2.** Section 4.20 has the results. All sessions ended `exit 0`, with no OOM kill and no 8 GiB retry. One deviation: the first baseline session ran 2 measured flat runs instead of 3, because `lib.sh`'s default reached it through the environment. It was fixed from the next session on.
 
 **07:15Z–07:19Z. The analysis, checked.** The agent's summary called filtered search "not improved". That holds only for flat: IVF filtered p50 went from 37.2 to 5.9 ms. The controller corrected it and checked raw run files against the tables; in IVF run 1, for example, serial QPS was 90 against 184 and filtered p50 37.6 against 6.0 ms. gn100 keeps the two A/B volumes (16 GB each) and the two images until the maintainer decides.
+**07:21Z–07:44Z. The public numbers updated.** The maintainer kept gn100's A/B volumes and images for now. They also asked for the repository's published figures to be updated with the end-to-end results.
+- A Sonnet agent first inventoried every published figure. Each was classed as an outdated current-state claim, a historical record of a past run, or a figure the A/B did not measure. Only the first class changed.
+- **The README's table.** The raggio columns now hold the final `main`'s medians. The Weaviate column keeps its 2026-08-23 figures, labelled as not re-measured, and "~13x less memory" became "~15x".
+- **Cold start.** The new cold-start row is marked as a different measure from Weaviate's 12.8 s: start to the first answered `GET` after evicting the volume's files, against restart to the first query.
+- **A new docs page,** `benchmark-arxiv-2026-10`, carries the setup, the protocol, every table, the swap figures, what differs besides the code, and the caveats.
+- **The older results stay.** The 2026-08-23 table is kept verbatim as historical, and the raw `bench/results*.md` files are untouched.
+- The controller read the diff and checked figures against the run files and the baseline image's package list (`efa0bc1`). 502 passed, and `mkdocs build --strict` passed. CI was green: `test` 434, `native` 502 on x86 and on arm, `freethreaded` 488 on x86 and on arm, and the docs deploy.
 
 ## 3. Decision register
 
