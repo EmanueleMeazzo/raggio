@@ -461,3 +461,46 @@ def test_relative_fusion(client):
         r = client.post("/collections/main/search", headers=ROOT,
                         json={"query": {"text": "planet"}, "mode": "hybrid", "fusion": "relative", **bad})
         assert r.status_code == 422, bad
+
+
+def test_doc_id_filter(client):
+    client.post("/collections", headers=ROOT, json={"name": "main"})
+    ingest(client, "main", [DOC, DOC_B])
+
+    def found(filt, mode="vector", scope="chunks", status=200):
+        r = client.post("/collections/main/search", headers=ROOT,
+                        json={"query": {"text": "planet"}, "mode": mode, "k": 10, "scope": scope, "filter": filt})
+        assert r.status_code == status, r.text
+        return {h["id"] for h in r.json()["hits"]} if status == 200 else None
+
+    # equality and `in` (list shorthand and explicit), in every mode
+    for mode in ("vector", "hybrid"):
+        assert found({"doc_id": "doc2"}, mode) == {"b1", "b2"}, mode
+        assert found({"doc_id": ["doc1", "doc2"]}, mode) == {"c1", "c2", "c3", "b1", "b2"}, mode
+        assert found({"doc_id": {"in": ["doc2", "nope"]}}, mode) == {"b1", "b2"}, mode
+    assert found({"doc_id": "doc2"}, "text") == {"b2"}  # BM25: only b2 says "planet"
+    assert found({"doc_id": "nope"}) == set()
+    # ANDed with metadata filters
+    for mode in ("vector", "text", "hybrid"):
+        assert found({"doc_id": "doc1", "src": "wiki"}, mode) == {"c1", "c2"}, mode
+    # scope still applies; doc2 has no summary
+    assert found({"doc_id": "doc1"}, scope="summaries") == {"doc1"}
+    assert found({"doc_id": "doc1"}, scope="both") == {"doc1", "c1", "c2", "c3"}
+    assert found({"doc_id": "doc2"}, scope="summaries") == set()
+    # reserved: b2's metadata key doc_id is not what the filter reads
+    assert "b2" not in found({"doc_id": "doc1"})
+    # equality and `in` only
+    for bad in ({"gte": "doc1"}, {"contains": "doc"}, {"in": []}, {"like": "doc%"}):
+        found({"doc_id": bad}, status=400)
+
+    # listing: the same key, with paging and total
+    url = "/collections/main/documents"
+    lst = lambda f, **kw: client.get(url, headers=ROOT, params={"filter": json.dumps(f), **kw})
+    r = lst({"doc_id": "doc1"}, scope="chunks", limit=2).json()
+    assert r["total"] == 3 and [x["id"] for x in r["records"]] == ["c1", "c2"]
+    r = lst({"doc_id": "doc1"}, scope="chunks", limit=2, offset=2).json()
+    assert [x["id"] for x in r["records"]] == ["c3"]
+    assert [x["id"] for x in lst({"doc_id": "doc1"}, scope="chunks", sort="-date").json()["records"]] == ["c2", "c1", "c3"]
+    assert lst({"doc_id": ["doc1", "doc2"], "src": "blog"}).json()["total"] == 2
+    assert lst({"doc_id": "doc1"}).json()["total"] == 4  # default scope: both
+    assert lst({"doc_id": {"lt": "doc2"}}).status_code == 400

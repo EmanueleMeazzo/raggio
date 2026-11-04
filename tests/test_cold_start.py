@@ -293,6 +293,28 @@ def test_records_scans_use_the_covering_index(tmp_path):
     assert plan(db, fts, ['"chunk"', "d1", 5]).startswith("SCAN records_fts VIRTUAL TABLE")
 
 
+
+@pytest.mark.parametrize("filt", [{"doc_id": "d1"}, {"doc_id": ["d1", "d2"]}, {"doc_id": "d1", "src": "wiki"}])
+def test_doc_id_filter_reads_the_doc_index(tmp_path, filt):
+    # ADR 0007: the reserved doc_id key finds its rows through idx_records_doc_type in
+    # the allowlist and in both listing queries (the page drops NOT INDEXED for it),
+    # while the text leg keeps records_fts the outer loop (ADR 0003)
+    col = make_collection(tmp_path)
+    ingest(col, 30, meta=LIST_META)
+    log = record_sql(col)
+    asyncio.run(col.search("vector", np.array([rowvec(1)], dtype=np.float32), None, 5, "chunks", filt, None))
+    col.list_records("chunks", filt, None, 20, 0)
+    col._text_ids("chunk", 5, "chunks", filt)
+    listing = [(s, p) for s, p in log if s.startswith("SELECT COUNT(*)") or "LIMIT ? OFFSET ?" in s]
+    allow = [(s, p) for s, p in log if s.startswith("SELECT id FROM records WHERE") and "LIMIT" not in s]
+    fts = [(s, p) for s, p in log if "MATCH" in s]
+    assert len(allow) == 1 and len(listing) == 2 and fts
+    for sql, params in allow + listing:
+        assert "idx_records_doc_type (doc_id=?" in plan(col.db, sql, params), (sql, plan(col.db, sql, params))
+    for sql, params in fts:
+        assert plan(col.db, sql, params).startswith("SCAN records_fts VIRTUAL TABLE"), sql
+
+
 # ---- Task 3: numpy id-set diffs ----
 
 

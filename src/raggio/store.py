@@ -364,30 +364,35 @@ def _rows_matrix(rows: list[list]) -> np.ndarray:
 
 def _filter_sql(scope: str, filt: dict | None) -> tuple[str, list]:
     """Build WHERE clause for records: type scope + metadata filters, all ANDed.
-    Per key: scalar = equality; list = `in`; object = range ops / `in` / `contains`."""
+    Per key: scalar = equality; list = `in`; object = range ops / `in` / `contains`.
+    `doc_id` is reserved (ADR 0007): it filters the records column, equality and `in`
+    only, so idx_records_doc_type finds the rows instead of a json_extract over every
+    row; a metadata key named doc_id cannot be filtered."""
     clauses, params = ["indexed = 1"], []
     if scope == "chunks":
         clauses.append("type = 'chunk'")
     elif scope == "summaries":
         clauses.append("type = 'summary'")
     for key, val in (filt or {}).items():
-        path = "$." + key
+        col, cparams = ("doc_id", []) if key == "doc_id" else ("json_extract(metadata, ?)", ["$." + key])
         ops = val.items() if isinstance(val, dict) else [("in" if isinstance(val, list) else "eq", val)]
         for op, bound in ops:
+            if key == "doc_id" and op not in ("eq", "in"):
+                raise ValueError(f"filter 'doc_id' supports equality and 'in' only, not '{op}'")
             if op == "eq":
-                clauses.append("json_extract(metadata, ?) = ?")
-                params.extend([path, bound])
+                clauses.append(f"{col} = ?")
+                params.extend([*cparams, bound])
             elif op in RANGE_OPS:
-                clauses.append(f"json_extract(metadata, ?) {RANGE_OPS[op]} ?")
-                params.extend([path, bound])
+                clauses.append(f"{col} {RANGE_OPS[op]} ?")
+                params.extend([*cparams, bound])
             elif op == "in":
                 if not isinstance(bound, list) or not bound or any(isinstance(b, (list, dict)) for b in bound):
                     raise ValueError(f"filter '{key}': 'in' needs a non-empty list of scalars")
-                clauses.append(f"json_extract(metadata, ?) IN ({','.join('?' * len(bound))})")
-                params.extend([path, *bound])
+                clauses.append(f"{col} IN ({','.join('?' * len(bound))})")
+                params.extend([*cparams, *bound])
             elif op == "contains":  # substring; SQLite lower() folds ASCII only
-                clauses.append("instr(lower(json_extract(metadata, ?)), lower(?)) > 0")
-                params.extend([path, str(bound)])
+                clauses.append(f"instr(lower({col}), lower(?)) > 0")
+                params.extend([*cparams, str(bound)])
             else:
                 raise ValueError(f"unsupported filter operator: {op}")
     return " AND ".join(clauses), params
@@ -2624,6 +2629,9 @@ class Collection:
             # an expression index per hot sort key is the follow-up (spec §5.2), not C
             order = f"json_extract(metadata, ?) {'DESC' if sort[0] == '-' else 'ASC'}, id"
             oparams = ["$." + sort.lstrip("-")]
+        # a doc_id filter is the exception: idx_records_doc_type finds its few rows, where
+        # the forced table scan would read every record (0.1 s at 300k rows) to page them
+        hint = "" if filt and "doc_id" in filt else " NOT INDEXED"
         with self._reading() as db:
             total = db.execute(f"SELECT COUNT(*) FROM records WHERE {where}", params).fetchone()[0]
             ids = [
@@ -2634,7 +2642,7 @@ class Collection:
                     # 0.91 -> 2.73 s warm at 2.55M; ANALYZE does not fix it). NOT INDEXED
                     # keeps the rowid-order table scan and still allows rowid lookups, so
                     # the default ORDER BY id page still stops after LIMIT rows.
-                    f"SELECT id FROM records NOT INDEXED WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
+                    f"SELECT id FROM records{hint} WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
                     [*params, *oparams, limit, offset],
                 )
             ]
