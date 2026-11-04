@@ -102,6 +102,33 @@ class PatchIn(BaseModel):
     apply_to_chunks: bool = True
 
 
+_JSON_RESPONSE_SCALARS = (str, int, float, bool, type(None))
+
+
+def _search_response(hits: list[dict]):
+    """Encode JSON hits directly when FastAPI's encoder would preserve every value."""
+    content = {"hits": hits}
+    pending = [(content, 0)]
+    while pending:
+        value, depth = pending.pop()
+        if type(value) is dict:
+            # FastAPI's sqlalchemy_safe default drops _sa* keys even in user JSON.
+            if any(type(key) is not str or key.startswith("_sa") for key in value):
+                return content
+            children = value.values()
+        else:  # only lists enter pending below
+            children = value
+        for child in children:
+            kind = type(child)
+            if kind is dict or kind is list:
+                if depth >= 32:
+                    return content  # deep/cyclic structures keep FastAPI's handling
+                pending.append((child, depth + 1))
+            elif kind not in _JSON_RESPONSE_SCALARS:
+                return content  # preserve conversion of other objects by FastAPI
+    return JSONResponse(content=content)
+
+
 _INGEST_VECTOR_EXCLUDE = {
     "documents": {"__all__": {"summary": {"vector"}, "chunks": {"__all__": {"vector"}}}}
 }
@@ -426,7 +453,7 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
             raise HTTPException(400, str(e))
         except CollectionDeletedError:  # DELETE /collections/{name} landed first
             raise HTTPException(404, f"collection '{c.cfg.name}' not found")
-        return {"hits": hits}
+        return _search_response(hits)
 
     @app.get("/healthz")
     async def healthz():
