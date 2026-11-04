@@ -1,9 +1,11 @@
 """Regression checks for the search-latency optimizations (allowlist skip, token
 pruning, micro-batcher, RW lock) and the crash-consistency fixes around them."""
 import asyncio
+import subprocess
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -438,3 +440,185 @@ def test_unpruned_query_skips_stage_two(tmp_path, monkeypatch):
     # default budget floor (1000 rows) >> corpus: nothing is pruned -> single FTS5 query
     hits = asyncio.run(col.search("text", None, "hello world", 5, "chunks", None, None))
     assert [h["id"] for h in hits] == ["c1"]
+
+
+# ---- relative fusion, exact small allowlists (ADR 0007) ----
+
+
+def test_relative_fusion_normalises_each_leg():
+    vec = ([1, 2, 3], [0.9, 0.5, 0.1])  # -> 1.0, 0.5, 0.0
+    text = ([3, 4], [10.0, 2.0])  # -> 1.0, 0.0
+    ids, scores = store._relative(10, 0.25, vec, text)
+    # 1: .25*1  2: .25*.5  3: .25*0 + .75*1  4: .75*0
+    assert ids == [3, 1, 2, 4] and scores == pytest.approx([0.75, 0.25, 0.125, 0.0])
+    assert store._relative(2, 0.25, vec, text)[0] == [3, 1]
+    # a leg of equal scores (one candidate included) normalises to 1.0, as Weaviate does
+    assert store._relative(10, 0.5, ([7], [0.3]), ([8, 9], [4.0, 4.0])) == ([7, 8, 9], [0.5, 0.5, 0.5])
+    assert store._relative(10, 0.5, ([], []), ([], [])) == ([], [])
+
+
+class _CountingIndex:
+    """The real index, counting the search calls that reach it."""
+
+    def __init__(self, inner):
+        self.inner, self.calls = inner, 0
+
+    def __len__(self):
+        return len(self.inner)
+
+    def search(self, *a, **kw):
+        self.calls += 1
+        return self.inner.search(*a, **kw)
+
+
+def _ingest_docs(col, docs, per_doc):
+    asyncio.run(col._process_job({"documents": [
+        {"doc_id": f"d{d}", "chunks": [{"id": f"d{d}#{i}", "text": f"chunk {i}", "vector": vec(100 * d + i)}
+                                      for i in range(per_doc)]}
+        for d in range(docs)
+    ]}))
+
+
+def _unit(seed):
+    q = np.array([vec(seed)], dtype=np.float32)
+    return q / np.linalg.norm(q)
+
+
+def test_small_allowlist_scores_like_the_masked_scan(tmp_path):
+    col = make_collection(tmp_path)
+    _ingest_docs(col, 3, 20)
+    col.index = _CountingIndex(col.index)
+    for d in range(3):
+        allow = np.array([r[0] for r in col.db.execute(
+            "SELECT id FROM records WHERE doc_id=?", (f"d{d}",))], dtype=np.uint64)
+        for seed, n in ((7, 1), (8, 5), (9, 30)):
+            q = _unit(seed)
+            masked = col._search_rescored(q, [n], allowlist=allow)[0]
+            calls = col.index.calls
+            ids, scores = col._search_allowed(q, n, allow)
+            assert col.index.calls == calls  # exact path: the index is never asked
+            assert ids == masked[0] and scores == pytest.approx(masked[1], rel=1e-6)
+    # the same path serves filtered search and sibling expansion
+    col.index.calls = 0
+    expand = SimpleNamespace(siblings_topk=3, siblings_all=False, summary=False)
+    hits = asyncio.run(col.search("vector", _unit(7), None, 5, "chunks", {"doc_id": "d1"}, expand))
+    assert len(hits) == 5 and {h["doc_id"] for h in hits} == {"d1"}
+    assert all(len(h["expansion"]["siblings"]) == 3 for h in hits) and col.index.calls == 0
+
+
+def test_exact_path_stops_at_the_rescore_depth(tmp_path):
+    col = make_collection(tmp_path)
+    _ingest_docs(col, 1, 60)
+    col.index = _CountingIndex(col.index)
+    q, depth = _unit(3), col._rescore_k(5)
+    assert depth == 50  # RESCORE_FLOOR at 4-bit
+    ids = np.arange(1, 61, dtype=np.uint64)
+    exact = col._search_allowed(q, 5, ids[:depth])
+    assert col.index.calls == 0 and len(exact[0]) == 5
+    masked = col._search_allowed(q, 5, ids[: depth + 1])
+    assert col.index.calls == 1 and len(masked[0]) == 5
+
+
+def test_exact_path_edge_cases(tmp_path):
+    col = make_collection(tmp_path)
+    _ingest_docs(col, 1, 5)
+    col.index = _CountingIndex(col.index)
+    q = _unit(4)
+    # empty allowlist: no hits, where the index would raise
+    assert col._search_allowed(q, 5, np.array([], dtype=np.uint64)) == ([], [])
+    # a row without a blob (ingested before vector retention): the index scores the lot
+    col.db.execute("DELETE FROM vecs WHERE id=2")
+    col.db.commit()
+    ids, scores = col._search_allowed(q, 5, np.arange(1, 6, dtype=np.uint64))
+    assert col.index.calls == 1 and sorted(ids) == [1, 2, 3, 4, 5]
+    # a closed collection fails closed, as the masked path does
+    asyncio.run(col.stop())
+    with pytest.raises(RuntimeError, match="closed"):
+        col._search_allowed(q, 5, np.arange(1, 6, dtype=np.uint64))
+
+
+def test_doc_scoped_text_leg_scores_like_the_fts_path(tmp_path, monkeypatch):
+    col = make_collection(tmp_path)
+    texts = {"a": "zeta common words here", "b": "zeta zeta and more text",
+             "c": "nothing relevant at all", "e": "common zeta common"}
+    asyncio.run(col._process_job({"documents": [
+        {"doc_id": "d1", "chunks": [{"id": k, "text": t, "vector": vec(i)} for i, (k, t) in enumerate(texts.items())]},
+        *({"doc_id": f"o{i}", "chunks": [{"id": f"o{i}", "text": "common filler text", "vector": vec(10 + i)}]}
+          for i in range(30)),
+    ]}))
+    # prune "common": the FTS path is two-stage, and every d1 row with a query term has "zeta"
+    monkeypatch.setattr(store, "FTS_SCAN_BUDGET_MIN_ROWS", 0)
+    query, filt = "common zeta", {"doc_id": "d1"}
+    kept, toks = col._prune_common(query)
+    assert kept == ["zeta"] and toks == ["common", "zeta"]
+    direct = col._text_ids(query, 10, "chunks", filt)
+    monkeypatch.setattr(store, "TEXT_DIRECT_MAX", 0)  # the doc's rows exceed it: FTS5 path
+    fts = col._text_ids(query, 10, "chunks", filt)
+    ids = {rid: ext for rid, ext in col.db.execute("SELECT id, external_id FROM records")}
+    assert [ids[r] for r in direct[0]] == [ids[r] for r in fts[0]] and set(ids[r] for r in direct[0]) == {"a", "b", "e"}
+    assert direct[1] == pytest.approx(fts[1], rel=1e-9) and all(s > 0 for s in direct[1])
+    # the hybrid leg and the metadata filter go the same way
+    assert col._text_ids(query, 10, "chunks", {"doc_id": ["d1"], "nope": 1}) == ([], [])
+
+
+def test_doc_scoped_text_leg_keeps_fts_for_trigram(tmp_path):
+    col = Collection(CollectionConfig("t", 8, 4, None, None, None, tokenizer="trigram"), Path(tmp_path), lambda: None)
+    asyncio.run(col._process_job({"documents": [{"doc_id": "d1", "chunks": [
+        {"id": "t1", "text": "PostgreSQL configuration parameters", "vector": vec(1)},
+        {"id": "t2", "text": "unrelated", "vector": vec(2)}]}]}))
+    col._bm25_rescore = lambda *a, **k: (_ for _ in ()).throw(AssertionError("trigram must stay on FTS5"))
+    rids, _ = col._text_ids("gresql", 5, "chunks", {"doc_id": "d1"})  # substring: only FTS5 trigram finds it
+    assert [r for (r,) in col.db.execute("SELECT id FROM records WHERE external_id='t1'")] == rids
+
+
+# ---- unix-excl VFS (ADR 0007) ----
+
+OTHER_PROCESS = """
+import sqlite3, sys, os
+db = sqlite3.connect(sys.argv[1], timeout=0.2)
+try:
+    if sys.argv[2] == "read":
+        print(db.execute(sys.argv[3]).fetchone()[0])
+    else:  # commit to the WAL and exit without a checkpoint, like a killed pre-0007 process
+        db.execute("PRAGMA wal_autocheckpoint=0")
+        db.execute(sys.argv[3])
+        db.commit()
+        os._exit(0)
+except sqlite3.OperationalError as e:
+    print(e)
+"""
+
+
+def other_process(path, mode, sql):
+    """The default VFS in another process, the way an external tool opens the file."""
+    return subprocess.run([sys.executable, "-c", OTHER_PROCESS, str(path), mode, sql],
+                          capture_output=True, text=True, timeout=WAIT_SECONDS, check=True).stdout.strip()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="unix-excl is a POSIX VFS")
+def test_databases_open_through_unix_excl(tmp_path, monkeypatch):
+    col = make_collection(tmp_path)
+    _ingest_docs(col, 2, 5)
+    asyncio.run(col.search("text", None, "chunk", 5, "chunks", None, None))  # read connections too
+    assert not (tmp_path / "meta.db-shm").exists()  # the WAL index lives in heap memory
+    count = "SELECT count(*) FROM records"
+    assert other_process(tmp_path / "meta.db", "read", count) == "database is locked"
+    asyncio.run(col.stop())
+    assert other_process(tmp_path / "meta.db", "read", count) == "10"  # released on close
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    m = store.CollectionManager(store.Settings())
+    assert other_process(tmp_path / "data" / "catalog.db", "read", "SELECT 1") == "database is locked"
+    asyncio.run(m.shutdown())
+
+
+def test_default_vfs_leftovers_open_after_the_switch(tmp_path):
+    col = make_collection(tmp_path)
+    _ingest_docs(col, 1, 3)
+    asyncio.run(col.stop())
+    other_process(tmp_path / "meta.db", "write", """UPDATE records SET metadata = '{"tag": "wal"}'""")
+    assert (tmp_path / "meta.db-wal").stat().st_size > 0 and (tmp_path / "meta.db-shm").exists()
+    col = make_collection(tmp_path)
+    chunks = col.get_document("d0")["chunks"]
+    assert len(chunks) == 3 and all(c["metadata"] == {"tag": "wal"} for c in chunks)
+    asyncio.run(col.stop())
+

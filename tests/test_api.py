@@ -1,5 +1,9 @@
 import json
+import os
 import sqlite3
+import subprocess
+import sys
+import threading
 import time
 import zlib
 
@@ -7,6 +11,7 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
+import raggio.app as app_module
 from raggio.app import create_app
 
 DIM = 32
@@ -411,3 +416,198 @@ def test_listing_filter_ops_and_patch(client):
     assert r.json() == {"patched_records": 1}
     assert "kind" not in client.get("/collections/main/documents/doc1", headers=ROOT).json()["summary"]["metadata"]
     assert client.patch("/collections/main/documents/nope", headers=ROOT, json={"metadata": {}}).status_code == 404
+
+
+DOC_B = {
+    "doc_id": "doc2",
+    "chunks": [
+        {"id": "b1", "text": "the closest star is the sun", "metadata": {"src": "wiki"}},
+        {"id": "b2", "text": "a planet orbits a star", "metadata": {"src": "blog", "doc_id": "doc1"}},
+    ],
+}
+
+
+def test_relative_fusion(client):
+    client.post("/collections", headers=ROOT, json={"name": "main"})
+    ingest(client, "main", [DOC, DOC_B])
+
+    def search(**body):
+        r = client.post("/collections/main/search", headers=ROOT,
+                        json={"query": {"text": "closest star"}, "k": 100, **body})
+        assert r.status_code == 200, r.text
+        return r.json()["hits"]
+
+    ids = lambda hits: [h["id"] for h in hits]
+    vec, text = search(mode="vector"), search(mode="text")
+    norm = lambda hits: {h["id"]: (h["score"] - hits[-1]["score"]) / (hits[0]["score"] - hits[-1]["score"])
+                         for h in hits}
+    assert len(vec) == 5 and ids(text)[0] == "b1" and len(text) == 3  # c1, b1, b2 match a term
+
+    # alpha 1 / 0 reproduce the single-leg rankings, rescaled to [0, 1]
+    hits = search(mode="hybrid", fusion="relative", alpha=1)
+    assert ids(hits) == ids(vec) and hits[0]["score"] == 1.0 and hits[-1]["score"] == 0.0
+    hits = search(mode="hybrid", fusion="relative", alpha=0)
+    assert ids(hits) == ids(text) and hits[0]["score"] == 1.0
+    # a mixed alpha is alpha * vector + (1 - alpha) * text over the min-max normalised legs
+    v, t = norm(vec), norm(text)
+    want = {rid: 0.3 * v.get(rid, 0.0) + 0.7 * t.get(rid, 0.0) for rid in {*v, *t}}
+    hits = search(mode="hybrid", fusion="relative", alpha=0.3)
+    assert ids(hits) == sorted(want, key=lambda rid: -want[rid])
+    assert all(h["score"] == pytest.approx(want[h["id"]]) and 0 <= h["score"] <= 1 for h in hits)
+    hits = search(mode="hybrid", fusion="relative", k=2)  # default alpha 0.5, k still applies
+    assert len(hits) == 2 and all(0 <= h["score"] <= 1 for h in hits)
+
+    # rrf stays the default, and ignores alpha
+    rrf = search(mode="hybrid")
+    assert rrf == search(mode="hybrid", fusion="rrf") == search(mode="hybrid", alpha=0.9)
+    assert all(0 < h["score"] <= 2 / 61 for h in rrf)
+
+    for bad in ({"alpha": -0.1}, {"alpha": 1.5}, {"fusion": "weighted"}):
+        r = client.post("/collections/main/search", headers=ROOT,
+                        json={"query": {"text": "planet"}, "mode": "hybrid", "fusion": "relative", **bad})
+        assert r.status_code == 422, bad
+
+
+def test_doc_id_filter(client):
+    client.post("/collections", headers=ROOT, json={"name": "main"})
+    ingest(client, "main", [DOC, DOC_B])
+
+    def found(filt, mode="vector", scope="chunks", status=200):
+        r = client.post("/collections/main/search", headers=ROOT,
+                        json={"query": {"text": "planet"}, "mode": mode, "k": 10, "scope": scope, "filter": filt})
+        assert r.status_code == status, r.text
+        return {h["id"] for h in r.json()["hits"]} if status == 200 else None
+
+    # equality and `in` (list shorthand and explicit), in every mode
+    for mode in ("vector", "hybrid"):
+        assert found({"doc_id": "doc2"}, mode) == {"b1", "b2"}, mode
+        assert found({"doc_id": ["doc1", "doc2"]}, mode) == {"c1", "c2", "c3", "b1", "b2"}, mode
+        assert found({"doc_id": {"in": ["doc2", "nope"]}}, mode) == {"b1", "b2"}, mode
+    assert found({"doc_id": "doc2"}, "text") == {"b2"}  # BM25: only b2 says "planet"
+    assert found({"doc_id": "nope"}) == set()
+    # ANDed with metadata filters
+    for mode in ("vector", "text", "hybrid"):
+        assert found({"doc_id": "doc1", "src": "wiki"}, mode) == {"c1", "c2"}, mode
+    # scope still applies; doc2 has no summary
+    assert found({"doc_id": "doc1"}, scope="summaries") == {"doc1"}
+    assert found({"doc_id": "doc1"}, scope="both") == {"doc1", "c1", "c2", "c3"}
+    assert found({"doc_id": "doc2"}, scope="summaries") == set()
+    # reserved: b2's metadata key doc_id is not what the filter reads
+    assert "b2" not in found({"doc_id": "doc1"})
+    # equality and `in` only
+    for bad in ({"gte": "doc1"}, {"contains": "doc"}, {"in": []}, {"like": "doc%"}):
+        found({"doc_id": bad}, status=400)
+
+    # listing: the same key, with paging and total
+    url = "/collections/main/documents"
+    lst = lambda f, **kw: client.get(url, headers=ROOT, params={"filter": json.dumps(f), **kw})
+    r = lst({"doc_id": "doc1"}, scope="chunks", limit=2).json()
+    assert r["total"] == 3 and [x["id"] for x in r["records"]] == ["c1", "c2"]
+    r = lst({"doc_id": "doc1"}, scope="chunks", limit=2, offset=2).json()
+    assert [x["id"] for x in r["records"]] == ["c3"]
+    assert [x["id"] for x in lst({"doc_id": "doc1"}, scope="chunks", sort="-date").json()["records"]] == ["c2", "c1", "c3"]
+    assert lst({"doc_id": ["doc1", "doc2"], "src": "blog"}).json()["total"] == 2
+    assert lst({"doc_id": "doc1"}).json()["total"] == 4  # default scope: both
+    assert lst({"doc_id": {"lt": "doc2"}}).status_code == 400
+
+
+# ---- one process per DATA_DIR (ADR 0007) ----
+
+
+def wait_health(client, status):
+    deadline = time.time() + WAIT_SECONDS
+    while time.time() < deadline:
+        r = client.get("/healthz")
+        if r.json()["status"] == status:
+            return r
+        time.sleep(0.02)
+    raise TimeoutError(f"/healthz never said {status!r}")
+
+
+def fake_held_lock(monkeypatch, tmp_path, free):
+    """Another process holds the data-dir lock until free() says True (any platform)."""
+    fd = os.open(tmp_path / "fake.lock", os.O_RDWR | os.O_CREAT)
+    monkeypatch.setattr(app_module, "open_data_dir_lock", lambda data_dir: fd)
+    monkeypatch.setattr(app_module, "lock_data_dir", lambda fd: free())
+    monkeypatch.setattr(app_module, "DATA_DIR_LOCK_POLL_S", 0.01)
+
+
+def test_start_waits_while_another_process_holds_the_data_dir(make_app, monkeypatch, tmp_path):
+    held = threading.Event()
+    held.set()
+    fake_held_lock(monkeypatch, tmp_path, lambda: not held.is_set())
+    with TestClient(make_app()) as c:  # the server answers at once: the lifespan did not wait
+        r = c.get("/healthz")
+        assert r.status_code == 200 and r.json() == {"status": "starting"}
+        for r in (c.get("/collections", headers=ROOT),
+                  c.post("/collections/x/search", headers=ROOT, json={})):  # before validation too
+            assert r.status_code == 503 and r.headers["retry-after"] == "2"
+        assert not (tmp_path / "catalog.db").exists()  # nothing in DATA_DIR opened yet
+        held.clear()
+        wait_health(c, "ok")
+        assert c.get("/collections", headers=ROOT).json() == {"collections": []}
+
+
+def test_failed_start_reports_unhealthy(make_app, monkeypatch, tmp_path):
+    tries = iter([False])  # held at the first try only
+    fake_held_lock(monkeypatch, tmp_path, lambda: next(tries, True))
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("catalog unreadable")
+
+    monkeypatch.setattr(app_module, "CollectionManager", broken)
+    with TestClient(make_app()) as c:
+        assert wait_health(c, "failed").status_code == 503  # the platform restarts it
+        assert c.get("/collections", headers=ROOT).status_code == 503
+
+
+LOCK_CHILD = """
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+try:
+    fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    print("held", flush=True)
+    sys.exit()
+print("locked", flush=True)
+sys.stdin.read()  # holds the lock until the test closes stdin
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fcntl record locks are POSIX-only")
+def test_data_dir_lock_keeps_a_second_process_out(make_app, tmp_path):
+    def child():
+        return subprocess.Popen([sys.executable, "-c", LOCK_CHILD, str(tmp_path / "raggio.lock")],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+
+    holder = child()
+    try:
+        assert holder.stdout.readline().strip() == "locked"
+        with TestClient(make_app()) as c:
+            assert c.get("/healthz").json() == {"status": "starting"}
+            assert c.get("/collections", headers=ROOT).status_code == 503
+            holder.stdin.close()  # the other process exits
+            assert holder.wait(WAIT_SECONDS) == 0
+            wait_health(c, "ok")
+            assert c.get("/collections", headers=ROOT).status_code == 200
+            assert child().communicate(timeout=WAIT_SECONDS)[0].strip() == "held"  # now ours
+        assert child().communicate(timeout=WAIT_SECONDS)[0].strip() == "locked"  # released at shutdown
+    finally:
+        holder.kill()
+
+
+def test_data_dir_with_uri_characters(tmp_path, monkeypatch):
+    # every database opens through a file: URI on POSIX (ADR 0007): the path is escaped there
+    data = tmp_path / ("data dir 100% #1" + ("" if sys.platform == "win32" else " ?vfs=unix"))
+    monkeypatch.setenv("ROOT_API_KEY", "root-key")
+    monkeypatch.setenv("DATA_DIR", str(data))
+    for first in (True, False):  # the second start reopens the catalog and each collection
+        with TestClient(create_app(embedder_factory=lambda cfg: FakeEmbedder())) as c:
+            if first:
+                assert c.post("/collections", headers=ROOT, json={"name": "main"}).status_code == 201
+                ingest(c, "main", [DOC])
+            r = c.post("/collections/main/search", headers=ROOT,
+                       json={"query": {"text": "jupiter"}, "mode": "hybrid", "k": 1})
+            assert r.json()["hits"][0]["id"] == "c2"
+    assert (data / "catalog.db").exists() and (data / "collections" / "main" / "meta.db").exists()
+

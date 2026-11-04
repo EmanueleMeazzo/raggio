@@ -28,6 +28,11 @@ from turbovec import IdMapIndex
 from .config import Settings, default_ivf_search_threads
 from .embeddings import Embedder
 
+try:
+    import fcntl
+except ImportError:  # Windows: no data-dir lock (open_data_dir_lock)
+    fcntl = None
+
 
 def _load_native():
     """The optional Rust stage-2 scorer (native/, ADR 0004; `uv sync --extra native`), or
@@ -79,6 +84,9 @@ TEXT_OR_CAND = 500
 # ponytail: AND candidates are rowid-ordered, not ranked — an AND set >> cap (queries of
 # only-common tokens) samples arbitrarily; stage 1a's rarest-token guarantee covers that class
 TEXT_AND_CAND = 1000
+# document-scoped BM25 (ADR 0007): a doc_id filter matching at most this many rows skips
+# FTS5 and scores the rows' texts directly with the stage-2 scorer
+TEXT_DIRECT_MAX = 1000
 SDM_WEIGHT = 0.2  # ordered-bigram proximity term (SDM-lite, Metzler & Croft 2005)
 BM25_K1, BM25_B = 1.2, 0.75  # FTS5's hardcoded parameters (fts5_aux.c) — kept for parity
 
@@ -364,30 +372,35 @@ def _rows_matrix(rows: list[list]) -> np.ndarray:
 
 def _filter_sql(scope: str, filt: dict | None) -> tuple[str, list]:
     """Build WHERE clause for records: type scope + metadata filters, all ANDed.
-    Per key: scalar = equality; list = `in`; object = range ops / `in` / `contains`."""
+    Per key: scalar = equality; list = `in`; object = range ops / `in` / `contains`.
+    `doc_id` is reserved (ADR 0007): it filters the records column, equality and `in`
+    only, so idx_records_doc_type finds the rows instead of a json_extract over every
+    row; a metadata key named doc_id cannot be filtered."""
     clauses, params = ["indexed = 1"], []
     if scope == "chunks":
         clauses.append("type = 'chunk'")
     elif scope == "summaries":
         clauses.append("type = 'summary'")
     for key, val in (filt or {}).items():
-        path = "$." + key
+        col, cparams = ("doc_id", []) if key == "doc_id" else ("json_extract(metadata, ?)", ["$." + key])
         ops = val.items() if isinstance(val, dict) else [("in" if isinstance(val, list) else "eq", val)]
         for op, bound in ops:
+            if key == "doc_id" and op not in ("eq", "in"):
+                raise ValueError(f"filter 'doc_id' supports equality and 'in' only, not '{op}'")
             if op == "eq":
-                clauses.append("json_extract(metadata, ?) = ?")
-                params.extend([path, bound])
+                clauses.append(f"{col} = ?")
+                params.extend([*cparams, bound])
             elif op in RANGE_OPS:
-                clauses.append(f"json_extract(metadata, ?) {RANGE_OPS[op]} ?")
-                params.extend([path, bound])
+                clauses.append(f"{col} {RANGE_OPS[op]} ?")
+                params.extend([*cparams, bound])
             elif op == "in":
                 if not isinstance(bound, list) or not bound or any(isinstance(b, (list, dict)) for b in bound):
                     raise ValueError(f"filter '{key}': 'in' needs a non-empty list of scalars")
-                clauses.append(f"json_extract(metadata, ?) IN ({','.join('?' * len(bound))})")
-                params.extend([path, *bound])
+                clauses.append(f"{col} IN ({','.join('?' * len(bound))})")
+                params.extend([*cparams, *bound])
             elif op == "contains":  # substring; SQLite lower() folds ASCII only
-                clauses.append("instr(lower(json_extract(metadata, ?)), lower(?)) > 0")
-                params.extend([path, str(bound)])
+                clauses.append(f"instr(lower({col}), lower(?)) > 0")
+                params.extend([*cparams, str(bound)])
             else:
                 raise ValueError(f"unsupported filter operator: {op}")
     return " AND ".join(clauses), params
@@ -494,6 +507,30 @@ def _rrf(k: int, *rankings: list[int]) -> tuple[list[int], list[float]]:
             scores[rid] = scores.get(rid, 0.0) + 1.0 / (RRF_K + rank)
     top = sorted(scores.items(), key=lambda kv: -kv[1])[:k]
     return [rid for rid, _ in top], [s for _, s in top]
+
+
+def _relative(
+    k: int, alpha: float, vec: tuple[list[int], list[float]], text: tuple[list[int], list[float]]
+) -> tuple[list[int], list[float]]:
+    """Relative score fusion, as Weaviate's relativeScoreFusion: each leg's scores are
+    min-max normalised to [0, 1] (a leg whose scores are all equal, one candidate
+    included, normalises to 1.0), then score(id) = alpha * vector + (1 - alpha) * text,
+    a leg that did not return the id adding 0. Ties keep first-seen order, vector leg
+    first, as in _rrf."""
+    scores: dict[int, float] = {}
+    for (ids, leg), weight in ((vec, alpha), (text, 1 - alpha)):
+        if not ids:
+            continue
+        lo, hi = min(leg), max(leg)
+        for rid, s in zip(ids, leg):
+            scores[rid] = scores.get(rid, 0.0) + weight * ((s - lo) / (hi - lo) if hi > lo else 1.0)
+    top = sorted(scores.items(), key=lambda kv: -kv[1])[:k]
+    return [rid for rid, _ in top], [s for _, s in top]
+
+
+async def _no_leg() -> tuple[list[int], list[float]]:
+    """A hybrid leg relative fusion skips because its weight is 0."""
+    return [], []
 
 
 class _RWLock:
@@ -647,9 +684,21 @@ class _ReadConn:
         return True
 
 
+def connect_db(path: Path, **kw) -> sqlite3.Connection:
+    """sqlite3.connect for a database in DATA_DIR. On POSIX through SQLite's unix-excl VFS
+    (ADR 0007): it takes the file's fcntl lock once and holds it, coordinates this
+    process's connections in memory and keeps the WAL index in heap memory (no -shm
+    file). The default VFS takes and drops fcntl locks on the database and its -shm
+    around every transaction, and on NFS each is an RPC that also drops the client's page
+    cache. No other process can open the file meanwhile: the data-dir lock keeps them out
+    anyway. Windows has no unix-excl."""
+    if os.name == "nt":
+        return sqlite3.connect(path, **kw)
+    return sqlite3.connect(f"{Path(path).absolute().as_uri()}?vfs=unix-excl", uri=True, **kw)
+
+
 def open_meta_db(path: Path, tokenizer: str = "unicode61") -> sqlite3.Connection:
-    db = sqlite3.connect(path, check_same_thread=False,
-                         cached_statements=SQLITE_CACHED_STATEMENTS)
+    db = connect_db(path, check_same_thread=False, cached_statements=SQLITE_CACHED_STATEMENTS)
     # job payloads are bulky and transient: without this the file keeps every page the
     # ingest backlog ever occupied (a full-corpus ingest ballooned meta.db to 7+ GB).
     # MUST run before journal_mode=WAL — that pragma initializes the db file, and
@@ -2096,8 +2145,8 @@ class Collection:
             raise RuntimeError(f"collection '{self.cfg.name}' is closed")
         rc = getattr(self._read_local, "rc", None)
         if rc is None:
-            db = sqlite3.connect(self.dir / "meta.db", check_same_thread=False,
-                                 cached_statements=SQLITE_CACHED_STATEMENTS)
+            db = connect_db(self.dir / "meta.db", check_same_thread=False,
+                            cached_statements=SQLITE_CACHED_STATEMENTS)
             db.execute("PRAGMA query_only=1")
             rc = _ReadConn(self, db)
             with self.db_lock:
@@ -2143,6 +2192,23 @@ class Collection:
         floor = RESCORE_FLOOR.get(self.cfg.bit_width, RESCORE_FLOOR[4])
         return max(1, min(max(floor, RESCORE_MULT * n), RESCORE_CAP, len(self.index)))
 
+    def _fp16_vecs(self, ids: list[int]) -> tuple[list[int], np.ndarray]:
+        """The retained fp16 originals of `ids` as unit-norm float32 rows, for the ids
+        that have a valid blob (rows ingested before vector retention have none):
+        (those ids, one matrix row each)."""
+        dim = self.cfg.dim
+        with self._reading() as db:
+            blobs = {
+                rid: blob
+                for rid, blob in _rows_by_id(db, "SELECT id, vec FROM vecs WHERE id IN ({})", ids)
+                if blob is not None and len(blob) == dim * 2
+            }
+        mat = np.frombuffer(b"".join(blobs.values()), dtype=np.float16)
+        mat = mat.reshape(len(blobs), dim).astype(np.float32)
+        # fp16 round-trip drifts norms ~1e-3: renormalize for exact cosine
+        mat /= np.maximum(np.linalg.norm(mat, axis=1, keepdims=True), 1e-12)
+        return list(blobs), mat
+
     def _rescore_rows(
         self, queries: np.ndarray, rows: list[tuple[list[int], list[float], int]]
     ) -> list[tuple[list[int], list[float]]]:
@@ -2151,24 +2217,12 @@ class Collection:
         union blob fetch + decode serves the whole batch, so the batched scan path
         pays a single round of point lookups. Ids without a valid blob (rows ingested
         before vector retention) keep their quantized score — merged, never dropped."""
-        dim = self.cfg.dim
-        union = list({rid for ids, _, _ in rows for rid in ids})
-        with self._reading() as db:
-            blobs = {
-                rid: blob
-                for rid, blob in _rows_by_id(db, "SELECT id, vec FROM vecs WHERE id IN ({})", union)
-                if blob is not None and len(blob) == dim * 2
-            }
-        if blobs:
-            mat = np.frombuffer(b"".join(blobs.values()), dtype=np.float16)
-            mat = mat.reshape(len(blobs), dim).astype(np.float32)
-            # fp16 round-trip drifts norms ~1e-3: renormalize for exact cosine
-            mat /= np.maximum(np.linalg.norm(mat, axis=1, keepdims=True), 1e-12)
-            rowof = {rid: j for j, rid in enumerate(blobs)}
+        found, mat = self._fp16_vecs(list({rid for ids, _, _ in rows for rid in ids}))
+        rowof = {rid: j for j, rid in enumerate(found)}
         out = []
         for qi, (ids, scores, n) in enumerate(rows):
             merged = list(scores)
-            have = [k for k, rid in enumerate(ids) if rid in blobs]
+            have = [k for k, rid in enumerate(ids) if rid in rowof]
             if have:
                 exact = mat[[rowof[ids[k]] for k in have]] @ queries[qi]
                 for j, k in enumerate(have):
@@ -2194,6 +2248,24 @@ class Collection:
                     r_scores.append(float(s))
             rows.append((r_ids, r_scores, n))
         return self._rescore_rows(queries, rows)
+
+    def _search_allowed(
+        self, qvec: np.ndarray, n: int, allow: np.ndarray, **kw
+    ) -> tuple[list[int], list[float]]:
+        """Top-n of one query over an allowlist (filters, sibling expansion). An
+        allowlist no larger than the rescore depth skips the index (ADR 0007): the
+        masked search would return all of it and the rescore fetch every blob anyway,
+        so scoring the fp16 originals directly gives the same ids, scores and
+        (-score, id) order without the index call. Past that depth a masked search's
+        bounded fetch is cheaper (each blob costs ~20 us at 3072-d). Blocking; call
+        from a thread."""
+        if len(allow) <= self._rescore_k(n):
+            ids, mat = self._fp16_vecs(allow.tolist())
+            if len(ids) == len(allow):  # else rows without a blob: only the index scores them
+                scores = mat @ qvec[0]
+                top = np.lexsort((ids, -scores))[:n]
+                return [ids[j] for j in top], [float(scores[j]) for j in top]
+        return self._search_rescored(qvec, [n], allowlist=allow, **kw)[0]
 
     async def _vector_ids(
         self, qvec: np.ndarray, n: int, scope: str, filt: dict | None,
@@ -2230,7 +2302,7 @@ class Collection:
             if len(allow) == 0:
                 return [], []
             kw = {"nprobe": nprobe} if isinstance(self.index, _IvfIndex) else {}
-            return self._search_rescored(qvec, [n], allowlist=allow, **kw)[0]
+            return self._search_allowed(qvec, n, allow, **kw)
 
         return await asyncio.to_thread(run)
 
@@ -2390,6 +2462,22 @@ class Collection:
         kept, toks = self._prune_common(qtext)
         if not kept:
             return [], []
+        if filt and "doc_id" in filt and self.cfg.tokenizer != "trigram":
+            # a document-scoped query (ADR 0007): FTS5 would rank the query over the whole
+            # corpus and filter by doc_id only afterwards, so a few rows are scored
+            # directly with the stage-2 scorer instead (corpus-wide idf and avgdl, the
+            # two-stage path's scores). Trigram matches substrings, which it cannot
+            where, params = _filter_sql(scope, filt)
+            with self._reading() as db:
+                ids = [r[0] for r in db.execute(
+                    f"SELECT id FROM records WHERE {where} LIMIT ?", [*params, TEXT_DIRECT_MAX + 1]
+                )]
+                if len(ids) <= TEXT_DIRECT_MAX:
+                    cand = list(_rows_by_id(db, "SELECT id, text FROM records WHERE id IN ({})", ids))
+            if len(ids) <= TEXT_DIRECT_MAX:
+                rids, scores = self._bm25_rescore(qtext, cand, n)
+                hit = [i for i, s in enumerate(scores) if s > 0]  # no query term: no match, as in FTS5
+                return [rids[i] for i in hit], [scores[i] for i in hit]
         two_stage = len(kept) < len(toks)
         match, limit = _or_query(kept), TEXT_OR_CAND if two_stage else n
         other = {"chunks": "summary", "summaries": "chunk"}.get(scope)
@@ -2445,8 +2533,10 @@ class Collection:
         filt: dict | None,
         expand,
         nprobe: int | None = None,
+        fusion: str = "rrf",
+        alpha: float = 0.5,
     ) -> list[dict]:
-        n = max(HYBRID_DEPTH, k) if mode == "hybrid" else k  # per-leg depth so RRF sees the tail
+        n = max(HYBRID_DEPTH, k) if mode == "hybrid" else k  # per-leg depth so fusion sees the tail
         async with self.lock.read():
             if self._closed:  # queued for the read lock behind stop()'s write section
                 if self.deleted:
@@ -2457,11 +2547,13 @@ class Collection:
             elif mode == "text":
                 ids, scores = await asyncio.to_thread(self._text_ids, qtext, n, scope, filt)
             else:  # hybrid: legs in parallel — sqlite releases the GIL, so they overlap
-                (v_ids, _), (t_ids, _) = await asyncio.gather(
-                    self._vector_ids(qvec, n, scope, filt, nprobe),
-                    asyncio.to_thread(self._text_ids, qtext, n, scope, filt),
+                # relative fusion skips a leg whose weight is 0, as Weaviate does
+                rrf = fusion == "rrf"
+                vec, text = await asyncio.gather(
+                    self._vector_ids(qvec, n, scope, filt, nprobe) if rrf or alpha > 0 else _no_leg(),
+                    asyncio.to_thread(self._text_ids, qtext, n, scope, filt) if rrf or alpha < 1 else _no_leg(),
                 )
-                ids, scores = _rrf(k, v_ids, t_ids)
+                ids, scores = _rrf(k, vec[0], text[0]) if rrf else _relative(k, alpha, vec, text)
             hits = self._hydrate(ids, scores)
             if expand:
                 for hit in hits:
@@ -2499,10 +2591,10 @@ class Collection:
                 ]
             if sib:
                 allow = np.array(sib, dtype=np.uint64)
-                rescored = await asyncio.to_thread(
-                    self._search_rescored, qvec, [expand.siblings_topk], allowlist=allow
+                ids, scores = await asyncio.to_thread(
+                    self._search_allowed, qvec, expand.siblings_topk, allow
                 )
-                ext["siblings"] = self._hydrate(*rescored[0])
+                ext["siblings"] = self._hydrate(ids, scores)
             else:
                 ext["siblings"] = []
         elif expand.siblings_all:
@@ -2596,6 +2688,9 @@ class Collection:
             # an expression index per hot sort key is the follow-up (spec §5.2), not C
             order = f"json_extract(metadata, ?) {'DESC' if sort[0] == '-' else 'ASC'}, id"
             oparams = ["$." + sort.lstrip("-")]
+        # a doc_id filter is the exception: idx_records_doc_type finds its few rows, where
+        # the forced table scan would read every record (0.1 s at 300k rows) to page them
+        hint = "" if filt and "doc_id" in filt else " NOT INDEXED"
         with self._reading() as db:
             total = db.execute(f"SELECT COUNT(*) FROM records WHERE {where}", params).fetchone()[0]
             ids = [
@@ -2606,7 +2701,7 @@ class Collection:
                     # 0.91 -> 2.73 s warm at 2.55M; ANALYZE does not fix it). NOT INDEXED
                     # keeps the rowid-order table scan and still allows rowid lookups, so
                     # the default ORDER BY id page still stops after LIMIT rows.
-                    f"SELECT id FROM records NOT INDEXED WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
+                    f"SELECT id FROM records{hint} WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
                     [*params, *oparams, limit, offset],
                 )
             ]
@@ -2653,13 +2748,44 @@ class Collection:
         }
 
 
+# One process per DATA_DIR (ADR 0007). Two processes on one WAL database corrupt it once
+# they run on different hosts, which do not share the -shm wal-index: a rolling restart on
+# a network volume did ("file is not a database" in the old replica). The lock is an
+# fcntl record lock on DATA_DIR/raggio.lock, held until the process is done with the
+# directory; NFSv4 enforces it across hosts unless the share is mounted with local locks.
+# A process that finds it held tries again every DATA_DIR_LOCK_POLL_S seconds: a blocking
+# lockf in a thread would keep the process from exiting on SIGTERM while it waits.
+DATA_DIR_LOCK_POLL_S = 0.5
+
+
+def open_data_dir_lock(data_dir: str) -> int | None:
+    """The fd of DATA_DIR/raggio.lock for lock_data_dir, or None where there is no fcntl
+    (Windows): the lock is skipped there, with a warning."""
+    if fcntl is None:
+        _log.warning("no fcntl on this platform: one process per DATA_DIR is not enforced")
+        return None
+    Path(data_dir).mkdir(parents=True, exist_ok=True)
+    return os.open(Path(data_dir) / "raggio.lock", os.O_RDWR | os.O_CREAT, 0o644)
+
+
+def lock_data_dir(fd: int) -> bool:
+    """One try, without waiting, for the exclusive lock on open_data_dir_lock's fd; False
+    while another process holds it. fcntl locks belong to the process, and closing any fd
+    of the file drops them: the fd stays open until the process is done with DATA_DIR."""
+    try:
+        fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, PermissionError):  # EAGAIN / EACCES: another process holds it
+        return False
+    return True
+
+
 class CollectionManager:
     def __init__(self, settings: Settings, embedder_factory=None) -> None:
         self.settings = settings
         self.embedder_factory = embedder_factory or self._default_embedder
         self.data_dir = Path(settings.data_dir)
         (self.data_dir / "collections").mkdir(parents=True, exist_ok=True)
-        self.catalog = sqlite3.connect(self.data_dir / "catalog.db", check_same_thread=False)
+        self.catalog = connect_db(self.data_dir / "catalog.db", check_same_thread=False)
         self.catalog.execute(
             "CREATE TABLE IF NOT EXISTS collections("
             "name TEXT PRIMARY KEY, dim INT, bit_width INT, model TEXT, base_url TEXT,"
@@ -2873,7 +2999,7 @@ class CollectionManager:
     async def resume_pending(self) -> None:
         """On boot, load any collection with unfinished jobs so its worker replays them."""
         for name in self.list_collections():
-            db = sqlite3.connect(self._dir(name) / "meta.db")
+            db = connect_db(self._dir(name) / "meta.db")
             pending = db.execute(
                 "SELECT COUNT(*) FROM jobs WHERE status IN ('pending','processing')"
             ).fetchone()[0]

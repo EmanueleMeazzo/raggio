@@ -66,6 +66,46 @@ older release cannot read `job_payloads`, so drain the ingest queue
 (`pending_jobs` is 0 in `GET /collections/{name}` for every collection)
 before downgrading.
 
+## One process per data directory
+
+A `DATA_DIR` belongs to one raggio process at a time. Before it opens any
+database, raggio takes an exclusive `fcntl` lock on `DATA_DIR/raggio.lock`, and
+it releases the lock only after shutdown has closed them all. Two processes on
+one SQLite WAL database corrupt it as soon as they run on different hosts,
+which do not share its `-shm` index; a rolling restart or a new revision on a
+network volume (an Azure Files NFS share, say) runs the new replica next to
+the old one for a while.
+
+A process that finds the lock held starts serving at once, with nothing
+opened: `/healthz` answers 200 `{"status": "starting"}`, so the platform goes
+on to stop the old replica, and every other request answers 503 with
+`Retry-After: 2`. It tries the lock again every 0.5 s; once the old process
+has exited it opens the catalog, replays unfinished jobs and serves. A
+handover costs clients a few seconds of 503s. If that start-up fails,
+`/healthz` answers 503 `{"status": "failed"}`, so the platform restarts the
+process. The log shows `waiting for data-dir lock` and
+`acquired data-dir lock after N s`.
+
+The lock needs a filesystem whose locks every host sees: a local disk, or
+NFSv4 mounted with `local_lock=none`. With local locks (`local_lock=all`, or
+NFSv3 `nolock`) each host sees only its own, and two hosts can still open one
+`DATA_DIR`. If the host holding the lock dies, an NFSv4 server frees it when
+that client's lease expires. Windows has no `fcntl`: there the lock is
+skipped, with a warning.
+
+On Linux and other POSIX systems every database, `catalog.db` and each
+`meta.db`, is opened through SQLite's `unix-excl` VFS. It takes the file's
+lock once, when the database opens, and holds it; the process's own
+connections coordinate in memory, and the WAL index lives in memory instead of
+a `-shm` file. SQLite's default VFS takes and drops file locks around every
+transaction, and on NFS each of those is a round trip to the server that also
+empties the client's cache of the file: about 40 ms on every request on an
+Azure Files share. So while raggio runs, no other process can open its
+databases (it gets `database is locked`): run an integrity check or the
+`sqlite3` shell on a stopped container, or on a copy of `DATA_DIR`. Data
+directories written by earlier versions open as they are, and a `-shm` file
+they left behind is ignored. Windows keeps SQLite's default VFS.
+
 ## Backup
 
 There is no backup API; a backup is a copy of `DATA_DIR`. `meta.db` is a WAL

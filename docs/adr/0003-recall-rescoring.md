@@ -1,6 +1,6 @@
 # ADR 0003 — Exact rescoring: fp16 re-rank for vectors, two-stage full-query BM25
 
-Status: accepted · Date: 2026-08-23
+Status: accepted · Date: 2026-08-23 · Relative-score fusion, a candidate future API under Rejected, ships as an option in ADR 0007
 
 ## Context
 
