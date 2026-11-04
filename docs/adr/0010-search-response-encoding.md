@@ -17,17 +17,26 @@ adds CPU and temporary allocations without changing the values.
 
 ## Decision
 
-Return the existing `JSONResponse(content={"hits": hits})` directly from the search
-endpoint. Use its existing stdlib JSON encoding and UTF-8/error policy. No dependency,
+`_search_response` checks the result containers without copying them, then returns
+the existing `JSONResponse(content={"hits": hits})` directly when FastAPI's encoder
+would preserve every value. Dictionaries with `_sa*` keys or non-string keys, and
+values outside the built-in JSON types, return the original content dictionary so
+FastAPI handles them normally. Containers deeper than 32 levels also use that
+fallback, bounding inspection of deep or cyclic structures. Its
+`sqlalchemy_safe=True` default removes `_sa*`
+keys even in user metadata; bypassing that behavior would change valid responses.
+Use the existing stdlib JSON encoding and UTF-8/error policy. No dependency,
 request parser, retrieval algorithm or storage change is added.
 
 The request schema, ranking, filters, expansion and authorization use the same
 code. Exact response bytes, content type and content length match the ordinary
 FastAPI return path in endpoint parity tests for vector/text/hybrid, relative
 fusion at multiple weights, scopes, expansion, no hits and nested Unicode/numeric
-metadata. Non-finite metadata retains the same encoding error. New hit fields must
-be JSON-compatible before reaching this response: datetime, bytes, NumPy arrays or
-Pydantic objects would require explicit conversion rather than this fast path.
+metadata, including nested `_sa*` keys. Non-finite metadata retains the same encoding
+error. Bytes, datetime, paths, tuples, NumPy scalar subclasses and non-string keys
+retain FastAPI's conversion through the fallback. Deep and cyclic values also
+retain its handling. The check does not mutate results;
+compatibility cases retain the ordinary encoder and pay the added inspection cost.
 
 ## Measurement protocol
 
@@ -41,7 +50,8 @@ query. The index is flat, below turbovec's 32,768-row single-query pool threshol
 
 Both arms use the same application and collection. The baseline restores the
 dictionary return for FastAPI's automatic encoder; the candidate uses the direct
-response. Both apply the same patch machinery outside the clocks. Each case has
+response, including its compatibility check. Both apply the same patch machinery
+outside the clocks. Each case has
 three warmup requests per arm, then five paired rounds of 20 requests per arm with
 alternating arm order. Response bytes are compared for every paired request.
 
@@ -50,6 +60,10 @@ then five rounds of 100 requests per arm. Both arms compare the same ordered
 response bytes. A preliminary run used shorter concurrent bursts; the final
 protocol warms client threads and measures longer samples. Its original raw run
 is retained locally in `C:/DevOps/raggio-retrieval-20261104/results-search-response.json`.
+The subsequent unchecked-response experiment is also retained locally as
+`results-search-response-final.json`; discovery of the `_sa*` compatibility behavior
+required the guard above and a fresh measurement. The committed results measure
+the guarded implementation.
 
 Environment: x86_64 WSL2 Linux, 3-CPU quota, 4 GiB container limit, local container
 storage, `OPENBLAS_NUM_THREADS=1`, CPython 3.12.15, FastAPI 0.142.2, Pydantic 2.13.5,
@@ -64,17 +78,17 @@ Medians over five rounds. Times are milliseconds per search; negative improvemen
 
 | Case | p50 default | p50 direct | p50 improvement | CPU default | CPU direct |
 |---|---:|---:|---:|---:|---:|
-| Vector, 10 hits | 5.32 | 5.03 | 5.6% | 5.33 | 5.05 |
-| Text, 10 hits | 4.08 | 3.92 | 3.8% | 4.22 | 4.06 |
-| Hybrid, 10 hits | 6.98 | 7.07 | -1.4% | 10.00 | 9.82 |
-| Vector, 100 hits | 8.46 | 7.16 | 15.3% | 8.84 | 7.25 |
-| Vector, 1,000 hits | 48.14 | 33.81 | 29.8% | 50.90 | 35.10 |
-| Vector, 10 hits + expansion | 8.59 | 8.09 | 5.9% | 8.94 | 8.32 |
-| Text, 10 hits + expansion | 6.25 | 5.95 | 4.8% | 6.41 | 6.21 |
-| Document-filtered vector, 10 hits | 1.61 | 1.45 | 9.6% | 1.67 | 1.54 |
+| Vector, 10 hits | 7.46 | 7.33 | 1.8% | 7.86 | 7.56 |
+| Text, 10 hits | 5.11 | 4.81 | 5.9% | 5.41 | 4.97 |
+| Hybrid, 10 hits | 8.43 | 8.49 | -0.7% | 11.90 | 11.95 |
+| Vector, 100 hits | 12.52 | 10.81 | 13.6% | 13.27 | 11.81 |
+| Vector, 1,000 hits | 59.82 | 46.05 | 23.0% | 65.70 | 46.75 |
+| Vector, 10 hits + expansion | 14.85 | 13.98 | 5.8% | 15.41 | 14.26 |
+| Text, 10 hits + expansion | 9.92 | 9.32 | 6.0% | 9.96 | 9.99 |
+| Document-filtered vector, 10 hits | 2.54 | 2.36 | 7.1% | 2.75 | 2.56 |
 
-Concurrent vector throughput was 216.0 vs 233.7 QPS.
-Round ranges were 195.4–238.6 vs 225.4–250.3;
+Concurrent vector throughput was 232.6 vs 240.4 QPS.
+Round ranges were 196.6–272.1 vs 230.8–294.8;
 the overlapping ranges support a directional result, not a production throughput claim.
 
 Encoding component timings use already hydrated responses. Allocation tracing runs
@@ -83,10 +97,10 @@ the pre-existing hits. It does not measure service RSS, SQLite memory or index s
 
 | Response | Encode p50 default (ms) | Encode p50 direct (ms) | Temporary peak default (bytes) | Temporary peak direct (bytes) |
 |---|---:|---:|---:|---:|
-| Vector, 10 hits | 0.154 | 0.027 | 38,677 | 30,517 |
-| Vector, 100 hits | 1.583 | 0.246 | 372,023 | 297,607 |
-| Vector, 1,000 hits | 15.794 | 2.334 | 3,706,039 | 2,968,487 |
-| Vector, 10 hits + expansion | 0.646 | 0.104 | 166,083 | 128,627 |
+| Vector, 10 hits | 0.182 | 0.065 | 38,677 | 31,525 |
+| Vector, 100 hits | 1.985 | 0.622 | 372,023 | 303,655 |
+| Vector, 1,000 hits | 19.563 | 6.556 | 3,706,039 | 3,024,935 |
+| Vector, 10 hits + expansion | 0.677 | 0.211 | 166,083 | 129,803 |
 
 The transport is in-process ASGI `TestClient`, so CPU includes client work. These
 are local synthetic measurements, not a re-run of the 2.55M-row DGX benchmark.

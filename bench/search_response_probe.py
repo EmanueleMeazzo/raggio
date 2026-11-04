@@ -3,7 +3,7 @@
 Run: uv run --group bench python bench/search_response_probe.py --pairs 5 --out results.json
 Uses generated vectors/text and temporary local storage. Both arms use the same
 collection, native search, SQLite reads, ranking and response bytes. The default
-arm returns a dict for FastAPI to encode; direct returns the existing JSONResponse.
+arm returns a dict for FastAPI to encode; direct uses the production fast path.
 ASGI TestClient timings include client work and exclude external embeddings/network.
 """
 import argparse
@@ -56,8 +56,8 @@ async def prepare(settings, rows, dim):
         await manager.shutdown()
 
 
-def default_response(*, content):
-    return content
+def default_response(hits):
+    return {"hits": hits}
 
 
 def post(client, raw):
@@ -70,7 +70,7 @@ def post(client, raw):
 
 def encode_probe(data, iterations):
     operations = {"default": lambda: JSONResponse(jsonable_encoder(data)),
-                  "direct": lambda: JSONResponse(data)}
+                  "direct": lambda: app_module._search_response(data["hits"])}
     assert operations["default"]().body == operations["direct"]().body
     samples = {name: [] for name in operations}
     for i in range(iterations):
@@ -113,7 +113,7 @@ def main():
         "text-expanded": {"mode": "text", "k": 10, "expand": {"siblings_topk": 3, "summary": True}},
         "vector-doc-filter": {"mode": "vector", "k": 10, "filter": {"doc_id": "d0"}},
     }
-    factories = {"default": default_response, "direct": JSONResponse}
+    factories = {"default": default_response, "direct": app_module._search_response}
     runs, components = {}, {}
     with tempfile.TemporaryDirectory(prefix="raggio-search-response-") as directory:
         settings = Settings()
@@ -130,7 +130,7 @@ def main():
                         query["vector"] = np.round(vec, 5)
                     bodies.append(orjson.dumps({**case, "query": query}, option=orjson.OPT_SERIALIZE_NUMPY))
                 for factory in factories.values():
-                    with patch.object(app_module, "JSONResponse", factory):
+                    with patch.object(app_module, "_search_response", factory):
                         for i in range(3):
                             post(client, bodies[i % len(bodies)])
                 case_runs = []
@@ -141,7 +141,7 @@ def main():
                         outputs = []
                         for name in (order if i % 2 == 0 else order[::-1]):
                             # Same patch machinery outside the clocks for both arms.
-                            with patch.object(app_module, "JSONResponse", factories[name]):
+                            with patch.object(app_module, "_search_response", factories[name]):
                                 wall, cpu = time.perf_counter(), time.process_time()
                                 response = post(client, raw)
                                 samples[name].append(((time.perf_counter() - wall) * 1000,
@@ -164,12 +164,12 @@ def main():
             # Start the client threads and warm the concurrent scan path outside
             # the clocks. Longer samples avoid measuring just a short startup burst.
             for factory in factories.values():
-                with patch.object(app_module, "JSONResponse", factory):
+                with patch.object(app_module, "_search_response", factory):
                     list(pool.map(lambda raw: post(client, raw), bodies))
             for pair in range(args.pairs):
                 row, outputs = {}, []
                 for name in (tuple(factories) if pair % 2 == 0 else tuple(factories)[::-1]):
-                    with patch.object(app_module, "JSONResponse", factories[name]):
+                    with patch.object(app_module, "_search_response", factories[name]):
                         wall, cpu = time.perf_counter(), time.process_time()
                         responses = []
                         for _ in range(5):

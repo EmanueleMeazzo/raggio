@@ -1,5 +1,7 @@
 import json
+from datetime import datetime
 import os
+from pathlib import Path
 import sqlite3
 import subprocess
 import sys
@@ -86,25 +88,54 @@ DOC = {
     {"mode": "hybrid", "expand": {"siblings_all": True, "summary": True}},
     {"mode": "vector", "filter": {"doc_id": "missing"}},
 ])
-def test_search_response_bytes_match_fastapi_default(client, monkeypatch, options):
+@pytest.mark.parametrize("encoder_keys", [False, True])
+def test_search_response_bytes_match_fastapi_default(client, monkeypatch, options, encoder_keys):
     client.post("/collections", headers=ROOT, json={"name": "main", "dim": DIM}).raise_for_status()
     document = json.loads(json.dumps(DOC))
     document["chunks"][0]["metadata"].update({
         "nested": {"array": [None, True, False, -0.0, 2**100, "café Σ漢字\n\t\\\""]},
         "number": 1.0000000000000002,
     })
+    if encoder_keys:
+        document["summary"]["metadata"]["_sample"] = "hidden by FastAPI"
+        for chunk in document["chunks"]:
+            chunk["metadata"].update({"_sample": "hidden by FastAPI", "ordinary": "kept",
+                                      "nested_encoder_keys": [{"_sa_hidden": 1, "visible": {"_safe": 2, "ok": 3}}]})
     ingest(client, "main", [document])
     body = {"query": {"text": "planet"}, **options}
     direct = client.post("/collections/main/search", headers=ROOT, json=body)
     # Returning the dict restores FastAPI's ordinary jsonable_encoder + JSONResponse
     # path while retaining exactly the same retrieval implementation and fixture.
     with monkeypatch.context() as reference:
-        reference.setattr(app_module, "JSONResponse", lambda *, content: content)
+        reference.setattr(app_module, "_search_response", lambda hits: {"hits": hits})
         baseline = client.post("/collections/main/search", headers=ROOT, json=body)
     assert direct.status_code == baseline.status_code == 200
     assert direct.content == baseline.content
     assert direct.headers["content-type"] == baseline.headers["content-type"] == "application/json"
     assert direct.headers["content-length"] == baseline.headers["content-length"]
+
+
+@pytest.mark.parametrize("value", [
+    b"caf\xc3\xa9", datetime(2026, 11, 4, 10, 30), Path("logical/path"),
+    ({"_sa_hidden": 1, "visible": 2},), {1: "numeric key", None: "null key"}, np.float64(1.25),
+])
+def test_search_response_preserves_other_fastapi_conversions(client, monkeypatch, value):
+    from raggio.store import Collection
+
+    client.post("/collections", headers=ROOT, json={"name": "main", "dim": DIM}).raise_for_status()
+
+    async def results(self, *args, **kwargs):
+        return [{"id": "c", "doc_id": "d", "type": "chunk", "position": 0, "text": "text",
+                 "score": 0.5, "metadata": {"value": value}}]
+
+    monkeypatch.setattr(Collection, "search", results)
+    body = {"query": {"text": "planet"}, "mode": "text"}
+    direct = client.post("/collections/main/search", headers=ROOT, json=body)
+    with monkeypatch.context() as reference:
+        reference.setattr(app_module, "_search_response", lambda hits: {"hits": hits})
+        baseline = client.post("/collections/main/search", headers=ROOT, json=body)
+    assert direct.status_code == baseline.status_code == 200
+    assert direct.content == baseline.content
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
@@ -121,9 +152,21 @@ def test_search_response_keeps_nonfinite_metadata_error(client, monkeypatch, val
     with pytest.raises(ValueError, match="Out of range float values"):
         client.post("/collections/main/search", headers=ROOT, json=body)
     with monkeypatch.context() as reference:
-        reference.setattr(app_module, "JSONResponse", lambda *, content: content)
+        reference.setattr(app_module, "_search_response", lambda hits: {"hits": hits})
         with pytest.raises(ValueError, match="Out of range float values"):
             client.post("/collections/main/search", headers=ROOT, json=body)
+
+
+def test_search_response_deep_or_cyclic_values_use_the_encoder():
+    deep = {"value": 0}
+    for _ in range(70):
+        deep = {"nested": [deep]}
+    hits = [{"metadata": deep}]
+    assert app_module._search_response(hits)["hits"] is hits
+    cyclic = []
+    cyclic.append(cyclic)
+    hits = [{"metadata": {"value": cyclic}}]
+    assert app_module._search_response(hits)["hits"] is hits
 
 
 def ingest(client, coll, docs):
