@@ -2172,6 +2172,23 @@ class Collection:
         floor = RESCORE_FLOOR.get(self.cfg.bit_width, RESCORE_FLOOR[4])
         return max(1, min(max(floor, RESCORE_MULT * n), RESCORE_CAP, len(self.index)))
 
+    def _fp16_vecs(self, ids: list[int]) -> tuple[list[int], np.ndarray]:
+        """The retained fp16 originals of `ids` as unit-norm float32 rows, for the ids
+        that have a valid blob (rows ingested before vector retention have none):
+        (those ids, one matrix row each)."""
+        dim = self.cfg.dim
+        with self._reading() as db:
+            blobs = {
+                rid: blob
+                for rid, blob in _rows_by_id(db, "SELECT id, vec FROM vecs WHERE id IN ({})", ids)
+                if blob is not None and len(blob) == dim * 2
+            }
+        mat = np.frombuffer(b"".join(blobs.values()), dtype=np.float16)
+        mat = mat.reshape(len(blobs), dim).astype(np.float32)
+        # fp16 round-trip drifts norms ~1e-3: renormalize for exact cosine
+        mat /= np.maximum(np.linalg.norm(mat, axis=1, keepdims=True), 1e-12)
+        return list(blobs), mat
+
     def _rescore_rows(
         self, queries: np.ndarray, rows: list[tuple[list[int], list[float], int]]
     ) -> list[tuple[list[int], list[float]]]:
@@ -2180,24 +2197,12 @@ class Collection:
         union blob fetch + decode serves the whole batch, so the batched scan path
         pays a single round of point lookups. Ids without a valid blob (rows ingested
         before vector retention) keep their quantized score — merged, never dropped."""
-        dim = self.cfg.dim
-        union = list({rid for ids, _, _ in rows for rid in ids})
-        with self._reading() as db:
-            blobs = {
-                rid: blob
-                for rid, blob in _rows_by_id(db, "SELECT id, vec FROM vecs WHERE id IN ({})", union)
-                if blob is not None and len(blob) == dim * 2
-            }
-        if blobs:
-            mat = np.frombuffer(b"".join(blobs.values()), dtype=np.float16)
-            mat = mat.reshape(len(blobs), dim).astype(np.float32)
-            # fp16 round-trip drifts norms ~1e-3: renormalize for exact cosine
-            mat /= np.maximum(np.linalg.norm(mat, axis=1, keepdims=True), 1e-12)
-            rowof = {rid: j for j, rid in enumerate(blobs)}
+        found, mat = self._fp16_vecs(list({rid for ids, _, _ in rows for rid in ids}))
+        rowof = {rid: j for j, rid in enumerate(found)}
         out = []
         for qi, (ids, scores, n) in enumerate(rows):
             merged = list(scores)
-            have = [k for k, rid in enumerate(ids) if rid in blobs]
+            have = [k for k, rid in enumerate(ids) if rid in rowof]
             if have:
                 exact = mat[[rowof[ids[k]] for k in have]] @ queries[qi]
                 for j, k in enumerate(have):
@@ -2223,6 +2228,24 @@ class Collection:
                     r_scores.append(float(s))
             rows.append((r_ids, r_scores, n))
         return self._rescore_rows(queries, rows)
+
+    def _search_allowed(
+        self, qvec: np.ndarray, n: int, allow: np.ndarray, **kw
+    ) -> tuple[list[int], list[float]]:
+        """Top-n of one query over an allowlist (filters, sibling expansion). An
+        allowlist no larger than the rescore depth skips the index (ADR 0007): the
+        masked search would return all of it and the rescore fetch every blob anyway,
+        so scoring the fp16 originals directly gives the same ids, scores and
+        (-score, id) order without the index call. Past that depth a masked search's
+        bounded fetch is cheaper (each blob costs ~20 us at 3072-d). Blocking; call
+        from a thread."""
+        if len(allow) <= self._rescore_k(n):
+            ids, mat = self._fp16_vecs(allow.tolist())
+            if len(ids) == len(allow):  # else rows without a blob: only the index scores them
+                scores = mat @ qvec[0]
+                top = np.lexsort((ids, -scores))[:n]
+                return [ids[j] for j in top], [float(scores[j]) for j in top]
+        return self._search_rescored(qvec, [n], allowlist=allow, **kw)[0]
 
     async def _vector_ids(
         self, qvec: np.ndarray, n: int, scope: str, filt: dict | None,
@@ -2259,7 +2282,7 @@ class Collection:
             if len(allow) == 0:
                 return [], []
             kw = {"nprobe": nprobe} if isinstance(self.index, _IvfIndex) else {}
-            return self._search_rescored(qvec, [n], allowlist=allow, **kw)[0]
+            return self._search_allowed(qvec, n, allow, **kw)
 
         return await asyncio.to_thread(run)
 
@@ -2532,10 +2555,10 @@ class Collection:
                 ]
             if sib:
                 allow = np.array(sib, dtype=np.uint64)
-                rescored = await asyncio.to_thread(
-                    self._search_rescored, qvec, [expand.siblings_topk], allowlist=allow
+                ids, scores = await asyncio.to_thread(
+                    self._search_allowed, qvec, expand.siblings_topk, allow
                 )
-                ext["siblings"] = self._hydrate(*rescored[0])
+                ext["siblings"] = self._hydrate(ids, scores)
             else:
                 ext["siblings"] = []
         elif expand.siblings_all:

@@ -4,6 +4,7 @@ import asyncio
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -453,3 +454,83 @@ def test_relative_fusion_normalises_each_leg():
     # a leg of equal scores (one candidate included) normalises to 1.0, as Weaviate does
     assert store._relative(10, 0.5, ([7], [0.3]), ([8, 9], [4.0, 4.0])) == ([7, 8, 9], [0.5, 0.5, 0.5])
     assert store._relative(10, 0.5, ([], []), ([], [])) == ([], [])
+
+
+class _CountingIndex:
+    """The real index, counting the search calls that reach it."""
+
+    def __init__(self, inner):
+        self.inner, self.calls = inner, 0
+
+    def __len__(self):
+        return len(self.inner)
+
+    def search(self, *a, **kw):
+        self.calls += 1
+        return self.inner.search(*a, **kw)
+
+
+def _ingest_docs(col, docs, per_doc):
+    asyncio.run(col._process_job({"documents": [
+        {"doc_id": f"d{d}", "chunks": [{"id": f"d{d}#{i}", "text": f"chunk {i}", "vector": vec(100 * d + i)}
+                                      for i in range(per_doc)]}
+        for d in range(docs)
+    ]}))
+
+
+def _unit(seed):
+    q = np.array([vec(seed)], dtype=np.float32)
+    return q / np.linalg.norm(q)
+
+
+def test_small_allowlist_scores_like_the_masked_scan(tmp_path):
+    col = make_collection(tmp_path)
+    _ingest_docs(col, 3, 20)
+    col.index = _CountingIndex(col.index)
+    for d in range(3):
+        allow = np.array([r[0] for r in col.db.execute(
+            "SELECT id FROM records WHERE doc_id=?", (f"d{d}",))], dtype=np.uint64)
+        for seed, n in ((7, 1), (8, 5), (9, 30)):
+            q = _unit(seed)
+            masked = col._search_rescored(q, [n], allowlist=allow)[0]
+            calls = col.index.calls
+            ids, scores = col._search_allowed(q, n, allow)
+            assert col.index.calls == calls  # exact path: the index is never asked
+            assert ids == masked[0] and scores == pytest.approx(masked[1], rel=1e-6)
+    # the same path serves filtered search and sibling expansion
+    col.index.calls = 0
+    expand = SimpleNamespace(siblings_topk=3, siblings_all=False, summary=False)
+    hits = asyncio.run(col.search("vector", _unit(7), None, 5, "chunks", {"doc_id": "d1"}, expand))
+    assert len(hits) == 5 and {h["doc_id"] for h in hits} == {"d1"}
+    assert all(len(h["expansion"]["siblings"]) == 3 for h in hits) and col.index.calls == 0
+
+
+def test_exact_path_stops_at_the_rescore_depth(tmp_path):
+    col = make_collection(tmp_path)
+    _ingest_docs(col, 1, 60)
+    col.index = _CountingIndex(col.index)
+    q, depth = _unit(3), col._rescore_k(5)
+    assert depth == 50  # RESCORE_FLOOR at 4-bit
+    ids = np.arange(1, 61, dtype=np.uint64)
+    exact = col._search_allowed(q, 5, ids[:depth])
+    assert col.index.calls == 0 and len(exact[0]) == 5
+    masked = col._search_allowed(q, 5, ids[: depth + 1])
+    assert col.index.calls == 1 and len(masked[0]) == 5
+
+
+def test_exact_path_edge_cases(tmp_path):
+    col = make_collection(tmp_path)
+    _ingest_docs(col, 1, 5)
+    col.index = _CountingIndex(col.index)
+    q = _unit(4)
+    # empty allowlist: no hits, where the index would raise
+    assert col._search_allowed(q, 5, np.array([], dtype=np.uint64)) == ([], [])
+    # a row without a blob (ingested before vector retention): the index scores the lot
+    col.db.execute("DELETE FROM vecs WHERE id=2")
+    col.db.commit()
+    ids, scores = col._search_allowed(q, 5, np.arange(1, 6, dtype=np.uint64))
+    assert col.index.calls == 1 and sorted(ids) == [1, 2, 3, 4, 5]
+    # a closed collection fails closed, as the masked path does
+    asyncio.run(col.stop())
+    with pytest.raises(RuntimeError, match="closed"):
+        col._search_allowed(q, 5, np.arange(1, 6, dtype=np.uint64))
