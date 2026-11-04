@@ -10,9 +10,10 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from fastapi.routing import APIRoute
+from pydantic import BaseModel, Field, ValidationError
 
 from .config import Settings
 from .store import (
@@ -99,6 +100,38 @@ class IndexIn(BaseModel):
 class PatchIn(BaseModel):
     metadata: dict[str, Any]  # RFC 7396 merge patch: null removes a key
     apply_to_chunks: bool = True
+
+
+class _IngestJSONRequest(Request):
+    """Validate normal ingest JSON in Pydantic's native parser, in one pass."""
+
+    def __init__(self, request: Request) -> None:
+        super().__init__(request.scope, request.receive)
+        self._original = request
+
+    async def body(self) -> bytes:
+        # Reuse a body already read by middleware, rather than consuming it twice.
+        return await self._original.body()
+
+    async def json(self) -> Any:
+        if not hasattr(self, "_json"):
+            try:
+                self._json = IngestIn.model_validate_json(await self.body())
+            except ValidationError:
+                # Keep stdlib encodings/surrogates and FastAPI's error details and
+                # dependency ordering for malformed JSON or invalid models.
+                self._json = await self._original.json()
+        return self._json
+
+
+class _IngestJSONRoute(APIRoute):
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def handle(request: Request):
+            return await handler(_IngestJSONRequest(request))
+
+        return handle
 
 
 def create_app(settings: Settings | None = None, embedder_factory=None) -> FastAPI:
@@ -261,7 +294,9 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
         if r.vector is not None and len(r.vector) != dim:
             raise HTTPException(400, f"{label}: vector has dim {len(r.vector)}, collection expects {dim}")
 
-    @app.post("/collections/{name}/documents", status_code=202)
+    ingest_router = APIRouter(route_class=_IngestJSONRoute)
+
+    @ingest_router.post("/collections/{name}/documents", status_code=202)
     async def ingest(body: IngestIn, c=Depends(get_collection)):
         for d in body.documents:
             if d.summary:
@@ -270,6 +305,8 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
                 _check_record(ch, c.cfg.dim, f"chunk '{ch.id}'")
         job_id = await c.enqueue(body.model_dump())
         return {"job_id": job_id}
+
+    app.include_router(ingest_router)
 
     @app.get("/collections/{name}/documents/{doc_id}")
     async def get_document(doc_id: str, c=Depends(get_collection)):
