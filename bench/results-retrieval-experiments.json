@@ -1,0 +1,814 @@
+{
+  "environment": {
+    "python": "3.12.15 (main, Oct  1 2026, 20:59:04) [Clang 22.1.3 ]",
+    "platform": "Linux-6.18.54.1-microsoft-standard-WSL2-x86_64-with-glibc2.41",
+    "sqlite": "3.53.1",
+    "versions": {
+      "fastapi": "0.142.2",
+      "pydantic": "2.13.5",
+      "numpy": "2.5.3",
+      "turbovec": "1.0.0"
+    }
+  },
+  "cpu_quota": 3,
+  "memory_limit_gib": 4,
+  "openblas_num_threads": 1,
+  "fts_rank": [
+    {
+      "match": "\"topic7\"",
+      "where": "indexed=1 AND type='chunk'",
+      "same": true,
+      "hits": 50,
+      "arms": {
+        "bm25": {
+          "wall_ms": 0.17956599913304672,
+          "cpu_ms": 0.18008899999988337,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 0:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            [
+              31,
+              0,
+              0,
+              "USE TEMP B-TREE FOR ORDER BY"
+            ]
+          ]
+        },
+        "rank": {
+          "wall_ms": 0.18355599968344904,
+          "cpu_ms": 0.18385149999988748,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 32:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "match": "\"topic7\"",
+      "where": "indexed=1 AND json_extract(metadata,?)=?",
+      "same": true,
+      "hits": 50,
+      "arms": {
+        "bm25": {
+          "wall_ms": 0.23620350111741573,
+          "cpu_ms": 0.23668749999994354,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 0:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            [
+              32,
+              0,
+              0,
+              "USE TEMP B-TREE FOR ORDER BY"
+            ]
+          ]
+        },
+        "rank": {
+          "wall_ms": 0.29398399965430144,
+          "cpu_ms": 0.2961029999999365,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 32:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "match": "\"topic7\"",
+      "where": "indexed=1 AND doc_id=? AND type='chunk'",
+      "same": true,
+      "hits": 1,
+      "arms": {
+        "bm25": {
+          "wall_ms": 0.09374100045533851,
+          "cpu_ms": 0.09402799999991274,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 0:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            [
+              33,
+              0,
+              0,
+              "USE TEMP B-TREE FOR ORDER BY"
+            ]
+          ]
+        },
+        "rank": {
+          "wall_ms": 0.19052599964197725,
+          "cpu_ms": 0.19105749999992483,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 32:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "match": "\"common\"",
+      "where": "indexed=1 AND type='chunk'",
+      "same": true,
+      "hits": 50,
+      "arms": {
+        "bm25": {
+          "wall_ms": 59.25483700229961,
+          "cpu_ms": 59.25057100000019,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 0:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            [
+              31,
+              0,
+              0,
+              "USE TEMP B-TREE FOR ORDER BY"
+            ]
+          ]
+        },
+        "rank": {
+          "wall_ms": 81.11130749966833,
+          "cpu_ms": 80.93627650000013,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 32:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "match": "\"common\"",
+      "where": "indexed=1 AND json_extract(metadata,?)=?",
+      "same": true,
+      "hits": 50,
+      "arms": {
+        "bm25": {
+          "wall_ms": 45.15540950160357,
+          "cpu_ms": 45.16095949999999,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 0:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            [
+              32,
+              0,
+              0,
+              "USE TEMP B-TREE FOR ORDER BY"
+            ]
+          ]
+        },
+        "rank": {
+          "wall_ms": 67.48078050077311,
+          "cpu_ms": 67.4861800000004,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 32:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "match": "\"common\"",
+      "where": "indexed=1 AND doc_id=? AND type='chunk'",
+      "same": true,
+      "hits": 16,
+      "arms": {
+        "bm25": {
+          "wall_ms": 14.312267001514556,
+          "cpu_ms": 14.316468500000123,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 0:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            [
+              33,
+              0,
+              0,
+              "USE TEMP B-TREE FOR ORDER BY"
+            ]
+          ]
+        },
+        "rank": {
+          "wall_ms": 127.76032549845695,
+          "cpu_ms": 127.6657404999999,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 32:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "match": "\"topic7\" OR \"common\"",
+      "where": "indexed=1 AND type='chunk'",
+      "same": true,
+      "hits": 50,
+      "arms": {
+        "bm25": {
+          "wall_ms": 50.432945501597715,
+          "cpu_ms": 50.43854999999997,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 0:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            [
+              31,
+              0,
+              0,
+              "USE TEMP B-TREE FOR ORDER BY"
+            ]
+          ]
+        },
+        "rank": {
+          "wall_ms": 74.61385699934908,
+          "cpu_ms": 74.61937600000024,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 32:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "match": "\"topic7\" OR \"common\"",
+      "where": "indexed=1 AND json_extract(metadata,?)=?",
+      "same": true,
+      "hits": 50,
+      "arms": {
+        "bm25": {
+          "wall_ms": 45.81667549791746,
+          "cpu_ms": 44.960918000000575,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 0:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            [
+              32,
+              0,
+              0,
+              "USE TEMP B-TREE FOR ORDER BY"
+            ]
+          ]
+        },
+        "rank": {
+          "wall_ms": 71.39770350113395,
+          "cpu_ms": 71.3909665000001,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 32:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "match": "\"topic7\" OR \"common\"",
+      "where": "indexed=1 AND doc_id=? AND type='chunk'",
+      "same": true,
+      "hits": 16,
+      "arms": {
+        "bm25": {
+          "wall_ms": 16.35997850098647,
+          "cpu_ms": 16.366751999999707,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 0:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            [
+              33,
+              0,
+              0,
+              "USE TEMP B-TREE FOR ORDER BY"
+            ]
+          ]
+        },
+        "rank": {
+          "wall_ms": 194.67864599937457,
+          "cpu_ms": 194.62155349999932,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 32:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "match": "\"retrieval\" OR \"scientific\"",
+      "where": "indexed=1 AND type='chunk'",
+      "same": true,
+      "hits": 50,
+      "arms": {
+        "bm25": {
+          "wall_ms": 73.08486599868047,
+          "cpu_ms": 73.09222599999998,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 0:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            [
+              31,
+              0,
+              0,
+              "USE TEMP B-TREE FOR ORDER BY"
+            ]
+          ]
+        },
+        "rank": {
+          "wall_ms": 97.14656849973835,
+          "cpu_ms": 97.15229250000057,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 32:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "match": "\"retrieval\" OR \"scientific\"",
+      "where": "indexed=1 AND json_extract(metadata,?)=?",
+      "same": true,
+      "hits": 50,
+      "arms": {
+        "bm25": {
+          "wall_ms": 49.75364249912673,
+          "cpu_ms": 49.75904700000022,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 0:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            [
+              32,
+              0,
+              0,
+              "USE TEMP B-TREE FOR ORDER BY"
+            ]
+          ]
+        },
+        "rank": {
+          "wall_ms": 80.19334849814186,
+          "cpu_ms": 80.19113349999962,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 32:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "match": "\"retrieval\" OR \"scientific\"",
+      "where": "indexed=1 AND doc_id=? AND type='chunk'",
+      "same": true,
+      "hits": 16,
+      "arms": {
+        "bm25": {
+          "wall_ms": 20.50591350052855,
+          "cpu_ms": 20.512790999999808,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 0:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ],
+            [
+              33,
+              0,
+              0,
+              "USE TEMP B-TREE FOR ORDER BY"
+            ]
+          ]
+        },
+        "rank": {
+          "wall_ms": 178.4952344987687,
+          "cpu_ms": 178.5015304999993,
+          "plan": [
+            [
+              5,
+              0,
+              156,
+              "SCAN records_fts VIRTUAL TABLE INDEX 32:M1"
+            ],
+            [
+              10,
+              0,
+              45,
+              "SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"
+            ]
+          ]
+        }
+      }
+    }
+  ],
+  "ivf_threads": {
+    "rows": 65536,
+    "dim": 1024,
+    "nlist": 16,
+    "nprobe": 8,
+    "cpu_max": "300000 100000",
+    "host_cpus": 4,
+    "results": [
+      {
+        "nq": 1,
+        "arms": {
+          "1": {
+            "wall_ms_per_query": 4.361784800130408,
+            "cpu_ms_per_query": 4.361291900000008
+          },
+          "3": {
+            "wall_ms_per_query": 2.2968260000197915,
+            "cpu_ms_per_query": 5.687697099999989
+          },
+          "12": {
+            "wall_ms_per_query": 1.8608717000461183,
+            "cpu_ms_per_query": 5.240485699999997
+          }
+        },
+        "samples": {
+          "1": [
+            {
+              "wall_ms_per_query": 4.232820799734327,
+              "cpu_ms_per_query": 4.2336524999999625
+            },
+            {
+              "wall_ms_per_query": 4.361784800130408,
+              "cpu_ms_per_query": 4.361291900000008
+            },
+            {
+              "wall_ms_per_query": 4.883900599816116,
+              "cpu_ms_per_query": 4.884906000000022
+            }
+          ],
+          "3": [
+            {
+              "wall_ms_per_query": 2.4256436998257414,
+              "cpu_ms_per_query": 5.8264400000000105
+            },
+            {
+              "wall_ms_per_query": 2.027700399776222,
+              "cpu_ms_per_query": 5.033364099999993
+            },
+            {
+              "wall_ms_per_query": 2.2968260000197915,
+              "cpu_ms_per_query": 5.687697099999989
+            }
+          ],
+          "12": [
+            {
+              "wall_ms_per_query": 1.8608717000461183,
+              "cpu_ms_per_query": 5.3092812000000045
+            },
+            {
+              "wall_ms_per_query": 1.7527799001982203,
+              "cpu_ms_per_query": 5.148330400000001
+            },
+            {
+              "wall_ms_per_query": 1.9943575000070268,
+              "cpu_ms_per_query": 5.240485699999997
+            }
+          ]
+        },
+        "same_ids_and_score_bits": true
+      },
+      {
+        "nq": 8,
+        "arms": {
+          "1": {
+            "wall_ms_per_query": 4.406858512493272,
+            "cpu_ms_per_query": 4.405609612499995
+          },
+          "3": {
+            "wall_ms_per_query": 1.9355462375187926,
+            "cpu_ms_per_query": 5.184361974999996
+          },
+          "12": {
+            "wall_ms_per_query": 1.7341136375307542,
+            "cpu_ms_per_query": 5.453222324999996
+          }
+        },
+        "samples": {
+          "1": [
+            {
+              "wall_ms_per_query": 4.406858512493272,
+              "cpu_ms_per_query": 4.405609612499995
+            },
+            {
+              "wall_ms_per_query": 5.083296337488719,
+              "cpu_ms_per_query": 5.08312675
+            },
+            {
+              "wall_ms_per_query": 4.353825487487484,
+              "cpu_ms_per_query": 4.315809212499999
+            }
+          ],
+          "3": [
+            {
+              "wall_ms_per_query": 1.836940075008897,
+              "cpu_ms_per_query": 5.152163575000001
+            },
+            {
+              "wall_ms_per_query": 2.0939125000040804,
+              "cpu_ms_per_query": 5.671575125000006
+            },
+            {
+              "wall_ms_per_query": 1.9355462375187926,
+              "cpu_ms_per_query": 5.184361974999996
+            }
+          ],
+          "12": [
+            {
+              "wall_ms_per_query": 1.7341136375307542,
+              "cpu_ms_per_query": 5.453222324999996
+            },
+            {
+              "wall_ms_per_query": 1.8379024874775496,
+              "cpu_ms_per_query": 5.610692762500003
+            },
+            {
+              "wall_ms_per_query": 1.4544373124863341,
+              "cpu_ms_per_query": 4.730529324999999
+            }
+          ]
+        },
+        "same_ids_and_score_bits": true
+      },
+      {
+        "nq": 16,
+        "arms": {
+          "1": {
+            "wall_ms_per_query": 5.143708662512836,
+            "cpu_ms_per_query": 5.143367075000005
+          },
+          "3": {
+            "wall_ms_per_query": 2.235596749983415,
+            "cpu_ms_per_query": 6.233042768749997
+          },
+          "12": {
+            "wall_ms_per_query": 2.0250183999905857,
+            "cpu_ms_per_query": 6.103167981249991
+          }
+        },
+        "samples": {
+          "1": [
+            {
+              "wall_ms_per_query": 5.004204962506265,
+              "cpu_ms_per_query": 4.953558593749996
+            },
+            {
+              "wall_ms_per_query": 6.023626806245375,
+              "cpu_ms_per_query": 6.02236788124999
+            },
+            {
+              "wall_ms_per_query": 5.143708662512836,
+              "cpu_ms_per_query": 5.143367075000005
+            }
+          ],
+          "3": [
+            {
+              "wall_ms_per_query": 2.2014170312559145,
+              "cpu_ms_per_query": 6.233042768749997
+            },
+            {
+              "wall_ms_per_query": 2.235596749983415,
+              "cpu_ms_per_query": 6.158438718750004
+            },
+            {
+              "wall_ms_per_query": 2.2906298749830967,
+              "cpu_ms_per_query": 6.39872681875
+            }
+          ],
+          "12": [
+            {
+              "wall_ms_per_query": 1.7802331499979118,
+              "cpu_ms_per_query": 5.542730768750004
+            },
+            {
+              "wall_ms_per_query": 2.0250183999905857,
+              "cpu_ms_per_query": 6.189068625000005
+            },
+            {
+              "wall_ms_per_query": 2.048176606240304,
+              "cpu_ms_per_query": 6.103167981249991
+            }
+          ]
+        },
+        "same_ids_and_score_bits": true
+      }
+    ]
+  }
+}

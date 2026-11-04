@@ -426,7 +426,8 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
             raise HTTPException(400, str(e))
         except CollectionDeletedError:  # DELETE /collections/{name} landed first
             raise HTTPException(404, f"collection '{c.cfg.name}' not found")
-        return {"hits": hits}
+        # Hydrated hits already contain JSON values; avoid FastAPI's recursive copy.
+        return JSONResponse(content={"hits": hits})
 
     @app.get("/healthz")
     async def healthz():

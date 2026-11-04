@@ -220,6 +220,10 @@ Setup and full table: [docs/benchmark.md](docs/benchmark.md).
 
 ## Develop
 
+Architecture and performance changes are recorded in the
+[ADR index and optimization history](docs/adr/index.md), including accepted and
+rejected experiments. Current optimization work focuses on search and retrieval.
+
 Ingest admission uses Pydantic's native JSON parser with a compatibility fallback.
 The local paired benchmark measured 30% lower admission p50 for 250-vector requests;
 protocol, scope and reproduction: [ADR 0008](docs/adr/0008-native-ingest-json.md).

@@ -1,0 +1,786 @@
+{
+  "python": "3.12.15 (main, Oct  1 2026, 20:59:04) [Clang 22.1.3 ]",
+  "platform": "Linux-6.18.54.1-microsoft-standard-WSL2-x86_64-with-glibc2.41",
+  "sqlite": "3.53.1",
+  "versions": {
+    "fastapi": "0.142.2",
+    "pydantic": "2.13.5",
+    "numpy": "2.5.3",
+    "turbovec": "1.0.0"
+  },
+  "chunk_rows": 20000,
+  "summary_rows": 1000,
+  "dim": 1024,
+  "pairs": 5,
+  "iterations": 20,
+  "seed_data": 719,
+  "seed_queries": 743,
+  "concurrent_requests_per_arm_per_pair": 100,
+  "concurrent_warmup_requests_per_arm": 20,
+  "transport": "in-process ASGI TestClient",
+  "same_response_bytes": true,
+  "medians": {
+    "vector-k10": {
+      "default": {
+        "search_p50_ms": 5.323354997017304,
+        "search_p95_ms": 7.558063549549844,
+        "cpu_per_search_ms": 5.333630249999977
+      },
+      "direct": {
+        "search_p50_ms": 5.02707249870582,
+        "search_p95_ms": 5.699916201956513,
+        "cpu_per_search_ms": 5.05163915000002
+      }
+    },
+    "text-k10": {
+      "default": {
+        "search_p50_ms": 4.075443999681738,
+        "search_p95_ms": 5.331852348535904,
+        "cpu_per_search_ms": 4.216904150000111
+      },
+      "direct": {
+        "search_p50_ms": 3.9199524999276036,
+        "search_p95_ms": 5.042229200080328,
+        "cpu_per_search_ms": 4.056711599999918
+      }
+    },
+    "hybrid-k10": {
+      "default": {
+        "search_p50_ms": 6.97546199990029,
+        "search_p95_ms": 8.969134350991228,
+        "cpu_per_search_ms": 10.000486899999794
+      },
+      "direct": {
+        "search_p50_ms": 7.070251498589641,
+        "search_p95_ms": 8.654684601970075,
+        "cpu_per_search_ms": 9.816823949999964
+      }
+    },
+    "vector-k100": {
+      "default": {
+        "search_p50_ms": 8.46189050207613,
+        "search_p95_ms": 10.30485984920233,
+        "cpu_per_search_ms": 8.837227400000014
+      },
+      "direct": {
+        "search_p50_ms": 7.164533000832307,
+        "search_p95_ms": 8.181023147881207,
+        "cpu_per_search_ms": 7.254227099999699
+      }
+    },
+    "vector-k1000": {
+      "default": {
+        "search_p50_ms": 48.137217499970575,
+        "search_p95_ms": 65.32702809854528,
+        "cpu_per_search_ms": 50.90398544999965
+      },
+      "direct": {
+        "search_p50_ms": 33.8111500004743,
+        "search_p95_ms": 40.78786675181619,
+        "cpu_per_search_ms": 35.10228160000004
+      }
+    },
+    "vector-expanded": {
+      "default": {
+        "search_p50_ms": 8.592532001785003,
+        "search_p95_ms": 9.68106299842475,
+        "cpu_per_search_ms": 8.935808000000023
+      },
+      "direct": {
+        "search_p50_ms": 8.086376499704784,
+        "search_p95_ms": 8.926153001448256,
+        "cpu_per_search_ms": 8.320930600000409
+      }
+    },
+    "text-expanded": {
+      "default": {
+        "search_p50_ms": 6.252125001992681,
+        "search_p95_ms": 7.762205196922878,
+        "cpu_per_search_ms": 6.414788850000086
+      },
+      "direct": {
+        "search_p50_ms": 5.953596499239211,
+        "search_p95_ms": 6.761291749535303,
+        "cpu_per_search_ms": 6.208309749999863
+      }
+    },
+    "vector-doc-filter": {
+      "default": {
+        "search_p50_ms": 1.6081039993878221,
+        "search_p95_ms": 2.040576903164038,
+        "cpu_per_search_ms": 1.673138649999828
+      },
+      "direct": {
+        "search_p50_ms": 1.4544774985552067,
+        "search_p95_ms": 1.6943684480793308,
+        "cpu_per_search_ms": 1.5381155000001812
+      }
+    },
+    "vector-concurrency8": {
+      "default": {
+        "qps": 215.98143435552393,
+        "cpu_per_search_ms": 8.087106099999986
+      },
+      "direct": {
+        "qps": 233.71815448281868,
+        "cpu_per_search_ms": 7.694351290000014
+      }
+    }
+  },
+  "runs": {
+    "vector-k10": [
+      {
+        "default": {
+          "search_p50_ms": 4.338796499723685,
+          "search_p95_ms": 9.008407400142461,
+          "cpu_per_search_ms": 4.517234849999996
+        },
+        "direct": {
+          "search_p50_ms": 4.254541499904008,
+          "search_p95_ms": 5.180491998544313,
+          "cpu_per_search_ms": 4.464925650000029
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 4.798640498847817,
+          "search_p95_ms": 5.8448969497476355,
+          "cpu_per_search_ms": 4.893770100000028
+        },
+        "direct": {
+          "search_p50_ms": 4.755393498271587,
+          "search_p95_ms": 5.699916201956513,
+          "cpu_per_search_ms": 4.972129800000014
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 5.323354997017304,
+          "search_p95_ms": 5.8780544517503595,
+          "cpu_per_search_ms": 5.333630249999977
+        },
+        "direct": {
+          "search_p50_ms": 5.02707249870582,
+          "search_p95_ms": 5.682393049755774,
+          "cpu_per_search_ms": 5.05163915000002
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 5.920242001593579,
+          "search_p95_ms": 7.558063549549844,
+          "cpu_per_search_ms": 6.120504100000002
+        },
+        "direct": {
+          "search_p50_ms": 5.334756498996285,
+          "search_p95_ms": 6.360853799014876,
+          "cpu_per_search_ms": 5.4768141999999465
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 6.072765498174704,
+          "search_p95_ms": 8.20804655122629,
+          "cpu_per_search_ms": 6.310661400000095
+        },
+        "direct": {
+          "search_p50_ms": 5.757122500654077,
+          "search_p95_ms": 6.8952964480558885,
+          "cpu_per_search_ms": 6.030768950000143
+        }
+      }
+    ],
+    "text-k10": [
+      {
+        "default": {
+          "search_p50_ms": 4.469131999940146,
+          "search_p95_ms": 5.641646148797008,
+          "cpu_per_search_ms": 4.407442049999943
+        },
+        "direct": {
+          "search_p50_ms": 3.9199524999276036,
+          "search_p95_ms": 5.042229200080328,
+          "cpu_per_search_ms": 4.056711599999918
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 3.933060501367436,
+          "search_p95_ms": 4.8490633507753955,
+          "cpu_per_search_ms": 4.1073710500001415
+        },
+        "direct": {
+          "search_p50_ms": 3.683593498863047,
+          "search_p95_ms": 4.568809101510851,
+          "cpu_per_search_ms": 3.7712636999999827
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 4.105583499040222,
+          "search_p95_ms": 5.098123748211948,
+          "cpu_per_search_ms": 4.216904150000111
+        },
+        "direct": {
+          "search_p50_ms": 3.7295880010788096,
+          "search_p95_ms": 4.35415475130867,
+          "cpu_per_search_ms": 3.8381618000001616
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 4.075443999681738,
+          "search_p95_ms": 5.393567152532342,
+          "cpu_per_search_ms": 4.371300850000059
+        },
+        "direct": {
+          "search_p50_ms": 3.957586501201149,
+          "search_p95_ms": 5.7877992501744355,
+          "cpu_per_search_ms": 4.495954999999974
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 3.9216955010488164,
+          "search_p95_ms": 5.331852348535904,
+          "cpu_per_search_ms": 4.095452199999983
+        },
+        "direct": {
+          "search_p50_ms": 3.934642500098562,
+          "search_p95_ms": 5.2099459993769415,
+          "cpu_per_search_ms": 4.101126100000041
+        }
+      }
+    ],
+    "hybrid-k10": [
+      {
+        "default": {
+          "search_p50_ms": 6.97546199990029,
+          "search_p95_ms": 8.037159202103796,
+          "cpu_per_search_ms": 9.886284900000009
+        },
+        "direct": {
+          "search_p50_ms": 7.070251498589641,
+          "search_p95_ms": 8.725713602143514,
+          "cpu_per_search_ms": 9.816823949999964
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 7.8501725001842715,
+          "search_p95_ms": 13.568296498306154,
+          "cpu_per_search_ms": 12.409734649999793
+        },
+        "direct": {
+          "search_p50_ms": 7.88933699914196,
+          "search_p95_ms": 11.58429440074542,
+          "cpu_per_search_ms": 11.048859549999923
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 7.567786000436172,
+          "search_p95_ms": 8.746338200762693,
+          "cpu_per_search_ms": 10.584076849999802
+        },
+        "direct": {
+          "search_p50_ms": 7.396477500151377,
+          "search_p95_ms": 8.654684601970075,
+          "cpu_per_search_ms": 10.3442496
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 6.920883997736382,
+          "search_p95_ms": 9.875569251380513,
+          "cpu_per_search_ms": 10.000486899999794
+        },
+        "direct": {
+          "search_p50_ms": 6.709586003125878,
+          "search_p95_ms": 7.942907698270575,
+          "cpu_per_search_ms": 9.195563899999915
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 6.774708999728318,
+          "search_p95_ms": 8.969134350991228,
+          "cpu_per_search_ms": 9.412859250000016
+        },
+        "direct": {
+          "search_p50_ms": 6.845187999715563,
+          "search_p95_ms": 7.717531701200642,
+          "cpu_per_search_ms": 9.20204539999987
+        }
+      }
+    ],
+    "vector-k100": [
+      {
+        "default": {
+          "search_p50_ms": 9.091262498259312,
+          "search_p95_ms": 11.538110501169285,
+          "cpu_per_search_ms": 9.698680499999979
+        },
+        "direct": {
+          "search_p50_ms": 7.668430000194348,
+          "search_p95_ms": 9.580885602736089,
+          "cpu_per_search_ms": 7.743267850000057
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 9.196125998641946,
+          "search_p95_ms": 15.889229499953217,
+          "cpu_per_search_ms": 10.038078050000143
+        },
+        "direct": {
+          "search_p50_ms": 7.264223000674974,
+          "search_p95_ms": 8.661507851502392,
+          "cpu_per_search_ms": 7.558372400000035
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 8.46189050207613,
+          "search_p95_ms": 10.30485984920233,
+          "cpu_per_search_ms": 8.837227400000014
+        },
+        "direct": {
+          "search_p50_ms": 7.164533000832307,
+          "search_p95_ms": 7.901080851479492,
+          "cpu_per_search_ms": 7.254227099999699
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 8.12452400168695,
+          "search_p95_ms": 9.977226949013131,
+          "cpu_per_search_ms": 8.397520800000002
+        },
+        "direct": {
+          "search_p50_ms": 6.795184999646153,
+          "search_p95_ms": 8.181023147881207,
+          "cpu_per_search_ms": 7.143403499999579
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 7.881279998400714,
+          "search_p95_ms": 8.556330898136366,
+          "cpu_per_search_ms": 7.933934150000077
+        },
+        "direct": {
+          "search_p50_ms": 6.605044000025373,
+          "search_p95_ms": 7.824077497571125,
+          "cpu_per_search_ms": 6.767275550000118
+        }
+      }
+    ],
+    "vector-k1000": [
+      {
+        "default": {
+          "search_p50_ms": 47.176092497466016,
+          "search_p95_ms": 55.575233001764,
+          "cpu_per_search_ms": 48.986726200000064
+        },
+        "direct": {
+          "search_p50_ms": 34.78829449886689,
+          "search_p95_ms": 56.98061530092673,
+          "cpu_per_search_ms": 36.48802349999993
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 47.98588700032269,
+          "search_p95_ms": 68.59595309761062,
+          "cpu_per_search_ms": 50.90398544999965
+        },
+        "direct": {
+          "search_p50_ms": 33.575758499864605,
+          "search_p95_ms": 38.86646449973341,
+          "cpu_per_search_ms": 34.18486180000002
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 49.44067300129973,
+          "search_p95_ms": 63.10480395113701,
+          "cpu_per_search_ms": 51.928565749999755
+        },
+        "direct": {
+          "search_p50_ms": 34.8822604992165,
+          "search_p95_ms": 40.78786675181619,
+          "cpu_per_search_ms": 35.52963049999995
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 49.767848000556114,
+          "search_p95_ms": 71.58981789962128,
+          "cpu_per_search_ms": 53.12959264999986
+        },
+        "direct": {
+          "search_p50_ms": 33.73961600118491,
+          "search_p95_ms": 42.96057989868132,
+          "cpu_per_search_ms": 35.10228160000004
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 48.137217499970575,
+          "search_p95_ms": 65.32702809854528,
+          "cpu_per_search_ms": 50.71427160000024
+        },
+        "direct": {
+          "search_p50_ms": 33.8111500004743,
+          "search_p95_ms": 39.30484520133177,
+          "cpu_per_search_ms": 34.474901250000656
+        }
+      }
+    ],
+    "vector-expanded": [
+      {
+        "default": {
+          "search_p50_ms": 8.592532001785003,
+          "search_p95_ms": 8.832284148957115,
+          "cpu_per_search_ms": 8.706401750000126
+        },
+        "direct": {
+          "search_p50_ms": 8.073882998360205,
+          "search_p95_ms": 8.917660947918193,
+          "cpu_per_search_ms": 8.250653649999506
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 8.578364499044255,
+          "search_p95_ms": 9.527853149484145,
+          "cpu_per_search_ms": 8.895601249999885
+        },
+        "direct": {
+          "search_p50_ms": 7.98626100004185,
+          "search_p95_ms": 8.891810952081869,
+          "cpu_per_search_ms": 8.267399399999853
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 8.452097499684896,
+          "search_p95_ms": 10.309026898539742,
+          "cpu_per_search_ms": 8.935808000000023
+        },
+        "direct": {
+          "search_p50_ms": 8.120974998746533,
+          "search_p95_ms": 9.0289636502348,
+          "cpu_per_search_ms": 8.459167800000067
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 8.646487000078196,
+          "search_p95_ms": 10.416552350943675,
+          "cpu_per_search_ms": 9.005455499999826
+        },
+        "direct": {
+          "search_p50_ms": 8.097045500107924,
+          "search_p95_ms": 9.30301940152276,
+          "cpu_per_search_ms": 8.44158930000063
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 8.754728998610517,
+          "search_p95_ms": 9.68106299842475,
+          "cpu_per_search_ms": 8.97908294999965
+        },
+        "direct": {
+          "search_p50_ms": 8.086376499704784,
+          "search_p95_ms": 8.926153001448256,
+          "cpu_per_search_ms": 8.320930600000409
+        }
+      }
+    ],
+    "text-expanded": [
+      {
+        "default": {
+          "search_p50_ms": 6.256400001802831,
+          "search_p95_ms": 8.623323999381682,
+          "cpu_per_search_ms": 6.720365350000179
+        },
+        "direct": {
+          "search_p50_ms": 5.7511405011609895,
+          "search_p95_ms": 6.7004900018218905,
+          "cpu_per_search_ms": 5.971915350000145
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 6.252125001992681,
+          "search_p95_ms": 6.6165265496238135,
+          "cpu_per_search_ms": 6.282169049999986
+        },
+        "direct": {
+          "search_p50_ms": 5.953596499239211,
+          "search_p95_ms": 7.63552205044107,
+          "cpu_per_search_ms": 6.274652899999644
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 6.178410500069731,
+          "search_p95_ms": 7.817994648212334,
+          "cpu_per_search_ms": 6.786144999999699
+        },
+        "direct": {
+          "search_p50_ms": 6.043579502147622,
+          "search_p95_ms": 6.98612614924059,
+          "cpu_per_search_ms": 6.236152100000147
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 6.156597501103533,
+          "search_p95_ms": 7.762205196922878,
+          "cpu_per_search_ms": 6.414788850000086
+        },
+        "direct": {
+          "search_p50_ms": 5.711310997867258,
+          "search_p95_ms": 6.7517395982577,
+          "cpu_per_search_ms": 5.9495604000003866
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 6.275967001784011,
+          "search_p95_ms": 6.872242298777564,
+          "cpu_per_search_ms": 6.374204649999804
+        },
+        "direct": {
+          "search_p50_ms": 6.090810500609223,
+          "search_p95_ms": 6.761291749535303,
+          "cpu_per_search_ms": 6.208309749999863
+        }
+      }
+    ],
+    "vector-doc-filter": [
+      {
+        "default": {
+          "search_p50_ms": 1.6221240002778359,
+          "search_p95_ms": 1.7909442512973328,
+          "cpu_per_search_ms": 1.6877134499999613
+        },
+        "direct": {
+          "search_p50_ms": 1.4979045008658431,
+          "search_p95_ms": 1.6943684480793308,
+          "cpu_per_search_ms": 1.5381155000001812
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 1.6047959979914594,
+          "search_p95_ms": 2.040576903164038,
+          "cpu_per_search_ms": 1.673138649999828
+        },
+        "direct": {
+          "search_p50_ms": 1.43211400063592,
+          "search_p95_ms": 1.6101812007036642,
+          "cpu_per_search_ms": 1.4663821000002741
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 1.628333500775625,
+          "search_p95_ms": 2.1060819995909696,
+          "cpu_per_search_ms": 1.6560428499994728
+        },
+        "direct": {
+          "search_p50_ms": 1.4851289997750428,
+          "search_p95_ms": 1.7533536500195623,
+          "cpu_per_search_ms": 1.5865158000000434
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 1.6081039993878221,
+          "search_p95_ms": 1.6878607020771599,
+          "cpu_per_search_ms": 1.6007761499999162
+        },
+        "direct": {
+          "search_p50_ms": 1.4271929994720267,
+          "search_p95_ms": 1.6054137971877935,
+          "cpu_per_search_ms": 1.452999199999816
+        }
+      },
+      {
+        "default": {
+          "search_p50_ms": 1.568723999298527,
+          "search_p95_ms": 4.072963049839035,
+          "cpu_per_search_ms": 2.97851815000012
+        },
+        "direct": {
+          "search_p50_ms": 1.4544774985552067,
+          "search_p95_ms": 2.448746400841628,
+          "cpu_per_search_ms": 1.620340949999921
+        }
+      }
+    ],
+    "vector-concurrency8": [
+      {
+        "default": {
+          "qps": 238.6008788065081,
+          "cpu_per_search_ms": 7.1836020499999975
+        },
+        "direct": {
+          "qps": 233.71815448281868,
+          "cpu_per_search_ms": 7.694351290000014
+        }
+      },
+      {
+        "direct": {
+          "qps": 239.781571072505,
+          "cpu_per_search_ms": 7.522782470000031
+        },
+        "default": {
+          "qps": 201.17384212698178,
+          "cpu_per_search_ms": 8.814921069999997
+        }
+      },
+      {
+        "default": {
+          "qps": 226.75316105522435,
+          "cpu_per_search_ms": 8.024509590000015
+        },
+        "direct": {
+          "qps": 225.3775240872784,
+          "cpu_per_search_ms": 7.9241869799999884
+        }
+      },
+      {
+        "direct": {
+          "qps": 233.56253120433897,
+          "cpu_per_search_ms": 7.759691310000001
+        },
+        "default": {
+          "qps": 215.98143435552393,
+          "cpu_per_search_ms": 8.087106099999986
+        }
+      },
+      {
+        "default": {
+          "qps": 195.42829049766345,
+          "cpu_per_search_ms": 8.663895920000009
+        },
+        "direct": {
+          "qps": 250.319933908562,
+          "cpu_per_search_ms": 7.270645910000013
+        }
+      }
+    ]
+  },
+  "encoding_components": {
+    "vector-k10": {
+      "response_bytes": 6556,
+      "arms": {
+        "default": {
+          "encode_p50_ms": 0.1535440005682176,
+          "encoding_python_peak_bytes": 38677
+        },
+        "direct": {
+          "encode_p50_ms": 0.026858499040827155,
+          "encoding_python_peak_bytes": 30517
+        }
+      }
+    },
+    "text-k10": {
+      "response_bytes": 6411,
+      "arms": {
+        "default": {
+          "encode_p50_ms": 0.14870099948893767,
+          "encoding_python_peak_bytes": 37744
+        },
+        "direct": {
+          "encode_p50_ms": 0.02491499799361918,
+          "encoding_python_peak_bytes": 29792
+        }
+      }
+    },
+    "hybrid-k10": {
+      "response_bytes": 6462,
+      "arms": {
+        "default": {
+          "encode_p50_ms": 0.14126300084171817,
+          "encoding_python_peak_bytes": 38207
+        },
+        "direct": {
+          "encode_p50_ms": 0.024902999939513393,
+          "encoding_python_peak_bytes": 30047
+        }
+      }
+    },
+    "vector-k100": {
+      "response_bytes": 65464,
+      "arms": {
+        "default": {
+          "encode_p50_ms": 1.5825520004000282,
+          "encoding_python_peak_bytes": 372023
+        },
+        "direct": {
+          "encode_p50_ms": 0.24632399981783237,
+          "encoding_python_peak_bytes": 297607
+        }
+      }
+    },
+    "vector-k1000": {
+      "response_bytes": 654540,
+      "arms": {
+        "default": {
+          "encode_p50_ms": 15.793717499036575,
+          "encoding_python_peak_bytes": 3706039
+        },
+        "direct": {
+          "encode_p50_ms": 2.3341510004684096,
+          "encoding_python_peak_bytes": 2968487
+        }
+      }
+    },
+    "vector-expanded": {
+      "response_bytes": 28008,
+      "arms": {
+        "default": {
+          "encode_p50_ms": 0.6455894999817247,
+          "encoding_python_peak_bytes": 166083
+        },
+        "direct": {
+          "encode_p50_ms": 0.10391100113338325,
+          "encoding_python_peak_bytes": 128627
+        }
+      }
+    },
+    "text-expanded": {
+      "response_bytes": 8177,
+      "arms": {
+        "default": {
+          "encode_p50_ms": 0.2248860000690911,
+          "encoding_python_peak_bytes": 53862
+        },
+        "direct": {
+          "encode_p50_ms": 0.032675499824108556,
+          "encoding_python_peak_bytes": 38622
+        }
+      }
+    },
+    "vector-doc-filter": {
+      "response_bytes": 6431,
+      "arms": {
+        "default": {
+          "encode_p50_ms": 0.13872849922336172,
+          "encoding_python_peak_bytes": 38052
+        },
+        "direct": {
+          "encode_p50_ms": 0.025254501451854594,
+          "encoding_python_peak_bytes": 29892
+        }
+      }
+    }
+  }
+}

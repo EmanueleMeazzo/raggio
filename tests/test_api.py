@@ -72,6 +72,60 @@ DOC = {
 }
 
 
+@pytest.mark.parametrize("options", [
+    {"mode": "vector"},
+    {"mode": "text"},
+    {"mode": "hybrid"},
+    {"mode": "hybrid", "fusion": "relative", "alpha": 0.25},
+    {"mode": "hybrid", "fusion": "relative", "alpha": 0},
+    {"mode": "hybrid", "fusion": "relative", "alpha": 1},
+    {"mode": "vector", "scope": "summaries"},
+    {"mode": "vector", "scope": "both", "k": 1000},
+    {"mode": "vector", "expand": {"siblings_topk": 2, "summary": True}},
+    {"mode": "text", "expand": {"siblings_topk": 2, "summary": True}},
+    {"mode": "hybrid", "expand": {"siblings_all": True, "summary": True}},
+    {"mode": "vector", "filter": {"doc_id": "missing"}},
+])
+def test_search_response_bytes_match_fastapi_default(client, monkeypatch, options):
+    client.post("/collections", headers=ROOT, json={"name": "main", "dim": DIM}).raise_for_status()
+    document = json.loads(json.dumps(DOC))
+    document["chunks"][0]["metadata"].update({
+        "nested": {"array": [None, True, False, -0.0, 2**100, "café Σ漢字\n\t\\\""]},
+        "number": 1.0000000000000002,
+    })
+    ingest(client, "main", [document])
+    body = {"query": {"text": "planet"}, **options}
+    direct = client.post("/collections/main/search", headers=ROOT, json=body)
+    # Returning the dict restores FastAPI's ordinary jsonable_encoder + JSONResponse
+    # path while retaining exactly the same retrieval implementation and fixture.
+    with monkeypatch.context() as reference:
+        reference.setattr(app_module, "JSONResponse", lambda *, content: content)
+        baseline = client.post("/collections/main/search", headers=ROOT, json=body)
+    assert direct.status_code == baseline.status_code == 200
+    assert direct.content == baseline.content
+    assert direct.headers["content-type"] == baseline.headers["content-type"] == "application/json"
+    assert direct.headers["content-length"] == baseline.headers["content-length"]
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_search_response_keeps_nonfinite_metadata_error(client, monkeypatch, value):
+    client.post("/collections", headers=ROOT, json={"name": "main", "dim": DIM}).raise_for_status()
+    document = json.loads(json.dumps(DOC))
+    for chunk in document["chunks"]:
+        chunk["metadata"]["nonfinite"] = value
+    response = client.post("/collections/main/documents", headers={**ROOT, "content-type": "application/json"},
+                           content=json.dumps({"documents": [document]}))
+    assert response.status_code == 202
+    assert wait_job(client, "main", response.json()["job_id"])["status"] == "done"
+    body = {"query": {"text": "planet"}, "mode": "text"}
+    with pytest.raises(ValueError, match="Out of range float values"):
+        client.post("/collections/main/search", headers=ROOT, json=body)
+    with monkeypatch.context() as reference:
+        reference.setattr(app_module, "JSONResponse", lambda *, content: content)
+        with pytest.raises(ValueError, match="Out of range float values"):
+            client.post("/collections/main/search", headers=ROOT, json=body)
+
+
 def ingest(client, coll, docs):
     r = client.post(f"/collections/{coll}/documents", headers=ROOT, json={"documents": docs})
     assert r.status_code == 202, r.text
