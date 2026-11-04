@@ -1,6 +1,6 @@
-# ADR 0012 â€” Bounded per-search sibling-vector reuse
+# ADR 0012 — Bounded per-search sibling-vector reuse
 
-Status: accepted Â· Date: 2026-11-04 Â· Implements the vector-reuse candidate in ADR 0011
+Status: accepted · Date: 2026-11-04 · Implements the vector-reuse candidate in ADR 0011
 
 ## Decision and scope
 
