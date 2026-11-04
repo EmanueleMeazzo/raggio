@@ -1,5 +1,9 @@
 import json
+import os
 import sqlite3
+import subprocess
+import sys
+import threading
 import time
 import zlib
 
@@ -7,6 +11,7 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
+import raggio.app as app_module
 from raggio.app import create_app
 
 DIM = 32
@@ -504,3 +509,89 @@ def test_doc_id_filter(client):
     assert lst({"doc_id": ["doc1", "doc2"], "src": "blog"}).json()["total"] == 2
     assert lst({"doc_id": "doc1"}).json()["total"] == 4  # default scope: both
     assert lst({"doc_id": {"lt": "doc2"}}).status_code == 400
+
+
+# ---- one process per DATA_DIR (ADR 0007) ----
+
+
+def wait_health(client, status):
+    deadline = time.time() + WAIT_SECONDS
+    while time.time() < deadline:
+        r = client.get("/healthz")
+        if r.json()["status"] == status:
+            return r
+        time.sleep(0.02)
+    raise TimeoutError(f"/healthz never said {status!r}")
+
+
+def fake_held_lock(monkeypatch, tmp_path, free):
+    """Another process holds the data-dir lock until free() says True (any platform)."""
+    fd = os.open(tmp_path / "fake.lock", os.O_RDWR | os.O_CREAT)
+    monkeypatch.setattr(app_module, "open_data_dir_lock", lambda data_dir: fd)
+    monkeypatch.setattr(app_module, "lock_data_dir", lambda fd: free())
+    monkeypatch.setattr(app_module, "DATA_DIR_LOCK_POLL_S", 0.01)
+
+
+def test_start_waits_while_another_process_holds_the_data_dir(make_app, monkeypatch, tmp_path):
+    held = threading.Event()
+    held.set()
+    fake_held_lock(monkeypatch, tmp_path, lambda: not held.is_set())
+    with TestClient(make_app()) as c:  # the server answers at once: the lifespan did not wait
+        r = c.get("/healthz")
+        assert r.status_code == 200 and r.json() == {"status": "starting"}
+        for r in (c.get("/collections", headers=ROOT),
+                  c.post("/collections/x/search", headers=ROOT, json={})):  # before validation too
+            assert r.status_code == 503 and r.headers["retry-after"] == "2"
+        assert not (tmp_path / "catalog.db").exists()  # nothing in DATA_DIR opened yet
+        held.clear()
+        wait_health(c, "ok")
+        assert c.get("/collections", headers=ROOT).json() == {"collections": []}
+
+
+def test_failed_start_reports_unhealthy(make_app, monkeypatch, tmp_path):
+    tries = iter([False])  # held at the first try only
+    fake_held_lock(monkeypatch, tmp_path, lambda: next(tries, True))
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("catalog unreadable")
+
+    monkeypatch.setattr(app_module, "CollectionManager", broken)
+    with TestClient(make_app()) as c:
+        assert wait_health(c, "failed").status_code == 503  # the platform restarts it
+        assert c.get("/collections", headers=ROOT).status_code == 503
+
+
+LOCK_CHILD = """
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+try:
+    fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    print("held", flush=True)
+    sys.exit()
+print("locked", flush=True)
+sys.stdin.read()  # holds the lock until the test closes stdin
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fcntl record locks are POSIX-only")
+def test_data_dir_lock_keeps_a_second_process_out(make_app, tmp_path):
+    def child():
+        return subprocess.Popen([sys.executable, "-c", LOCK_CHILD, str(tmp_path / "raggio.lock")],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+
+    holder = child()
+    try:
+        assert holder.stdout.readline().strip() == "locked"
+        with TestClient(make_app()) as c:
+            assert c.get("/healthz").json() == {"status": "starting"}
+            assert c.get("/collections", headers=ROOT).status_code == 503
+            holder.stdin.close()  # the other process exits
+            assert holder.wait(WAIT_SECONDS) == 0
+            wait_health(c, "ok")
+            assert c.get("/collections", headers=ROOT).status_code == 200
+            assert child().communicate(timeout=WAIT_SECONDS)[0].strip() == "held"  # now ours
+        assert child().communicate(timeout=WAIT_SECONDS)[0].strip() == "locked"  # released at shutdown
+    finally:
+        holder.kill()
+

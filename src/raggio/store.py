@@ -28,6 +28,11 @@ from turbovec import IdMapIndex
 from .config import Settings, default_ivf_search_threads
 from .embeddings import Embedder
 
+try:
+    import fcntl
+except ImportError:  # Windows: no data-dir lock (open_data_dir_lock)
+    fcntl = None
+
 
 def _load_native():
     """The optional Rust stage-2 scorer (native/, ADR 0004; `uv sync --extra native`), or
@@ -2710,6 +2715,37 @@ class Collection:
             "summaries": counts.get("summary", 0),
             "pending_jobs": self.pending_jobs(),
         }
+
+
+# One process per DATA_DIR (ADR 0007). Two processes on one WAL database corrupt it once
+# they run on different hosts, which do not share the -shm wal-index: a rolling restart on
+# a network volume did ("file is not a database" in the old replica). The lock is an
+# fcntl record lock on DATA_DIR/raggio.lock, held until the process is done with the
+# directory; NFSv4 enforces it across hosts unless the share is mounted with local locks.
+# A process that finds it held tries again every DATA_DIR_LOCK_POLL_S seconds: a blocking
+# lockf in a thread would keep the process from exiting on SIGTERM while it waits.
+DATA_DIR_LOCK_POLL_S = 0.5
+
+
+def open_data_dir_lock(data_dir: str) -> int | None:
+    """The fd of DATA_DIR/raggio.lock for lock_data_dir, or None where there is no fcntl
+    (Windows): the lock is skipped there, with a warning."""
+    if fcntl is None:
+        _log.warning("no fcntl on this platform: one process per DATA_DIR is not enforced")
+        return None
+    Path(data_dir).mkdir(parents=True, exist_ok=True)
+    return os.open(Path(data_dir) / "raggio.lock", os.O_RDWR | os.O_CREAT, 0o644)
+
+
+def lock_data_dir(fd: int) -> bool:
+    """One try, without waiting, for the exclusive lock on open_data_dir_lock's fd; False
+    while another process holds it. fcntl locks belong to the process, and closing any fd
+    of the file drops them: the fd stays open until the process is done with DATA_DIR."""
+    try:
+        fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, PermissionError):  # EAGAIN / EACCES: another process holds it
+        return False
+    return True
 
 
 class CollectionManager:

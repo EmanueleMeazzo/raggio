@@ -2,16 +2,29 @@ import asyncio
 import gc
 import hmac
 import json
+import os
 import sys
+import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .config import Settings
-from .store import CollectionDeletedError, CollectionManager, _normalize, hash_key
+from .store import (
+    DATA_DIR_LOCK_POLL_S,
+    CollectionDeletedError,
+    CollectionManager,
+    _log,
+    _normalize,
+    hash_key,
+    lock_data_dir,
+    open_data_dir_lock,
+)
 
 
 def _gil_enabled() -> bool:
@@ -92,24 +105,66 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
     settings = settings or Settings()
     if not settings.root_api_key:
         raise RuntimeError("ROOT_API_KEY must be set")
-    manager = CollectionManager(settings, embedder_factory)
+    # opened by start() once this process holds the data-dir lock (ADR 0007): every
+    # request but /healthz answers 503 until then (require_ready)
+    manager: CollectionManager | None = None
+    status = "starting"  # then "ok", or "failed" if start() raised
+    housekeeping: asyncio.Task | None = None
+
+    async def start(lock_fd: int | None, locked: bool) -> None:
+        """Wait for the data-dir lock if another process holds it, then open the catalog,
+        replay unfinished jobs and start housekeeping."""
+        nonlocal manager, status, housekeeping
+        try:
+            if not locked:
+                _log.info("waiting for data-dir lock %s", Path(settings.data_dir) / "raggio.lock")
+                t0 = time.monotonic()
+                while not await asyncio.to_thread(lock_data_dir, lock_fd):
+                    await asyncio.sleep(DATA_DIR_LOCK_POLL_S)
+                _log.info("acquired data-dir lock after %.1f s", time.monotonic() - t0)
+            manager = CollectionManager(settings, embedder_factory)
+            await manager.resume_pending()
+            if settings.gc_freeze:
+                # after resume_pending: what it loaded is startup heap too. A frozen
+                # collection that is evicted or deleted is still freed, by reference counting
+                gc.collect()
+                gc.freeze()
+            housekeeping = asyncio.create_task(manager.housekeeping())
+            status = "ok"
+        except Exception:
+            status = "failed"
+            _log.exception("start-up failed")
+            raise
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        await manager.resume_pending()
-        if settings.gc_freeze:
-            # after resume_pending: what it loaded is startup heap too. A frozen
-            # collection that is evicted or deleted is still freed, by reference counting
-            gc.collect()
-            gc.freeze()
-        housekeeping = asyncio.create_task(manager.housekeeping())
+        lock_fd = open_data_dir_lock(settings.data_dir)
+        locked = lock_fd is None or await asyncio.to_thread(lock_data_dir, lock_fd)
+        startup = asyncio.create_task(start(lock_fd, locked))
+        if locked:
+            # the usual start: start-up finishes before the server answers, as it always
+            # has. While another process holds the lock (the old replica of a rolling
+            # restart) it goes on in the background: the platform stops the old replica
+            # only once this one is up and answering /healthz
+            await startup
         yield
-        housekeeping.cancel()
-        await manager.shutdown()
+        startup.cancel()
+        await asyncio.gather(startup, return_exceptions=True)
+        if housekeeping:
+            housekeeping.cancel()
+        if manager:
+            await manager.shutdown()
+        if lock_fd is not None:
+            os.close(lock_fd)  # releases the lock: every database of DATA_DIR is closed
         if settings.gc_freeze:
             gc.unfreeze()
 
-    app = FastAPI(title="raggio", lifespan=lifespan)
+    async def require_ready(request: Request) -> None:
+        if status != "ok" and request.scope["path"] != "/healthz":
+            detail = "waiting for the data directory" if status == "starting" else "start-up failed"
+            raise HTTPException(503, detail, headers={"Retry-After": "2"})
+
+    app = FastAPI(title="raggio", lifespan=lifespan, dependencies=[Depends(require_ready)])
 
     # ---- auth ----
 
@@ -314,6 +369,10 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
 
     @app.get("/healthz")
     async def healthz():
+        if status != "ok":
+            # 200 while waiting for the data-dir lock, so a rolling restart goes on to stop
+            # the old process; 503 once start-up failed, so the platform restarts this one
+            return JSONResponse({"status": status}, status_code=200 if status == "starting" else 503)
         return {
             "status": "ok",
             "resident_collections": list(manager.resident),
