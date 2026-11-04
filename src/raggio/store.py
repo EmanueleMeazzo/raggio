@@ -84,6 +84,9 @@ TEXT_OR_CAND = 500
 # ponytail: AND candidates are rowid-ordered, not ranked — an AND set >> cap (queries of
 # only-common tokens) samples arbitrarily; stage 1a's rarest-token guarantee covers that class
 TEXT_AND_CAND = 1000
+# document-scoped BM25 (ADR 0007): a doc_id filter matching at most this many rows skips
+# FTS5 and scores the rows' texts directly with the stage-2 scorer
+TEXT_DIRECT_MAX = 1000
 SDM_WEIGHT = 0.2  # ordered-bigram proximity term (SDM-lite, Metzler & Croft 2005)
 BM25_K1, BM25_B = 1.2, 0.75  # FTS5's hardcoded parameters (fts5_aux.c) — kept for parity
 
@@ -2447,6 +2450,22 @@ class Collection:
         kept, toks = self._prune_common(qtext)
         if not kept:
             return [], []
+        if filt and "doc_id" in filt and self.cfg.tokenizer != "trigram":
+            # a document-scoped query (ADR 0007): FTS5 would rank the query over the whole
+            # corpus and filter by doc_id only afterwards, so a few rows are scored
+            # directly with the stage-2 scorer instead (corpus-wide idf and avgdl, the
+            # two-stage path's scores). Trigram matches substrings, which it cannot
+            where, params = _filter_sql(scope, filt)
+            with self._reading() as db:
+                ids = [r[0] for r in db.execute(
+                    f"SELECT id FROM records WHERE {where} LIMIT ?", [*params, TEXT_DIRECT_MAX + 1]
+                )]
+                if len(ids) <= TEXT_DIRECT_MAX:
+                    cand = list(_rows_by_id(db, "SELECT id, text FROM records WHERE id IN ({})", ids))
+            if len(ids) <= TEXT_DIRECT_MAX:
+                rids, scores = self._bm25_rescore(qtext, cand, n)
+                hit = [i for i, s in enumerate(scores) if s > 0]  # no query term: no match, as in FTS5
+                return [rids[i] for i in hit], [scores[i] for i in hit]
         two_stage = len(kept) < len(toks)
         match, limit = _or_query(kept), TEXT_OR_CAND if two_stage else n
         other = {"chunks": "summary", "summaries": "chunk"}.get(scope)

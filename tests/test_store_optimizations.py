@@ -534,3 +534,38 @@ def test_exact_path_edge_cases(tmp_path):
     asyncio.run(col.stop())
     with pytest.raises(RuntimeError, match="closed"):
         col._search_allowed(q, 5, np.arange(1, 6, dtype=np.uint64))
+
+
+def test_doc_scoped_text_leg_scores_like_the_fts_path(tmp_path, monkeypatch):
+    col = make_collection(tmp_path)
+    texts = {"a": "zeta common words here", "b": "zeta zeta and more text",
+             "c": "nothing relevant at all", "e": "common zeta common"}
+    asyncio.run(col._process_job({"documents": [
+        {"doc_id": "d1", "chunks": [{"id": k, "text": t, "vector": vec(i)} for i, (k, t) in enumerate(texts.items())]},
+        *({"doc_id": f"o{i}", "chunks": [{"id": f"o{i}", "text": "common filler text", "vector": vec(10 + i)}]}
+          for i in range(30)),
+    ]}))
+    # prune "common": the FTS path is two-stage, and every d1 row with a query term has "zeta"
+    monkeypatch.setattr(store, "FTS_SCAN_BUDGET_MIN_ROWS", 0)
+    query, filt = "common zeta", {"doc_id": "d1"}
+    kept, toks = col._prune_common(query)
+    assert kept == ["zeta"] and toks == ["common", "zeta"]
+    direct = col._text_ids(query, 10, "chunks", filt)
+    monkeypatch.setattr(store, "TEXT_DIRECT_MAX", 0)  # the doc's rows exceed it: FTS5 path
+    fts = col._text_ids(query, 10, "chunks", filt)
+    ids = {rid: ext for rid, ext in col.db.execute("SELECT id, external_id FROM records")}
+    assert [ids[r] for r in direct[0]] == [ids[r] for r in fts[0]] and set(ids[r] for r in direct[0]) == {"a", "b", "e"}
+    assert direct[1] == pytest.approx(fts[1], rel=1e-9) and all(s > 0 for s in direct[1])
+    # the hybrid leg and the metadata filter go the same way
+    assert col._text_ids(query, 10, "chunks", {"doc_id": ["d1"], "nope": 1}) == ([], [])
+
+
+def test_doc_scoped_text_leg_keeps_fts_for_trigram(tmp_path):
+    col = Collection(CollectionConfig("t", 8, 4, None, None, None, tokenizer="trigram"), Path(tmp_path), lambda: None)
+    asyncio.run(col._process_job({"documents": [{"doc_id": "d1", "chunks": [
+        {"id": "t1", "text": "PostgreSQL configuration parameters", "vector": vec(1)},
+        {"id": "t2", "text": "unrelated", "vector": vec(2)}]}]}))
+    col._bm25_rescore = lambda *a, **k: (_ for _ in ()).throw(AssertionError("trigram must stay on FTS5"))
+    rids, _ = col._text_ids("gresql", 5, "chunks", {"doc_id": "d1"})  # substring: only FTS5 trigram finds it
+    assert [r for (r,) in col.db.execute("SELECT id FROM records WHERE external_id='t1'")] == rids
+
