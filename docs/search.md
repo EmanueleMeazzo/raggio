@@ -117,6 +117,14 @@ matching more of the query — or the query as a phrase — rank ahead of record
 that merely repeat its rarest word. Small collections skip the second stage;
 the single FTS5 query already ranks the full query there.
 
+A query filtered by `doc_id` to at most 1000 records skips FTS5 altogether:
+those records are ranked by the second stage directly, with the collection's
+corpus-wide statistics, so searching inside a document costs what the document
+costs, not what the corpus does. Its scores are always the second stage's,
+small collections included. `trigram` collections, and `doc_id` filters
+matching more records, take the FTS5 path
+([ADR 0007](adr/0007-sofia-backend-requirements.md)).
+
 ## Tokenizers
 
 BM25 tokenization is chosen per collection at creation and cannot be changed

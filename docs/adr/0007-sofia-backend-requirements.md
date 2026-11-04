@@ -1,4 +1,4 @@
-# ADR 0007 — For the S.O.F.I.A. backend: relative fusion, a doc_id filter, exact small allowlists, one process per data directory
+# ADR 0007 — For the S.O.F.I.A. backend: relative fusion, a doc_id filter, exact small allowlists, a document-scoped BM25 leg, one process per data directory
 
 Status: accepted · Date: 2026-11-03 · Takes up the relative-score fusion ADR 0003 left as a candidate future API
 
@@ -6,7 +6,7 @@ Status: accepted · Date: 2026-11-03 · Takes up the relative-score fusion ADR 0
 
 raggio is about to replace Weaviate as the vector store behind the S.O.F.I.A. chat
 backend. Three things that backend relies on had no raggio equivalent, and its DEV spike
-found a fourth gap, in deployment:
+found a fourth gap, in deployment, and a fifth on real data:
 
 1. **Hybrid scores on Weaviate's scale.** The backend runs one hybrid query shape,
    Weaviate's default `relativeScoreFusion` (the default since Weaviate 1.24) with an
@@ -34,6 +34,17 @@ found a fourth gap, in deployment:
    had one WAL database open, and WAL's `-shm` wal-index is not coherent across hosts.
    Deploying a new revision overlaps the same way. Nothing in raggio stopped a second
    process from opening a `DATA_DIR`.
+5. **The BM25 leg of a one-document search.** With 1-4 in place, the DEV spike ran real
+   Sofia data (text-embedding-3-large, chunks of ~1000 tokens of legal and business
+   prose, summaries and chunks in one collection; Azure Container Apps, 2 vCPU / 4 GiB,
+   NFS 4.1 data dir, native scorer, warm; measured from a laptop with ~28 ms RTT).
+   On `legal_knowhow` (22,339 summaries + 143,236 chunks), hybrid relative, alpha 0.5,
+   scope chunks, `{"doc_id": X}`, k=5: 99 / 114 ms p50/p95 (main with a metadata
+   `parent_id` filter: 544 / 620; Weaviate: 32 / 36). Scope summaries, k=10, no
+   filter: 124 / 156 ms (Weaviate 54 / 56). `datascience` (2,983 + 40,634): 96 / 103
+   in one document, 105 / 111 summaries (Weaviate 31 / 36). About 70-85 ms of the
+   one-document figure is server time, and the BM25 leg dominates it: FTS5 ranks the
+   pruned query over the whole corpus and filters by `doc_id` only after the join.
 
 Weaviate's behaviour, read from its source (`usecases/traverser/hybrid/hybrid_fusion.go`,
 `FusionRelativeScore`, and `searcher.go`, weaviate/weaviate main, 2026-11-03):
@@ -74,6 +85,9 @@ Weaviate's behaviour, read from its source (`usecases/traverser/hybrid/hybrid_fu
 | A start-up that raises turns `/healthz` into 503 `{"status": "failed"}` | A failed process must not report healthy: the platform restarts it |
 | Logs: `waiting for data-dir lock <path>`, `acquired data-dir lock after N s` (INFO) | The handover is visible in the platform logs |
 | Windows (no `fcntl`): no lock, one warning | The tests run there; `msvcrt` locking would be a second implementation for a platform the image never runs on |
+| **A document-scoped BM25 leg** (`_text_ids`): with `doc_id` in the filter and a unicode61 collection, count the matching rows through `idx_records_doc_type`; at most `TEXT_DIRECT_MAX` (1000) are scored directly by the stage-2 scorer (`_bm25_rescore`: corpus-wide idf from the df cache, the sampled avgdl, `raggio_native.bm25_topn` or its Python reference), rows scoring 0 (no query term) dropped as FTS5 MATCH drops them | The two-stage path's scores, without its corpus-wide stage 1 and its candidate caps, so a document's rows holding only pruned (common) query terms are found too. `_prune_common` still runs first, so the df cache refreshes after write churn exactly as before. At 165k records (below) the leg went from 22.8 / 69.5 to 1.8 / 7.6 ms p50/p95 |
+| `TEXT_DIRECT_MAX = 1000` | The direct path costs ~37 µs per ~1000-word row, linear (1000 rows: 37 / 42 ms p50/p95); the FTS5 path cost 9-14 ms p50 and 48-270 ms p95 whatever the row count, on the synthetic 165k corpus. So the p50 crossover is ~350 rows and the p95 one beyond 1000. FTS5's cost grows with the corpus (the 2% pruning budget) and was ~5x heavier on the DEV data (about 60 ms of its ~70-85 ms server time), which puts the real-data p50 crossover near 1,600 rows; 1000 stays under it. A `doc_id` list over the cut-off keeps the FTS5 path |
+| Trigram collections keep the FTS5 path | Trigram matches substrings; the stage-2 tokenizer splits words, so it would miss them (pinned by a test) |
 
 ## Rejected
 
@@ -93,10 +107,12 @@ Weaviate's behaviour, read from its source (`usecases/traverser/hybrid/hybrid_fu
   an ordinary start.
 - **`flock`**: on Linux NFS it is emulated with `fcntl` locks anyway, and locally it does
   not see them; `lockf` behaves the same on both.
-- **A doc-scoped BM25 path** (score a small allowlist's texts with the stage-2 scorer
-  instead of FTS5's corpus-wide stage 1): changes `text`-mode scores (the SDM-lite
-  bonus) for filtered queries and needs a trigram exception. Follow-up; see
-  Consequences.
+- **Speeding up `scope: summaries`** (profile below): its cost is a masked search over
+  the 22k summary ids plus the 200-blob rescore of a 100-deep hybrid leg, and FTS5
+  candidate queries over every record before the type join. Cheaper would take scope
+  allowlists maintained across writes (every write clears the cache today; 15 ms to
+  rebuild) or a type column in the FTS5 index (a rebuild of every existing index):
+  neither is cheap or low-risk, and nothing was built.
 
 ## Measured
 
@@ -164,18 +180,68 @@ The masked turbovec search alone took 0.25-0.70 ms in every row. With random ids
 nearly all in the two-stage FTS5 candidate queries, for a median of 0 matching chunks
 in the document.
 
+**165k records shaped like `legal_knowhow`** (added with the document-scoped BM25 leg):
+22,018 documents of one ~300-word summary and 3-10 chunks of ~1000 words (13.3%
+summaries), Zipf(1.1) over a 50k vocabulary, dim 3072; queries of 4 words from the
+target document plus 6 Zipf words. WSL Ubuntu on the same laptop (4 vCPU, the host
+busy with other applications), CPython 3.12.13, the native scorer. *main* filters a
+metadata copy of the id with RRF; *0007 before the BM25 leg* (f530504) and *after*
+filter `{"doc_id": X}` with relative fusion, alpha 0.5. All three ran in one process
+on the same collection, alternating per query (100 timed each):
+
+| p50 / p95 ms | main | 0007, before the BM25 leg | after |
+|---|---|---|---|
+| Hybrid, one document, k=5 | 223.5 / 320.5 | 24.6 / 84.0 | **5.0 / 19.1** |
+| BM25 leg, one document (n=100) | 17.6 / 203.9 | 22.8 / 69.5 | **1.8 / 7.6** |
+| Vector, one document, k=5 | 226.2 / 259.6 | 0.83 / 1.41 | 0.83 / 3.07 |
+| Hybrid, summaries, k=10 | 70.9 / 180.4 | 71.5 / 166.3 | 70.0 / 175.8 |
+| Vector, unfiltered, k=5 | 26.9 / 55.2 | 24.9 / 44.5 | 26.8 / 46.4 |
+
+The BM25 leg's cut-off, same collection, a `doc_id` list of growing size (30 queries
+each, warm page cache):
+
+| rows | 7 | 50 | 100 | 200 | 300 | 500 | 1000 |
+|---|---|---|---|---|---|---|---|
+| FTS5 path p50 / p95 | 30.2 / 132 | 11.1 / 184 | 11.6 / 48 | 12.4 / 122 | 14.5 / 174 | 9.0 / 66 | 13.8 / 79 |
+| direct p50 / p95 | 1.1 / 13 | 3.0 / 10 | 3.7 / 7 | 8.7 / 14 | 11.7 / 15 | 18.0 / 22 | 37.0 / 42 |
+
+`scope: summaries` hybrid, per step (every query two-stage):
+
+| step | p50 / p95 ms |
+|---|---|
+| summaries allowlist, `SELECT` + sort (only after a write clears the cache) | 14.6 / 19.6 |
+| masked search, 22,018 ids, k=200 | 20.6 / 30.9 |
+| fp16 rescore of 200 | 9.1 / 13.3 |
+| BM25: prune (df lookups) | 4.2 / 17.6 |
+| BM25: FTS5 OR ranked, LIMIT 500, type join | 5.7 / 29.5 |
+| BM25: FTS5 AND, LIMIT 1000, type join | 10.9 / 55.7 |
+| BM25: candidate texts + stage 2 | 1.5 / 6.1 |
+| plain scan of all 165k, k=200, for comparison | 39.2 / 58.7 |
+
+The two legs run concurrently, so the vector leg sets the median and the BM25 leg's
+candidate queries the tail. The masked search over 13% of the rows already beats the
+plain scan. A check of `_vector_ids` against a direct call of the same masked search
+and rescore found no overhead between them.
+
 ## Consequences
 
 - A metadata key named `doc_id` can no longer be filtered: the key now means the
   document id. Records keep such metadata; only the filter changed meaning.
 - A one-document vector search no longer depends on collection size: an index lookup
   and at most the rescore depth of fp16 blobs.
-- **A one-document hybrid search is now bounded by its BM25 leg**: 25 ms p50 and
-  ~135 ms p95 at 100k chunks here, 136 / 568 ms at 300k under load. FTS5 stage 1 ranks
-  the pruned query over the whole corpus and only then joins and filters by `doc_id`,
-  so its cost follows the corpus (the 2% pruning budget), not the document. The native
-  scorer the image builds shortens stage 2 only. The follow-up is the doc-scoped BM25
-  path above.
+- A one-document hybrid search no longer depends on corpus size either. Before the
+  document-scoped BM25 leg it was bounded by that leg (25 / 138 ms at 100k, 136 / 568
+  ms at 300k under load, ~70-85 ms server time on DEV); at 165k it is now 5.0 / 19.1
+  ms. A `doc_id` list matching more than 1000 rows, and trigram collections, still pay
+  the corpus-wide FTS5 leg.
+- A document-scoped text or hybrid query now always gets the stage-2 scores. Before,
+  a query nothing was pruned from (small collections, queries of rare terms) was
+  ranked by FTS5's own `bm25()`: same k1, b and idf, but the exact average length
+  instead of the sampled one, and no SDM-lite bigram bonus. Scores move slightly and
+  phrase matches can move up; pruned queries, the common case on large collections,
+  score exactly as before.
+- `scope: summaries` hybrid is unchanged (70 / 176 ms at 165k here; 124 / 156 ms with
+  RTT on DEV, against Weaviate's 54 / 56).
 - Relative scores are relative to each query's candidates, as Weaviate's are: a hit
   that tops both legs scores 1.0 on any query, so a "top score >= 0.85" shortcut means
   "leads both rankings", not "relevant". On a one-document search the candidates are
@@ -195,5 +261,6 @@ in the document.
 - Tests: `tests/test_api.py` covers the wait (503s, `/healthz` "starting", nothing in
   `DATA_DIR` opened), the failed start-up (503 "failed") with the lock simulated, and,
   POSIX only, a real second process holding `raggio.lock`.
-- Docs: `docs/search.md` (fusion, the `doc_id` key, the exact path), `docs/api.md`,
+- Docs: `docs/search.md` (fusion, the `doc_id` key, the exact path, the document-scoped
+  BM25 leg), `docs/api.md`,
   `docs/concepts.md`, `docs/storage.md` (one process per data directory), README.
