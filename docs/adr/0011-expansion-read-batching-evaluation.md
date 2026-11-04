@@ -2,6 +2,10 @@
 
 Status: proposed; exploration only · Date: 2026-11-04 · Builds on ADRs 0007 and 0010
 
+Implementation follow-up: [ADR 0012](0012-per-search-sibling-vector-reuse.md) records
+the production vector-reuse path and its new evaluation. The results below describe
+the historical exploration committed at `f87e1d1`, rather than the final implementation.
+
 ## Decision
 
 Keep production retrieval unchanged during this investigation. Prioritize bounded,

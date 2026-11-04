@@ -17,6 +17,7 @@ import time
 import unicodedata
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -73,6 +74,10 @@ HYBRID_DEPTH = 100  # candidates fetched per hybrid leg before fusion (Weaviate 
 RESCORE_MULT = 2
 RESCORE_FLOOR = {2: 200, 4: 50}
 RESCORE_CAP = 2000  # bounds per-query blob fetches at huge k
+
+# Per-search sibling reuse only: bound both float32 payload and Python row bookkeeping.
+SIBLING_VECTOR_CACHE_BYTES = 8 * 1024 * 1024
+SIBLING_VECTOR_CACHE_ROWS = 4096
 
 # two-stage BM25 (ADR 0003): FTS5 cannot rank a full query cheaply (no WAND — ORDER BY
 # rank scores every row matching ANY term) and must never rank a rowid-restricted MATCH
@@ -2250,7 +2255,8 @@ class Collection:
         return self._rescore_rows(queries, rows)
 
     def _search_allowed(
-        self, qvec: np.ndarray, n: int, allow: np.ndarray, **kw
+        self, qvec: np.ndarray, n: int, allow: np.ndarray, *,
+        vectors: dict[int, np.ndarray] | None = None, **kw
     ) -> tuple[list[int], list[float]]:
         """Top-n of one query over an allowlist (filters, sibling expansion). An
         allowlist no larger than the rescore depth skips the index (ADR 0007): the
@@ -2260,7 +2266,14 @@ class Collection:
         bounded fetch is cheaper (each blob costs ~20 us at 3072-d). Blocking; call
         from a thread."""
         if len(allow) <= self._rescore_k(n):
-            ids, mat = self._fp16_vecs(allow.tolist())
+            allowed = allow.tolist()
+            if vectors is not None and allowed and all(rid in vectors for rid in allowed):
+                # The per-document membership query and point fetch visit rowids
+                # ascending. Keep that matrix shape/order and the same dot product.
+                ids = sorted(set(allowed))
+                mat = np.array([vectors[rid] for rid in ids], dtype=np.float32)
+            else:
+                ids, mat = self._fp16_vecs(allowed)
             if len(ids) == len(allow):  # else rows without a blob: only the index scores them
                 scores = mat @ qvec[0]
                 top = np.lexsort((ids, -scores))[:n]
@@ -2556,11 +2569,63 @@ class Collection:
                 ids, scores = _rrf(k, vec[0], text[0]) if rrf else _relative(k, alpha, vec, text)
             hits = self._hydrate(ids, scores)
             if expand:
-                for hit in hits:
-                    await self._expand(hit, qvec, qtext, expand)
+                await self._expand_hits(hits, qvec, qtext, expand)
         return hits
 
-    async def _expand(self, hit: dict, qvec: np.ndarray | None, qtext: str | None, expand) -> None:
+    def _prepare_sibling_vectors(self, hits: list[dict], n: int) -> dict[str, dict[int, np.ndarray]]:
+        """Worker-only preparation inside search's read lock; no cache survives it.
+
+        Limited covering-index reads reject large documents without materializing
+        their entire membership. A cancelled search's orphaned worker is still
+        bounded, and a generation change discards any mixed write snapshot.
+        """
+        counts = Counter(hit["doc_id"] for hit in hits)
+        repeated = [doc for doc, count in counts.items() if count > 1]
+        remaining = min(SIBLING_VECTOR_CACHE_ROWS, SIBLING_VECTOR_CACHE_BYTES // (self.cfg.dim * 4))
+        if not repeated or remaining <= 0:
+            return {}
+        depth, gen = self._rescore_k(n), self._allow_gen
+        groups = {}
+        with self._reading() as db:
+            for doc in sorted(repeated, key=lambda doc: -counts[doc]):
+                limit = min(depth, remaining)
+                if limit <= 0:
+                    break
+                rows = db.execute(
+                    "SELECT id FROM records WHERE doc_id=? AND type='chunk' AND indexed=1"
+                    " ORDER BY id LIMIT ?", (doc, limit + 1),
+                ).fetchall()
+                if gen != self._allow_gen:
+                    return {}
+                if 0 < len(rows) <= limit:
+                    groups[doc] = [row[0] for row in rows]
+                    remaining -= len(rows)
+        if not groups or gen != self._allow_gen:
+            return {}
+        found, mat = self._fp16_vecs([rid for ids in groups.values() for rid in ids])
+        if gen != self._allow_gen:
+            return {}
+        mat.flags.writeable = False
+        rowof = {rid: mat[j] for j, rid in enumerate(found)}
+        # A partially valid document retains the original quantized fallback.
+        return {doc: {rid: rowof[rid] for rid in ids} for doc, ids in groups.items()
+                if all(rid in rowof for rid in ids)}
+
+    async def _expand_hits(self, hits: list[dict], qvec: np.ndarray | None,
+                           qtext: str | None, expand) -> None:
+        vectors = None
+        if (qvec is not None and expand.siblings_topk
+                and len({hit["doc_id"] for hit in hits}) < len(hits)):
+            vectors = await asyncio.to_thread(self._prepare_sibling_vectors, hits, expand.siblings_topk)
+        if vectors:
+            for hit in hits:
+                await self._expand(hit, qvec, qtext, expand, vectors=vectors.get(hit["doc_id"]))
+        else:
+            for hit in hits:
+                await self._expand(hit, qvec, qtext, expand)
+
+    async def _expand(self, hit: dict, qvec: np.ndarray | None, qtext: str | None, expand,
+                      *, vectors: dict[int, np.ndarray] | None = None) -> None:
         doc_id, ext = hit["doc_id"], {}
         self_clause = "AND external_id != ?" if hit["type"] == "chunk" else ""
         self_param = [hit["id"]] if hit["type"] == "chunk" else []
@@ -2592,7 +2657,7 @@ class Collection:
             if sib:
                 allow = np.array(sib, dtype=np.uint64)
                 ids, scores = await asyncio.to_thread(
-                    self._search_allowed, qvec, expand.siblings_topk, allow
+                    self._search_allowed, qvec, expand.siblings_topk, allow, vectors=vectors
                 )
                 ext["siblings"] = self._hydrate(ids, scores)
             else:

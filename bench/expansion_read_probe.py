@@ -8,6 +8,7 @@ SQL tracing and allocation tracing are outside the paired endpoint timings.
 import argparse
 import asyncio
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import gc
 import hashlib
 import inspect
@@ -85,12 +86,19 @@ async def batch_expansion(col, hits, qvec, qtext, expand):
 def candidate_search(expansion_function=batch_expansion):
     """Keep the production search and lock verbatim; replace one guarded loop."""
     source = textwrap.dedent(inspect.getsource(store.Collection.search))
-    before = "for hit in hits:\n                await self._expand(hit, qvec, qtext, expand)"
+    before = ("await self._expand_hits(hits, qvec, qtext, expand)" if hasattr(store.Collection, "_expand_hits") else
+              "for hit in hits:\n                await self._expand(hit, qvec, qtext, expand)")
     assert source.count(before) == 1, "Search changed; review the prototype hook before running"
     source = source.replace(before, "await _probe_batch_expansion(self, hits, qvec, qtext, expand)")
     namespace = {**vars(store), "_probe_batch_expansion": expansion_function}
     exec(compile(source, __file__, "exec"), namespace)
     return namespace["search"]
+
+
+async def reference_expansion(col, hits, qvec, qtext, expand):
+    """The original production expansion loop, without reuse preparation."""
+    for hit in hits:
+        await col._expand(hit, qvec, qtext, expand)
 
 
 async def prepare(settings, rows, dim):
@@ -181,11 +189,20 @@ def main():
     parser.add_argument("--out", type=Path)
     parser.add_argument("--baseline-revision")
     parser.add_argument("--vector-reuse", action="store_true", help="Also compare the bounded sibling-vector prototype")
+    parser.add_argument("--production", action="store_true", help="Compare production reuse with the original expansion loop")
+    parser.add_argument("--concurrency", type=int, default=0, help="Additional warmed concurrent requests for ranked expansion")
+    parser.add_argument("--concurrency-only", action="store_true", help="Skip single-request measurements for a concurrent follow-up")
     args = parser.parse_args()
     if args.rows < 400 or args.dim < 8 or args.dim % 8 or min(args.pairs, args.iterations) < 1:
         parser.error("rows >= 400, dim divisible by 8, positive pairs/iterations required")
+    if args.concurrency < 0 or (args.concurrency_only and args.concurrency == 0):
+        parser.error("--concurrency must be positive with --concurrency-only")
     baseline = store.Collection.search
     factories = {"baseline": baseline, "prototype": candidate_search()}
+    if args.production:
+        if args.vector_reuse:
+            parser.error("--production and --vector-reuse are separate comparisons")
+        factories = {"baseline": candidate_search(reference_expansion), "production": baseline}
     vector_methods = {name: store.Collection._fp16_vecs for name in factories}
     if args.vector_reuse:
         from expansion_vector_probe import cached_fp16_vecs, vector_expansion
@@ -202,11 +219,12 @@ def main():
         "dispersed-k10-ranked": ("dispersed", {"mode": "vector", "k": 10, "expand": top}),
         "dispersed-k10-all": ("dispersed", {"mode": "vector", "k": 10, "expand": all_rows}),
         "summary-hits-all": ("clustered", {"mode": "vector", "scope": "summaries", "k": 10, "expand": all_rows}),
+        "summaries-k10-ranked": ("clustered", {"mode": "vector", "scope": "summaries", "k": 10, "expand": top}),
         "text-k10-ranked": ("clustered", {"mode": "text", "k": 10, "expand": top}),
         "hybrid-k10-ranked": ("clustered", {"mode": "hybrid", "k": 10, "expand": top}),
         "clustered-k10-control": ("clustered", {"mode": "vector", "k": 10}),
     }
-    runs, profiles = {}, {}
+    runs, profiles, concurrent = {}, {}, {}
     with tempfile.TemporaryDirectory(prefix="raggio-expansion-") as directory:
         settings = Settings()
         settings.data_dir, settings.root_api_key = directory, "benchmark"
@@ -217,7 +235,7 @@ def main():
             managers.append(manager)
             return manager
         with patch.object(app_module, "CollectionManager", capture_manager), TestClient(create_app(settings)) as client:
-            for label, (collection, case) in cases.items():
+            for label, (collection, case) in (() if args.concurrency_only else cases.items()):
                 bodies = []
                 for i in range(args.iterations):
                     query = {"text": f"topic{i % 20}"} if case["mode"] != "vector" else {}
@@ -256,6 +274,32 @@ def main():
                     return profiles
                 profiles[label] = client.portal.call(profile)
                 print(json.dumps({"case": label, "last_round": rounds[-1], "profiles": profiles[label]}), flush=True)
+            if args.concurrency:
+                with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+                    for label in ("clustered-k10-ranked", "hybrid-k10-ranked", "dispersed-k10-ranked", "summaries-k10-ranked"):
+                        collection, case = cases[label]
+                        bodies = [orjson.dumps({**case, "query": {"vector": np.round(centers[i % len(centers)], 5),
+                                   **({"text": f"topic{i % 20}"} if case["mode"] == "hybrid" else {})}},
+                                   option=orjson.OPT_SERIALIZE_NUMPY) for i in range(args.iterations)]
+                        for name, factory in factories.items():
+                            with patch.object(store.Collection, "search", factory), patch.object(store.Collection, "_fp16_vecs", vector_methods[name]):
+                                list(pool.map(lambda raw: post(client, collection, raw), bodies))
+                        rounds = []
+                        for pair in range(args.pairs):
+                            outputs, row = [], {}
+                            for name in (tuple(factories) if pair % 2 == 0 else tuple(factories)[::-1]):
+                                with patch.object(store.Collection, "search", factories[name]), patch.object(store.Collection, "_fp16_vecs", vector_methods[name]):
+                                    wall, cpu = time.perf_counter(), time.process_time()
+                                    responses = []
+                                    for _ in range(5):
+                                        responses.extend(pool.map(lambda raw: post(client, collection, raw), bodies))
+                                    row[name] = {"qps": len(responses)/(time.perf_counter()-wall),
+                                                 "cpu_per_request_ms": (time.process_time()-cpu)*1000/len(responses)}
+                                outputs.append([r.content for r in responses])
+                            assert all(output == outputs[0] for output in outputs), (label, "concurrent")
+                            rounds.append(row)
+                        concurrent[label] = rounds
+                        print(json.dumps({"concurrent_case": label, "rounds": rounds}), flush=True)
     medians = {label: {name: {key: statistics.median(row[name][key] for row in rows)
                              for key in rows[0][name]} for name in factories} for label, rows in runs.items()}
     result = {"baseline_revision": args.baseline_revision,
@@ -265,7 +309,9 @@ def main():
               "openblas_threads": os.environ.get("OPENBLAS_NUM_THREADS"),
               "rows_per_collection": args.rows, "dim": args.dim, "pairs": args.pairs, "iterations": args.iterations,
               "seed": 821, "transport": "ASGI TestClient", "same_response_bytes": True,
-              "medians": medians, "runs": runs, "profiles": profiles}
+              "medians": medians, "runs": runs, "profiles": profiles,
+              "concurrency": args.concurrency, "concurrent_requests_per_arm_per_pair": 5 * args.iterations,
+              "concurrent_runs": concurrent}
     if args.out:
         args.out.write_text(json.dumps(result, indent=2)+"\n", encoding="utf-8")
     print(json.dumps(medians, indent=2))
