@@ -135,7 +135,9 @@ concurrent queries into a single pass over the data. This is every
 collection's default; below ~1M vectors it is as fast as (or faster than) a
 graph index, at higher recall ([Vector indexing](indexing.md)). A metadata
 `filter` compiles to an **allowlist** — the set of record ids the filter
-permits — which the scan intersects on the fly.
+permits — which the scan intersects on the fly. An allowlist no longer than
+the rescore depth (a `doc_id` filter, say) skips the scan: its records' fp16
+originals are scored directly ([ADR 0007](adr/0007-sofia-backend-requirements.md)).
 
 ### IVF (inverted file index)
 
@@ -309,7 +311,7 @@ user-facing search ([Search](search.md)).
 
 ### Reciprocal Rank Fusion (RRF)
 
-raggio's fusion rule: `score(id) = Σ 1 / (60 + rank_in_leg)`. It is
+raggio's default fusion rule: `score(id) = Σ 1 / (60 + rank_in_leg)`. It is
 **rank-based**, not score-based — only positions matter, so there is nothing
 to reconcile between a bounded cosine and an unbounded BM25 score, and a
 record found by both legs beats one found by either alone. The constant
@@ -317,6 +319,17 @@ k = 60 comes from
 [Cormack, Clarke & Büttcher 2009](https://dl.acm.org/doi/10.1145/1571941.1572114)
 and damps the top ranks so a leg's #1 doesn't automatically dominate the
 fusion. Fused scores land in `(0, 2/61]`, and there is nothing to configure.
+
+### Relative score fusion and alpha
+
+The other fusion rule (`"fusion": "relative"`), the same as Weaviate's
+`relativeScoreFusion`: **score-based**. Each leg's scores are min-max
+normalised to `[0, 1]` — the leg's best candidate becomes 1, its worst 0 —
+and the fused score is `alpha × vector + (1 − alpha) × bm25`, so **alpha**
+weights the legs: 1 is vector only, 0 is BM25 only, 0.5 (raggio's default)
+is equal. Scores land in `[0, 1]`, but they stay relative to each query's
+candidates: a hit that tops both legs scores 1 on any query
+([Search](search.md#how-hybrid-works)).
 
 ### Leg depth
 
@@ -330,8 +343,9 @@ tail: a record ranked 70th by *both* legs can still make a fused top-10. The
 For comparison shopping: Weaviate's `rankedFusion` is the same k = 60 RRF,
 and its `alpha` parameter weights the two legs — 0.5 means equal, equivalent
 to raggio's unweighted RRF and the setting the [benchmarks](benchmark.md)
-use. raggio deliberately ships no weighting knob today; weighted RRF is
-noted as a possible future API in [ADR 0003](adr/0003-recall-rescoring.md).
+use. raggio's RRF has no weighting knob; `alpha` applies to relative fusion,
+which Weaviate has used by default since 1.24 (with a server default alpha of
+0.75; raggio's is 0.5) — see [ADR 0007](adr/0007-sofia-backend-requirements.md).
 
 ## Benchmark vocabulary
 

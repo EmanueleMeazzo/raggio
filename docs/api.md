@@ -150,7 +150,7 @@ browsing, paging, per-filter counts and exports.
 | Query param | Type | Default | Notes |
 |---|---|---|---|
 | `scope` | `chunks` \| `summaries` \| `both` | `both` | Record types listed |
-| `filter` | JSON object (URL-encoded) | none | Same grammar as the search `filter` |
+| `filter` | JSON object (URL-encoded) | none | Same grammar as the search `filter`, `doc_id` included: `{"doc_id": "contract-42"}` pages one document's records |
 | `sort` | string | insertion order | Metadata key; `-` prefix for descending. Records lacking the key sort first ascending, last descending |
 | `limit` | int | `20` | 1–1000 |
 | `offset` | int | `0` | |
@@ -211,9 +211,11 @@ Removes the document's summary and chunks from both indexes.
 | `mode` | `vector` \| `text` \| `hybrid` | `vector` | See [Search](search.md) |
 | `k` | int | `10` | 1–1000 |
 | `scope` | `chunks` \| `summaries` \| `both` | `chunks` | Record types searched |
-| `filter` | object | none | Metadata filters, ANDed: scalar = equality, list = `in`, object = `gte`/`lte`/`gt`/`lt`, `in`, `contains` ([grammar](search.md#scope-and-filters)) |
+| `filter` | object | none | Metadata filters, ANDed: scalar = equality, list = `in`, object = `gte`/`lte`/`gt`/`lt`, `in`, `contains`; the reserved key `doc_id` filters on the document id (equality and `in` only) ([grammar](search.md#scope-and-filters)) |
 | `expand` | object | none | Per-hit context expansion |
 | `nprobe` | int | index default | [IVF](indexing.md) shards probed for this query (speed/recall knob); ignored without an index |
+| `fusion` | `rrf` \| `relative` | `rrf` | `hybrid` only: how the two legs are fused ([Search](search.md#how-hybrid-works)); ignored in the other modes |
+| `alpha` | float, 0–1 | `0.5` | `relative` fusion only: weight of the vector leg (0 = BM25 only, 1 = vector only); ignored by `rrf` |
 
 **200**
 
@@ -232,9 +234,14 @@ Removes the document's summary and chunks from both indexes.
 }
 ```
 
+`score` is on the mode's scale ([Search](search.md#modes)): cosine for
+`vector`, BM25 for `text`, and for `hybrid` an RRF score in `(0, 2/61]` or, with
+`fusion: relative`, a score in `[0, 1]`.
+
 **400** — query/mode mismatch, wrong vector dim, unsupported filter operator,
 or a text query in `vector`/`hybrid` mode with no embedding endpoint
-configured.
+configured · **422** — a field outside its schema (`k` or `alpha` out of range,
+an unknown `mode` or `fusion`).
 
 ---
 
@@ -251,3 +258,9 @@ same results.
 
 `gil_enabled` is `false` only on the experimental free-threaded 3.14t image
 ([ADR 0006](adr/0006-free-threaded-python.md)).
+
+While another process holds the data directory
+([one process per data directory](storage.md#one-process-per-data-directory)),
+`/healthz` answers **200** `{"status": "starting"}` and every other endpoint
+**503** with `Retry-After: 2`. If start-up fails, `/healthz` answers **503**
+`{"status": "failed"}`.

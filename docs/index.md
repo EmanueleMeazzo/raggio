@@ -16,8 +16,8 @@ quantization shrinks vector indexes ≈8x, and collections are offloaded to disk
 instead of kept always in memory, so stored data isn't bounded by RAM.
 
 - **Hybrid search** — vector (cosine over quantized turbovec indexes), text
-  (BM25 via SQLite FTS5), or both fused with Reciprocal Rank Fusion. The
-  client picks the mode per request.
+  (BM25 via SQLite FTS5), or both fused with Reciprocal Rank Fusion or
+  Weaviate-style relative score fusion. The client picks the mode per request.
 - **Durable async ingest** — documents are journaled to SQLite before the API
   acknowledges them; interrupted jobs replay after a crash.
 - **Physically separate collections** — each collection has its own vector

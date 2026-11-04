@@ -66,6 +66,12 @@ the same Dockerfile, for evaluation only ([ADR 0006](docs/adr/0006-free-threaded
 `podman build --build-arg PYTHON=3.14t -t raggio:py314t .`. It compiles turbovec from source
 and fails the build if anything re-enables the GIL; `/healthz` reports `gil_enabled`.
 
+One process per `DATA_DIR`: raggio locks `DATA_DIR/raggio.lock` before opening
+anything, and a second process (the new replica of a rolling restart on a shared
+volume) answers `/healthz` with `{"status": "starting"}` and everything else with 503 +
+`Retry-After` until the first has exited
+([details](docs/storage.md#one-process-per-data-directory)).
+
 ### Config (env)
 
 | Var | Default | |
@@ -108,8 +114,9 @@ curl :8000/collections/bu-sales/documents -H "x-api-key: sales-secret" --json '{
     ]}]}'
 # -> {"job_id": 1}    poll: GET /collections/bu-sales/jobs/1
 
-# search: mode vector (default) | text (BM25) | hybrid (RRF fusion of both),
-# scope chunks|summaries|both, metadata filters (equality, ranges, in, contains),
+# search: mode vector (default) | text (BM25) | hybrid (RRF fusion of both, or
+# "fusion": "relative" weighted by "alpha"), scope chunks|summaries|both, metadata
+# filters (equality, ranges, in, contains) plus the reserved doc_id key,
 # per-hit expansion to sibling chunks and/or the parent summary
 curl :8000/collections/bu-sales/search -H "x-api-key: sales-secret" --json '{
   "query": {"text": "acme pricing terms"},
@@ -121,9 +128,10 @@ curl :8000/collections/bu-sales/search -H "x-api-key: sales-secret" --json '{
 
 Search modes: `vector` embeds the query (or takes a raw vector) and returns cosine
 scores; `text` runs BM25 over SQLite FTS5 (no embedding endpoint needed, score is
-`-bm25`, higher = better); `hybrid` fuses both rankings with Reciprocal Rank Fusion
-(text required, vector optional to skip the embedding call). Records ingested without
-text are invisible to the BM25 leg.
+`-bm25`, higher = better); `hybrid` fuses both rankings (text required, vector
+optional to skip the embedding call) with Reciprocal Rank Fusion, or with Weaviate's
+relative score fusion when `"fusion": "relative"` (scores in [0, 1], `alpha` weighs
+the vector leg). Records ingested without text are invisible to the BM25 leg.
 
 Also: `GET/DELETE /collections/{name}`, `GET/PATCH/DELETE /collections/{name}/documents/{doc_id}`
 (PATCH merge-patches metadata without re-embedding), `GET /collections/{name}/documents`
