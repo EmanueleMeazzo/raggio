@@ -1,0 +1,117 @@
+{
+  "python": "3.12.15 (main, Oct  1 2026, 20:59:04) [Clang 22.1.3 ]",
+  "platform": "Linux-6.18.54.1-microsoft-standard-WSL2-x86_64-with-glibc2.41",
+  "sqlite": "3.53.1",
+  "versions": {
+    "fastapi": "0.142.2",
+    "pydantic": "2.13.5",
+    "numpy": "2.5.3",
+    "turbovec": "1.0.0"
+  },
+  "rows": 1,
+  "dim": 8,
+  "payload_bytes": 737,
+  "pairs": 5,
+  "iterations": 50,
+  "workers": "paused",
+  "transport": "in-process ASGI TestClient",
+  "comparison": "conversion",
+  "medians": {
+    "copy": {
+      "admission_p50_ms": 1.3217905016063014,
+      "admission_p95_ms": 1.918313350870448,
+      "cpu_per_admission_ms": 1.399144759999995,
+      "model_conversion_ms": 0.0017636599659454077,
+      "conversion_encode_ms": 0.007210359981399961
+    },
+    "reuse": {
+      "admission_p50_ms": 1.2807564999093302,
+      "admission_p95_ms": 2.2139435504868743,
+      "cpu_per_admission_ms": 1.4060204000000542,
+      "model_conversion_ms": 0.0036297799670137465,
+      "conversion_encode_ms": 0.008966440000222065
+    }
+  },
+  "runs": [
+    {
+      "copy": {
+        "admission_p50_ms": 1.931562999743619,
+        "admission_p95_ms": 3.1532881521343366,
+        "cpu_per_admission_ms": 2.0471737399999945,
+        "model_conversion_ms": 0.0035410399868851528,
+        "conversion_encode_ms": 0.015224079979816452
+      },
+      "reuse": {
+        "admission_p50_ms": 2.019675999690662,
+        "admission_p95_ms": 2.7510685507877493,
+        "cpu_per_admission_ms": 2.0496327599999953,
+        "model_conversion_ms": 0.004780899980687536,
+        "conversion_encode_ms": 0.008966440000222065
+      }
+    },
+    {
+      "copy": {
+        "admission_p50_ms": 1.4889849990140647,
+        "admission_p95_ms": 2.5071420010135617,
+        "cpu_per_admission_ms": 1.5911555599999794,
+        "model_conversion_ms": 0.0020840200159000233,
+        "conversion_encode_ms": 0.007210359981399961
+      },
+      "reuse": {
+        "admission_p50_ms": 1.3434734992188169,
+        "admission_p95_ms": 3.0354468515724835,
+        "cpu_per_admission_ms": 1.5554769399999913,
+        "model_conversion_ms": 0.003649260033853352,
+        "conversion_encode_ms": 0.008908780000638217
+      }
+    },
+    {
+      "copy": {
+        "admission_p50_ms": 1.3217905016063014,
+        "admission_p95_ms": 1.8838866009900808,
+        "cpu_per_admission_ms": 1.399144759999995,
+        "model_conversion_ms": 0.0015797399828443304,
+        "conversion_encode_ms": 0.006714060000376776
+      },
+      "reuse": {
+        "admission_p50_ms": 1.2702459989668569,
+        "admission_p95_ms": 2.2139435504868743,
+        "cpu_per_admission_ms": 1.399503900000001,
+        "model_conversion_ms": 0.0036297799670137465,
+        "conversion_encode_ms": 0.009485039990977384
+      }
+    },
+    {
+      "copy": {
+        "admission_p50_ms": 1.224747999003739,
+        "admission_p95_ms": 1.7740122499162674,
+        "cpu_per_admission_ms": 1.334749879999988,
+        "model_conversion_ms": 0.0017636599659454077,
+        "conversion_encode_ms": 0.00638404002529569
+      },
+      "reuse": {
+        "admission_p50_ms": 1.2488430002122186,
+        "admission_p95_ms": 1.7962711510335794,
+        "cpu_per_admission_ms": 1.295840419999994,
+        "model_conversion_ms": 0.0034561999927973375,
+        "conversion_encode_ms": 0.008933460048865527
+      }
+    },
+    {
+      "copy": {
+        "admission_p50_ms": 1.2440699993021553,
+        "admission_p95_ms": 1.918313350870448,
+        "cpu_per_admission_ms": 1.3635321200000128,
+        "model_conversion_ms": 0.0015502599853789434,
+        "conversion_encode_ms": 0.00739744005841203
+      },
+      "reuse": {
+        "admission_p50_ms": 1.2807564999093302,
+        "admission_p95_ms": 2.0342130499557243,
+        "cpu_per_admission_ms": 1.4060204000000542,
+        "model_conversion_ms": 0.0034362800215603784,
+        "conversion_encode_ms": 0.008999159981613047
+      }
+    }
+  ]
+}
