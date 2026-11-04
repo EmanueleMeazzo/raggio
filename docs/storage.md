@@ -93,6 +93,19 @@ NFSv3 `nolock`) each host sees only its own, and two hosts can still open one
 that client's lease expires. Windows has no `fcntl`: there the lock is
 skipped, with a warning.
 
+On Linux and other POSIX systems every database, `catalog.db` and each
+`meta.db`, is opened through SQLite's `unix-excl` VFS. It takes the file's
+lock once, when the database opens, and holds it; the process's own
+connections coordinate in memory, and the WAL index lives in memory instead of
+a `-shm` file. SQLite's default VFS takes and drops file locks around every
+transaction, and on NFS each of those is a round trip to the server that also
+empties the client's cache of the file: about 40 ms on every request on an
+Azure Files share. So while raggio runs, no other process can open its
+databases (it gets `database is locked`): run an integrity check or the
+`sqlite3` shell on a stopped container, or on a copy of `DATA_DIR`. Data
+directories written by earlier versions open as they are, and a `-shm` file
+they left behind is ignored. Windows keeps SQLite's default VFS.
+
 ## Backup
 
 There is no backup API; a backup is a copy of `DATA_DIR`. `meta.db` is a WAL

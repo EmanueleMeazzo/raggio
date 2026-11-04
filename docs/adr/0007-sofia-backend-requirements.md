@@ -1,4 +1,4 @@
-# ADR 0007 — For the S.O.F.I.A. backend: relative fusion, a doc_id filter, exact small allowlists, a document-scoped BM25 leg, one process per data directory
+# ADR 0007 — For the S.O.F.I.A. backend: relative fusion, a doc_id filter, exact small allowlists, a document-scoped BM25 leg, one process per data directory, SQLite on NFS
 
 Status: accepted · Date: 2026-11-03 · Takes up the relative-score fusion ADR 0003 left as a candidate future API
 
@@ -6,7 +6,7 @@ Status: accepted · Date: 2026-11-03 · Takes up the relative-score fusion ADR 0
 
 raggio is about to replace Weaviate as the vector store behind the S.O.F.I.A. chat
 backend. Three things that backend relies on had no raggio equivalent, and its DEV spike
-found a fourth gap, in deployment, and a fifth on real data:
+found a fourth gap, in deployment, and two more on real data:
 
 1. **Hybrid scores on Weaviate's scale.** The backend runs one hybrid query shape,
    Weaviate's default `relativeScoreFusion` (the default since Weaviate 1.24) with an
@@ -45,6 +45,18 @@ found a fourth gap, in deployment, and a fifth on real data:
    in one document, 105 / 111 summaries (Weaviate 31 / 36). About 70-85 ms of the
    one-document figure is server time, and the BM25 leg dominates it: FTS5 ranks the
    pruned query over the whole corpus and filters by `doc_id` only after the join.
+6. **SQLite's file locks on NFS.** With 1-5 deployed, the same collection and image,
+   measured inside the container against 127.0.0.1 (p50 / p95 ms), on the NFS share
+   (`vers=4.1,hard,local_lock=none,acregmin=30`) and on a local-disk copy of the same
+   files: `/healthz` 0.6 / 0.7 and 0.5 / 0.5; `GET /collections/{name}` 117 / 130 and
+   65 / 71; one-document vector 48 / 55 and 3.5 / 3.9, text 45 / 51 and 1.2 / 2.3,
+   hybrid 35 / 49 and 3.8 / 4.6; summaries vector 66 / 74 and 25 / 34, text 74 / 98 and
+   12 / 25, hybrid 80 / 101 and 42 / 53. Every request touching SQLite paid about
+   40 ms on NFS. SQLite's default unix VFS takes and drops `fcntl` locks on the
+   database and on its `-shm` file around every transaction; with `local_lock=none` each
+   is an NFSv4 LOCK/LOCKU round trip, and the Linux client also flushes and drops the
+   file's page cache when it takes a lock (locking is a cache-coherency point), so the
+   pages come from the server again.
 
 Weaviate's behaviour, read from its source (`usecases/traverser/hybrid/hybrid_fusion.go`,
 `FusionRelativeScore`, and `searcher.go`, weaviate/weaviate main, 2026-11-03):
@@ -88,6 +100,11 @@ Weaviate's behaviour, read from its source (`usecases/traverser/hybrid/hybrid_fu
 | **A document-scoped BM25 leg** (`_text_ids`): with `doc_id` in the filter and a unicode61 collection, count the matching rows through `idx_records_doc_type`; at most `TEXT_DIRECT_MAX` (1000) are scored directly by the stage-2 scorer (`_bm25_rescore`: corpus-wide idf from the df cache, the sampled avgdl, `raggio_native.bm25_topn` or its Python reference), rows scoring 0 (no query term) dropped as FTS5 MATCH drops them | The two-stage path's scores, without its corpus-wide stage 1 and its candidate caps, so a document's rows holding only pruned (common) query terms are found too. `_prune_common` still runs first, so the df cache refreshes after write churn exactly as before. At 165k records (below) the leg went from 22.8 / 69.5 to 1.8 / 7.6 ms p50/p95 |
 | `TEXT_DIRECT_MAX = 1000` | The direct path costs ~37 µs per ~1000-word row, linear (1000 rows: 37 / 42 ms p50/p95); the FTS5 path cost 9-14 ms p50 and 48-270 ms p95 whatever the row count, on the synthetic 165k corpus. So the p50 crossover is ~350 rows and the p95 one beyond 1000. FTS5's cost grows with the corpus (the 2% pruning budget) and was ~5x heavier on the DEV data (about 60 ms of its ~70-85 ms server time), which puts the real-data p50 crossover near 1,600 rows; 1000 stays under it. A `doc_id` list over the cut-off keeps the FTS5 path |
 | Trigram collections keep the FTS5 path | Trigram matches substrings; the stage-2 tokenizer splits words, so it would miss them (pinned by a test) |
+| **Every SQLite connection through the `unix-excl` VFS on POSIX** (`connect_db`: `file:<path>?vfs=unix-excl`): `catalog.db`, the write connection and the per-thread read connections of each `meta.db`, and `resume_pending`'s check | `unix-excl` takes the database file's `fcntl` lock once, at the first transaction, and holds it until the last connection closes; the process's connections coordinate through SQLite's in-memory per-inode lock state, and the WAL index is allocated on the heap instead of an mmap'd `-shm` file. Counted with an `LD_PRELOAD` shim around `fcntl` (SQLite 3.50.4): 2 lock calls per read transaction and 6 per write with the default VFS, 0 with `unix-excl`. WAL concurrency is unchanged: a reader inside a transaction keeps its snapshot while the writer commits, then sees the commit; four reader threads run in parallel (0.06 s, against 0.12 s one after another). R5's lock already makes the process the only one in `DATA_DIR`, which is what `unix-excl` requires |
+| The path goes in as `Path.absolute().as_uri()` | A `file:` URI: spaces, `%`, `#` and `?` in `DATA_DIR` must be escaped, or SQLite reads them as URI syntax (a `?` would start the query string); a test runs a data dir named with all four |
+| Windows keeps the default VFS | No `unix-excl` there; same branch as the `fcntl` lock |
+| R5's lock on `raggio.lock` stays | Under `unix-excl` a second process would fail with `database is locked` (after the 30 s busy timeout) rather than wait; R5 keeps the clean 503 handover. The two locks are on different files |
+| Data dirs written by the default VFS open as they are | Checked: a database left with committed but un-checkpointed WAL frames (`-wal` and `-shm` from a process that exited without closing) opens through `unix-excl` with every committed row; the heap WAL index is rebuilt from the `-wal` file, and the stale `-shm` is ignored (pinned by a test) |
 
 ## Rejected
 
@@ -223,6 +240,24 @@ candidate queries the tail. The masked search over 13% of the rows already beats
 plain scan. A check of `_vector_ids` against a direct call of the same masked search
 and rescore found no overhead between them.
 
+**`unix-excl` on a local disk** (the 165k collection rebuilt; WSL ext4, native scorer;
+the change before `unix-excl` (a3d8573) and after it in one process, each on its own
+copy of the collection so the two VFSes never share a file, alternating per query, 100
+timed each; `fcntl` lock calls per request counted with the `LD_PRELOAD` shim):
+
+| p50 / p95 ms, lock calls per request | default VFS | `unix-excl` |
+|---|---|---|
+| `GET /collections/{name}` (`stats()`) | 39.9 / 92.1, 6 | 39.5 / 95.6, 0 |
+| Vector, one document, k=5 | 0.39 / 0.55, 6 | 0.39 / 0.57, 0 |
+| Text, one document, k=5 | 2.30 / 6.01, 12 | 2.46 / 6.71, 0 |
+| Hybrid relative, one document, k=5 | 1.93 / 4.51, 12 | 1.92 / 3.85, 0 |
+| Vector, summaries, k=10 | 18.1 / 25.7, 4 | 18.0 / 24.5, 0 |
+| Text, summaries, k=10 | 14.5 / 160.8, 12 | 15.4 / 130.2, 0 |
+| Hybrid relative, summaries, k=10 | 58.3 / 123.8, 14 | 59.5 / 132.7, 0 |
+
+Neutral on a local disk, as expected. On NFS each of those 4-14 lock calls was a server
+round trip plus a page-cache drop; the DEV figures with `unix-excl` are to be measured.
+
 ## Consequences
 
 - A metadata key named `doc_id` can no longer be filtered: the key now means the
@@ -242,6 +277,13 @@ and rescore found no overhead between them.
   score exactly as before.
 - `scope: summaries` hybrid is unchanged (70 / 176 ms at 165k here; 124 / 156 ms with
   RTT on DEV, against Weaviate's 54 / 56).
+- With `unix-excl`, a request makes no `fcntl` calls on SQLite's files, so on NFS it no
+  longer pays the ~40 ms of lock round trips and re-reads measured above. The Linux NFS
+  client still revalidates its cache on its own schedule (`acregmin`, close-to-open),
+  which this does not change; DEV measures the result.
+- While raggio runs, no other process can open its databases (`database is locked`),
+  integrity checks and the `sqlite3` shell included: they need a stopped container or
+  a copy of `DATA_DIR`. There is no `-shm` file next to a database any more on POSIX.
 - Relative scores are relative to each query's candidates, as Weaviate's are: a hit
   that tops both legs scores 1.0 on any query, so a "top score >= 0.85" shortcut means
   "leads both rankings", not "relevant". On a one-document search the candidates are
@@ -260,7 +302,11 @@ and rescore found no overhead between them.
   in that window fail fast with `Retry-After` instead of corrupting the database.
 - Tests: `tests/test_api.py` covers the wait (503s, `/healthz` "starting", nothing in
   `DATA_DIR` opened), the failed start-up (503 "failed") with the lock simulated, and,
-  POSIX only, a real second process holding `raggio.lock`.
+  POSIX only, a real second process holding `raggio.lock`; also a `DATA_DIR` named with
+  a space, `%`, `#` and `?`. `tests/test_store_optimizations.py` pins `unix-excl` (POSIX:
+  no `-shm`, another process locked out of `meta.db` and `catalog.db` until they close)
+  and the open of a default-VFS leftover.
 - Docs: `docs/search.md` (fusion, the `doc_id` key, the exact path, the document-scoped
   BM25 leg), `docs/api.md`,
-  `docs/concepts.md`, `docs/storage.md` (one process per data directory), README.
+  `docs/concepts.md`, `docs/storage.md` (one process per data directory, `unix-excl`),
+  README.
