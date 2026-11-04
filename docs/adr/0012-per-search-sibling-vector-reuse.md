@@ -16,6 +16,12 @@ exploration prototype's context variable and patched vector-fetch method. All
 preparation runs in a worker while `Collection.search` holds its existing read lock.
 The result is passed to `_expand`/`_search_allowed`; nothing is stored on the collection.
 
+The subsequent [Sofia deployment report](../research/sofia-retrieval-benchmark-2026-11-04.md)
+evaluates PR #9, not this change. Sofia's planned flow does not use
+`expand.siblings_topk`; this reuse is an optional feature improvement and is not
+expected to accelerate that flow. Further Sofia work should target its summary
+and in-document queries directly.
+
 ## Eligibility, bounds and compatibility
 
 - Prioritize documents with more returned hits. Fetch their indexed chunk IDs with
