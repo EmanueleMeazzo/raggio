@@ -1,0 +1,117 @@
+{
+  "python": "3.12.15 (main, Oct  1 2026, 20:59:04) [Clang 22.1.3 ]",
+  "platform": "Linux-6.18.54.1-microsoft-standard-WSL2-x86_64-with-glibc2.41",
+  "sqlite": "3.53.1",
+  "versions": {
+    "fastapi": "0.142.2",
+    "pydantic": "2.13.5",
+    "numpy": "2.5.3",
+    "turbovec": "1.0.0"
+  },
+  "rows": 250,
+  "dim": 1024,
+  "payload_bytes": 2312459,
+  "pairs": 5,
+  "iterations": 20,
+  "workers": "paused",
+  "transport": "in-process ASGI TestClient",
+  "comparison": "conversion",
+  "medians": {
+    "copy": {
+      "admission_p50_ms": 35.07133250059269,
+      "admission_p95_ms": 43.2402842008742,
+      "cpu_per_admission_ms": 37.929270249999945,
+      "model_conversion_ms": 6.736900800024159,
+      "conversion_encode_ms": 11.963045450102072
+    },
+    "reuse": {
+      "admission_p50_ms": 29.01644699886674,
+      "admission_p95_ms": 35.78818470123224,
+      "cpu_per_admission_ms": 30.097189250000113,
+      "model_conversion_ms": 0.9133725501669687,
+      "conversion_encode_ms": 7.559118300014234
+    }
+  },
+  "runs": [
+    {
+      "copy": {
+        "admission_p50_ms": 40.42026699971757,
+        "admission_p95_ms": 50.509209701158426,
+        "cpu_per_admission_ms": 43.364591500000095,
+        "model_conversion_ms": 6.023437350086169,
+        "conversion_encode_ms": 11.923609299992677
+      },
+      "reuse": {
+        "admission_p50_ms": 30.332039999848348,
+        "admission_p95_ms": 43.289997250212764,
+        "cpu_per_admission_ms": 32.39113229999999,
+        "model_conversion_ms": 2.7855874999659136,
+        "conversion_encode_ms": 7.085837649901805
+      }
+    },
+    {
+      "copy": {
+        "admission_p50_ms": 32.93160900102521,
+        "admission_p95_ms": 43.2402842008742,
+        "cpu_per_admission_ms": 36.82215024999995,
+        "model_conversion_ms": 6.736900800024159,
+        "conversion_encode_ms": 13.31978700000036
+      },
+      "reuse": {
+        "admission_p50_ms": 26.014380000560777,
+        "admission_p95_ms": 31.250663850005367,
+        "cpu_per_admission_ms": 26.716636000000136,
+        "model_conversion_ms": 0.5106963999423897,
+        "conversion_encode_ms": 10.587784400013334
+      }
+    },
+    {
+      "copy": {
+        "admission_p50_ms": 35.07133250059269,
+        "admission_p95_ms": 43.181931799881596,
+        "cpu_per_admission_ms": 37.929270249999945,
+        "model_conversion_ms": 7.229194149840623,
+        "conversion_encode_ms": 17.98451645008754
+      },
+      "reuse": {
+        "admission_p50_ms": 29.01644699886674,
+        "admission_p95_ms": 35.78818470123224,
+        "cpu_per_admission_ms": 30.097189250000113,
+        "model_conversion_ms": 0.9133725501669687,
+        "conversion_encode_ms": 7.905608849978307
+      }
+    },
+    {
+      "copy": {
+        "admission_p50_ms": 39.63188300076581,
+        "admission_p95_ms": 47.253336998619496,
+        "cpu_per_admission_ms": 40.40198629999993,
+        "model_conversion_ms": 5.854066299980332,
+        "conversion_encode_ms": 11.963045450102072
+      },
+      "reuse": {
+        "admission_p50_ms": 29.494258500562864,
+        "admission_p95_ms": 36.23184524840326,
+        "cpu_per_admission_ms": 30.565399999999965,
+        "model_conversion_ms": 2.8144950500063715,
+        "conversion_encode_ms": 7.559118300014234
+      }
+    },
+    {
+      "copy": {
+        "admission_p50_ms": 31.435314000191283,
+        "admission_p95_ms": 37.28472464681545,
+        "cpu_per_admission_ms": 32.30599800000018,
+        "model_conversion_ms": 7.310057600079745,
+        "conversion_encode_ms": 11.707697749989165
+      },
+      "reuse": {
+        "admission_p50_ms": 26.287618000424118,
+        "admission_p95_ms": 32.79357954816078,
+        "cpu_per_admission_ms": 27.117006649999897,
+        "model_conversion_ms": 0.7079934999637771,
+        "conversion_encode_ms": 7.350593649971415
+      }
+    }
+  ]
+}

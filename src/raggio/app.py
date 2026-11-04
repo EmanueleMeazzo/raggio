@@ -102,6 +102,30 @@ class PatchIn(BaseModel):
     apply_to_chunks: bool = True
 
 
+_INGEST_VECTOR_EXCLUDE = {
+    "documents": {"__all__": {"summary": {"vector"}, "chunks": {"__all__": {"vector"}}}}
+}
+
+
+def _ingest_payload(body: IngestIn) -> dict:
+    """Serialize metadata normally, reusing vector lists until enqueue encodes them."""
+    payload = body.model_dump(exclude=_INGEST_VECTOR_EXCLUDE)
+
+    def record_payload(record: RecordIn, values: dict, model: type[RecordIn]) -> dict:
+        # Restore the declared field order too: the journal must stay byte-identical
+        # to model_dump(), including summaries serialized as RecordIn.
+        return {key: record.vector if key == "vector" else values[key] for key in model.model_fields}
+
+    for document, source in zip(payload["documents"], body.documents):
+        if source.summary is not None:
+            document["summary"] = record_payload(source.summary, document["summary"], RecordIn)
+        document["chunks"] = [
+            record_payload(record, chunk, ChunkIn)
+            for chunk, record in zip(document["chunks"], source.chunks)
+        ]
+    return payload
+
+
 class _IngestJSONRequest(Request):
     """Validate normal ingest JSON in Pydantic's native parser, in one pass."""
 
@@ -303,7 +327,7 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
                 _check_record(d.summary, c.cfg.dim, f"document '{d.doc_id}' summary")
             for ch in d.chunks:
                 _check_record(ch, c.cfg.dim, f"chunk '{ch.id}'")
-        job_id = await c.enqueue(body.model_dump())
+        job_id = await c.enqueue(_ingest_payload(body))
         return {"job_id": job_id}
 
     app.include_router(ingest_router)

@@ -224,6 +224,11 @@ Ingest admission uses Pydantic's native JSON parser with a compatibility fallbac
 The local paired benchmark measured 30% lower admission p50 for 250-vector requests;
 protocol, scope and reproduction: [ADR 0008](docs/adr/0008-native-ingest-json.md).
 
+Payload conversion also reuses validated vector lists until journal encoding.
+A separate paired benchmark measured another 17% lower admission p50 for that
+request shape, with native parsing in both arms; details and limits:
+[ADR 0009](docs/adr/0009-ingest-vector-conversion.md).
+
 Needs uv 0.12 or newer (`required-version` in `pyproject.toml`).
 
 ```bash
