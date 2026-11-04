@@ -496,6 +496,30 @@ def _rrf(k: int, *rankings: list[int]) -> tuple[list[int], list[float]]:
     return [rid for rid, _ in top], [s for _, s in top]
 
 
+def _relative(
+    k: int, alpha: float, vec: tuple[list[int], list[float]], text: tuple[list[int], list[float]]
+) -> tuple[list[int], list[float]]:
+    """Relative score fusion, as Weaviate's relativeScoreFusion: each leg's scores are
+    min-max normalised to [0, 1] (a leg whose scores are all equal, one candidate
+    included, normalises to 1.0), then score(id) = alpha * vector + (1 - alpha) * text,
+    a leg that did not return the id adding 0. Ties keep first-seen order, vector leg
+    first, as in _rrf."""
+    scores: dict[int, float] = {}
+    for (ids, leg), weight in ((vec, alpha), (text, 1 - alpha)):
+        if not ids:
+            continue
+        lo, hi = min(leg), max(leg)
+        for rid, s in zip(ids, leg):
+            scores[rid] = scores.get(rid, 0.0) + weight * ((s - lo) / (hi - lo) if hi > lo else 1.0)
+    top = sorted(scores.items(), key=lambda kv: -kv[1])[:k]
+    return [rid for rid, _ in top], [s for _, s in top]
+
+
+async def _no_leg() -> tuple[list[int], list[float]]:
+    """A hybrid leg relative fusion skips because its weight is 0."""
+    return [], []
+
+
 class _RWLock:
     """asyncio readers-writer lock: many readers or one writer, writer-preferring
     (new readers wait once a writer is queued, so steady query traffic can't
@@ -2445,8 +2469,10 @@ class Collection:
         filt: dict | None,
         expand,
         nprobe: int | None = None,
+        fusion: str = "rrf",
+        alpha: float = 0.5,
     ) -> list[dict]:
-        n = max(HYBRID_DEPTH, k) if mode == "hybrid" else k  # per-leg depth so RRF sees the tail
+        n = max(HYBRID_DEPTH, k) if mode == "hybrid" else k  # per-leg depth so fusion sees the tail
         async with self.lock.read():
             if self._closed:  # queued for the read lock behind stop()'s write section
                 if self.deleted:
@@ -2457,11 +2483,13 @@ class Collection:
             elif mode == "text":
                 ids, scores = await asyncio.to_thread(self._text_ids, qtext, n, scope, filt)
             else:  # hybrid: legs in parallel — sqlite releases the GIL, so they overlap
-                (v_ids, _), (t_ids, _) = await asyncio.gather(
-                    self._vector_ids(qvec, n, scope, filt, nprobe),
-                    asyncio.to_thread(self._text_ids, qtext, n, scope, filt),
+                # relative fusion skips a leg whose weight is 0, as Weaviate does
+                rrf = fusion == "rrf"
+                vec, text = await asyncio.gather(
+                    self._vector_ids(qvec, n, scope, filt, nprobe) if rrf or alpha > 0 else _no_leg(),
+                    asyncio.to_thread(self._text_ids, qtext, n, scope, filt) if rrf or alpha < 1 else _no_leg(),
                 )
-                ids, scores = _rrf(k, v_ids, t_ids)
+                ids, scores = _rrf(k, vec[0], text[0]) if rrf else _relative(k, alpha, vec, text)
             hits = self._hydrate(ids, scores)
             if expand:
                 for hit in hits:

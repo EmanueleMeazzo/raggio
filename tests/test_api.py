@@ -411,3 +411,53 @@ def test_listing_filter_ops_and_patch(client):
     assert r.json() == {"patched_records": 1}
     assert "kind" not in client.get("/collections/main/documents/doc1", headers=ROOT).json()["summary"]["metadata"]
     assert client.patch("/collections/main/documents/nope", headers=ROOT, json={"metadata": {}}).status_code == 404
+
+
+DOC_B = {
+    "doc_id": "doc2",
+    "chunks": [
+        {"id": "b1", "text": "the closest star is the sun", "metadata": {"src": "wiki"}},
+        {"id": "b2", "text": "a planet orbits a star", "metadata": {"src": "blog", "doc_id": "doc1"}},
+    ],
+}
+
+
+def test_relative_fusion(client):
+    client.post("/collections", headers=ROOT, json={"name": "main"})
+    ingest(client, "main", [DOC, DOC_B])
+
+    def search(**body):
+        r = client.post("/collections/main/search", headers=ROOT,
+                        json={"query": {"text": "closest star"}, "k": 100, **body})
+        assert r.status_code == 200, r.text
+        return r.json()["hits"]
+
+    ids = lambda hits: [h["id"] for h in hits]
+    vec, text = search(mode="vector"), search(mode="text")
+    norm = lambda hits: {h["id"]: (h["score"] - hits[-1]["score"]) / (hits[0]["score"] - hits[-1]["score"])
+                         for h in hits}
+    assert len(vec) == 5 and ids(text)[0] == "b1" and len(text) == 3  # c1, b1, b2 match a term
+
+    # alpha 1 / 0 reproduce the single-leg rankings, rescaled to [0, 1]
+    hits = search(mode="hybrid", fusion="relative", alpha=1)
+    assert ids(hits) == ids(vec) and hits[0]["score"] == 1.0 and hits[-1]["score"] == 0.0
+    hits = search(mode="hybrid", fusion="relative", alpha=0)
+    assert ids(hits) == ids(text) and hits[0]["score"] == 1.0
+    # a mixed alpha is alpha * vector + (1 - alpha) * text over the min-max normalised legs
+    v, t = norm(vec), norm(text)
+    want = {rid: 0.3 * v.get(rid, 0.0) + 0.7 * t.get(rid, 0.0) for rid in {*v, *t}}
+    hits = search(mode="hybrid", fusion="relative", alpha=0.3)
+    assert ids(hits) == sorted(want, key=lambda rid: -want[rid])
+    assert all(h["score"] == pytest.approx(want[h["id"]]) and 0 <= h["score"] <= 1 for h in hits)
+    hits = search(mode="hybrid", fusion="relative", k=2)  # default alpha 0.5, k still applies
+    assert len(hits) == 2 and all(0 <= h["score"] <= 1 for h in hits)
+
+    # rrf stays the default, and ignores alpha
+    rrf = search(mode="hybrid")
+    assert rrf == search(mode="hybrid", fusion="rrf") == search(mode="hybrid", alpha=0.9)
+    assert all(0 < h["score"] <= 2 / 61 for h in rrf)
+
+    for bad in ({"alpha": -0.1}, {"alpha": 1.5}, {"fusion": "weighted"}):
+        r = client.post("/collections/main/search", headers=ROOT,
+                        json={"query": {"text": "planet"}, "mode": "hybrid", "fusion": "relative", **bad})
+        assert r.status_code == 422, bad

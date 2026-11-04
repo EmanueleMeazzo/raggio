@@ -72,6 +72,10 @@ class SearchIn(BaseModel):
     expand: ExpandIn | None = None
     # IVF speed/recall knob: shards probed for this query (ignored without an index)
     nprobe: int | None = Field(default=None, ge=1, le=4096)
+    # hybrid only: how the two legs are fused. alpha weighs the vector leg in relative
+    # fusion (0 = BM25 only, 1 = vector only); rrf ignores it
+    fusion: Literal["rrf", "relative"] = "rrf"
+    alpha: float = Field(default=0.5, ge=0, le=1)
 
 
 class IndexIn(BaseModel):
@@ -301,7 +305,7 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
                         raise
                 qvec = _normalize(np.array([vec], dtype=np.float32))
             hits = await c.search(body.mode, qvec, q.text, body.k, body.scope, body.filter,
-                                  body.expand, body.nprobe)
+                                  body.expand, body.nprobe, body.fusion, body.alpha)
         except ValueError as e:
             raise HTTPException(400, str(e))
         except CollectionDeletedError:  # DELETE /collections/{name} landed first

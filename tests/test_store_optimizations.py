@@ -438,3 +438,18 @@ def test_unpruned_query_skips_stage_two(tmp_path, monkeypatch):
     # default budget floor (1000 rows) >> corpus: nothing is pruned -> single FTS5 query
     hits = asyncio.run(col.search("text", None, "hello world", 5, "chunks", None, None))
     assert [h["id"] for h in hits] == ["c1"]
+
+
+# ---- relative fusion, exact small allowlists (ADR 0007) ----
+
+
+def test_relative_fusion_normalises_each_leg():
+    vec = ([1, 2, 3], [0.9, 0.5, 0.1])  # -> 1.0, 0.5, 0.0
+    text = ([3, 4], [10.0, 2.0])  # -> 1.0, 0.0
+    ids, scores = store._relative(10, 0.25, vec, text)
+    # 1: .25*1  2: .25*.5  3: .25*0 + .75*1  4: .75*0
+    assert ids == [3, 1, 2, 4] and scores == pytest.approx([0.75, 0.25, 0.125, 0.0])
+    assert store._relative(2, 0.25, vec, text)[0] == [3, 1]
+    # a leg of equal scores (one candidate included) normalises to 1.0, as Weaviate does
+    assert store._relative(10, 0.5, ([7], [0.3]), ([8, 9], [4.0, 4.0])) == ([7, 8, 9], [0.5, 0.5, 0.5])
+    assert store._relative(10, 0.5, ([], []), ([], [])) == ([], [])
