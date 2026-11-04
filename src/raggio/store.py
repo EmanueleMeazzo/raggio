@@ -74,6 +74,11 @@ RESCORE_MULT = 2
 RESCORE_FLOOR = {2: 200, 4: 50}
 RESCORE_CAP = 2000  # bounds per-query blob fetches at huge k
 
+# Scoped scans coalesce only already-arrived requests. Bound a cohort's query rows
+# and worst-case float32 rescore payload; a lone large request keeps its old bound.
+SCOPED_SCAN_BATCH_ROWS = 16
+SCOPED_SCAN_BATCH_BYTES = 16 * 1024 * 1024
+
 # two-stage BM25 (ADR 0003): FTS5 cannot rank a full query cheaply (no WAND — ORDER BY
 # rank scores every row matching ANY term) and must never rank a rowid-restricted MATCH
 # (bm25()'s IDF is recomputed per row probe, ~400x slower). So when the pruner dropped
@@ -1082,7 +1087,8 @@ class _IvfIndex:
         pos = np.minimum(np.searchsorted(big, small), len(big) - 1)
         return small[big[pos] == small]
 
-    def search(self, queries: np.ndarray, k: int, allowlist=None, nprobe: int | None = None):
+    def search(self, queries: np.ndarray, k: int, allowlist=None, nprobe: int | None = None,
+               *, _single_query_routing: bool = False):
         """Merged top-k over probed shards. Mirrors IdMapIndex.search: single-query
         results are trimmed exactly; a batch is rectangular, short rows padded with
         id 0 / -inf score (record ids start at 1, so padding never hydrates).
@@ -1107,7 +1113,10 @@ class _IvfIndex:
             probes = [list(owned)] * len(queries)
         else:
             npb = min(nprobe or self.nprobe, self.nlist)
-            sims = queries @ self.centroids.T
+            # New scoped cohorts must route exactly as their independent calls did:
+            # GEMM/GEMV reductions can differ at a centroid selection boundary.
+            sims = (np.vstack([q @ self.centroids.T for q in queries[:, None, :]])
+                    if _single_query_routing and len(queries) > 1 else queries @ self.centroids.T)
             probes = [
                 np.argpartition(-sims[qi], npb - 1)[:npb] for qi in range(len(queries))
             ]
@@ -1229,6 +1238,9 @@ class Collection:
         self.lock = _RWLock()  # searches share; ingest/delete/sync are exclusive
         self._scan_queue: list = []  # (qvec, n, future) waiting for a batched scan
         self._scan_task: asyncio.Task | None = None
+        # (allowlist identity, rescore depth, effective nprobe) -> (queue, drain task).
+        # Per-group drains leave unrelated filters and the full-index queue independent.
+        self._scoped_scans: dict[tuple, tuple[list, asyncio.Task]] = {}
         self._allow_cache: dict[str, np.ndarray] = {}  # (scope, filter) -> allowlist ids
         # bumped by every metadata/membership write; a filter scan that started before
         # a write may not cache its (older) snapshot. Read lock-free, bumped under the lock.
@@ -2281,6 +2293,15 @@ class Collection:
         if not filt and not (other and self.indexed_counts.get(other, 0)):
             return await self._scan_batched(qvec, n, nprobe)
 
+        if filt is None:
+            # Fixed scope keys are cheap on the loop. Explicit filters retain their
+            # worker-side key/SQL path, including Sofia's small document searches.
+            allow = self._allow_cache.get(f"{scope}|null")
+            if allow is not None:
+                depth = self._rescore_k(n)
+                if len(allow) > depth:
+                    return await self._scan_scoped(qvec, n, nprobe, allow, depth)
+
         def run() -> tuple[list[int], list[float]]:
             key = f"{scope}|{json.dumps(filt, sort_keys=True)}"
             allow = self._allow_cache.get(key)
@@ -2305,6 +2326,60 @@ class Collection:
             return self._search_allowed(qvec, n, allow, **kw)
 
         return await asyncio.to_thread(run)
+
+    async def _scan_scoped(self, qvec: np.ndarray, n: int, nprobe: int | None,
+                           allow: np.ndarray, depth: int) -> tuple[list[int], list[float]]:
+        probe = min(nprobe or self.index.nprobe, self.index.nlist) if isinstance(self.index, _IvfIndex) else None
+        key = (id(allow), depth, probe)
+        state = self._scoped_scans.get(key)
+        if state is None:
+            queue = []
+            task = asyncio.create_task(self._drain_scoped(key, queue, allow, probe, depth))
+            self._scoped_scans[key] = (queue, task)
+        else:
+            queue = state[0]
+        fut = asyncio.get_running_loop().create_future()
+        queue.append((qvec, n, fut))
+        return await fut
+
+    async def _drain_scoped(self, key: tuple, queue: list, allow: np.ndarray,
+                            probe: int | None, depth: int) -> None:
+        # Each non-cancelled waiter holds search's read lock. All-cancelled orphan
+        # work has the same guarded-read / closed-collection behavior as a solo scan.
+        limit = max(1, min(SCOPED_SCAN_BATCH_ROWS,
+                           SCOPED_SCAN_BATCH_BYTES // (depth * self.cfg.dim * 4)))
+        group = []
+        try:
+            while queue:
+                group, queue[:] = queue[:limit], queue[limit:]
+                group = [item for item in group if not item[2].done()]
+                if not group:
+                    continue
+                try:
+                    kw = {"nprobe": probe} if probe is not None else {}
+                    if len(group) == 1:
+                        q, n, _ = group[0]
+                        results = [await asyncio.to_thread(self._search_allowed, q, n, allow, **kw)]
+                    else:
+                        mat = np.vstack([q for q, _, _ in group])
+                        ns = [n for _, n, _ in group]
+                        if probe is not None:
+                            kw["_single_query_routing"] = True
+                        results = await asyncio.to_thread(self._search_rescored, mat, ns, allowlist=allow, **kw)
+                    for (_, _, fut), result in zip(group, results):
+                        if not fut.done():
+                            fut.set_result(result)
+                except Exception as exc:
+                    for _, _, fut in group:
+                        if not fut.done():
+                            fut.set_exception(exc)
+        except asyncio.CancelledError:
+            for _, _, fut in [*group, *queue]:
+                if not fut.done():
+                    fut.cancel()
+            raise
+        finally:
+            self._scoped_scans.pop(key, None)
 
     async def _scan_batched(
         self, qvec: np.ndarray, n: int, nprobe: int | None = None
