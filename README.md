@@ -220,6 +220,10 @@ Setup and full table: [docs/benchmark.md](docs/benchmark.md).
 
 ## Develop
 
+Ingest admission uses Pydantic's native JSON parser with a compatibility fallback.
+The local paired benchmark measured 30% lower admission p50 for 250-vector requests;
+protocol, scope and reproduction: [ADR 0008](docs/adr/0008-native-ingest-json.md).
+
 Needs uv 0.12 or newer (`required-version` in `pyproject.toml`).
 
 ```bash
