@@ -595,3 +595,19 @@ def test_data_dir_lock_keeps_a_second_process_out(make_app, tmp_path):
     finally:
         holder.kill()
 
+
+def test_data_dir_with_uri_characters(tmp_path, monkeypatch):
+    # every database opens through a file: URI on POSIX (ADR 0007): the path is escaped there
+    data = tmp_path / ("data dir 100% #1" + ("" if sys.platform == "win32" else " ?vfs=unix"))
+    monkeypatch.setenv("ROOT_API_KEY", "root-key")
+    monkeypatch.setenv("DATA_DIR", str(data))
+    for first in (True, False):  # the second start reopens the catalog and each collection
+        with TestClient(create_app(embedder_factory=lambda cfg: FakeEmbedder())) as c:
+            if first:
+                assert c.post("/collections", headers=ROOT, json={"name": "main"}).status_code == 201
+                ingest(c, "main", [DOC])
+            r = c.post("/collections/main/search", headers=ROOT,
+                       json={"query": {"text": "jupiter"}, "mode": "hybrid", "k": 1})
+            assert r.json()["hits"][0]["id"] == "c2"
+    assert (data / "catalog.db").exists() and (data / "collections" / "main" / "meta.db").exists()
+

@@ -1,6 +1,7 @@
 """Regression checks for the search-latency optimizations (allowlist skip, token
 pruning, micro-batcher, RW lock) and the crash-consistency fixes around them."""
 import asyncio
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -568,4 +569,56 @@ def test_doc_scoped_text_leg_keeps_fts_for_trigram(tmp_path):
     col._bm25_rescore = lambda *a, **k: (_ for _ in ()).throw(AssertionError("trigram must stay on FTS5"))
     rids, _ = col._text_ids("gresql", 5, "chunks", {"doc_id": "d1"})  # substring: only FTS5 trigram finds it
     assert [r for (r,) in col.db.execute("SELECT id FROM records WHERE external_id='t1'")] == rids
+
+
+# ---- unix-excl VFS (ADR 0007) ----
+
+OTHER_PROCESS = """
+import sqlite3, sys, os
+db = sqlite3.connect(sys.argv[1], timeout=0.2)
+try:
+    if sys.argv[2] == "read":
+        print(db.execute(sys.argv[3]).fetchone()[0])
+    else:  # commit to the WAL and exit without a checkpoint, like a killed pre-0007 process
+        db.execute("PRAGMA wal_autocheckpoint=0")
+        db.execute(sys.argv[3])
+        db.commit()
+        os._exit(0)
+except sqlite3.OperationalError as e:
+    print(e)
+"""
+
+
+def other_process(path, mode, sql):
+    """The default VFS in another process, the way an external tool opens the file."""
+    return subprocess.run([sys.executable, "-c", OTHER_PROCESS, str(path), mode, sql],
+                          capture_output=True, text=True, timeout=WAIT_SECONDS, check=True).stdout.strip()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="unix-excl is a POSIX VFS")
+def test_databases_open_through_unix_excl(tmp_path, monkeypatch):
+    col = make_collection(tmp_path)
+    _ingest_docs(col, 2, 5)
+    asyncio.run(col.search("text", None, "chunk", 5, "chunks", None, None))  # read connections too
+    assert not (tmp_path / "meta.db-shm").exists()  # the WAL index lives in heap memory
+    count = "SELECT count(*) FROM records"
+    assert other_process(tmp_path / "meta.db", "read", count) == "database is locked"
+    asyncio.run(col.stop())
+    assert other_process(tmp_path / "meta.db", "read", count) == "10"  # released on close
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    m = store.CollectionManager(store.Settings())
+    assert other_process(tmp_path / "data" / "catalog.db", "read", "SELECT 1") == "database is locked"
+    asyncio.run(m.shutdown())
+
+
+def test_default_vfs_leftovers_open_after_the_switch(tmp_path):
+    col = make_collection(tmp_path)
+    _ingest_docs(col, 1, 3)
+    asyncio.run(col.stop())
+    other_process(tmp_path / "meta.db", "write", """UPDATE records SET metadata = '{"tag": "wal"}'""")
+    assert (tmp_path / "meta.db-wal").stat().st_size > 0 and (tmp_path / "meta.db-shm").exists()
+    col = make_collection(tmp_path)
+    chunks = col.get_document("d0")["chunks"]
+    assert len(chunks) == 3 and all(c["metadata"] == {"tag": "wal"} for c in chunks)
+    asyncio.run(col.stop())
 

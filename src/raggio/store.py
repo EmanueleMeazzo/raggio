@@ -684,9 +684,21 @@ class _ReadConn:
         return True
 
 
+def connect_db(path: Path, **kw) -> sqlite3.Connection:
+    """sqlite3.connect for a database in DATA_DIR. On POSIX through SQLite's unix-excl VFS
+    (ADR 0007): it takes the file's fcntl lock once and holds it, coordinates this
+    process's connections in memory and keeps the WAL index in heap memory (no -shm
+    file). The default VFS takes and drops fcntl locks on the database and its -shm
+    around every transaction, and on NFS each is an RPC that also drops the client's page
+    cache. No other process can open the file meanwhile: the data-dir lock keeps them out
+    anyway. Windows has no unix-excl."""
+    if os.name == "nt":
+        return sqlite3.connect(path, **kw)
+    return sqlite3.connect(f"{Path(path).absolute().as_uri()}?vfs=unix-excl", uri=True, **kw)
+
+
 def open_meta_db(path: Path, tokenizer: str = "unicode61") -> sqlite3.Connection:
-    db = sqlite3.connect(path, check_same_thread=False,
-                         cached_statements=SQLITE_CACHED_STATEMENTS)
+    db = connect_db(path, check_same_thread=False, cached_statements=SQLITE_CACHED_STATEMENTS)
     # job payloads are bulky and transient: without this the file keeps every page the
     # ingest backlog ever occupied (a full-corpus ingest ballooned meta.db to 7+ GB).
     # MUST run before journal_mode=WAL — that pragma initializes the db file, and
@@ -2133,8 +2145,8 @@ class Collection:
             raise RuntimeError(f"collection '{self.cfg.name}' is closed")
         rc = getattr(self._read_local, "rc", None)
         if rc is None:
-            db = sqlite3.connect(self.dir / "meta.db", check_same_thread=False,
-                                 cached_statements=SQLITE_CACHED_STATEMENTS)
+            db = connect_db(self.dir / "meta.db", check_same_thread=False,
+                            cached_statements=SQLITE_CACHED_STATEMENTS)
             db.execute("PRAGMA query_only=1")
             rc = _ReadConn(self, db)
             with self.db_lock:
@@ -2773,7 +2785,7 @@ class CollectionManager:
         self.embedder_factory = embedder_factory or self._default_embedder
         self.data_dir = Path(settings.data_dir)
         (self.data_dir / "collections").mkdir(parents=True, exist_ok=True)
-        self.catalog = sqlite3.connect(self.data_dir / "catalog.db", check_same_thread=False)
+        self.catalog = connect_db(self.data_dir / "catalog.db", check_same_thread=False)
         self.catalog.execute(
             "CREATE TABLE IF NOT EXISTS collections("
             "name TEXT PRIMARY KEY, dim INT, bit_width INT, model TEXT, base_url TEXT,"
@@ -2987,7 +2999,7 @@ class CollectionManager:
     async def resume_pending(self) -> None:
         """On boot, load any collection with unfinished jobs so its worker replays them."""
         for name in self.list_collections():
-            db = sqlite3.connect(self._dir(name) / "meta.db")
+            db = connect_db(self._dir(name) / "meta.db")
             pending = db.execute(
                 "SELECT COUNT(*) FROM jobs WHERE status IN ('pending','processing')"
             ).fetchone()[0]
