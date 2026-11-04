@@ -20,6 +20,7 @@ results describe their measured revisions, rather than the latest commit.
 | [0008](0008-native-ingest-json.md) | Pydantic native ingest JSON parsing with compatibility fallback | Accepted |
 | [0009](0009-ingest-vector-conversion.md) | Reuse validated ingest vectors until journal encoding | Accepted |
 | [0010](0010-search-response-encoding.md) | Encode hydrated search hits directly; retrieval-only optimization | Accepted |
+| [0011](0011-expansion-read-batching-evaluation.md) | Evaluate batched expansion reads and bounded sibling-vector reuse | Proposed; prototypes only |
 
 ## Work from the November 2026 optimization review
 
@@ -28,7 +29,8 @@ results describe their measured revisions, rather than the latest commit.
 | Rust rewrite assessment | Keep the Python/native architecture; no service rewrite | [Archived assessment](../research/rust-rewrite-assessment-2026-11-04.md), measured at `da432a6`; original raw experiments retained locally in `C:/DevOps/raggio-rust-evaluation-20261104/` |
 | Native ingest JSON parsing | `b6311a5`, merged by `96b55ed` in [PR #7](https://github.com/EmanueleMeazzo/raggio/pull/7) | [ADR 0008](0008-native-ingest-json.md); `bench/results-ingest-json.json` |
 | Avoid ingest vector-list copies | `7b3eb14`, merged by `813b6da` in [PR #8](https://github.com/EmanueleMeazzo/raggio/pull/8) | [ADR 0009](0009-ingest-vector-conversion.md); large/small raw results under `bench/` |
-| Search response encoding | [PR #9](https://github.com/EmanueleMeazzo/raggio/pull/9), branch `perf/search-response-encoding`; only the search response path changes | [ADR 0010](0010-search-response-encoding.md), endpoint parity tests and paired search results under `bench/` |
+| Search response encoding | `a872161`, merged by `6327693` in [PR #9](https://github.com/EmanueleMeazzo/raggio/pull/9); only the search response path changes | [ADR 0010](0010-search-response-encoding.md), endpoint parity tests and paired search results under `bench/` |
+| Expansion read evaluation | Branch `research/expansion-retrieval`; benchmark prototype, production retrieval unchanged | [ADR 0011](0011-expansion-read-batching-evaluation.md); paired results and compatibility probes under `bench/` |
 
 From 2026-11-04, ingestion is considered sufficiently fast for its frequency.
 Further optimization work focuses on search/retrieval latency, CPU and memory,
