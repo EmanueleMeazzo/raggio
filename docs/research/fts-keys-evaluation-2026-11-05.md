@@ -2,7 +2,9 @@
 
 Date: 2026-11-05. Implementation: [ADR 0015](../adr/0015-metadata-fts-keys.md).
 This capability is stacked on PR #13 (`a197726311296d77fd12d932be7a594a6c46c08a`).
-Sofia deployment/title acceptance and remote benchmarks are a separate follow-up.
+Sofia deployment/title acceptance is recorded in the [accepted DEV baseline](sofia-fts-keys-acceptance-2026-11-05.md).
+This document preserves the earlier local cost evaluation; remote performance
+measurement is a separate follow-up.
 
 ## Protocol and revisions
 
@@ -120,8 +122,9 @@ uv run --group bench python bench/fts_keys_probe.py --queries 500 --rounds 5 --o
 uv run --group bench python bench/fts_keys_probe.py --arm default --paired-control --queries 1000 --out control.json
 ```
 
-The selected design and rejected alternatives are documented in ADR 0015. The
-Sofia agent should use the published 0.3.0 image, recreate document collections with
-the three selected keys, then run title top-3 acceptance and its established latency,
-CPU and working-set benchmark. This PR stays unmerged for that review; no application
-deployment is performed here.
+The selected design and rejected alternatives are documented in ADR 0015. Sofia
+subsequently recreated the three test collections with selected metadata keys and
+passed its title/copy acceptance on 0.3.0. The user authorized merging PR #14 into
+main (`2e8082b`), alongside PR #13. The [acceptance report](sofia-fts-keys-acceptance-2026-11-05.md)
+records that result. Further deployment latency, CPU and working-set measurements
+must use the accepted runtime and record its updated IVF settings.

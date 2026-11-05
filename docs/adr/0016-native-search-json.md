@@ -1,6 +1,6 @@
 # ADR 0016 — Native search JSON validation through a shared route helper
 
-Status: accepted after local evaluation; Sofia deployment validation pending · Date: 2026-11-05
+Status: accepted and merged in PR #13; included in Sofia 0.3.0 functional acceptance · Date: 2026-11-05
 
 Builds on [ADR 0008](0008-native-ingest-json.md), [ADR 0010](0010-search-response-encoding.md)
 and the retrieval baseline in [ADR 0013](0013-scoped-search-batching.md).
@@ -79,3 +79,11 @@ The final full suite, documentation build and pull-request CI results are record
 in the evaluation report. Future comparisons should use the recorded source
 hashes and repeat equivalent corpus/cache history; the historical Sofia baseline
 remains labeled with the revision it actually measured.
+
+## Merge and deployment follow-up, 2026-11-05
+
+PR #13 was merged by `e5d42be` alongside the accepted metadata-key retrieval in
+PR #14 (`2e8082b`). Both are included in the 0.3.0 image used for Sofia's reported
+[DEV acceptance](../research/sofia-fts-keys-acceptance-2026-11-05.md). That report
+checks title retrieval and copied content; it adds no deployment timing measurements
+for the parser. The accepted local performance evidence and its limits stay unchanged.

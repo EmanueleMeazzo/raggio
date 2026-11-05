@@ -1,6 +1,6 @@
 # ADR 0015: Select metadata keys for BM25
 
-Date: 2026-11-05. Status: implemented for review; Sofia deployment acceptance pending.
+Date: 2026-11-05. Status: accepted after Sofia DEV validation; merged in PR #14.
 
 ## Problem and scope
 
@@ -75,6 +75,14 @@ Mutation tests run FTS5 `integrity-check` **with rank=1**, also checking externa
 
 The local cost protocol and raw data are in [the evaluation report](../research/fts-keys-evaluation-2026-11-05.md).
 These generated-data measurements do not establish Sofia recall or remote/NFS latency.
-Sofia must recreate document collections with `["title", "source", "tags"]` and run its
-title top-3 acceptance on nickysap, legal_knowhow and datascience. Publish the reviewed
-image artifact, leave the PR unmerged, and let the Sofia agent deploy and benchmark.
+
+## Sofia acceptance and merge, 2026-11-05
+
+Sofia recreated the three document collections with `["title", "source", "tags"]`
+and reported matching title top-3 results with Weaviate, equal document/chunk counts,
+and zero mismatches in 100 spot checks per collection. The user accepted the result
+and authorized merging PRs #13 and #14. Main merge `2e8082b` contains the accepted
+0.3.0 runtime. The [deployment acceptance report](../research/sofia-fts-keys-acceptance-2026-11-05.md)
+preserves the screenshot, exact counts, exclusions, image identity and changed IVF
+settings. It validates quality and copy integrity; deployment performance remains
+to be measured with those settings.
