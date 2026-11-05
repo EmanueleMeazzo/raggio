@@ -13,6 +13,9 @@ rounds, resource logs and benchmark scripts were not supplied.
   warm scope-search batching, documented in [ADR 0013](../adr/0013-scoped-search-batching.md).
 - Accepted code baseline: main after merge `01b160ff62a7d03573e2f5f9536399b8861b7814`.
   The report and decision updates add documentation without changing that runtime.
+- PR #10 was closed without merging on 2026-11-05; its optional ranked sibling-vector
+  reuse is excluded from this baseline. [ADR 0012](../adr/0012-per-search-sibling-vector-reuse.md)
+  retains the evaluation and closure rationale.
 - Store source SHA-256:
   `2e5d9647907df908f4dec19c4ab48a0d682ec9eb73392a2ae4a5f18c35fc631d`.
 - The same implementation passed all five PR CI jobs: production/reference,

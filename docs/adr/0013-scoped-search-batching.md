@@ -8,8 +8,11 @@ The [Sofia deployment benchmark](../research/sofia-retrieval-benchmark-2026-11-0
 validates PR #9's latency improvement, but reports little change to saturated
 throughput. Sofia uses summary search and in-document search, without ranked
 sibling expansion. This change branches from main `6327693` independently of
-[draft PR #10](https://github.com/EmanueleMeazzo/raggio/pull/10), whose sibling reuse
-does not affect that planned flow. ADRs 0011–0012 are tracked in that separate PR.
+[PR #10](https://github.com/EmanueleMeazzo/raggio/pull/10), whose sibling reuse
+does not affect that planned flow. PR #10 was closed without merging on 2026-11-05;
+its historical evaluation and closure rationale are archived in
+[ADR 0011](0011-expansion-read-batching-evaluation.md) and
+[ADR 0012](0012-per-search-sibling-vector-reuse.md).
 PR #11 is merged by `01b160f`; its implementation is now the accepted main baseline.
 
 `_vector_ids` sends unrestricted vector queries through `_scan_batched`, sharing

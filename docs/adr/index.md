@@ -20,11 +20,16 @@ results describe their measured revisions, rather than the latest commit.
 | [0008](0008-native-ingest-json.md) | Pydantic native ingest JSON parsing with compatibility fallback | Accepted |
 | [0009](0009-ingest-vector-conversion.md) | Reuse validated ingest vectors until journal encoding | Accepted |
 | [0010](0010-search-response-encoding.md) | Encode hydrated search hits directly; retrieval-only optimization | Accepted |
+| [0011](0011-expansion-read-batching-evaluation.md) | Evaluate expansion read batching and sibling-vector reuse | Archived; not adopted |
+| [0012](0012-per-search-sibling-vector-reuse.md) | Evaluate bounded per-search sibling-vector reuse | Not adopted; PR #10 closed unmerged |
 | [0013](0013-scoped-search-batching.md) | Bound and coalesce warm scope-only vector searches | Accepted; retrieval baseline from 2026-11-05 |
 
-ADRs 0011–0012 cover expansion experiments and sibling-vector reuse in the separate
-[draft PR #10](https://github.com/EmanueleMeazzo/raggio/pull/10). ADR 0013 branches
-from main independently and targets Sofia's summary-search path.
+ADRs 0011–0012 archive the expansion experiments and sibling-vector reuse from
+[PR #10](https://github.com/EmanueleMeazzo/raggio/pull/10), closed without merging
+on 2026-11-05 because Sofia does not use ranked sibling expansion and representative
+deployment benefit remains unvalidated. The branch and raw evidence are retained;
+its runtime and tests are not part of main. ADR 0013 independently targets Sofia's
+summary-search path.
 
 ## Current retrieval baseline
 
@@ -45,6 +50,7 @@ this runtime as their baseline and keep historical benchmarks labeled by revisio
 | Native ingest JSON parsing | `b6311a5`, merged by `96b55ed` in [PR #7](https://github.com/EmanueleMeazzo/raggio/pull/7) | [ADR 0008](0008-native-ingest-json.md); `bench/results-ingest-json.json` |
 | Avoid ingest vector-list copies | `7b3eb14`, merged by `813b6da` in [PR #8](https://github.com/EmanueleMeazzo/raggio/pull/8) | [ADR 0009](0009-ingest-vector-conversion.md); large/small raw results under `bench/` |
 | Search response encoding | `a872161`, merged by `6327693` in [PR #9](https://github.com/EmanueleMeazzo/raggio/pull/9); only the search response path changes | [ADR 0010](0010-search-response-encoding.md), endpoint parity tests and paired search results under `bench/`; [Sofia deployment follow-up](../research/sofia-retrieval-benchmark-2026-11-04.md) |
+| Expansion experiments and sibling reuse | [PR #10](https://github.com/EmanueleMeazzo/raggio/pull/10), closed without merging; branch `perf/sibling-vector-reuse` retained at `614c4b8` | Archived [ADR 0011](0011-expansion-read-batching-evaluation.md) and [ADR 0012](0012-per-search-sibling-vector-reuse.md), with original results/source links and closure rationale |
 | Warm scope search batching | `1cdae1d`, merged by `01b160f` in [PR #11](https://github.com/EmanueleMeazzo/raggio/pull/11); bounded independent cohorts for cached scope allowlists | [ADR 0013](0013-scoped-search-batching.md), paired benchmarks, exact parity/resource/lifecycle tests and [accepted Sofia baseline](../research/sofia-scoped-search-baseline-2026-11-05.md) |
 
 From 2026-11-04, ingestion is considered sufficiently fast for its frequency.
