@@ -211,7 +211,7 @@ Removes the document's summary and chunks from both indexes.
 | `mode` | `vector` \| `text` \| `hybrid` | `vector` | See [Search](search.md) |
 | `k` | int | `10` | 1–1000 |
 | `scope` | `chunks` \| `summaries` \| `both` | `chunks` | Record types searched |
-| `filter` | object | none | Metadata filters, ANDed: scalar = equality, list = `in`, object = `gte`/`lte`/`gt`/`lt`, `in`, `contains`, `contains_any`; the reserved key `doc_id` filters on the document id (equality and `in` only) ([grammar](search.md#scope-and-filters)) |
+| `filter` | object | none | Metadata filters, ANDed: scalar = equality, list = `in`, object = `gte`/`lte`/`gt`/`lt`, `in`, `contains`, `contains_any` (1–256 scalar alternatives); the reserved key `doc_id` filters on the document id (equality and `in` only) ([grammar](search.md#scope-and-filters)) |
 | `expand` | object | none | Per-hit context expansion |
 | `nprobe` | int | index default | [IVF](indexing.md) shards probed for this query (speed/recall knob); ignored without an index |
 | `fusion` | `rrf` \| `relative` | `rrf` | `hybrid` only: how the two legs are fused ([Search](search.md#how-hybrid-works)); ignored in the other modes |

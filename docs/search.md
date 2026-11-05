@@ -156,8 +156,14 @@ Both apply to every mode (in hybrid, to both legs):
     - object — `gte` / `lte` / `gt` / `lt` ranges (string comparison, so ISO
       dates work naturally), `in`, `contains` (case-insensitive substring,
       ASCII case folding only: `{"title": {"contains": "acme"}}`) and
-      `contains_any` (any of several substrings, the same folding:
+      `contains_any` (a list of 1–256 scalar values, matching any substring with the same folding:
       `{"title": {"contains_any": ["q3", "report"]}}`).
+
+  `contains_any` applies OR within that key and AND with other keys. It does not
+  split phrases into words or require word boundaries; `%`, `_` and quotes are
+  literal characters. Values use the same string conversion as `contains`.
+  Empty, nested, non-list or oversized inputs return 400. More alternatives can
+  increase metadata-scan cost, so use a short list of meaningful terms.
 
   `doc_id` is a reserved key: it filters on the document id itself, not on
   metadata, with equality or `in` only (`{"doc_id": "contract-42"}`,

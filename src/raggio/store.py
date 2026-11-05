@@ -56,6 +56,8 @@ def _load_native():
 _native = _load_native()
 
 RANGE_OPS = {"gte": ">=", "lte": "<=", "gt": ">", "lt": "<"}
+# Keep the per-key OR expression comfortably below SQLite's expression-depth limit.
+CONTAINS_ANY_MAX = 256
 
 FTS_TOKENIZERS = {
     "unicode61": "unicode61 remove_diacritics 2",  # language-neutral exact tokens
@@ -410,6 +412,8 @@ def _filter_sql(scope: str, filt: dict | None) -> tuple[str, list]:
             elif op == "contains_any":  # OR of `contains`: e.g. any word of a title query
                 if not isinstance(bound, list) or not bound or any(isinstance(b, (list, dict)) for b in bound):
                     raise ValueError(f"filter '{key}': 'contains_any' needs a non-empty list of scalars")
+                if len(bound) > CONTAINS_ANY_MAX:
+                    raise ValueError(f"filter '{key}': 'contains_any' accepts at most {CONTAINS_ANY_MAX} values")
                 clauses.append("(" + " OR ".join([f"instr(lower({col}), lower(?)) > 0"] * len(bound)) + ")")
                 for b in bound:
                     params.extend([*cparams, str(b)])
