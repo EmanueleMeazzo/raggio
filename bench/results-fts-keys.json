@@ -1,0 +1,444 @@
+{
+  "protocol": "fresh subprocesses, reversed round order, seeded identical generated corpus; local filesystem",
+  "base_revision": "a197726311296d77fd12d932be7a594a6c46c08a",
+  "search_transport": "Collection.search with hydration and asyncio handoffs, no HTTP",
+  "admission_transport": "in-process ASGI TestClient, client CPU included, workers paused",
+  "docs": 1200,
+  "records": 8400,
+  "dim": 256,
+  "body_words": 80,
+  "queries_per_shape": 100,
+  "rounds": 3,
+  "openblas_num_threads": "1",
+  "runs": [
+    {
+      "base": {
+        "ingest": {
+          "records_per_s": 12573.796077055278,
+          "cpu_ms_per_record": 0.0802985330952381
+        },
+        "size": {
+          "meta_db_bytes": 16941056,
+          "fts_bytes": 2400256
+        },
+        "search": {
+          "text_summaries": {
+            "p50_ms": 0.4943950043525547,
+            "p95_ms": 0.6968870024138596,
+            "cpu_ms_per_query": 0.5129512600000119
+          },
+          "text_document": {
+            "p50_ms": 0.27341950044501573,
+            "p95_ms": 0.4225505479553249,
+            "cpu_ms_per_query": 0.30144929999999626
+          },
+          "hybrid_summaries": {
+            "p50_ms": 1.619137496163603,
+            "p95_ms": 2.403605452127522,
+            "cpu_ms_per_query": 2.050609900000031
+          },
+          "hybrid_document": {
+            "p50_ms": 0.8568189878133126,
+            "p95_ms": 1.1801370041212067,
+            "cpu_ms_per_query": 1.0318244899999929
+          }
+        },
+        "body_query_digest": "6f739294dd7323dba103f1a0a7475abc9930e575f6718ab30d9f54c8d89d7e82",
+        "synthetic_title_top3": 0,
+        "admission": {
+          "p50_ms": 6.257630011532456,
+          "p95_ms": 8.351451202179303,
+          "cpu_ms": 6.4835700666667035,
+          "records": 175
+        },
+        "arm": "base",
+        "max_rss_kib": 122176,
+        "store_lf_sha256": "cdd7b70fe021e8c1938095659fcc0dfbb224d53b026896cde19d047170c78b08",
+        "api_lf_sha256": "87cf11faa70d2f7f6f9e7b9db22a7fce23be02550edeab944bdaab4ec4271abe",
+        "python": "3.12.15",
+        "sqlite": "3.53.1",
+        "native": true
+      },
+      "default": {
+        "ingest": {
+          "records_per_s": 12561.484935848408,
+          "cpu_ms_per_record": 0.08056657476190478
+        },
+        "size": {
+          "meta_db_bytes": 16941056,
+          "fts_bytes": 2400256
+        },
+        "search": {
+          "text_summaries": {
+            "p50_ms": 0.46995249431347474,
+            "p95_ms": 0.6450512584706302,
+            "cpu_ms_per_query": 0.48548079000001687
+          },
+          "text_document": {
+            "p50_ms": 0.30676100141135976,
+            "p95_ms": 0.49681670643622045,
+            "cpu_ms_per_query": 0.33983302000000437
+          },
+          "hybrid_summaries": {
+            "p50_ms": 1.6313634987454861,
+            "p95_ms": 2.1079663951240946,
+            "cpu_ms_per_query": 2.0222422099999804
+          },
+          "hybrid_document": {
+            "p50_ms": 0.6813744985265657,
+            "p95_ms": 0.877915353339631,
+            "cpu_ms_per_query": 0.7908391099999923
+          }
+        },
+        "body_query_digest": "6f739294dd7323dba103f1a0a7475abc9930e575f6718ab30d9f54c8d89d7e82",
+        "synthetic_title_top3": 0,
+        "admission": {
+          "p50_ms": 6.149663997348398,
+          "p95_ms": 11.125662803533483,
+          "cpu_ms": 6.709432399999986,
+          "records": 175
+        },
+        "arm": "default",
+        "max_rss_kib": 116792,
+        "store_lf_sha256": "cdc0dbc8591bcb37aad9e7978ce783269d3500343a0c8f98a928c2104fa719db",
+        "api_lf_sha256": "b69848a655d92bc4e9a3e694e5be2d4f20ed7307ab5314fa6e593258d2efaa01",
+        "python": "3.12.15",
+        "sqlite": "3.53.1",
+        "native": true
+      },
+      "keys": {
+        "ingest": {
+          "records_per_s": 10431.491375937023,
+          "cpu_ms_per_record": 0.09670603607142857
+        },
+        "size": {
+          "meta_db_bytes": 20283392,
+          "fts_bytes": 2973696
+        },
+        "search": {
+          "text_summaries": {
+            "p50_ms": 0.4470919957384467,
+            "p95_ms": 0.767154355708044,
+            "cpu_ms_per_query": 0.48189806999999973
+          },
+          "text_document": {
+            "p50_ms": 0.2522149952710606,
+            "p95_ms": 0.48332375517929893,
+            "cpu_ms_per_query": 0.30123687999999316
+          },
+          "hybrid_summaries": {
+            "p50_ms": 1.565100006700959,
+            "p95_ms": 2.5770308959181416,
+            "cpu_ms_per_query": 2.0245816499999947
+          },
+          "hybrid_document": {
+            "p50_ms": 0.6811284983996302,
+            "p95_ms": 0.9302920974732841,
+            "cpu_ms_per_query": 0.7683697100000053
+          }
+        },
+        "body_query_digest": "c46026971df979fe065e7517c1d2ffb64f70a7438f60967390f2902c94c309b0",
+        "synthetic_title_top3": 20,
+        "admission": {
+          "p50_ms": 5.6471190036972985,
+          "p95_ms": 9.765831401455214,
+          "cpu_ms": 6.753097199999895,
+          "records": 175
+        },
+        "arm": "keys",
+        "max_rss_kib": 121768,
+        "store_lf_sha256": "cdc0dbc8591bcb37aad9e7978ce783269d3500343a0c8f98a928c2104fa719db",
+        "api_lf_sha256": "b69848a655d92bc4e9a3e694e5be2d4f20ed7307ab5314fa6e593258d2efaa01",
+        "python": "3.12.15",
+        "sqlite": "3.53.1",
+        "native": true
+      }
+    },
+    {
+      "keys": {
+        "ingest": {
+          "records_per_s": 10307.34072745758,
+          "cpu_ms_per_record": 0.09829208416666668
+        },
+        "size": {
+          "meta_db_bytes": 20283392,
+          "fts_bytes": 2973696
+        },
+        "search": {
+          "text_summaries": {
+            "p50_ms": 0.4738054994959384,
+            "p95_ms": 0.888030304486164,
+            "cpu_ms_per_query": 0.596337619999987
+          },
+          "text_document": {
+            "p50_ms": 0.32605799788143486,
+            "p95_ms": 0.5888363499252589,
+            "cpu_ms_per_query": 0.4113294699999992
+          },
+          "hybrid_summaries": {
+            "p50_ms": 1.7178454945678823,
+            "p95_ms": 2.7411178438342163,
+            "cpu_ms_per_query": 2.231248080000008
+          },
+          "hybrid_document": {
+            "p50_ms": 0.7826490036677569,
+            "p95_ms": 1.103095500729978,
+            "cpu_ms_per_query": 0.8946062900000062
+          }
+        },
+        "body_query_digest": "c46026971df979fe065e7517c1d2ffb64f70a7438f60967390f2902c94c309b0",
+        "synthetic_title_top3": 20,
+        "admission": {
+          "p50_ms": 5.686549993697554,
+          "p95_ms": 12.356561800697817,
+          "cpu_ms": 7.078095466666697,
+          "records": 175
+        },
+        "arm": "keys",
+        "max_rss_kib": 121968,
+        "store_lf_sha256": "cdc0dbc8591bcb37aad9e7978ce783269d3500343a0c8f98a928c2104fa719db",
+        "api_lf_sha256": "b69848a655d92bc4e9a3e694e5be2d4f20ed7307ab5314fa6e593258d2efaa01",
+        "python": "3.12.15",
+        "sqlite": "3.53.1",
+        "native": true
+      },
+      "default": {
+        "ingest": {
+          "records_per_s": 12126.345957575222,
+          "cpu_ms_per_record": 0.0835801344047619
+        },
+        "size": {
+          "meta_db_bytes": 16941056,
+          "fts_bytes": 2400256
+        },
+        "search": {
+          "text_summaries": {
+            "p50_ms": 0.49369849875802174,
+            "p95_ms": 0.9383778517076279,
+            "cpu_ms_per_query": 0.5319811999999935
+          },
+          "text_document": {
+            "p50_ms": 0.3508360023261048,
+            "p95_ms": 0.4905252557364292,
+            "cpu_ms_per_query": 0.33877983000000444
+          },
+          "hybrid_summaries": {
+            "p50_ms": 1.5237524930853397,
+            "p95_ms": 2.2518614045111462,
+            "cpu_ms_per_query": 1.9321213599999854
+          },
+          "hybrid_document": {
+            "p50_ms": 0.7455205050064251,
+            "p95_ms": 1.1081785523856524,
+            "cpu_ms_per_query": 0.8668424899999971
+          }
+        },
+        "body_query_digest": "6f739294dd7323dba103f1a0a7475abc9930e575f6718ab30d9f54c8d89d7e82",
+        "synthetic_title_top3": 0,
+        "admission": {
+          "p50_ms": 6.743756006471813,
+          "p95_ms": 11.552214098628607,
+          "cpu_ms": 7.371873133333325,
+          "records": 175
+        },
+        "arm": "default",
+        "max_rss_kib": 114092,
+        "store_lf_sha256": "cdc0dbc8591bcb37aad9e7978ce783269d3500343a0c8f98a928c2104fa719db",
+        "api_lf_sha256": "b69848a655d92bc4e9a3e694e5be2d4f20ed7307ab5314fa6e593258d2efaa01",
+        "python": "3.12.15",
+        "sqlite": "3.53.1",
+        "native": true
+      },
+      "base": {
+        "ingest": {
+          "records_per_s": 12294.663999182723,
+          "cpu_ms_per_record": 0.08223196476190477
+        },
+        "size": {
+          "meta_db_bytes": 16941056,
+          "fts_bytes": 2400256
+        },
+        "search": {
+          "text_summaries": {
+            "p50_ms": 0.43069499952252954,
+            "p95_ms": 0.7142622453102375,
+            "cpu_ms_per_query": 0.43714845999999863
+          },
+          "text_document": {
+            "p50_ms": 0.24305999977514148,
+            "p95_ms": 0.3115159517619759,
+            "cpu_ms_per_query": 0.25911603000000616
+          },
+          "hybrid_summaries": {
+            "p50_ms": 1.491386501584202,
+            "p95_ms": 2.429723998648114,
+            "cpu_ms_per_query": 2.1962568399999904
+          },
+          "hybrid_document": {
+            "p50_ms": 0.7518250058637932,
+            "p95_ms": 0.9576375545293558,
+            "cpu_ms_per_query": 0.8687269699999844
+          }
+        },
+        "body_query_digest": "6f739294dd7323dba103f1a0a7475abc9930e575f6718ab30d9f54c8d89d7e82",
+        "synthetic_title_top3": 0,
+        "admission": {
+          "p50_ms": 5.590428001596592,
+          "p95_ms": 8.625860702886712,
+          "cpu_ms": 6.01320279999998,
+          "records": 175
+        },
+        "arm": "base",
+        "max_rss_kib": 121324,
+        "store_lf_sha256": "cdd7b70fe021e8c1938095659fcc0dfbb224d53b026896cde19d047170c78b08",
+        "api_lf_sha256": "87cf11faa70d2f7f6f9e7b9db22a7fce23be02550edeab944bdaab4ec4271abe",
+        "python": "3.12.15",
+        "sqlite": "3.53.1",
+        "native": true
+      }
+    },
+    {
+      "base": {
+        "ingest": {
+          "records_per_s": 12456.099866313205,
+          "cpu_ms_per_record": 0.08116846952380953
+        },
+        "size": {
+          "meta_db_bytes": 16941056,
+          "fts_bytes": 2400256
+        },
+        "search": {
+          "text_summaries": {
+            "p50_ms": 0.46193999878596514,
+            "p95_ms": 0.8451220033748541,
+            "cpu_ms_per_query": 0.4948315999999786
+          },
+          "text_document": {
+            "p50_ms": 0.3396100000827573,
+            "p95_ms": 0.5292377521982417,
+            "cpu_ms_per_query": 0.35630699999999127
+          },
+          "hybrid_summaries": {
+            "p50_ms": 1.565214006404858,
+            "p95_ms": 2.244190355122555,
+            "cpu_ms_per_query": 1.9811253499999992
+          },
+          "hybrid_document": {
+            "p50_ms": 0.7473584992112592,
+            "p95_ms": 1.0263207033858635,
+            "cpu_ms_per_query": 0.9271454000000001
+          }
+        },
+        "body_query_digest": "6f739294dd7323dba103f1a0a7475abc9930e575f6718ab30d9f54c8d89d7e82",
+        "synthetic_title_top3": 0,
+        "admission": {
+          "p50_ms": 7.545389991719276,
+          "p95_ms": 10.412938297668006,
+          "cpu_ms": 7.533355000000015,
+          "records": 175
+        },
+        "arm": "base",
+        "max_rss_kib": 116768,
+        "store_lf_sha256": "cdd7b70fe021e8c1938095659fcc0dfbb224d53b026896cde19d047170c78b08",
+        "api_lf_sha256": "87cf11faa70d2f7f6f9e7b9db22a7fce23be02550edeab944bdaab4ec4271abe",
+        "python": "3.12.15",
+        "sqlite": "3.53.1",
+        "native": true
+      },
+      "default": {
+        "ingest": {
+          "records_per_s": 12359.153395664502,
+          "cpu_ms_per_record": 0.08128999238095237
+        },
+        "size": {
+          "meta_db_bytes": 16941056,
+          "fts_bytes": 2400256
+        },
+        "search": {
+          "text_summaries": {
+            "p50_ms": 0.46436449338216335,
+            "p95_ms": 1.0033668906544335,
+            "cpu_ms_per_query": 0.5238788400000094
+          },
+          "text_document": {
+            "p50_ms": 0.2477669986546971,
+            "p95_ms": 0.44058095809305076,
+            "cpu_ms_per_query": 0.28503530000001387
+          },
+          "hybrid_summaries": {
+            "p50_ms": 1.7024815024342388,
+            "p95_ms": 3.904962354135932,
+            "cpu_ms_per_query": 2.4355712300000154
+          },
+          "hybrid_document": {
+            "p50_ms": 0.700687502103392,
+            "p95_ms": 0.9631400411308274,
+            "cpu_ms_per_query": 0.8795275599999997
+          }
+        },
+        "body_query_digest": "6f739294dd7323dba103f1a0a7475abc9930e575f6718ab30d9f54c8d89d7e82",
+        "synthetic_title_top3": 0,
+        "admission": {
+          "p50_ms": 6.3416299963137135,
+          "p95_ms": 9.462629104382357,
+          "cpu_ms": 6.885012533333319,
+          "records": 175
+        },
+        "arm": "default",
+        "max_rss_kib": 120868,
+        "store_lf_sha256": "cdc0dbc8591bcb37aad9e7978ce783269d3500343a0c8f98a928c2104fa719db",
+        "api_lf_sha256": "b69848a655d92bc4e9a3e694e5be2d4f20ed7307ab5314fa6e593258d2efaa01",
+        "python": "3.12.15",
+        "sqlite": "3.53.1",
+        "native": true
+      },
+      "keys": {
+        "ingest": {
+          "records_per_s": 10450.967769195946,
+          "cpu_ms_per_record": 0.09709779976190476
+        },
+        "size": {
+          "meta_db_bytes": 20283392,
+          "fts_bytes": 2973696
+        },
+        "search": {
+          "text_summaries": {
+            "p50_ms": 0.44806450023315847,
+            "p95_ms": 0.5724248985643497,
+            "cpu_ms_per_query": 0.4531298500000047
+          },
+          "text_document": {
+            "p50_ms": 0.3131949997623451,
+            "p95_ms": 0.4641529492801054,
+            "cpu_ms_per_query": 0.3386941499999918
+          },
+          "hybrid_summaries": {
+            "p50_ms": 1.6061544956755824,
+            "p95_ms": 2.4939434028055985,
+            "cpu_ms_per_query": 2.042451640000005
+          },
+          "hybrid_document": {
+            "p50_ms": 0.8044924979913048,
+            "p95_ms": 0.9873011520539876,
+            "cpu_ms_per_query": 0.9177766699999879
+          }
+        },
+        "body_query_digest": "c46026971df979fe065e7517c1d2ffb64f70a7438f60967390f2902c94c309b0",
+        "synthetic_title_top3": 20,
+        "admission": {
+          "p50_ms": 6.086107998271473,
+          "p95_ms": 7.752939595957285,
+          "cpu_ms": 6.305864999999973,
+          "records": 175
+        },
+        "arm": "keys",
+        "max_rss_kib": 121864,
+        "store_lf_sha256": "cdc0dbc8591bcb37aad9e7978ce783269d3500343a0c8f98a928c2104fa719db",
+        "api_lf_sha256": "b69848a655d92bc4e9a3e694e5be2d4f20ed7307ab5314fa6e593258d2efaa01",
+        "python": "3.12.15",
+        "sqlite": "3.53.1",
+        "native": true
+      }
+    }
+  ]
+}

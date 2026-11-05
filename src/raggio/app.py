@@ -13,7 +13,7 @@ import numpy as np
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from .config import Settings
 from .store import (
@@ -22,6 +22,7 @@ from .store import (
     CollectionManager,
     _log,
     _normalize,
+    _validate_fts_keys,
     hash_key,
     lock_data_dir,
     open_data_dir_lock,
@@ -64,6 +65,13 @@ class CollectionIn(BaseModel):
     base_url: str | None = None
     collection_key: str | None = None
     tokenizer: Literal["unicode61", "trigram"] = "unicode61"
+    fts_keys: list[str] | None = None
+
+    @field_validator("fts_keys")
+    @classmethod
+    def validate_fts_keys(cls, value):
+        _validate_fts_keys(value)
+        return value
 
 
 class QueryIn(BaseModel):
@@ -293,12 +301,12 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
         try:
             cfg = await manager.create_collection(
                 body.name, body.dim, body.bit_width, body.model, body.base_url,
-                body.collection_key, body.tokenizer,
+                body.collection_key, body.tokenizer, body.fts_keys,
             )
         except ValueError as e:
             raise HTTPException(409 if "already exists" in str(e) else 400, str(e))
         return {"name": cfg.name, "dim": cfg.dim, "bit_width": cfg.bit_width,
-                "tokenizer": cfg.tokenizer}
+                "tokenizer": cfg.tokenizer, "fts_keys": cfg.fts_keys}
 
     @app.get("/collections", dependencies=[Depends(require_root)])
     async def list_collections():
@@ -310,7 +318,7 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
         # (the covering index since plan C: about 96 MB read cold at 2.55M rows, p1)
         stats = await asyncio.to_thread(c.stats)
         return {"name": c.cfg.name, "dim": c.cfg.dim, "bit_width": c.cfg.bit_width,
-                "model": c.cfg.model, "tokenizer": c.cfg.tokenizer,
+                "model": c.cfg.model, "tokenizer": c.cfg.tokenizer, "fts_keys": c.cfg.fts_keys,
                 "index": c.index_info(), **stats}
 
     # ---- optional IVF index: an additional object, added/removed per collection ----

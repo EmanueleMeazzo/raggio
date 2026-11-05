@@ -56,6 +56,7 @@ class TextLeg(Collection):
         with self._reading() as db:
             # _prune_common branches on the tokenizer (D14): read it from the FTS schema
             (fts_sql,) = db.execute("SELECT sql FROM sqlite_master WHERE name='records_fts'").fetchone()
+            self._bm25_column = "bm25_text" if "bm25_text" in fts_sql else "text"
             tokenizer = "trigram" if "trigram" in fts_sql else "unicode61"
             self.cfg = CollectionConfig("probe", 0, 0, None, None, None, tokenizer=tokenizer)
             self.indexed_counts = dict(

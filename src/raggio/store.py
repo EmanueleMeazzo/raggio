@@ -605,6 +605,36 @@ class CollectionConfig:
     key_hash: str | None
     tokenizer: str = "unicode61"
     index_config: dict | None = None  # {"nlist": N, "nprobe": M} when an IVF index is attached
+    fts_keys: list[str] | None = None
+
+
+def _validate_fts_keys(keys: list[str] | None) -> None:
+    if keys is None:
+        return
+    if (not isinstance(keys, list) or len(keys) > 8
+            or any(not isinstance(k, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", k)
+                   or k == "doc_id" for k in keys)
+            or len(set(keys)) != len(keys)):
+        raise ValueError("fts_keys must contain at most 8 unique metadata keys matching"
+                         " [A-Za-z0-9_.-]{1,64}; doc_id is reserved")
+
+
+def _fts_metadata(metadata: dict | None, keys: list[str]) -> str:
+    """Metadata suffix, with literal top-level keys and Python scalar str().
+
+    Nulls and objects are skipped. Null list members are skipped; lists containing
+    objects or nested arrays are skipped altogether because they are not scalar lists.
+    """
+    parts = []
+    for key in keys:
+        value = (metadata or {}).get(key)
+        if isinstance(value, list):
+            if any(isinstance(v, (list, dict)) for v in value):
+                continue
+            value = " ".join(str(v) for v in value if v is not None)
+        if value is not None and not isinstance(value, dict):
+            parts.append("\n" + str(value))
+    return "".join(parts)
 
 
 # meta.db connections are used from many threads and closed from yet another one. On a
@@ -713,7 +743,10 @@ def connect_db(path: Path, **kw) -> sqlite3.Connection:
     return sqlite3.connect(f"{Path(path).absolute().as_uri()}?vfs=unix-excl", uri=True, **kw)
 
 
-def open_meta_db(path: Path, tokenizer: str = "unicode61") -> sqlite3.Connection:
+def open_meta_db(
+    path: Path, tokenizer: str = "unicode61", fts_keys: list[str] | None = None
+) -> sqlite3.Connection:
+    _validate_fts_keys(fts_keys)
     db = connect_db(path, check_same_thread=False, cached_statements=SQLITE_CACHED_STATEMENTS)
     # job payloads are bulky and transient: without this the file keeps every page the
     # ingest backlog ever occupied (a full-corpus ingest ballooned meta.db to 7+ GB).
@@ -763,8 +796,23 @@ def open_meta_db(path: Path, tokenizer: str = "unicode61") -> sqlite3.Connection
         );
         """
     )
+    if fts_keys:
+        # Only opt-in collections get these columns. Duplicate the metadata suffix,
+        # not document bodies; pure-SQL VIRTUAL text adds no disk or Python read work.
+        have = {r[1] for r in db.execute("PRAGMA table_xinfo(records)")}
+        if "fts_metadata" not in have:
+            db.executescript(
+                "BEGIN;"
+                "ALTER TABLE records ADD COLUMN fts_metadata TEXT NOT NULL DEFAULT '';"
+                "ALTER TABLE records ADD COLUMN bm25_text TEXT GENERATED ALWAYS AS"
+                " (coalesce(text, '') || fts_metadata) VIRTUAL;"
+                "COMMIT;"
+            )
+        # Used by the atomic PATCH statement only, never by readers or the schema.
+        db.create_function("raggio_fts_metadata", 1,
+                           lambda raw: _fts_metadata(json.loads(raw), fts_keys), deterministic=True)
     _ensure_indexes(db, str(path))
-    _ensure_fts(db, tokenizer)
+    _ensure_fts(db, tokenizer, "bm25_text" if fts_keys else "text")
     # doc-frequency lookups for query-token pruning; references records_fts by name so
     # it survives an _ensure_fts rebuild
     db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS records_fts_v USING fts5vocab(records_fts, 'row')")
@@ -819,7 +867,7 @@ def _ensure_indexes(db: sqlite3.Connection, label: str) -> None:
     )
 
 
-def _ensure_fts(db: sqlite3.Connection, tokenizer: str) -> None:
+def _ensure_fts(db: sqlite3.Connection, tokenizer: str, column: str = "text") -> None:
     """Create (or repair) the BM25 index. Table, triggers and backfill run in ONE
     transaction: an interrupted backfill rolls the table back too, so the next open
     retries instead of silently serving an incomplete FTS index (or corrupting the
@@ -827,26 +875,37 @@ def _ensure_fts(db: sqlite3.Connection, tokenizer: str) -> None:
     tokenize = f"tokenize='{FTS_TOKENIZERS[tokenizer]}'"
     create = f"""
         CREATE VIRTUAL TABLE records_fts USING fts5(
-            text, content='records', content_rowid='id', {tokenize}
+            {column}, content='records', content_rowid='id', {tokenize}
         );
         CREATE TRIGGER records_fts_ai AFTER INSERT ON records BEGIN
-            INSERT INTO records_fts(rowid, text) VALUES (new.id, new.text);
+            INSERT INTO records_fts(rowid, {column}) VALUES (new.id, new.{column});
         END;
         CREATE TRIGGER records_fts_ad AFTER DELETE ON records BEGIN
-            INSERT INTO records_fts(records_fts, rowid, text) VALUES('delete', old.id, old.text);
+            INSERT INTO records_fts(records_fts, rowid, {column}) VALUES('delete', old.id, old.{column});
         END;
         INSERT INTO records_fts(records_fts) VALUES('rebuild');
     """
     row = db.execute("SELECT sql FROM sqlite_master WHERE name='records_fts'").fetchone()
+    if column == "bm25_text":
+        create = create.replace("INSERT INTO records_fts(records_fts) VALUES('rebuild');", f"""
+        CREATE TRIGGER records_fts_au AFTER UPDATE OF text, fts_metadata ON records
+        WHEN old.{column} IS NOT new.{column} BEGIN
+            INSERT INTO records_fts(records_fts, rowid, {column})
+                VALUES('delete', old.id, old.{column});
+            INSERT INTO records_fts(rowid, {column}) VALUES(new.id, new.{column});
+        END;
+        INSERT INTO records_fts(records_fts) VALUES('rebuild');
+        """)
     if row is None:
         db.executescript(f"BEGIN;{create}COMMIT;")
-    elif tokenize not in row[0]:
+    elif tokenize not in row[0] or ("bm25_text" in row[0]) != (column == "bm25_text"):
         # table built with another tokenizer (e.g. collection dir survived a crashed
         # create or failed delete): drop and rebuild from records, atomically
         db.executescript(
             "BEGIN;"
             "DROP TRIGGER IF EXISTS records_fts_ai;"
             "DROP TRIGGER IF EXISTS records_fts_ad;"
+            "DROP TRIGGER IF EXISTS records_fts_au;"
             "DROP TABLE records_fts;"
             f"{create}COMMIT;"
         )
@@ -1209,7 +1268,8 @@ class Collection:
         # other's in-flight transactions (a full-corpus ingest LOST a journaled job);
         # two independent write connections starved each other's busy handler under a
         # hot worker loop ("database is locked" past a 30s timeout).
-        self.db = open_meta_db(directory / "meta.db", cfg.tokenizer)
+        self.db = open_meta_db(directory / "meta.db", cfg.tokenizer, cfg.fts_keys)
+        self._bm25_column = "bm25_text" if cfg.fts_keys else "text"
         # IVF shard fan-out (ADR 0005): threads start on the first multi-shard search and
         # stop with the collection; flat collections never start any. 1 = serial loop.
         self._shard_pool = _ShardPool(ivf_search_threads or default_ivf_search_threads(), cfg.name)
@@ -1784,6 +1844,7 @@ class Collection:
         # row CPU before db_lock: the lock serializes every write on self.db
         blobs = [v.tobytes() for v in vecs16]
         metas = [json.dumps(r[5] or {}) for r in rows]
+        suffixes = [_fts_metadata(r[5], self.cfg.fts_keys) for r in rows] if self.cfg.fts_keys else None
         with self.db_lock:
             try:
                 # one IN query per 512 rows instead of a point query per row
@@ -1803,10 +1864,14 @@ class Collection:
                 gone = [(rid,) for rid, _, _ in old.values()]
                 self.db.executemany("DELETE FROM records WHERE id=?", gone)
                 self.db.executemany("DELETE FROM vecs WHERE id=?", gone)
+                values = [(i, *r[:5], m) for i, r, m in zip(ids, rows, metas)]
+                extra = ", fts_metadata" if suffixes is not None else ""
+                slots = ",?" if suffixes is not None else ""
+                if suffixes is not None:
+                    values = [(*v, suffix) for v, suffix in zip(values, suffixes)]
                 self.db.executemany(
-                    "INSERT INTO records(id, external_id, doc_id, type, position, text, metadata, indexed)"
-                    " VALUES (?,?,?,?,?,?,?,1)",
-                    [(i, *r[:5], m) for i, r, m in zip(ids, rows, metas)],
+                    "INSERT INTO records(id, external_id, doc_id, type, position, text, metadata, indexed"
+                    f"{extra}) VALUES (?,?,?,?,?,?,?,1{slots})", values,
                 )
                 # OR REPLACE: a vecs row already at a new id (past MAX(records.id)) is an
                 # orphan with no record; a plain INSERT would fail this job and, as the
@@ -2501,14 +2566,16 @@ class Collection:
             if maxid:
                 for g in np.random.default_rng(0).integers(1, maxid + 1, size=256):
                     row = db.execute(
-                        "SELECT text FROM records WHERE id>=? AND indexed=1"
-                        " AND text IS NOT NULL AND text!='' LIMIT 1",
+                        f"SELECT {self._bm25_column} FROM records WHERE id>=? AND indexed=1"
+                        f" AND {self._bm25_column} IS NOT NULL AND {self._bm25_column}!='' LIMIT 1",
                         (int(g),),
                     ).fetchone()
                     if row:
                         texts.append(row[0])
         dls = [len(fold_tokens(t)) for t in texts]
         avgdl = (sum(dls) / len(dls)) if dls else 1.0
+        if self._bm25_column == "bm25_text" and avgdl == 0:
+            avgdl = 1.0  # selected empty/punctuation-only values can leave only separators
         self._avgdl_cache = avgdl
         return avgdl
 
@@ -2559,7 +2626,9 @@ class Collection:
                     f"SELECT id FROM records WHERE {where} LIMIT ?", [*params, TEXT_DIRECT_MAX + 1]
                 )]
                 if len(ids) <= TEXT_DIRECT_MAX:
-                    cand = list(_rows_by_id(db, "SELECT id, text FROM records WHERE id IN ({})", ids))
+                    cand = list(_rows_by_id(
+                        db, f"SELECT id, {self._bm25_column} FROM records WHERE id IN ({{}})", ids
+                    ))
             if len(ids) <= TEXT_DIRECT_MAX:
                 rids, scores = self._bm25_rescore(qtext, cand, n)
                 hit = [i for i, s in enumerate(scores) if s > 0]  # no query term: no match, as in FTS5
@@ -2604,7 +2673,9 @@ class Collection:
                         [m_and, *params, TEXT_AND_CAND],
                     ).fetchall()
                 cand_ids = list(dict.fromkeys([r[0] for r in rows] + [r[0] for r in and_rows]))
-                texts = dict(_rows_by_id(db, "SELECT id, text FROM records WHERE id IN ({})", cand_ids))
+                texts = dict(_rows_by_id(
+                    db, f"SELECT id, {self._bm25_column} FROM records WHERE id IN ({{}})", cand_ids
+                ))
         if not two_stage:
             return [r[0] for r in rows], [r[1] for r in rows]
         return self._bm25_rescore(qtext, [(rid, texts.get(rid)) for rid in cand_ids], n)
@@ -2807,19 +2878,36 @@ class Collection:
 
     async def patch_metadata(self, doc_id: str, patch: dict, apply_to_chunks: bool) -> int:
         """RFC 7396 merge-patch the metadata of a document's records (null deletes a
-        key). Metadata is neither embedded nor FTS-indexed, so this is one UPDATE."""
+        key). With fts_keys, the same transaction updates the BM25 metadata suffix."""
         async with self.lock.write():
             return await asyncio.to_thread(self._patch_rows, doc_id, patch, apply_to_chunks)
 
     def _patch_rows(self, doc_id: str, patch: dict, apply_to_chunks: bool) -> int:
         types = "" if apply_to_chunks else " AND type='summary'"
+        raw = json.dumps(patch)
+        reindex = bool(self.cfg.fts_keys and any(k in patch for k in self.cfg.fts_keys))
         with self.db_lock:
-            cur = self.db.execute(
-                f"UPDATE records SET metadata = json_patch(metadata, ?) WHERE doc_id=?{types}",
-                (json.dumps(patch), doc_id),
-            )
-            self.db.commit()
+            try:
+                if reindex:
+                    cur = self.db.execute(
+                        "UPDATE records SET metadata=json_patch(metadata, ?),"
+                        " fts_metadata=raggio_fts_metadata(json_patch(metadata, ?))"
+                        f" WHERE doc_id=?{types}", (raw, raw, doc_id),
+                    )
+                else:
+                    cur = self.db.execute(
+                        f"UPDATE records SET metadata = json_patch(metadata, ?) WHERE doc_id=?{types}",
+                        (raw, doc_id),
+                    )
+                self.db.commit()
+            except BaseException:
+                self.db.rollback()
+                raise
         self._invalidate_allow()  # cached allowlists were evaluated over the old metadata
+        if cur.rowcount and reindex:
+            self._df_cache.clear()
+            self._avgdl_cache = None
+            self._df_cache_churn = 0
         return cur.rowcount
 
     def stats(self) -> dict:
@@ -2876,12 +2964,13 @@ class CollectionManager:
             "CREATE TABLE IF NOT EXISTS collections("
             "name TEXT PRIMARY KEY, dim INT, bit_width INT, model TEXT, base_url TEXT,"
             "key_hash TEXT, created_at TEXT, tokenizer TEXT DEFAULT 'unicode61',"
-            "index_config TEXT)"
+            "index_config TEXT, fts_keys TEXT)"
         )
         have = [r[1] for r in self.catalog.execute("PRAGMA table_info(collections)")]
         for col, ddl in (  # migrate catalogs created before hybrid search / the IVF index
             ("tokenizer", "tokenizer TEXT DEFAULT 'unicode61'"),
             ("index_config", "index_config TEXT"),
+            ("fts_keys", "fts_keys TEXT"),
         ):
             if col not in have:
                 self.catalog.execute(f"ALTER TABLE collections ADD COLUMN {ddl}")
@@ -2917,14 +3006,15 @@ class CollectionManager:
     def get_config(self, name: str) -> CollectionConfig | None:
         with self._catalog_lock:
             row = self.catalog.execute(
-                "SELECT name, dim, bit_width, model, base_url, key_hash, tokenizer, index_config"
+                "SELECT name, dim, bit_width, model, base_url, key_hash, tokenizer, index_config, fts_keys"
                 " FROM collections WHERE name=?",
                 (name,),
             ).fetchone()
         if row is None:
             return None
         return CollectionConfig(
-            *row[:6], row[6] or "unicode61", json.loads(row[7]) if row[7] else None
+            *row[:6], row[6] or "unicode61", json.loads(row[7]) if row[7] else None,
+            json.loads(row[8]) if row[8] else None,
         )
 
     def set_index_config(self, name: str, ic: dict | None) -> None:
@@ -2949,7 +3039,9 @@ class CollectionManager:
         base_url: str | None,
         collection_key: str | None,
         tokenizer: str = "unicode61",
+        fts_keys: list[str] | None = None,
     ) -> CollectionConfig:
+        _validate_fts_keys(fts_keys)
         if tokenizer not in FTS_TOKENIZERS:
             raise ValueError(f"tokenizer must be one of {sorted(FTS_TOKENIZERS)}")
         if self.get_config(name):
@@ -2966,17 +3058,19 @@ class CollectionManager:
         if dim <= 0 or dim % 8:  # turbovec constraint
             raise ValueError(f"dim must be a positive multiple of 8, got {dim}")
         cfg = CollectionConfig(name, dim, bit_width, model, base_url,
-                               hash_key(collection_key) if collection_key else None, tokenizer)
+                               hash_key(collection_key) if collection_key else None, tokenizer,
+                               fts_keys=list(fts_keys) if fts_keys is not None else None)
         directory = self._dir(name)
         if directory.exists():  # leftover from a crashed create or failed delete: never resurrect
             await asyncio.to_thread(shutil.rmtree, directory)
         directory.mkdir(parents=True)
-        open_meta_db(directory / "meta.db", tokenizer).close()
+        open_meta_db(directory / "meta.db", tokenizer, cfg.fts_keys).close()
         with self._catalog_lock:
             self.catalog.execute(
                 "INSERT INTO collections(name, dim, bit_width, model, base_url, key_hash,"
-                " created_at, tokenizer) VALUES (?,?,?,?,?,?,?,?)",
-                (name, dim, bit_width, model, base_url, cfg.key_hash, _now(), tokenizer),
+                " created_at, tokenizer, fts_keys) VALUES (?,?,?,?,?,?,?,?,?)",
+                (name, dim, bit_width, model, base_url, cfg.key_hash, _now(), tokenizer,
+                 json.dumps(cfg.fts_keys) if cfg.fts_keys is not None else None),
             )
             self.catalog.commit()
         return cfg

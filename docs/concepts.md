@@ -173,6 +173,12 @@ small-container goal, and turbovec exposes no graph hooks
 
 ## Text search (BM25)
 
+BM25 indexes a record's original text plus any metadata values selected by the
+collection's immutable `fts_keys`. Titles, sources and tags can therefore match
+even when absent from the body. All BM25 paths use the same combined text, while
+embeddings and returned records keep the original body. See
+[what BM25 indexes](search.md#what-bm25-indexes) for conversion and PATCH behavior.
+
 ### Tokenization
 
 Splitting text into the units the text index matches on. raggio offers two

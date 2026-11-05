@@ -131,7 +131,9 @@ scores; `text` runs BM25 over SQLite FTS5 (no embedding endpoint needed, score i
 `-bm25`, higher = better); `hybrid` fuses both rankings (text required, vector
 optional to skip the embedding call) with Reciprocal Rank Fusion, or with Weaviate's
 relative score fusion when `"fusion": "relative"` (scores in [0, 1], `alpha` weighs
-the vector leg). Records ingested without text are invisible to the BM25 leg.
+the vector leg). Collections can opt into `fts_keys` to include metadata such as
+title, source and tags in BM25. Records without either text or selected metadata
+are invisible to that leg; embeddings and returned text remain unchanged.
 
 Also: `GET/DELETE /collections/{name}`, `GET/PATCH/DELETE /collections/{name}/documents/{doc_id}`
 (PATCH merge-patches metadata without re-embedding), `GET /collections/{name}/documents`
