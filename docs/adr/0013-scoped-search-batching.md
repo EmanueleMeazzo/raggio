@@ -1,6 +1,6 @@
 # ADR 0013 — Bounded batching of warm scope searches
 
-Status: accepted candidate implementation · Date: 2026-11-04 · Builds on ADRs 0003–0005 and 0010
+Status: accepted · Date: 2026-11-04 · Baseline accepted: 2026-11-05 · Builds on ADRs 0003–0005 and 0010
 
 ## Context and scope
 
@@ -10,6 +10,7 @@ throughput. Sofia uses summary search and in-document search, without ranked
 sibling expansion. This change branches from main `6327693` independently of
 [draft PR #10](https://github.com/EmanueleMeazzo/raggio/pull/10), whose sibling reuse
 does not affect that planned flow. ADRs 0011–0012 are tracked in that separate PR.
+PR #11 is merged by `01b160f`; its implementation is now the accepted main baseline.
 
 `_vector_ids` sends unrestricted vector queries through `_scan_batched`, sharing
 scan/rescore work across already-arrived queries. Scope searches on collections
@@ -107,7 +108,8 @@ the two protocols' medians.
 Environment: native CPython 3.12.15, x86_64 WSL2 Linux, local container storage,
 three-CPU quota, 4 GiB limit, `OPENBLAS_NUM_THREADS=1`, SQLite 3.53.1 and frozen
 dependencies. The raw results record package versions and the measured store hash.
-These are local experiments; deployment gains require a Sofia re-run.
+These are local experiments; the Sofia deployment follow-up below records the
+subsequent workload-specific evaluation.
 
 ## Results
 
@@ -138,8 +140,8 @@ changes by +0.5%; there is no claimed low-load latency improvement.
 Controls still vary despite identical code paths: the metadata c=8 control
 shows -13.4% paired QPS while the plain c=8 control shows +10.7%. These
 are not effects of scoped batching. Do not predict deployment throughput
-from a pooled ratio or claim that every query improves. A Sofia re-run
-with its own index, limits and query mix is required before rollout.
+from a pooled ratio or claim that every query improves. These controls motivated
+the subsequent Sofia re-run with its own index, limits and query mix.
 
 A separate flat-index check uses the same fixture and three paired rounds:
 
@@ -179,6 +181,35 @@ fetches, candidate row counts and temporary traced allocations. It excludes exis
 index/collection memory and does not measure process RSS. Controls retain their
 original work, so mixed differences on those paths are not optimization gains.
 
+## Sofia deployment follow-up and baseline acceptance, 2026-11-05
+
+The user supplied a [deployment benchmark and accepted baseline report](../research/sofia-scoped-search-baseline-2026-11-05.md)
+comparing main `6327693` with tested PR #11 revision `1cdae1d`. Both runs used
+33 resident collections including PRD copies, the same 3 vCPU / 6 GiB container
+limit and 60 queries on `legal_knowhow` (about 165,000 records, IVF, `nprobe=16`).
+The report retains the source screenshot and displayed values; raw samples and
+scripts were not supplied, so this is reported deployment evidence rather than
+an independent re-run.
+
+Concurrent summary QPS improves from 49.4 to 60.0 at eight clients (+21.5%) and
+47.8 to 58.6 at sixteen (+22.6%). Approximate CPU/query falls from 60 to 44 ms
+(-26.7%), while p95 falls from 248 to 173 ms at eight clients (-30.2%) and
+435 to 344 ms at sixteen (-20.9%). Use these workload-specific gains for Sofia;
+the larger local synthetic ratios remain evidence for their own fixture.
+
+In-document and plain-vector throughput remain similar. Single-client summary
+QPS declines from 49.3 to 45.2, and sequential p50/p95 rises from 18.4/30.0 to
+19.2/32.5 ms. The source calls the difference noise, but without repeated raw
+rounds its significance cannot be established. No single-query benefit is claimed.
+
+The reported 4.5 to 1.5 GiB working-set difference has unequal restart/file-cache
+history and is not a memory saving caused by this change. The local temporary
+allocation increase and cohort payload bound above remain applicable.
+
+The user accepted PR #11 as the new retrieval baseline on 2026-11-05. Main merge
+`01b160f` retains the tested runtime source. Future retrieval work should compare
+against it with equivalent cache warmup and retain low-load and document controls.
+
 ## Rejected or deferred alternatives
 
 The initial prototype compared batching and moving hydration to `asyncio.to_thread`
@@ -209,8 +240,9 @@ The native CPython 3.12 full suite passed **672 tests, 4 skipped**, including th
 30-second concurrency stress run, in 130.77 seconds. The two candidate-cutoff tie
 cases were then added; the complete focused file passed **31 tests** in 21.33
 seconds with the same measured runtime source. The strict MkDocs build passed.
-Pull-request CI also exercises native x86_64/ARM64 and the experimental
-free-threaded interpreters; those checks remain rollout gates.
+All five pull-request CI jobs passed on `1cdae1d`: production/reference, native
+x86_64/ARM64 and experimental free-threaded x86_64/ARM64, including the extended
+concurrency stress runs. This does not promote the experimental interpreter.
 
 ```bash
 uv run --group bench --extra native python bench/scoped_retrieval_probe.py --arms production --baseline shared --pairs 5 --iterations 20 --concurrency 8 16 --out results.json

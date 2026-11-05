@@ -6,6 +6,10 @@ This is deployment evidence for [ADR 0010](../adr/0010-search-response-encoding.
 separate from its local synthetic measurements. The raw requests, per-query samples,
 resource logs and scripts were not supplied; no new benchmark was run for this report.
 
+This is historical evidence for the PR #9 revision. The subsequent
+[PR #11 evaluation and accepted baseline](sofia-scoped-search-baseline-2026-11-05.md)
+records the scoped-search optimization and replaces PR #9 as the comparison baseline.
+
 ## Reported setup
 
 - Same settings in the earlier baseline and PR #9 run: IVF index, `nprobe=16`,
