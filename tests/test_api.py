@@ -477,6 +477,12 @@ def test_listing_filter_ops_and_patch(client):
     assert flt({"src": ["blog", "wiki"]}).json()["total"] == 3
     assert ids(flt({"src": {"contains": "IK"}})) == ["c1", "c2"]
     assert ids(flt({"src": {"contains": "log"}, "date": {"lt": "2026-01-01"}})) == ["c3"]
+    # contains_any: OR of contains, ANDed with the other keys
+    assert ids(flt({"src": {"contains_any": ["nope", "IK"]}})) == ["c1", "c2"]
+    assert flt({"src": {"contains_any": ["LOG", "wik"]}}).json()["total"] == 3
+    assert ids(flt({"src": {"contains_any": ["log", "wiki"]}, "date": {"lt": "2026-01-01"}})) == ["c3"]
+    for bad in ([], "wiki", [["wiki"]]):
+        assert flt({"src": {"contains_any": bad}}).status_code == 400
 
     # vectors on request: decoded fp16 originals, unit length
     rec = flt({"src": "blog"}, include_vector="true").json()["records"][0]
@@ -487,6 +493,10 @@ def test_listing_filter_ops_and_patch(client):
         r = client.post("/collections/main/search", headers=ROOT,
                         json={"query": {"text": "planet"}, "mode": mode, "k": 10,
                               "filter": {"src": {"contains": "LOG"}}})
+        assert [h["id"] for h in r.json()["hits"]] == ["c3"], mode
+        r = client.post("/collections/main/search", headers=ROOT,
+                        json={"query": {"text": "planet"}, "mode": mode, "k": 10,
+                              "filter": {"src": {"contains_any": ["nope", "LOG"]}}})
         assert [h["id"] for h in r.json()["hits"]] == ["c3"], mode
 
     # bad input is a 400, never a 500
@@ -513,6 +523,77 @@ def test_listing_filter_ops_and_patch(client):
     assert r.json() == {"patched_records": 1}
     assert "kind" not in client.get("/collections/main/documents/doc1", headers=ROOT).json()["summary"]["metadata"]
     assert client.patch("/collections/main/documents/nope", headers=ROOT, json={"metadata": {}}).status_code == 404
+
+
+def test_contains_any_title_filters_preserve_scope_and_other_keys(client):
+    client.post("/collections", headers=ROOT, json={"name": "main"}).raise_for_status()
+    ingest(client, "main", [
+        {"doc_id": "report", "summary": {"text": "planet", "metadata": {"title": "Report - Q3", "tenant": "ours"}},
+         "chunks": [{"id": "chunk", "text": "planet", "metadata": {"title": "Q3 report", "tenant": "ours"}}]},
+        {"doc_id": "substring", "summary": {"text": "planet", "metadata": {"title": "Reportage", "tenant": "ours"}}},
+        {"doc_id": "other", "summary": {"text": "planet", "metadata": {"title": "Q3 report", "tenant": "other"}}},
+        {"doc_id": "missing", "summary": {"text": "planet"}},
+    ])
+    filt = {"title": {"contains_any": ["q3", "report"]}, "tenant": "ours"}
+    r = client.get("/collections/main/documents", headers=ROOT,
+                   params={"scope": "summaries", "filter": json.dumps(filt)})
+    r.raise_for_status()
+    assert r.json()["total"] == 2
+    assert {row["id"] for row in r.json()["records"]} == {"report", "substring"}
+    for mode in ("vector", "text", "hybrid"):
+        r = client.post("/collections/main/search", headers=ROOT,
+                        json={"mode": mode, "scope": "summaries", "query": {"text": "planet"},
+                              "k": 10, "filter": filt})
+        r.raise_for_status()
+        assert {hit["id"] for hit in r.json()["hits"]} == {"report", "substring"}
+    # The operator does not tokenize a single phrase or require word boundaries.
+    filt["title"] = {"contains_any": ["q3 report"]}
+    r = client.get("/collections/main/documents", headers=ROOT,
+                   params={"scope": "summaries", "filter": json.dumps(filt)})
+    assert r.json()["total"] == 0
+
+
+def test_contains_any_literals_ascii_folding_and_null_metadata(client):
+    client.post("/collections", headers=ROOT, json={"name": "main"}).raise_for_status()
+    ingest(client, "main", [{"doc_id": "literals", "chunks": [
+        {"id": "literal", "text": "planet", "metadata": {"title": "100%_ O'Reilly"}},
+        {"id": "plain", "text": "planet", "metadata": {"title": "plain"}},
+        {"id": "accent", "text": "planet", "metadata": {"title": "CAFÉ"}},
+        {"id": "null", "text": "planet", "metadata": {"title": None}},
+        {"id": "missing", "text": "planet"},
+    ]}])
+    def found(terms):
+        r = client.get("/collections/main/documents", headers=ROOT,
+                       params={"scope": "chunks", "filter": json.dumps({"title": {"contains_any": terms}})})
+        r.raise_for_status()
+        return {row["id"] for row in r.json()["records"]}
+    assert found(["x' OR 1=1 --", "%_"]) == {"literal"}
+    assert found(["o'reilly"]) == {"literal"}
+    assert found(["cafÉ"]) == {"accent"}
+    assert found(["café"]) == set()  # SQLite lower() leaves non-ASCII É unchanged.
+    assert found([""]) == {"literal", "plain", "accent"}  # Existing contains behavior.
+
+
+def test_contains_any_list_boundary_and_bad_input_return_400_in_every_mode(client):
+    client.post("/collections", headers=ROOT, json={"name": "main"}).raise_for_status()
+    ingest(client, "main", [DOC])
+    url = "/collections/main/documents"
+    valid = {"src": {"contains_any": ["nope"] * 255 + ["LOG"]}}
+    r = client.get(url, headers=ROOT, params={"scope": "chunks", "filter": json.dumps(valid)})
+    r.raise_for_status()
+    assert [row["id"] for row in r.json()["records"]] == ["c3"]
+    for mode in ("vector", "text", "hybrid"):
+        r = client.post("/collections/main/search", headers=ROOT,
+                        json={"mode": mode, "query": {"text": "planet"}, "filter": valid})
+        r.raise_for_status()
+        assert [hit["id"] for hit in r.json()["hits"]] == ["c3"]
+    for bad in ([], "wiki", {"word": "wiki"}, [["wiki"]], [{"word": "wiki"}], ["wiki"] * 257, ["wiki"] * 1001):
+        filt = {"src": {"contains_any": bad}}
+        assert client.get(url, headers=ROOT, params={"filter": json.dumps(filt)}).status_code == 400
+        for mode in ("vector", "text", "hybrid"):
+            r = client.post("/collections/main/search", headers=ROOT,
+                            json={"mode": mode, "query": {"text": "planet"}, "filter": filt})
+            assert r.status_code == 400, (mode, bad)
 
 
 DOC_B = {
@@ -592,7 +673,7 @@ def test_doc_id_filter(client):
     # reserved: b2's metadata key doc_id is not what the filter reads
     assert "b2" not in found({"doc_id": "doc1"})
     # equality and `in` only
-    for bad in ({"gte": "doc1"}, {"contains": "doc"}, {"in": []}, {"like": "doc%"}):
+    for bad in ({"gte": "doc1"}, {"contains": "doc"}, {"contains_any": ["doc"]}, {"in": []}, {"like": "doc%"}):
         found({"doc_id": bad}, status=400)
 
     # listing: the same key, with paging and total

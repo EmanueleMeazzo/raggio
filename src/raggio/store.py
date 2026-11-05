@@ -56,6 +56,8 @@ def _load_native():
 _native = _load_native()
 
 RANGE_OPS = {"gte": ">=", "lte": "<=", "gt": ">", "lt": "<"}
+# Keep the per-key OR expression comfortably below SQLite's expression-depth limit.
+CONTAINS_ANY_MAX = 256
 
 FTS_TOKENIZERS = {
     "unicode61": "unicode61 remove_diacritics 2",  # language-neutral exact tokens
@@ -377,7 +379,8 @@ def _rows_matrix(rows: list[list]) -> np.ndarray:
 
 def _filter_sql(scope: str, filt: dict | None) -> tuple[str, list]:
     """Build WHERE clause for records: type scope + metadata filters, all ANDed.
-    Per key: scalar = equality; list = `in`; object = range ops / `in` / `contains`.
+    Per key: scalar = equality; list = `in`; object = range ops / `in` / `contains` /
+    `contains_any`.
     `doc_id` is reserved (ADR 0007): it filters the records column, equality and `in`
     only, so idx_records_doc_type finds the rows instead of a json_extract over every
     row; a metadata key named doc_id cannot be filtered."""
@@ -406,6 +409,14 @@ def _filter_sql(scope: str, filt: dict | None) -> tuple[str, list]:
             elif op == "contains":  # substring; SQLite lower() folds ASCII only
                 clauses.append(f"instr(lower({col}), lower(?)) > 0")
                 params.extend([*cparams, str(bound)])
+            elif op == "contains_any":  # OR of `contains`: e.g. any word of a title query
+                if not isinstance(bound, list) or not bound or any(isinstance(b, (list, dict)) for b in bound):
+                    raise ValueError(f"filter '{key}': 'contains_any' needs a non-empty list of scalars")
+                if len(bound) > CONTAINS_ANY_MAX:
+                    raise ValueError(f"filter '{key}': 'contains_any' accepts at most {CONTAINS_ANY_MAX} values")
+                clauses.append("(" + " OR ".join([f"instr(lower({col}), lower(?)) > 0"] * len(bound)) + ")")
+                for b in bound:
+                    params.extend([*cparams, str(b)])
             else:
                 raise ValueError(f"unsupported filter operator: {op}")
     return " AND ".join(clauses), params
