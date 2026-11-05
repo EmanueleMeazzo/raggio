@@ -163,6 +163,26 @@ uv run --group bench python bench/ivf_thread_probe.py --out ivf-results.json
 
 ## Further retrieval work
 
+### Sofia deployment follow-up, 2026-11-04
+
+The user supplied a [Sofia benchmark summary](../research/sofia-retrieval-benchmark-2026-11-04.md)
+for main `6327693`, using the same earlier-run settings (IVF, `nprobe=16`,
+3 vCPU / 6 GiB, 60 queries and in-environment client). In-document p50 improves
+from 5.2 to 3.6 ms on `legal_knowhow` and 5.0 to 3.2 ms on `datascience`
+(30.8% and 36.0%). Summary p50 improves too, but `legal_knowhow` summary p95
+stays at 30.9 ms. Throughput under 8–16 clients moves modestly, and the reported
+0.87 GiB working set remains much smaller than Weaviate's 5.6 GiB.
+
+The linked report retains the supplied screenshot, exact displayed tables,
+provenance and limits; these are reported deployment measurements, not a local
+re-run or raw samples. Sofia's planned requests do not use `expand.siblings_topk`,
+so ADR 0012's optional reuse is outside this workload. The next investigation
+should profile scoped ranking/rescoring and hydration for Sofia's actual query
+shapes. CPU utilization suggests possible serialization but does not prove the GIL
+is the sole bottleneck. Existing free-threaded decision gates in ADR 0006 remain.
+
+### Remaining candidates
+
 The next candidates require workload-specific profiles, rather than another
 language change:
 
