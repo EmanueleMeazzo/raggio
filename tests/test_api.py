@@ -477,6 +477,12 @@ def test_listing_filter_ops_and_patch(client):
     assert flt({"src": ["blog", "wiki"]}).json()["total"] == 3
     assert ids(flt({"src": {"contains": "IK"}})) == ["c1", "c2"]
     assert ids(flt({"src": {"contains": "log"}, "date": {"lt": "2026-01-01"}})) == ["c3"]
+    # contains_any: OR of contains, ANDed with the other keys
+    assert ids(flt({"src": {"contains_any": ["nope", "IK"]}})) == ["c1", "c2"]
+    assert flt({"src": {"contains_any": ["LOG", "wik"]}}).json()["total"] == 3
+    assert ids(flt({"src": {"contains_any": ["log", "wiki"]}, "date": {"lt": "2026-01-01"}})) == ["c3"]
+    for bad in ([], "wiki", [["wiki"]]):
+        assert flt({"src": {"contains_any": bad}}).status_code == 400
 
     # vectors on request: decoded fp16 originals, unit length
     rec = flt({"src": "blog"}, include_vector="true").json()["records"][0]
@@ -487,6 +493,10 @@ def test_listing_filter_ops_and_patch(client):
         r = client.post("/collections/main/search", headers=ROOT,
                         json={"query": {"text": "planet"}, "mode": mode, "k": 10,
                               "filter": {"src": {"contains": "LOG"}}})
+        assert [h["id"] for h in r.json()["hits"]] == ["c3"], mode
+        r = client.post("/collections/main/search", headers=ROOT,
+                        json={"query": {"text": "planet"}, "mode": mode, "k": 10,
+                              "filter": {"src": {"contains_any": ["nope", "LOG"]}}})
         assert [h["id"] for h in r.json()["hits"]] == ["c3"], mode
 
     # bad input is a 400, never a 500
@@ -592,7 +602,7 @@ def test_doc_id_filter(client):
     # reserved: b2's metadata key doc_id is not what the filter reads
     assert "b2" not in found({"doc_id": "doc1"})
     # equality and `in` only
-    for bad in ({"gte": "doc1"}, {"contains": "doc"}, {"in": []}, {"like": "doc%"}):
+    for bad in ({"gte": "doc1"}, {"contains": "doc"}, {"contains_any": ["doc"]}, {"in": []}, {"like": "doc%"}):
         found({"doc_id": bad}, status=400)
 
     # listing: the same key, with paging and total

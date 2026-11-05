@@ -154,8 +154,10 @@ Both apply to every mode (in hybrid, to both legs):
     - scalar — equality (`"src": "sharepoint"`);
     - list — membership (`"src": ["sharepoint", "smb"]`, same as `{"in": [...]}`);
     - object — `gte` / `lte` / `gt` / `lt` ranges (string comparison, so ISO
-      dates work naturally), `in`, and `contains` (case-insensitive substring,
-      ASCII case folding only: `{"title": {"contains": "acme"}}`).
+      dates work naturally), `in`, `contains` (case-insensitive substring,
+      ASCII case folding only: `{"title": {"contains": "acme"}}`) and
+      `contains_any` (any of several substrings, the same folding:
+      `{"title": {"contains_any": ["q3", "report"]}}`).
 
   `doc_id` is a reserved key: it filters on the document id itself, not on
   metadata, with equality or `in` only (`{"doc_id": "contract-42"}`,
