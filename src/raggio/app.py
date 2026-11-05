@@ -153,12 +153,13 @@ def _ingest_payload(body: IngestIn) -> dict:
     return payload
 
 
-class _IngestJSONRequest(Request):
-    """Validate normal ingest JSON in Pydantic's native parser, in one pass."""
+class _ValidatedJSONRequest(Request):
+    """Validate a route's JSON body in Pydantic's native parser, in one pass."""
 
-    def __init__(self, request: Request) -> None:
+    def __init__(self, request: Request, model: type[BaseModel]) -> None:
         super().__init__(request.scope, request.receive)
         self._original = request
+        self._model = model
 
     async def body(self) -> bytes:
         # Reuse a body already read by middleware, rather than consuming it twice.
@@ -167,7 +168,7 @@ class _IngestJSONRequest(Request):
     async def json(self) -> Any:
         if not hasattr(self, "_json"):
             try:
-                self._json = IngestIn.model_validate_json(await self.body())
+                self._json = self._model.model_validate_json(await self.body())
             except ValidationError:
                 # Keep stdlib encodings/surrogates and FastAPI's error details and
                 # dependency ordering for malformed JSON or invalid models.
@@ -175,12 +176,15 @@ class _IngestJSONRequest(Request):
         return self._json
 
 
-class _IngestJSONRoute(APIRoute):
+class _ValidatedJSONRoute(APIRoute):
+    """For routes declaring a single Pydantic body model."""
+
     def get_route_handler(self):
         handler = super().get_route_handler()
+        model = self.body_field.field_info.annotation
 
         async def handle(request: Request):
-            return await handler(_IngestJSONRequest(request))
+            return await handler(_ValidatedJSONRequest(request, model))
 
         return handle
 
@@ -345,7 +349,7 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
         if r.vector is not None and len(r.vector) != dim:
             raise HTTPException(400, f"{label}: vector has dim {len(r.vector)}, collection expects {dim}")
 
-    ingest_router = APIRouter(route_class=_IngestJSONRoute)
+    ingest_router = APIRouter(route_class=_ValidatedJSONRoute)
 
     @ingest_router.post("/collections/{name}/documents", status_code=202)
     async def ingest(body: IngestIn, c=Depends(get_collection)):
@@ -420,7 +424,9 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
 
     # ---- search ----
 
-    @app.post("/collections/{name}/search")
+    search_router = APIRouter(route_class=_ValidatedJSONRoute)
+
+    @search_router.post("/collections/{name}/search")
     async def search(body: SearchIn, c=Depends(get_collection)):
         q = body.query
         if q.text is not None and not q.text.strip():
@@ -454,6 +460,8 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
         except CollectionDeletedError:  # DELETE /collections/{name} landed first
             raise HTTPException(404, f"collection '{c.cfg.name}' not found")
         return _search_response(hits)
+
+    app.include_router(search_router)
 
     @app.get("/healthz")
     async def healthz():

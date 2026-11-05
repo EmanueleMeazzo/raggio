@@ -80,3 +80,12 @@ Compatibility/error cases retain the old path and can cost an extra native parse
 The custom route assumes the endpoint has one unembedded `IngestIn` body; a future
 change to that signature must update the adapter and parity tests together.
 Upgrades to FastAPI/Pydantic should run these parity tests before adoption.
+
+## Shared helper follow-up, 2026-11-05
+
+[ADR 0016](0016-native-search-json.md) generalizes the existing adapter to the
+route's single Pydantic body model and also uses it for search. The private classes
+are now `_ValidatedJSONRequest` and `_ValidatedJSONRoute`; ingestion still validates
+`IngestIn` and retains the same compatibility path. Its original request-contract
+tests are kept and run alongside the new search parity tests. The measurements
+above retain their original revision and are not new ingestion results.
