@@ -10,7 +10,7 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 import pytest
 
-from raggio.app import IngestIn, _IngestJSONRequest, _IngestJSONRoute
+from raggio.app import IngestIn, _ValidatedJSONRequest, _ValidatedJSONRoute
 
 
 def make_app(route_class):
@@ -39,7 +39,7 @@ PAYLOAD = {"documents": [{"doc_id": "d", "chunks": [{
 
 @pytest.fixture
 def clients():
-    with TestClient(make_app(APIRoute)) as baseline, TestClient(make_app(_IngestJSONRoute)) as native:
+    with TestClient(make_app(APIRoute)) as baseline, TestClient(make_app(_ValidatedJSONRoute)) as native:
         yield baseline, native
 
 
@@ -132,7 +132,7 @@ def test_request_reuses_cached_body_and_parses_once(monkeypatch):
     async def run():
         request = Request({"type": "http"})
         request._body = json.dumps(PAYLOAD).encode()
-        native = _IngestJSONRequest(request)
+        native = _ValidatedJSONRequest(request, IngestIn)
         original = IngestIn.model_validate_json
         calls = []
 

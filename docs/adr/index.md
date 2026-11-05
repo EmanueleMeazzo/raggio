@@ -24,6 +24,7 @@ results describe their measured revisions, rather than the latest commit.
 | [0012](0012-per-search-sibling-vector-reuse.md) | Evaluate bounded per-search sibling-vector reuse | Not adopted; PR #10 closed unmerged |
 | [0013](0013-scoped-search-batching.md) | Bound and coalesce warm scope-only vector searches | Accepted; retrieval baseline from 2026-11-05 |
 | [0014](0014-contains-any-metadata-filter.md) | Add bounded OR of metadata substring alternatives | Accepted; retrieval capability, PR #12 |
+| [0016](0016-native-search-json.md) | Reuse a shared native JSON request parser for search | Accepted after local evaluation; Sofia follow-up pending |
 
 ADRs 0011–0012 archive the expansion experiments and sibling-vector reuse from
 [PR #10](https://github.com/EmanueleMeazzo/raggio/pull/10), closed without merging
@@ -54,6 +55,7 @@ this runtime as their baseline and keep historical benchmarks labeled by revisio
 | Expansion experiments and sibling reuse | [PR #10](https://github.com/EmanueleMeazzo/raggio/pull/10), closed without merging; branch `perf/sibling-vector-reuse` retained at `614c4b8` | Archived [ADR 0011](0011-expansion-read-batching-evaluation.md) and [ADR 0012](0012-per-search-sibling-vector-reuse.md), with original results/source links and closure rationale |
 | Warm scope search batching | `1cdae1d`, merged by `01b160f` in [PR #11](https://github.com/EmanueleMeazzo/raggio/pull/11); bounded independent cohorts for cached scope allowlists | [ADR 0013](0013-scoped-search-batching.md), paired benchmarks, exact parity/resource/lifecycle tests and [accepted Sofia baseline](../research/sofia-scoped-search-baseline-2026-11-05.md) |
 | Alternative title/source substrings | [PR #12](https://github.com/EmanueleMeazzo/raggio/pull/12); `contains_any` with 1–256 scalar alternatives, OR within a key and AND across keys | [ADR 0014](0014-contains-any-metadata-filter.md), API grammar and title/literal/validation regression tests |
+| Document retrieval evaluation and native search parsing | Share the existing native JSON route helper between ingestion and search; reject a persistent prepared-vector cache | [ADR 0016](0016-native-search-json.md), [evaluation report](../research/document-retrieval-evaluation-2026-11-05.md), parser/API parity tests and raw benchmarks |
 
 From 2026-11-04, ingestion is considered sufficiently fast for its frequency.
 Further optimization work focuses on search/retrieval latency, CPU and memory,
