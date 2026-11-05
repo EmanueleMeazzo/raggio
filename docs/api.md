@@ -25,7 +25,8 @@ An interactive OpenAPI UI is served at `/docs` (FastAPI built-in).
   "model": "text-embedding-3-small",
   "base_url": null,
   "collection_key": "kb-secret",
-  "tokenizer": "unicode61"
+  "tokenizer": "unicode61",
+  "fts_keys": ["title", "source", "tags"]
 }
 ```
 
@@ -38,9 +39,13 @@ An interactive OpenAPI UI is served at `/docs` (FastAPI built-in).
 | `base_url` | string | env | Per-collection embedding endpoint override |
 | `collection_key` | string | none | Per-collection API key; if unset, root-only |
 | `tokenizer` | `unicode61` \| `trigram` | `unicode61` | BM25 tokenizer, immutable after creation |
+| `fts_keys` | string array or null | `null` | Metadata keys appended to BM25 text, immutable; at most 8 unique literal keys matching `[A-Za-z0-9_.-]{1,64}`, excluding `doc_id` |
 
-**201** `{"name": "kb", "dim": 1536, "bit_width": 4, "tokenizer": "unicode61"}` ·
+**201** `{"name": "kb", "dim": 1536, "bit_width": 4, "tokenizer": "unicode61", "fts_keys": ["title", "source", "tags"]}` ·
 **409** name exists · **400** invalid dim / no embedding endpoint to probe
+
+Invalid `fts_keys` returns **422**. Omitted, `null`, or empty keys preserve text-only
+indexing. See [indexed metadata](search.md#what-bm25-indexes) for value conversion.
 
 ### List collections
 
@@ -58,6 +63,7 @@ An interactive OpenAPI UI is served at `/docs` (FastAPI built-in).
 {
   "name": "kb", "dim": 1536, "bit_width": 4,
   "model": null, "tokenizer": "unicode61",
+  "fts_keys": ["title", "source", "tags"],
   "index": {"type": "flat"},
   "documents": 12, "chunks": 340, "summaries": 12, "pending_jobs": 0
 }
@@ -175,8 +181,9 @@ curl -G :8000/collections/kb/documents -H "x-api-key: $KEY" \
 
 [JSON merge patch](https://www.rfc-editor.org/rfc/rfc7396) applied to the
 document's summary and, with `apply_to_chunks` (default `true`), every chunk:
-keys are added or replaced, `null` deletes a key, other keys are kept. Nothing
-is re-embedded or re-indexed.
+keys are added or replaced, `null` deletes a key, other keys are kept. When a
+selected `fts_keys` value changes, the keyword index updates in the same transaction.
+Other metadata patches leave it untouched. Vectors are never re-embedded.
 
 **200** `{"patched_records": 4}` · **404**
 

@@ -96,8 +96,31 @@ curl :8000/collections/kb/search -H "x-api-key: $KEY" --json '{
 `alpha` is ignored by `rrf`, and `fusion` outside `hybrid` mode.
 
 !!! note "Records without text"
-    Chunks ingested with only a `vector` are invisible to the BM25 leg (and
-    to `text` mode). They can still be found by the vector leg.
+    A vector-only record can match BM25 when its collection indexes metadata
+    through `fts_keys`. Without indexed metadata values it is invisible to the
+    BM25 leg and `text` mode. The vector leg can still find it.
+
+## What BM25 indexes
+
+By default BM25 indexes each record's `text`. At collection creation, optional
+`fts_keys`, for example `["title", "source", "tags"]`, append those metadata
+values to the indexed text, in the specified order, separated by newlines.
+Keys refer to literal top-level metadata names; `a.b` is a key, not a nested path.
+
+Strings are used as supplied, numbers and booleans use Python `str()` (for example
+`True` and `1.0`), and scalar lists are joined with spaces. Nulls and objects are
+skipped. Null list members are skipped; a list containing an object or nested list
+is skipped altogether. A null body contributes no text, so metadata alone can match.
+
+The combined text is used for FTS5 ranking, full-query rescoring, document-scoped
+search, length normalization and text-mode sibling expansion. Selected metadata
+therefore also contributes to document length and term frequencies. Metadata is
+never added to embeddings. Search hits and document reads retain the original
+`text` and `metadata`, and filters still inspect metadata itself.
+
+`fts_keys` is immutable; recreate a collection to change it. Metadata PATCH updates
+the keyword index transactionally when selected values change. A patch to other
+keys leaves that index untouched. Existing collections keep text-only indexing.
 
 ## Text query handling
 
