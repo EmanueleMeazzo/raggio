@@ -24,7 +24,9 @@ import pytest
 import raggio.store as store
 from raggio.app import create_app
 from raggio.config import Settings
-from raggio.store import Collection, CollectionConfig, CollectionDeletedError, CollectionManager
+from raggio.store import (
+    Collection, CollectionClosedError, CollectionConfig, CollectionDeletedError, CollectionManager,
+)
 
 DIM = 8
 ROOT = {"x-api-key": "root-key"}
@@ -558,7 +560,7 @@ STRESS_CLIENTS = int(os.environ.get("RAGGIO_STRESS_CLIENTS", "16"))
 SEED_DOCS = 300
 WORDS = [f"w{i}" for i in range(400)] + ["alpha", "beta", "gamma", "delta", "planet", "star"]
 _CLOSED = re.compile(
-    r"RuntimeError: collection '\w+' is closed|ProgrammingError: Cannot operate on a closed database"
+    r"CollectionClosedError: collection '\w+' is closed|ProgrammingError: Cannot operate on a closed database"
 )
 
 
@@ -833,7 +835,7 @@ def _run_close_race(tmp_path, mode):
 # the read fails closed; 3.47.1 clears it, so the read finishes with its rows. Either is
 # a correct answer for a read that started before the close; a crash or an open
 # connection is not. The translation itself is pinned in process, below.
-_PARKED_READ_ENDS = ("ok", "RuntimeError: collection 't' is closed")
+_PARKED_READ_ENDS = ("ok", "CollectionClosedError: collection 't' is closed")
 
 
 def test_close_waits_for_a_read_parked_in_prepare(tmp_path):
@@ -1046,3 +1048,245 @@ def test_closed_collection_never_builds_an_embedder(tmp_path):
     with pytest.raises(CollectionDeletedError):
         col.embedder
     assert calls == []
+
+
+# ---- a request racing an LRU or idle eviction: 503 + Retry-After; racing DELETE: 404 ----
+# (ADR 0001, Deferred row on unlocked reads, update 2026-11-06)
+
+
+def test_a_stopped_collection_fails_every_path_with_the_closed_or_the_deleted_error(tmp_path):
+    col = make_collection(tmp_path)
+    paths = {
+        "_reading": col._reading,
+        "embedder": lambda: col.embedder,
+        "pending_jobs": col.pending_jobs,
+        "stats": col.stats,
+        "get_document": lambda: col.get_document("d0"),
+        "list_records": lambda: col.list_records("both", None, None, 5, 0),
+        "search": lambda: col.search("text", None, "w1", 3, "chunks", None, None),
+        "enqueue": lambda: col.enqueue({"documents": []}),
+        "patch_metadata": lambda: col.patch_metadata("d0", {"g": 1}, True),
+        "delete_document": lambda: col.delete_document("d0"),
+    }
+
+    async def run():
+        await col.stop()
+        out = {}
+        for deleted in (False, True):  # an eviction closed it, or DELETE did
+            col.deleted = deleted
+            for name, call in paths.items():
+                try:
+                    r = call()
+                    if asyncio.iscoroutine(r):
+                        await r
+                    out[name, deleted] = None
+                except Exception as e:
+                    out[name, deleted] = type(e)
+        return out
+
+    assert asyncio.run(run()) == {
+        **{(name, False): CollectionClosedError for name in paths},
+        **{(name, True): CollectionDeletedError for name in paths},
+    }
+
+
+def _http_app(tmp_path, monkeypatch, embedder_factory=lambda cfg: FakeEmbedder(), **env):
+    monkeypatch.setenv("ROOT_API_KEY", "root-key")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    return create_app(embedder_factory=embedder_factory)
+
+
+async def _seed_http(c: httpx.AsyncClient, name: str) -> None:
+    """Create `name` with documents d0-d2 (3 chunks each, job 1) and wait for the job."""
+    r = await c.post("/collections", headers=ROOT, json={"name": name})
+    assert r.status_code == 201, r.text
+    docs = [{"doc_id": f"d{i}", "chunks": [
+        {"id": f"d{i}c{j}", "text": f"w{i} w{j}", "vector": vec(10 * i + j)} for j in range(3)]}
+        for i in range(3)]
+    r = await c.post(f"/collections/{name}/documents", headers=ROOT, json={"documents": docs})
+    job = r.json()["job_id"]
+    deadline = time.monotonic() + WAIT_SECONDS
+    while time.monotonic() < deadline:
+        r = await c.get(f"/collections/{name}/jobs/{job}", headers=ROOT)
+        if r.json()["status"] == "done":
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"seed job of {name} not done: {r.text}")
+
+
+# every route that runs on a collection, and its answer when nothing races it. The index
+# routes are left out: on a collection this small they answer 400/404 before reaching
+# the store, and with enough rows they reach it through enqueue, which ingest covers
+_RACED_ROUTES = [
+    ("GET", "", None, 200),  # stats(): guarded reads in a worker thread
+    ("GET", "/jobs/1", None, 200),  # job status: a guarded read on the loop thread
+    ("GET", "/documents/d0", None, 200),  # get_document: on the loop thread
+    ("GET", "/documents", None, 200),  # list_records: in a worker thread
+    ("POST", "/search", {"query": {"vector": vec(0)}, "k": 3}, 200),  # waits for the read lock
+    ("POST", "/search", {"query": {"text": "w1"}, "mode": "text", "k": 3}, 200),
+    ("POST", "/documents", {"documents": [{"doc_id": "n", "chunks": [
+        {"id": "n0", "text": "w1", "vector": vec(99)}]}]}, 202),  # enqueue, under db_lock
+    ("PATCH", "/documents/d1", {"metadata": {"g": 1}}, 200),  # waits for the write lock
+    ("DELETE", "/documents/d2", None, 200),  # waits for the write lock
+]
+
+
+@pytest.mark.parametrize("close", ["evict", "delete", "evict_then_delete"])
+def test_http_requests_racing_a_close_answer_503_or_404(tmp_path, monkeypatch, close):
+    # the close lands once the request holds its collection and before it uses it.
+    # evict: what housekeeping's idle TTL does (an LRU eviction is the same _evict).
+    # delete: the state DELETE leaves while its stop() runs (deleted set, catalog row
+    # still there). evict_then_delete: DELETE after an eviction, which cannot flag the
+    # request's no-longer-resident object, so only the catalog says it is gone
+    app = _http_app(tmp_path, monkeypatch)
+    race = set()
+    real_touch = CollectionManager.touch
+
+    async def touch_then_close(self, name):
+        c = await real_touch(self, name)
+        if name in race:
+            race.discard(name)
+            async with self._load_lock:
+                if close == "delete":
+                    c.deleted = True
+                await self._evict(name)
+            if close == "evict_then_delete":
+                await self.delete_collection(name)
+        return c
+
+    monkeypatch.setattr(CollectionManager, "touch", touch_then_close)
+
+    async def run():
+        out = []
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+                for i, (method, suffix, body, ok) in enumerate(_RACED_ROUTES):
+                    name = f"r{i}"
+                    await _seed_http(c, name)
+                    race.add(name)
+                    url = f"/collections/{name}{suffix}"
+                    r = await c.request(method, url, headers=ROOT, json=body)
+                    retry = await c.request(method, url, headers=ROOT, json=body)
+                    out.append((r.status_code, r.headers.get("retry-after"), r.json()["detail"],
+                                retry.status_code))
+        return out
+
+    expected = []
+    for i, (*_, ok) in enumerate(_RACED_ROUTES):
+        if close == "evict":  # still there: come back in a second, and the retry reloads it
+            expected.append((503, "1", f"collection 'r{i}' is closed", ok))
+        elif close == "delete":  # (the catalog row survives this simulation, so a retry reloads)
+            expected.append((404, None, f"collection 'r{i}' not found", ok))
+        else:
+            expected.append((404, None, f"collection 'r{i}' not found", 404))
+    assert asyncio.run(run()) == expected
+
+
+def test_http_searches_queued_behind_a_writer_when_an_lru_eviction_lands_answer_503(
+        tmp_path, monkeypatch):
+    # the race in its natural order, as in the DELETE test above: searches queue for x's
+    # read lock behind a PATCH, a request for y evicts x (MAX_RESIDENT_COLLECTIONS=1), and
+    # writer preference runs x's stop() before them. They answer 503 + Retry-After, never
+    # 500, and a retry reloads x
+    app = _http_app(tmp_path, monkeypatch, MAX_RESIDENT_COLLECTIONS="1")
+    inside, release, gate = threading.Event(), threading.Event(), {}
+    real_patch = Collection._patch_rows
+
+    def gated_patch(self, *args):  # holds a PATCH inside its write section
+        gate["col"] = self
+        inside.set()
+        release.wait(WAIT_SECONDS)
+        return real_patch(self, *args)
+
+    body = {"query": {"vector": vec(0)}, "k": 3}
+
+    async def run():
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+                await _seed_http(c, "y")
+                await _seed_http(c, "x")  # evicts y
+                monkeypatch.setattr(Collection, "_patch_rows", gated_patch)
+                patch = asyncio.create_task(c.patch("/collections/x/documents/d0", headers=ROOT,
+                                                    json={"metadata": {"g": 1}}))
+                assert await asyncio.to_thread(inside.wait, WAIT_SECONDS)
+                searches = [asyncio.create_task(c.post("/collections/x/search", headers=ROOT, json=body))
+                            for _ in range(4)]
+                await asyncio.sleep(0.1)  # they queue for the read lock behind the PATCH
+                other = asyncio.create_task(c.get("/collections/y", headers=ROOT))  # evicts x
+                deadline = time.monotonic() + WAIT_SECONDS
+                while time.monotonic() < deadline:  # until x's stop() waits for the write lock
+                    if gate["col"].lock._writers_waiting:
+                        break
+                    await asyncio.sleep(0.01)
+                queued = bool(gate["col"].lock._writers_waiting)
+                release.set()
+                assert queued, "the eviction's stop() never queued for the write lock"
+                p, o = await patch, await other
+                s = [await t for t in searches]
+                retry = await c.post("/collections/x/search", headers=ROOT, json=body)
+                resident = (await c.get("/healthz")).json()["resident_collections"]
+        return (p.status_code, o.status_code, [(r.status_code, r.headers.get("retry-after")) for r in s],
+                retry.status_code, len(retry.json()["hits"]), resident)
+
+    assert asyncio.run(run()) == (200, 200, [(503, "1")] * 4, 200, 3, ["x"])
+
+
+@pytest.mark.parametrize("fail_after_close", [True, False])
+def test_http_search_embedding_while_an_eviction_lands_answers_503(tmp_path, monkeypatch,
+                                                                   fail_after_close):
+    # the eviction counterpart of the DELETE test above: the eviction's stop() closes the
+    # embedder under the search's embedding call
+    emb = GatedEmbedder(fail_after_close)
+    gated = [emb]
+
+    def factory(cfg):  # x's first residency embeds through the gate, the reload does not
+        return gated.pop() if cfg.name == "x" and gated else FakeEmbedder()
+
+    app = _http_app(tmp_path, monkeypatch, embedder_factory=factory, MAX_RESIDENT_COLLECTIONS="1")
+    search_body = {"query": {"text": "w1"}, "mode": "hybrid", "k": 5}
+
+    async def run():
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+                await _seed_http(c, "y")
+                await _seed_http(c, "x")  # evicts y
+                search = asyncio.create_task(
+                    c.post("/collections/x/search", headers=ROOT, json=search_body))
+                await asyncio.wait_for(emb.entered.wait(), WAIT_SECONDS)
+                o = await c.get("/collections/y", headers=ROOT)  # evicts x
+                s = await asyncio.wait_for(search, WAIT_SECONDS)
+                after = await c.post("/collections/x/search", headers=ROOT, json=search_body)
+        return o.status_code, s.status_code, s.headers.get("retry-after"), after.status_code
+
+    assert asyncio.run(run()) == (200, 503, "1", 200)
+
+
+def test_http_other_errors_on_a_live_collection_stay_500(tmp_path, monkeypatch):
+    # only the typed closed and deleted errors map to 503/404: an SQLite error or any
+    # other RuntimeError on a live collection is a real fault, even one worded like the
+    # closed error
+    app = _http_app(tmp_path, monkeypatch)
+    errors = iter([sqlite3.OperationalError("disk I/O error"),
+                   sqlite3.ProgrammingError("Cannot operate on a closed database."),
+                   RuntimeError("boom"),
+                   RuntimeError("collection 'x' is closed")])
+
+    def failing_get_document(self, doc_id):
+        raise next(errors)
+
+    async def run():
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+                await _seed_http(c, "x")
+                monkeypatch.setattr(Collection, "get_document", failing_get_document)
+                rs = [await c.get("/collections/x/documents/d0", headers=ROOT) for _ in range(4)]
+        return [(r.status_code, r.headers.get("retry-after")) for r in rs]
+
+    assert asyncio.run(run()) == [(500, None)] * 4

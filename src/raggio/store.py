@@ -678,7 +678,7 @@ class _ReadConn:
         self.lock.acquire()
         if self.closed:
             self.lock.release()
-            raise RuntimeError(f"collection '{self.col.cfg.name}' is closed")
+            raise self.col._closed_error()
         return self.db
 
     def __exit__(self, exc_type, exc, tb) -> bool:
@@ -704,7 +704,7 @@ class _ReadConn:
                 and issubclass(exc_type, (sqlite3.OperationalError, sqlite3.ProgrammingError))):
             # "interrupted" by the sweep, or "closed database": the collection is
             # closed, and that is the error a request racing a close has always got
-            raise RuntimeError(f"collection '{self.col.cfg.name}' is closed") from exc
+            raise self.col._closed_error() from exc
         return False
 
     def close_when_idle(self, deadline: float) -> bool:
@@ -1239,6 +1239,17 @@ class CollectionDeletedError(Exception):
     it waited; the app answers 404, as for a name that never existed (spec 3.1 B1)."""
 
 
+class CollectionClosedError(RuntimeError):
+    """A request reached a collection that an LRU or idle eviction (or shutdown) closed
+    while it was in flight. The collection still exists and the next request reloads
+    it, so the app answers 503 + Retry-After (ADR 0001, Deferred row on unlocked reads,
+    update 2026-11-06). A RuntimeError, as the closed error always was."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(f"collection '{name}' is closed")
+        self.name = name
+
+
 class Collection:
     """A resident collection: turbovec index + sqlite metadata + ingest worker."""
 
@@ -1365,11 +1376,18 @@ class Collection:
         # lazy so vector-only collections work without any embedding endpoint configured
         if self._embedder is None:
             if self._closed:  # stop() has run: a client built now would never be closed
-                if self.deleted:
-                    raise CollectionDeletedError(self.cfg.name)
-                raise RuntimeError(f"collection '{self.cfg.name}' is closed")
+                raise self._closed_error()
             self._embedder = self._embedder_factory()
         return self._embedder
+
+    def _closed_error(self) -> Exception:
+        """What a request that reached this collection after stop() fails with: a
+        CollectionDeletedError (404) when DELETE closed it (delete_collection sets
+        `deleted` before stop()), else a CollectionClosedError (503 + Retry-After): an
+        eviction closed it and the next request reloads it."""
+        if self.deleted:
+            return CollectionDeletedError(self.cfg.name)
+        return CollectionClosedError(self.cfg.name)
 
     def _reconcile_ghosts(self) -> None:
         """Evict index ids with no matching record: a crash between a db commit and
@@ -1470,8 +1488,9 @@ class Collection:
                 )
         # a write transaction that already holds db_lock on self.db (a request's
         # enqueue, or the worker's claim/finish orphaned by its cancellation) commits
-        # before the close; one still waiting for db_lock finds the connection closed
-        # and fails, and its job keeps its old status and replays on boot
+        # before the close; one still waiting for db_lock fails: an enqueue with the
+        # closed error before it writes, an orphaned claim/finish on the closed
+        # connection, and its job keeps its old status and replays on boot
         with self.db_lock:
             self.db.close()
 
@@ -1487,6 +1506,8 @@ class Collection:
         # CPU work under it would stall the worker's claim/finish and other enqueues
         data = _encode_payload(payload)
         with self.db_lock:
+            if self._closed:  # stop() closes self.db under db_lock once _closed is set
+                raise self._closed_error()
             try:
                 # explicit id, not lastrowid: MAX+1 is race-free under db_lock
                 job_id = self.db.execute("SELECT COALESCE(MAX(id),0)+1 FROM jobs").fetchone()[0]
@@ -2230,7 +2251,7 @@ class Collection:
         Every read of an unlocked path goes through it (see _ReadConn): the section
         covers the SQLite calls and the materialising of their rows, nothing else."""
         if self._closed:
-            raise RuntimeError(f"collection '{self.cfg.name}' is closed")
+            raise self._closed_error()
         rc = getattr(self._read_local, "rc", None)
         if rc is None:
             db = connect_db(self.dir / "meta.db", check_same_thread=False,
@@ -2240,7 +2261,7 @@ class Collection:
             with self.db_lock:
                 if self._closed:  # stop() swept the registry while this one opened
                     db.close()
-                    raise RuntimeError(f"collection '{self.cfg.name}' is closed")
+                    raise self._closed_error()
                 self._read_conns.append(rc)
             self._read_local.rc = rc
         return rc
@@ -2696,9 +2717,7 @@ class Collection:
         n = max(HYBRID_DEPTH, k) if mode == "hybrid" else k  # per-leg depth so fusion sees the tail
         async with self.lock.read():
             if self._closed:  # queued for the read lock behind stop()'s write section
-                if self.deleted:
-                    raise CollectionDeletedError(self.cfg.name)
-                raise RuntimeError(f"collection '{self.cfg.name}' is closed")
+                raise self._closed_error()
             if mode == "vector":
                 ids, scores = await self._vector_ids(qvec, n, scope, filt, nprobe)
             elif mode == "text":
@@ -2796,6 +2815,8 @@ class Collection:
 
     async def delete_document(self, doc_id: str) -> int:
         async with self.lock.write():
+            if self._closed:  # queued for the write lock behind stop()
+                raise self._closed_error()
             # off the event loop: the bulk DELETE fires the FTS trigger per row
             deleted = await asyncio.to_thread(self._delete_doc_rows, doc_id)
             if deleted:
@@ -2880,6 +2901,8 @@ class Collection:
         """RFC 7396 merge-patch the metadata of a document's records (null deletes a
         key). With fts_keys, the same transaction updates the BM25 metadata suffix."""
         async with self.lock.write():
+            if self._closed:  # queued for the write lock behind stop()
+                raise self._closed_error()
             return await asyncio.to_thread(self._patch_rows, doc_id, patch, apply_to_chunks)
 
     def _patch_rows(self, doc_id: str, patch: dict, apply_to_chunks: bool) -> int:

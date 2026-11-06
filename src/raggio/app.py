@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from .config import Settings
 from .store import (
     DATA_DIR_LOCK_POLL_S,
+    CollectionClosedError,
     CollectionDeletedError,
     CollectionManager,
     _log,
@@ -262,6 +263,24 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
 
     app = FastAPI(title="raggio", lifespan=lifespan, dependencies=[Depends(require_ready)])
 
+    # ---- a request that lost the race with its collection's stop() (ADR 0001, Deferred
+    # row on unlocked reads, update 2026-11-06). Only these two typed errors map here: any
+    # other error on a live collection, SQLite's included, is a real fault and stays 500
+
+    @app.exception_handler(CollectionDeletedError)
+    async def collection_deleted(request: Request, exc: CollectionDeletedError):
+        # DELETE /collections/{name} landed first: as for a name that never existed
+        return JSONResponse({"detail": f"collection '{exc.args[0]}' not found"}, status_code=404)
+
+    @app.exception_handler(CollectionClosedError)
+    async def collection_closed(request: Request, exc: CollectionClosedError):
+        # an LRU or idle eviction closed it: it still exists and the retry reloads it, so
+        # there is nothing to wait for beyond the reload. A DELETE that came after the
+        # eviction could not flag this (no longer resident) object, so the catalog decides
+        if manager.get_config(exc.name) is None:
+            return JSONResponse({"detail": f"collection '{exc.name}' not found"}, status_code=404)
+        return JSONResponse({"detail": str(exc)}, status_code=503, headers={"Retry-After": "1"})
+
     # ---- auth ----
 
     def request_key(request: Request) -> str:
@@ -457,16 +476,15 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
                     try:
                         vec = (await c.embedder.embed([q.text]))[0]
                     except Exception:
-                        if c.deleted:  # DELETE's stop() closed the embedder under this call
-                            raise CollectionDeletedError(c.cfg.name) from None
+                        # DELETE (404) or an eviction (503) closed the embedder under this call
+                        if c.deleted or c._closed:
+                            raise c._closed_error() from None
                         raise
                 qvec = _normalize(np.array([vec], dtype=np.float32))
             hits = await c.search(body.mode, qvec, q.text, body.k, body.scope, body.filter,
                                   body.expand, body.nprobe, body.fusion, body.alpha)
         except ValueError as e:
             raise HTTPException(400, str(e))
-        except CollectionDeletedError:  # DELETE /collections/{name} landed first
-            raise HTTPException(404, f"collection '{c.cfg.name}' not found")
         return _search_response(hits)
 
     app.include_router(search_router)

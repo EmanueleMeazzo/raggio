@@ -155,6 +155,10 @@ dropped) by two policies:
 - **Idle TTL** — a collection untouched for `COLLECTION_IDLE_TTL` seconds is
   offloaded by a background sweep.
 
+A request still in flight on a collection that is being offloaded answers 503 with
+`Retry-After: 1`, and its retry loads the collection again
+([API reference](api.md)).
+
 Total stored data can therefore far exceed container memory; only actively
 used collections pay the RAM cost.
 
