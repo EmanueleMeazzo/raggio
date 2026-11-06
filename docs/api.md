@@ -9,6 +9,14 @@ Base URL: `http://<host>:8000`. All requests and responses are JSON.
 
 An interactive OpenAPI UI is served at `/docs` (FastAPI built-in).
 
+**A collection closed under a request** — the LRU cap (`MAX_RESIDENT_COLLECTIONS`)
+and the idle TTL (`COLLECTION_IDLE_TTL`) can offload a collection while a request on
+it is in flight ([memory management](storage.md#memory-management)). Any endpoint
+on that collection then answers **503** with `Retry-After: 1`: the
+collection still exists, and the retry loads it again. A request that races
+`DELETE /collections/{name}` answers **404**, as for a name that never existed.
+Other errors stay **500**.
+
 ---
 
 ## Collections
