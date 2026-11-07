@@ -77,6 +77,8 @@ At 22:53:49Z the maintainer replied "Plan for items 1,2,3,4". Item 5 stayed guid
 - Hybrid search ran 2.0–2.8× the QPS, with a p99 under concurrency 7.5–8.9× lower (3,545 → 471 ms on flat).
 - Flat vector search, flat filtered search, recall, serving memory and disk did not move beyond the noise bands.
 
+**Dated note, 2026-11-07.** After the program, PRs #6–#14 (the Sofia backend requirements and the November optimization review, outside this program) took `main` to release 0.3.0. One gn100 re-measurement of 0.3.0 against `19c3293`, with section 4.20's protocol, found no figure moved beyond the run-to-run spread; the README and the docs now show 0.3.0's medians (section 4.21, `8b45bb2`). The first attempt was spoiled by another job on gn100 (section 5.33).
+
 ## 2. Timeline
 
 Times are UTC unless marked CEST (UTC+2). The maintainer's messages are quoted verbatim, typos included. Source: the session transcript; DGX run windows are from the research notes.
@@ -1824,6 +1826,44 @@ The maintainer chose one end-to-end A/B, baseline `19a8a2e` against the final `m
 - **The older results stay.** The 2026-08-23 table is kept verbatim as historical, and the raw `bench/results*.md` files are untouched.
 - The controller read the diff and checked figures against the run files and the baseline image's package list (`efa0bc1`). 502 passed, and `mkdocs build --strict` passed. CI was green: `test` 434, `native` 502 on x86 and on arm, `freethreaded` 488 on x86 and on arm, and the docs deploy.
 
+### 2026-11-06
+
+**About 09:35Z. The question.** The maintainer: after the pull requests merged in the past few days, the README "needs to get updated because the benchmark numbers maybe are not accurate anymore".
+- The README's raggio columns were `19c3293`'s (2026-10-03, section 4.20). `main` was release 0.3.0: runtime `2e8082b`, then `f1b0ab3` (documentation only), after PRs #6–#14.
+- Those PRs changed the measured request path: native JSON parsing for ingest and search (ADRs 0008, 0009, 0016), direct response encoding (ADR 0010), the `unix-excl` SQLite VFS (ADR 0007). Their ADRs measured local paired benches and the Sofia deployment, not the arXiv corpus.
+- Unchanged since `19c3293`: `bench/bench.py`, `bench/dgx/`, `native/`, the Dockerfile.
+
+**09:40Z. X34: re-run on gn100.** Offered: re-run (recommended), relabel the October figures only, or both. The maintainer chose the re-run.
+
+**09:42Z–09:49Z. Setup and smoke.** The 2026-10 e2e harness, retargeted.
+- A is `localhost/raggio:19c3293`, the image measured on 2026-10-03. B is `localhost/raggio:f1b0ab3`, built from a `git archive` with `core.autocrlf=false` (LF), in 19 s from cached layers.
+- Image facts are identical except `src/`: CPython 3.12.15, SQLite 3.53.1, glibc 2.41, numpy 2.5.3, turbovec 1.0.0, `raggio-native` 0.1.0, fastapi 0.142.2, pydantic 2.13.5, uvicorn 0.54.0, the same image ENV. B's `src/` hash equals the archive's.
+- The patched client's sha256 before and after the patch equals October's.
+- Fresh volumes `bench-n11-a` and `bench-n11-b`. Both arms detach at 4 GiB; neither gets an 8 GiB fallback.
+- A 60,000-vector smoke of B ran every step, exit 0. Its single-run numbers (ingest 3,670 vec/s, flat p50 5.7 ms; October's B smoke: 3,075 and 3.9 ms) were not used.
+
+**09:49Z–13:00Z. The first run.** Every ingest, cold start and session ended `exit 0`.
+- No median moved beyond both bands, but B had blocks of consecutive slow runs, each in a fresh container: b1 IVF runs 2–3 and b1-c16 IVF runs 1–3 (concurrent QPS 225–249 against about 385–430), b1-c16 flat runs 1–3 and b2 flat runs 0–2 (serial p50 24–30 against 18.6 ms), with the hybrid CPU per query a third of the usual. A's 32 runs were steady.
+- Memory (anon about 1.5 GB, page cache about 21 MB on flat runs), swap (0 in every serving run) and the server logs (no warning or error in either arm) showed no difference.
+
+**About 13:05Z. The cause.** `ps` on gn100 showed another project's job, `recon_lite mine --workers 16`, started by another agent session under the same account, spawning worker processes every 2–3 s. `sar -u` (10-minute windows) put host user CPU at 67% and 51% in the windows ending 11:50Z and 12:00Z (b1-c16), and 36% and 50% ending 12:40Z and 12:50Z (b2, b2-c16), against 4–8% during the ingests. The logged-in user count went from 6 to 7 at b1's start. Section 5.33.
+
+**About 13:15Z. X35: a guarded re-run.** Offered: re-run the sessions behind a guard (recommended), the maintainer pauses the job first, or publish from the uncontaminated runs only. The maintainer chose the guarded re-run. The other job is the maintainer's and was not touched.
+
+**By 23:38Z. The guard.** A 1 Hz per-process sampler classes every process as the run's own (its session id), the raggio container (libpod cgroup), infrastructure (conmon, the port forwarder, daemons), kernel, or foreign. A gate before each session waits for 120 s with mean foreign CPU under 0.25 cores and no second over 1 core. A session counts if its whole window has mean foreign CPU under 0.25 cores and no 10-second mean over 1 core (fixed before any guarded data); otherwise it repeats in place, up to 3 attempts. Validated on gn100: a busy loop in another session read as foreign at 1.0 core, the same loop in the run's session as its own. The analysis was changed to use the chosen attempts and to drop the smoke rows its cold-start glob had picked up. Launched 23:38Z.
+
+### 2026-11-07
+
+**23:38Z (11-06) to 01:48Z. The guarded re-run.** All 8 sessions clean at the first attempt: mean foreign CPU 0.013–0.022 cores, the highest 10-second mean 0.27. No slow block in either arm. Section 4.21.
+
+**The public figures.** In a worktree on `docs/bench-refresh-2026-11`, from `main`:
+- the README's table and the current arxiv table show B's medians; `docs/indexing.md` its IVF and rebuild figures;
+- a new page, `benchmark-arxiv-2026-11`, with setup, protocol, guard, tables, the discarded first attempt (the other job named only as an unrelated job) and caveats; the raw tables in `bench/results-arxiv-2026-11.md`;
+- pointers from the ADR index, the 2026-10 page and the email benchmark page.
+- The page's 34 table rows were checked mechanically against the analysis (0 mismatches). Two claims were corrected before the commit: "no figure moved" now says "over six runs per arm", because three two-run post-ingest rows exceed both bands; and the bench-alone CPU baseline comes from the guarded run (4–16%), not from the contaminated day.
+- 754 passed, 74 skipped on CPython 3.12.15 (the worktree's first venv came up on 3.14.8t, where orjson does not build), and `mkdocs build --strict` passed. Commit `8b45bb2`.
+- Pushed and opened as PR #16. PR #15 (`41215f0`, merged as `cbe973f` after the measurement) changes error paths only: a request racing an eviction gets a typed 503 + `Retry-After`, or 404 after a DELETE, and enqueue gains one `_closed` check under a lock it already holds. No hot path changed and the version stayed 0.3.0, so the figures still describe `main`; noted on the PR.
+
 ## 3. Decision register
 
 ID prefixes:
@@ -1909,6 +1949,8 @@ ID prefixes:
 | X31 | 2026-10-02, 23:01Z | turbovec's unreleased `main` (`c6cf0ba`) gets one gn100 A/B against v1.0.0. Both are built from source with the same toolchain, in images that differ only in that wheel, under plan G's ABAB protocol. | PyPI's 1.0.0 against a source build of `main`: the build would confound the code. Skip it because the changelog says 4-bit is unchanged: the diff refactors gn100's 4-bit NEON kernel. | No change beyond noise on any speed metric; flat memory −43 MB (section 4.19). | Maintainer (the bench), controller (design) | Section 2, 22:58Z | Done |
 | X32 | 2026-10-02, 23:31Z | Every read on a per-thread read connection runs inside a per-connection lock. The closer interrupts each reader and waits for its lock without holding `db_lock`, for up to 5 s, then leaves the close to the reader. | A reader count per collection: contended on every `_hydrate`. The owner closing alone: `stop()` would return with handles open, and `DELETE`'s `rmtree` fails on Windows. A cursor proxy: it hides the lock's scope. | Before: a deterministic repro crashed 20 of 20 runs on each build. After: none in the repro loops, plus an independent review (section 5.32). | Controller | — | Adopted (`c4a93d6`) |
 | X33 | 2026-10-03, 00:31Z | One end-to-end A/B on gn100: `localhost/raggio:baseline` (`19a8a2e`) against the final `main` (`19c3293`). Each arm runs on its own freshly ingested volume, with the same bench client, serving at 4 GiB. | Per-plan numbers only: they do not multiply (section 2, 00:29Z). | — | Maintainer | AskUserQuestion, 2026-10-03 | In progress. Dated note, 2026-10-03: done (section 4.20). |
+| X34 | 2026-11-06, 09:40Z | Re-measure on gn100 with section 4.20's protocol: A = `19c3293` (the image measured on 2026-10-03) against B = `main` `f1b0ab3` (runtime 0.3.0), fresh volumes, both detaching at 4 GiB; publish B's medians. | Relabel only: keep the October figures, labelled as `19c3293`'s. Both: relabel now, replace after a re-run. | The README showed `19c3293`; PRs #6–#14 changed the request path; no arXiv run since. | Maintainer (chose "Re-run on gn100", recommended) | AskUserQuestion, 2026-11-06 | Done (section 4.21, `8b45bb2`) |
+| X35 | 2026-11-06, about 13:15Z | Discard the first set of search sessions for both arms and re-run all 8 behind a host-CPU guard: 1 Hz per-process sampler, a quiet-host gate before each session, and a session verdict fixed before data (mean foreign CPU < 0.25 cores, highest 10-s mean < 1.0 core), up to 3 attempts. Keep the ingests and cold starts (run on an idle host). Never touch the other job. | The maintainer pauses the other job, then an immediate re-run. Publish from the runs outside the contaminated windows only. | Section 5.33. | Maintainer (chose "Re-run sessions, guarded", recommended) | AskUserQuestion, 2026-11-06 | Done: 8 of 8 clean at the first attempt |
 | W-1 | 2026-09-27 23:27Z | "Answer, don't act": a question such as "is it OK to X?" gets an answer and an offer, never an unrequested action. | None. | The gn100 restart incident (section 7). | Maintainer (correction) | Transcript | Standing rule |
 | W-2 | 2026-09-27 23:09Z to 2026-09-28 01:11Z | Offload work to gn100 "when it makes sense". First baseline: "not more than 65m". Later: "no limits" for this program while the PC stays on. The spec keeps a rule that DGX runs over about 5 minutes need a go-ahead with a time cap. | None. | None. | Maintainer | Transcript; spec §6 | Standing |
 | W-3 | 2026-09-28 18:45Z | Every question to the maintainer goes through the structured question tool. | None. | None. | Maintainer | Transcript | Standing |
@@ -1927,7 +1969,7 @@ ID prefixes:
 | W-13 | 2026-09-30, asked 10:05Z, answered 10:24Z | `main` is pushed after plan C: a fast-forward from 00c70a1 to d7f4b01 (plan C's 13 commits, its merge bb907ac, and the probe-path fix), no force. The docs branches and `bench-hardening` stay local. | "Not yet" (keep `main` local and ask again later). | Pushed 10:24:36Z; Actions green (tests, docs). A scan of 00c70a1..cd3cbf2, run after the pushes, finds no added home path, IP or key path; the only home-path lines are the ones d7f4b01 removes. | Maintainer (chose "Push main now", recommended) | Transcript; section 2 | Done. cd3cbf2 (the 4 GiB detach) followed at 10:37:21Z under W-14. |
 | W-14 | 2026-09-30, about 10:24Z | Routine decisions no longer go to the maintainer: "just assume that the reply is the same and ask only really blocking questions. If something needs to be double checked, just do it, assume I'm not at the desk and you have time to do stuff". The controller takes the usual answer for a local merge commit, pushing `main`, committing the journal, the recommended option, archiving ledgers and starting the next plan in the agreed order. It still asks before a history rewrite, a force-push, anything posted outside the repo (issues, upstream), deleting data, or touching the maintainer's containers. | None offered: a free-text instruction. | "I have replied in the same way for the past 10 times you've asked the same stuff". | Maintainer (free text) | Transcript; section 2 | In force |
 
-Register total: 75 entries (P 3, D 16, R 23, X 19, W 14). (Dated note, 2026-10-02 07:10Z: X18 and X19 added. Dated note, 2026-10-02 05:52Z: X17 added. Dated note, 2026-10-02 04:25Z: X13 to X16 added. Dated note, 2026-10-02 03:12Z: X11 and X12 added; X9 and X10, added on 2026-10-01 and 2026-10-02, had not been counted here. Dated note, 2026-10-01 21:45Z: X8 added. Dated note, 2026-10-01 21:26Z: R-D5 added; X7, added 2026-09-30 at 14:04Z, had not been counted here. Dated note, 2026-09-30 13:20Z: X6 added. Dated note, 2026-09-30 10:46Z: W-13 and W-14 added. Dated note, 2026-09-30 00:28Z: W-12 added. Dated note, 2026-09-30 00:08Z: R-A5 added. Dated note, 2026-09-29 21:05Z: W-11 added. Dated note, 08:30Z: R-A4 added. Dated note, 08:05Z: R-A3 and W-10 added; W-8 superseded. Dated note, 23:00Z: W-9 added. Dated note, 22:45Z: R-G8, R-G9 and W-8 added. Dated note, 21:20Z: R-G7 added. Dated note, 21:23Z: X4 added. Dated note, 21:45Z: X5 added. Dated note, 22:30Z: W-7 added.) (Dated note, 20:40Z: R-B1, R-B2, R-G5, R-G6, W-6 and X3 were added after p4; before them the total was 38 (P 3, D 16, R 12, X 2, W 5).) R-D3, R-G3 and R-G4 were added at 20:05Z, and R-D4 at about 20:15Z; the backfill written at about 19:30Z had 34.
+Register total: 75 entries (P 3, D 16, R 23, X 19, W 14). (Dated note, 2026-11-07: X20 to X33 were added without updating this total; with X34 and X35 the register has 91 entries: P 3, D 16, R 23, X 35, W 14.) (Dated note, 2026-10-02 07:10Z: X18 and X19 added. Dated note, 2026-10-02 05:52Z: X17 added. Dated note, 2026-10-02 04:25Z: X13 to X16 added. Dated note, 2026-10-02 03:12Z: X11 and X12 added; X9 and X10, added on 2026-10-01 and 2026-10-02, had not been counted here. Dated note, 2026-10-01 21:45Z: X8 added. Dated note, 2026-10-01 21:26Z: R-D5 added; X7, added 2026-09-30 at 14:04Z, had not been counted here. Dated note, 2026-09-30 13:20Z: X6 added. Dated note, 2026-09-30 10:46Z: W-13 and W-14 added. Dated note, 2026-09-30 00:28Z: W-12 added. Dated note, 2026-09-30 00:08Z: R-A5 added. Dated note, 2026-09-29 21:05Z: W-11 added. Dated note, 08:30Z: R-A4 added. Dated note, 08:05Z: R-A3 and W-10 added; W-8 superseded. Dated note, 23:00Z: W-9 added. Dated note, 22:45Z: R-G8, R-G9 and W-8 added. Dated note, 21:20Z: R-G7 added. Dated note, 21:23Z: X4 added. Dated note, 21:45Z: X5 added. Dated note, 22:30Z: W-7 added.) (Dated note, 20:40Z: R-B1, R-B2, R-G5, R-G6, W-6 and X3 were added after p4; before them the total was 38 (P 3, D 16, R 12, X 2, W 5).) R-D3, R-G3 and R-G4 were added at 20:05Z, and R-D4 at about 20:15Z; the backfill written at about 19:30Z had 34.
 
 Three recommended options were overridden: the review scope at 18:46:59Z (R-EX, "Go through the key ones" instead of "Accept all defaults"), and R-A1 and W-5 at 18:51:48Z. At 18:46:59Z the commit question's recommended "I commit in my terminal" was also answered with free text instead: "I already committed, let's debug the shell, I can also reboot if necessary". Separately, spec §3.1 says two of its rows override a plan's default: A1 and the fallback in G2.
 
@@ -2819,6 +2861,35 @@ Medians, A → B, with B's gain. Every difference exceeds both arms' bands unles
 - **What it is not:** a measure of any one plan. Each row mixes code, Python, SQLite and image settings; the per-plan A/Bs are in sections 4.9–4.18.
 - **One gap:** the first baseline session gives 5 flat c=8 runs to the pool instead of 6 (section 2, 2026-10-03 01:40Z).
 
+### 4.21 The 0.3.0 re-measurement on gn100: `19c3293` against 0.3.0
+
+Ingests and cold starts on 2026-11-06, 09:49Z–10:51Z; the search sessions behind the host-CPU guard from 23:38Z to 01:48Z on 11-07; one boot throughout (X34, X35).
+- **Arms.** A is `localhost/raggio:19c3293` (`fedb51eed07a`), the image of section 4.20. B is `localhost/raggio:f1b0ab3` (`90648ddff9cd`), runtime 0.3.0. They differ in `src/` only (section 2, 2026-11-06 09:42Z).
+- **Protocol.** Section 4.20's, with both arms detaching at 4 GiB and no fallback. 6 measured runs per arm, engine and concurrency; ingest 2 per arm.
+
+Medians, A → B. Every row is within both arms' bands.
+
+| Area | Metric | `19c3293` | 0.3.0 |
+|---|---|---|---|
+| Ingest | Reingest at 4 GiB (vec/s) | 3,116 (3,124, 3,107) | 3,378 (3,749, 3,007) |
+| Cold start | True-cold, flat / IVF (s) | 4.8 / 5.2 | 4.9 / 5.2 |
+| Flat | p50 (ms); QPS serial; QPS concurrent c=8 / c=16 | 18.7; 53; 125 / 209 | 18.5; 54; 126 / 206 |
+| IVF | p50 (ms); QPS serial; QPS concurrent c=8 / c=16 | 6.4; 152; 378 / 400 | 6.2; 160; 385 / 430 |
+| | Filtered p50, flat / IVF (ms) | 26.2 / 5.7 | 24.4 / 6.0 |
+| Hybrid | p50, flat / IVF (ms) | 48.5 / 44.9 | 48.1 / 45.1 |
+| | QPS concurrent c=8, flat / IVF | 36.0 / 38.1 | 34.9 / 38.5 |
+| | p99 under concurrency c=16, flat / IVF (ms) | 1,034 / 932 | 1,007 / 912 |
+| CPU | Per IVF vector query / per flat hybrid query, c=8 (ms) | 10.1 / 338 | 9.9 / 345 |
+| Recall | @10, flat / IVF | 1.000 / 0.994 | 1.000 / 0.994 |
+| IVF index | Build / detach at 4 GiB (s) | 180 / 110 | 183 / 109 |
+| Memory | After a restart / under load, flat (MB) | 1,501 / 1,505 | 1,501 / 1,506 |
+
+- **Outside both bands, in the two-run post-ingest set only:** memory after ingest 1,606 → 1,555 MB, search p99 29.3 → 30.6 ms, hybrid p99 without the first 10 queries 215.8 → 208.6 ms. The same quantities over six runs after a restart do not differ. Reported, not claimed.
+- **The host had not drifted.** A reproduces section 4.20's `19c3293` figures: flat p50 18.7 against 18.5 ms, IVF concurrent QPS 378 against 380, true-cold flat start 4.8 against 4.6 s, build 180 against 178 s.
+- **Swap.** No serving run swapped; no OOM kill. One IVF build per arm swapped about 2 GiB (2,066 and 2,016 MiB); detaches up to 755 and 705 MiB. In section 4.20 the same `19c3293` image peaked at 58 MiB in its builds; this is not explained. Build times did not move.
+- **Why nothing moved.** The 0.3.0 changes on this path save per request what their ADRs measured: ADR 0010's direct encoding saved 0.13 ms (1.8%) of a 10-hit vector search, and ADR 0016 measured 3,072-dim document-scoped hybrid requests. Against an 18.5 ms flat or 6.2 ms IVF search that stays inside the spread.
+- **Published** in `8b45bb2`: README, `docs/benchmark-arxiv.md`, `docs/indexing.md`, `docs/benchmark-arxiv-2026-11.md`, `bench/results-arxiv-2026-11.md`.
+
 ## 5. Negative results and surprises
 
 ### 5.1 Audience batching lost on NEON
@@ -3044,6 +3115,14 @@ ADR 0001 classed the unlocked reads that race a close as "an error, never a wron
   - How a read parked across the close ends depends on the SQLite build. 3.53.1 fails it with the closed error, while 3.47.1 lets it finish with its rows (section 2, 2026-10-03 00:24Z).
 - **Upstream.** No CPython issue covers it, and CPython's `main` had the same code on 2026-10-02. A draft issue with a stdlib-only repro waits for the maintainer; nothing is posted.
 
+### 5.33 Another job on the bench host made the new code look slower
+
+The first set of 0.3.0 search sessions (section 2, 2026-11-06) showed only B with slow blocks: runs in fresh containers, several in a row, 59% slower in serial flat search or 41–43% lower in concurrent IVF throughput, while the server spent a third of its usual CPU per hybrid query. A held steady across 32 runs.
+- **What misled.** A slow mode that survives fresh containers but clears after a few runs points at state outside the process. The first suspects were B's volume (the `unix-excl` VFS rebuilds the WAL index on open) and the host's memory (page cache, huge pages). Memory, swap and logs ruled out the volume and paging; less CPU per query with slower answers meant the server was waiting, not working.
+- **What found it.** `ps --sort=-pcpu` on gn100, then `sar -u`'s 10-minute history: another project's 16-worker job, run by another agent session under the same account, in bursts that lined up with B's sessions. The A/B's interleaving did not protect it: the bursts happened to fall in B's slots.
+- **The fix.** Not run selection by outcome: the whole set of search sessions was discarded for both arms and re-run behind a host-CPU guard decided before any data (X35). All 8 sessions were clean at the first attempt, and B's slow blocks did not recur.
+- **The lesson.** "gn100 exclusive" (section 2, 2026-10-03 01:40Z) had been an assumption, never checked during a run. From now on benches on gn100 gate on, and record, foreign CPU.
+
 ## 6. Method: how we measured
 
 Spec §6 sets one protocol for every plan. Each rule below gives the reason the sources record, or says "reason not recorded".
@@ -3145,6 +3224,8 @@ Recorded subagent tokens for the completed workflows sum to 10,021,309. That tot
 - `pkill -f` matched and killed its own ssh session. Fixed by killing by PID.
 - `podman rm -f bench-tv bench-wv` in the first baseline script (09-27 23:10Z) removed the Weaviate container by mistake. Its volume was intact. The script was fixed (it now removes only `bench-tv`). No message telling the maintainer is recorded in the transcript. (Dated note, 2026-09-28 20:05Z: this was confirmed by a search of every assistant message. The maintainer was told at about 20:10Z and offered a recreation of the container; the answer is recorded when given. Dated note, 20:40Z: recreated on its volume at 20:33:45Z, created but not started, with the maintainer's approval of the exact command (W-6).) The spec rule "`podman rm -f` may only name `bench-tv`, never `bench-wv`" comes from this.
 - The first capped baseline (09-28 00:09:40Z) produced no numbers: the `stats()` scan, the wrong fingerprint, post-build RSS retention and the blocking cold load all got in the way. Baseline3 then ran a patched bench: reuse timeout 900 s, ingest disabled, the correct fingerprint, and an 8 GiB detach container.
+
+- 2026-11-06: gn100 is shared with another project's bursts (section 5.33). A/Bs now run behind a host-CPU guard: a 1 Hz per-process sampler (own session / container / infrastructure / kernel / foreign), a quiet-host gate before each session, and a pre-registered per-session verdict with in-place retries. `sar -u` (sysstat, 10-minute windows) is the after-the-fact check.
 
 ### 7.6 Workflow gotchas worth repeating
 
