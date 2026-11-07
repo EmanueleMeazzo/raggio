@@ -144,8 +144,9 @@ an existing chunk/doc id upserts it.
 
 Collections don't need an index — below ~1M vectors the exact quantized scan is as
 fast as (or faster than) a graph index at higher recall, so the default is none. Past
-~2M vectors, attach a ScaNN-style IVF index (measured 3.5–6.8x faster vector search at
-2.2M for ~1pt recall@10, tunable per query via `nprobe`):
+~2M vectors, attach a ScaNN-style IVF index (at 2.55M vectors: 6.2 ms p50 against
+18.5 ms and 3x the concurrent throughput, for recall@10 0.994; tunable per query via
+`nprobe`):
 
 ```bash
 curl -X POST :8000/collections/bu-sales/index -H "x-api-key: sales-secret" --json '{}'
@@ -172,12 +173,12 @@ so total stored data can far exceed container memory.
 
 ## Performance
 
-**2,549,119 real arXiv abstracts** (title+abstract chunks, 1024-dim Qwen3
-embeddings, k=10), raggio capped at **4 GiB** vs Weaviate at **32 GiB** (HNSW,
-uncompressed float32, defaults), on an NVIDIA DGX Spark (GB10 Grace, 20 arm64
-cores, 122 GB unified LPDDR5x). The raggio columns are release 0.3.0
-(`f1b0ab3`, measured 2026-11-07, medians of 6 runs; ingest: median of 2); the
-Weaviate column is from the 2026-08-23 run and was not re-measured:
+Two benchmarks on an NVIDIA DGX Spark (GB10 Grace, 20 arm64 cores, 122 GB unified
+LPDDR5x), raggio capped at **4 GiB** (medians of 6 runs; ingest: 2), Weaviate as the
+reference.
+
+**A large collection: 2,549,119 arXiv abstracts** (one chunk each, 1024-dim Qwen3
+embeddings, k=10), Weaviate at **32 GiB** (HNSW, uncompressed float32, defaults):
 
 | Metric | raggio (4 GiB) | + IVF index | Weaviate (32 GiB) |
 |---|---|---|---|
@@ -191,86 +192,38 @@ Weaviate column is from the 2026-08-23 run and was not re-measured:
 | Ingest 2.55M vectors (journaled + crash-safe) | **13 min (3,378 vec/s)** | +3.1 min index build | 16.3 min (2,614 vec/s) |
 | Cold start, evicted page cache, to first answer | 4.9 s | 5.2 s | 12.8 s (not the same measure) |
 
-Flat concurrent QPS is bimodal (125 to 175 across runs), and the two ingests
-ran at 3,007 and 3,749 vec/s. The cold-start row times a container start to the
-first answered `GET /collections/bench` after the volume's files were evicted
-from the page cache; Weaviate's 12.8 s is the older restart-to-first-query
-measure, so that row is not a like-for-like comparison.
+raggio serves the same 2.55M vectors in ~15x less memory with recall 1.000 (the
+quantized scan re-ranks its candidates against the stored fp16 originals) and
+text-hit parity from two-stage BM25; the optional IVF index beats HNSW on vector
+latency at equal recall. Weaviate wins concurrent throughput and hybrid latency.
+Weaviate's column comes from its own run on the same host and corpus; its cold start
+is restart to first query, not the evicted-cache measure. Full table, method and
+caveats: [docs/benchmark-arxiv.md](docs/benchmark-arxiv.md).
 
-The 2026-09 performance work, measured against the original baseline
-(`19a8a2e`) the same way on the same host (code `19c3293`, 2026-10-03), ingests
-2.55M vectors at 3,174 vs 1,362 vec/s, serves IVF vector queries at 161 vs 90 QPS
-serial and 380 vs 191 QPS at 8 clients, runs hybrid search at 20.5 vs 10.0 QPS
-serial (flat), and starts from a cold page cache in 4.6 s instead of 155 s. Flat
-vector search, recall and the memory footprint are unchanged. The images differ
-beyond the code (Debian, Python, SQLite, BLAS threads), so this is what a user
-gets, not a single-change measurement. Full A/B, protocol and caveats:
-[docs/benchmark-arxiv-2026-10.md](docs/benchmark-arxiv-2026-10.md).
+**A document collection: 25,000 Wikipedia articles** stored as documents (one summary
+plus up to 10 chunks each, 173,320 records, 1024-dim), flat index, 8 clients, Weaviate
+1.38.11 at 8 GiB on the same queries:
 
-Release 0.3.0 (PRs #6–#14) was then re-measured against `19c3293` with the
-same protocol, on the same host, with images that differ only in `src/`: over
-six runs per arm, no search, hybrid, recall, memory, disk, cold-start or
-index-build figure moved beyond the run-to-run spread, at 8 or 16 clients. The 0.3.0 changes on this
-path (native JSON request parsing, direct response encoding, the `unix-excl`
-SQLite VFS) pay off most on large responses, large request vectors,
-document-scoped retrieval and SQLite on NFS ([ADR index](docs/adr/index.md));
-on this benchmark's k=10 queries over 1024-dim vectors on a local disk their
-effect is below the spread. Re-measurement and caveats:
-[docs/benchmark-arxiv-2026-11.md](docs/benchmark-arxiv-2026-11.md). Where they do
-show is the document-shaped benchmark below.
+| Query | raggio | Weaviate |
+|---|---|---|
+| Within one document, vector, k=5: p50 / QPS | **2.9 ms** / 902 | 5.9 ms / **1,201** |
+| Within one document, hybrid, k=5: p50 / QPS | **5.5 ms** / 607 | 7.3 ms / **1,011** |
+| Summaries, vector, k=10: p50 / QPS | **7.5 ms** / **461** | 21.2 ms / 285 |
+| Summaries, hybrid, k=10: p50 / QPS | **9.9 ms** / 222 | 19.6 ms / **262** |
+| Chunks, k=100: p50 / QPS / recall@100 | 18.1 ms / 166 / **1.000** | **17.2 ms** / **396** / 0.982 |
+| Chunks, k=1000: p50 / QPS / recall@1000 | **69 ms** / 21 / **1.000** | 75 ms / **88** / 0.949 |
+| Memory after the workloads / disk | **474 MB / 2.0 GB** | 2.1 GB / 2.5 GB |
 
-The trade in one line: raggio serves the same 2.55M vectors in ~15x less memory
-with **exact recall** — the quantized scan re-ranks its candidates against the
-stored fp16 originals, so quantization costs no recall — and text-hit parity from
-two-stage BM25 (bounded FTS5 candidate generation + full-query rescoring); the
-optional IVF index then beats HNSW on vector latency at equal recall. Weaviate
-still wins concurrent throughput and hybrid latency in these figures; ingest
-and cold start now favour raggio, but those two rows compare against Weaviate
-numbers from the earlier run. Full table, method, and caveats:
-[docs/benchmark-arxiv.md](docs/benchmark-arxiv.md).
-
-**Document retrieval: summaries, one document, large k.** The arXiv corpus has one
-chunk per document, so it never runs a document store's typical queries. On 25,000
-Wikipedia articles stored as documents (one summary plus up to 10 chunks each,
-173,320 records, 1024-dim, flat index, 4 GiB, concurrency 8, medians of 6 runs), the
-code before PRs #6–#14 (`19c3293`) against 0.3.0, with Weaviate 1.38.11 as a reference
-on the same queries:
-
-| Query | before (`19c3293`) | 0.3.0 | Weaviate |
-|---|---|---|---|
-| Within one document, vector, k=5: p50 / QPS | 197 ms / 29 | **2.9 ms** / 902 | 5.9 ms / **1,201** |
-| Within one document, hybrid, k=5: p50 / QPS | 200 ms / 24 | **5.5 ms** / 607 | 7.3 ms / **1,011** |
-| Summaries, hybrid, k=10: p50 / QPS | 10.3 ms / 135 | **9.9 ms** / 222 | 19.6 ms / **262** |
-| Chunks, k=1000: p50 / QPS / recall@1000 | 74 ms / 14 / 1.000 | **69 ms** / 21 / **1.000** | 75 ms / **88** / 0.949 |
-
-The `doc_id` filter replaces the metadata scan older releases needed to search within
-one document (68x lower p50); coalesced scope searches and direct response encoding
-raise concurrent summary and large-k throughput 1.2–1.6x at a third to a half of the
-server CPU per query, while single-query latency stays put. Weaviate still serves more
-concurrent queries; raggio answers single queries faster at recall 1.000 (0.9999 at
-k=1000). 0.3.0
-holds about 110 MB more memory after the workloads (474 vs 366 MB; Weaviate 2.1 GB).
-Every workload, the IVF figures, setup and caveats:
+raggio answers summary, one-document and k=1000 queries faster, at recall 1.000 and
+in a quarter of the memory; Weaviate serves more concurrent queries within one
+document and at large k, and is slightly faster at k=100. Every
+workload, the IVF figures, setup and caveats:
 [docs/benchmark-documents.md](docs/benchmark-documents.md).
-
-An earlier 553k-email run (1 GiB vs 8 GiB, pre-rescoring build) told the same
-memory story at smaller scale — there the flat scan also won every latency row.
-Setup and full table: [docs/benchmark.md](docs/benchmark.md).
 
 ## Develop
 
-Architecture and performance changes are recorded in the
-[ADR index and optimization history](docs/adr/index.md), including accepted and
-rejected experiments. Current optimization work focuses on search and retrieval.
-
-Ingest admission uses Pydantic's native JSON parser with a compatibility fallback.
-The local paired benchmark measured 30% lower admission p50 for 250-vector requests;
-protocol, scope and reproduction: [ADR 0008](docs/adr/0008-native-ingest-json.md).
-
-Payload conversion also reuses validated vector lists until journal encoding.
-A separate paired benchmark measured another 17% lower admission p50 for that
-request shape, with native parsing in both arms; details and limits:
-[ADR 0009](docs/adr/0009-ingest-vector-conversion.md).
+Architecture and performance decisions, with their measurements and the rejected
+experiments, are in the [ADR index](docs/adr/index.md).
 
 Needs uv 0.12 or newer (`required-version` in `pyproject.toml`).
 
