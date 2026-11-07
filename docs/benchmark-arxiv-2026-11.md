@@ -175,7 +175,8 @@ measured on request admission with the index workers paused
 IVF search with k=10 over 1024-dim vectors on a local disk, savings of that size
 stay inside the spread. The new filters, fusion mode, scoped-search batching and
 BM25 metadata keys are opt-in or apply to other request shapes, and this
-benchmark does not exercise them.
+benchmark does not exercise them. The [document retrieval benchmark](benchmark-documents.md)
+does: within one document, 0.3.0 answers in 2.9 ms where `19c3293` took 197 ms.
 
 ## The first attempt at the search sessions
 

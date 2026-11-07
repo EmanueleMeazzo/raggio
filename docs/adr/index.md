@@ -53,6 +53,15 @@ and ingest throughput stayed within it
 `bench/results-arxiv-2026-11.md`). The README and the current arxiv table now show
 0.3.0's medians.
 
+The request shapes these ADRs target are measured publicly by the
+[document retrieval benchmark](../benchmark-documents.md) (2026-11-07; 25,000 Wikipedia
+articles as summary + chunk documents; `bench/prep_wiki.py`, `bench/bench_docs.py`,
+raw tables in `bench/results-docs-2026-11.md`): against `19c3293`, one-document search
+p50 197 → 2.9 ms (vector) and 200 → 5.5 ms (hybrid) with the `doc_id` filter of ADR 0007;
+concurrent summary and k=100/1000 throughput 1.2–1.6x at a third to a half of the server
+CPU per query (ADRs 0013, 0010); single-query latency of those unchanged; quality
+identical; about 110 MB more server memory after the workload set.
+
 ### Historical performance baseline
 
 The user accepted [PR #11](https://github.com/EmanueleMeazzo/raggio/pull/11) on
