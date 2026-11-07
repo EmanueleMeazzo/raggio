@@ -1,5 +1,11 @@
 # Benchmark: arxiv abstracts, end-to-end A/B (2026-10)
 
+!!! note "Later re-measurement"
+    "Current" on this page means `19c3293`, the code of 2026-10-03. Release 0.3.0
+    was re-measured against it on 2026-11-07 with the same protocol and host, and
+    no figure moved beyond the run-to-run spread:
+    [Benchmark: arxiv abstracts, 0.3.0 re-measurement](benchmark-arxiv-2026-11.md).
+
 The [arxiv benchmark](benchmark-arxiv.md) was measured on 2026-08-23. Since then
 the code has changed a lot (the 2026-09 performance work: ingest path, cold
 start, native BM25, IVF shard fan-out, memory hygiene). This page is the
