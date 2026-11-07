@@ -44,6 +44,15 @@ metadata keys, exclusions and `legal_knowhow` IVF settings (256 partitions,
 `nprobe=32`). Future retrieval work starts from this runtime and records equivalent
 data/index/cache settings. The documentation addendum changes no runtime code.
 
+On the public 2.55M-vector arxiv benchmark, 0.3.0 (`f1b0ab3`) was re-measured
+against `19c3293` on 2026-11-07 with the 2026-10 end-to-end protocol, on images
+that differ only in `src/`: over six runs per arm, no search, hybrid, recall,
+memory, disk, cold-start or index-build figure moved beyond the run-to-run spread,
+and ingest throughput stayed within it
+([re-measurement](../benchmark-arxiv-2026-11.md), raw tables in
+`bench/results-arxiv-2026-11.md`). The README and the current arxiv table now show
+0.3.0's medians.
+
 ### Historical performance baseline
 
 The user accepted [PR #11](https://github.com/EmanueleMeazzo/raggio/pull/11) on

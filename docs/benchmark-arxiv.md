@@ -66,38 +66,41 @@ its cap fails loudly rather than getting a quiet upgrade.
 
 ## Results
 
-**Current version, measured 2026-10-03** on the same DGX Spark and corpus: the
-raggio columns are commit `19c3293`, each figure the median of 6 runs
-(concurrency 8), from the end-to-end A/B in
-[Benchmark: arxiv abstracts, end-to-end A/B](benchmark-arxiv-2026-10.md), which
-has the protocol, the baseline figures next to these, and the caveats. The
-Weaviate column is carried over from the 2026-08-23 run below and was not
-re-measured, so the two sides were measured about six weeks apart.
+**Current version, release 0.3.0, measured 2026-11-07** on the same DGX Spark and
+corpus: the raggio columns are commit `f1b0ab3`, each figure the median of 6 runs
+(concurrency 8; ingest: the median of 2), from the re-measurement in
+[Benchmark: arxiv abstracts, 0.3.0 re-measurement](benchmark-arxiv-2026-11.md),
+which has the protocol, the `19c3293` figures next to these, and the caveats.
+Against `19c3293` (the version this table showed before, measured 2026-10-03 in
+[the end-to-end A/B](benchmark-arxiv-2026-10.md)) no row moved beyond the
+run-to-run spread. The Weaviate column is carried over from the 2026-08-23 run
+below and was not re-measured, so the two sides were measured about eleven weeks
+apart.
 
 | Metric | raggio | raggio-ivf | weaviate |
 |---|---|---|---|
-| Ingest wall time (s) | 803 | — | 975 |
-| Ingest throughput (vec/s) | 3174 | — | 2614 |
-| IVF index build (s) | — | 178 | — |
-| Memory after a restart (MB) | 1502 | 1506 | 22990 |
-| Memory under query load (MB) | 1506 | 1513 | 23380 |
+| Ingest wall time (s) | 764 | — | 975 |
+| Ingest throughput (vec/s) | 3378 | — | 2614 |
+| IVF index build (s) | — | 183 | — |
+| Memory after a restart (MB) | 1501 | 1506 | 22990 |
+| Memory under query load (MB) | 1506 | 1514 | 23380 |
 | Disk footprint (MB) | 16463 | 16751 | 18374 |
-| Search p50 (ms) | 18.5 | 6.1 | 15.3 |
-| Search p95 (ms) | 19.6 | 7.7 | 50.3 |
-| Search p99 (ms) | 20.3 | 8.4 | 82.5 |
-| QPS serial | 54 | 161 | 49 |
-| QPS concurrent | 137 | 380 | 1050 |
-| p95 under concurrency (ms) | 69.4 | 25.0 | 10.8 |
-| Filtered p50 (ms) | 24.7 | 5.9 | 12.8 |
-| Filtered p95 (ms) | 29.6 | 7.0 | 21.1 |
+| Search p50 (ms) | 18.5 | 6.2 | 15.3 |
+| Search p95 (ms) | 19.9 | 8.0 | 50.3 |
+| Search p99 (ms) | 20.5 | 8.9 | 82.5 |
+| QPS serial | 54 | 160 | 49 |
+| QPS concurrent | 126 | 385 | 1050 |
+| p95 under concurrency (ms) | 69.4 | 25.5 | 10.8 |
+| Filtered p50 (ms) | 24.4 | 6.0 | 12.8 |
+| Filtered p95 (ms) | 31.0 | 7.2 | 21.1 |
 | Recall@10 vs exact | **1.000** | 0.994 | 0.995 |
-| Hybrid p50 (ms) | 48.2 | 44.9 | 35.8 |
-| Hybrid p95 (ms) | 72.6 | 69.7 | 72.5 |
-| Hybrid p99 (ms) | 100.5 | 95.5 | 114.4 |
-| Hybrid QPS serial | 20.5 | 22.0 | 25.3 |
-| Hybrid QPS concurrent | 36.1 | 38.1 | 169.0 |
+| Hybrid p50 (ms) | 48.1 | 45.1 | 35.8 |
+| Hybrid p95 (ms) | 73.4 | 70.8 | 72.5 |
+| Hybrid p99 (ms) | 98.8 | 96.1 | 114.4 |
+| Hybrid QPS serial | 20.5 | 21.9 | 25.3 |
+| Hybrid QPS concurrent | 34.9 | 38.5 | 169.0 |
 | Hybrid text-hit@10 | **0.984** | **0.984** | 0.978 |
-| Cold start, evicted page cache, to first answer (s) | 4.6 | 5.2 | 12.8 (older measure) |
+| Cold start, evicted page cache, to first answer (s) | 4.9 | 5.2 | 12.8 (older measure) |
 
 Notes on the current table:
 
@@ -107,12 +110,14 @@ Notes on the current table:
   row (restart to first vector search, file cache not evicted), and Weaviate's
   12.8 s is that older measure, so the row is not like for like.
 - **Memory** rows are read after a container restart, in a 4 GiB container. In the
-  container that just ingested, flat raggio reads 1611 MB right after ingest (the
-  original run read 729 MB, so that row is higher now) and 1618 MB under load
+  container that just ingested, flat raggio reads 1555 MB right after ingest (the
+  original run read 729 MB, so that row is higher now) and 1587 MB under load
   (original: 1761 MB). The original run's 3052 MB for raggio-ivf was read in the
   container that had just built the index, not after a restart.
-- **Flat concurrent QPS** (137) is bimodal across runs (126 to 174) and within noise
-  of the baseline's 111.
+- **Flat concurrent QPS** (126) is bimodal across runs (125 to 175), as it was for
+  `19c3293` (125 in the same sessions) and the original baseline.
+- **Ingest** is the median of two full ingests, at 3,007 and 3,749 vec/s;
+  `19c3293` ingested at 3,124 and 3,107 vec/s in the same session.
 
 ### Original run, 2026-08-23
 
