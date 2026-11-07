@@ -216,7 +216,8 @@ SQLite VFS) pay off most on large responses, large request vectors,
 document-scoped retrieval and SQLite on NFS ([ADR index](docs/adr/index.md));
 on this benchmark's k=10 queries over 1024-dim vectors on a local disk their
 effect is below the spread. Re-measurement and caveats:
-[docs/benchmark-arxiv-2026-11.md](docs/benchmark-arxiv-2026-11.md).
+[docs/benchmark-arxiv-2026-11.md](docs/benchmark-arxiv-2026-11.md). Where they do
+show is the document-shaped benchmark below.
 
 The trade in one line: raggio serves the same 2.55M vectors in ~15x less memory
 with **exact recall** — the quantized scan re-ranks its candidates against the
@@ -227,6 +228,30 @@ still wins concurrent throughput and hybrid latency in these figures; ingest
 and cold start now favour raggio, but those two rows compare against Weaviate
 numbers from the earlier run. Full table, method, and caveats:
 [docs/benchmark-arxiv.md](docs/benchmark-arxiv.md).
+
+**Document retrieval: summaries, one document, large k.** The arXiv corpus has one
+chunk per document, so it never runs a document store's typical queries. On 25,000
+Wikipedia articles stored as documents (one summary plus up to 10 chunks each,
+173,320 records, 1024-dim, flat index, 4 GiB, concurrency 8, medians of 6 runs), the
+code before PRs #6–#14 (`19c3293`) against 0.3.0, with Weaviate 1.38.11 as a reference
+on the same queries:
+
+| Query | before (`19c3293`) | 0.3.0 | Weaviate |
+|---|---|---|---|
+| Within one document, vector, k=5: p50 / QPS | 197 ms / 29 | **2.9 ms** / 902 | 5.9 ms / **1,201** |
+| Within one document, hybrid, k=5: p50 / QPS | 200 ms / 24 | **5.5 ms** / 607 | 7.3 ms / **1,011** |
+| Summaries, hybrid, k=10: p50 / QPS | 10.3 ms / 135 | **9.9 ms** / 222 | 19.6 ms / **262** |
+| Chunks, k=1000: p50 / QPS / recall@1000 | 74 ms / 14 / 1.000 | **69 ms** / 21 / **1.000** | 75 ms / **88** / 0.949 |
+
+The `doc_id` filter replaces the metadata scan older releases needed to search within
+one document (68x lower p50); coalesced scope searches and direct response encoding
+raise concurrent summary and large-k throughput 1.2–1.6x at a third to a half of the
+server CPU per query, while single-query latency stays put. Weaviate still serves more
+concurrent queries; raggio answers single queries faster at recall 1.000 (0.9999 at
+k=1000). 0.3.0
+holds about 110 MB more memory after the workloads (474 vs 366 MB; Weaviate 2.1 GB).
+Every workload, the IVF figures, setup and caveats:
+[docs/benchmark-documents.md](docs/benchmark-documents.md).
 
 An earlier 553k-email run (1 GiB vs 8 GiB, pre-rescoring build) told the same
 memory story at smaller scale — there the flat scan also won every latency row.
