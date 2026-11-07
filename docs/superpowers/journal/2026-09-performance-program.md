@@ -1887,6 +1887,8 @@ The maintainer chose one end-to-end A/B, baseline `19a8a2e` against the final `m
 
 **The write-up.** `docs/benchmark-documents.md`, `bench/results-docs-2026-11.md`, a README table, pointers from the ADR index and the arxiv re-measurement page; commit `4174bc3`, PR #17. Checked: the page's per-workload tables are generated from the run files and the headline numbers were cross-checked against them. Corrections before the commit: summary hybrid quality (0.994) was missing; two cells listed as beyond the spread were within it; "every one-document cell" included quality, which did not change; the response size at k=10 depends on the scope (15 or 51 KB); "exact recall" became "1.000 (0.9999 at k=1000)"; the throughput range became 1.2–1.6× (summary vector is 1.17×). 777 passed, `mkdocs build --strict` clean.
 
+**PR #17 merged; the README becomes baseline-only.** The maintainer said "Merge": PR #17 merged as `5d6ee3c`, CI and docs green, branch and worktree removed. Then: "These benchmark numbers are the new baseline, don't make a difference in the readme. Simplify the readme removing all history, leave only the current baseline." PR #18 (`docs/readme-baseline`): the README's performance section keeps two tables of 0.3.0 against Weaviate (arXiv 2.55M; the document collection, now with raggio and Weaviate columns only) and drops the 2026-09 A/B, the 0.3.0 re-measurement, the before column, the email run and the ADR 0008/0009 notes; the IVF sentence quotes the 2.55M figures. History stays in the docs pages, the ADR index and this journal. From now on the README states the current baseline only.
+
 ## 3. Decision register
 
 ID prefixes:
