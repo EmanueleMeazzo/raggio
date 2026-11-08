@@ -1,0 +1,26 @@
+2026-11-07T23:23:55Z
+b741d280-a143-48ca-b765-63d820f49d42
+ 00:23:55 up 41 min,  4 users,  load average: 3.73, 5.45, 5.69
+               total        used        free      shared  buff/cache   available
+Mem:          124544        3073      104918           5       17608      121470
+Swap:          16383           0       16383
+    PID COMMAND         %CPU
+  89844 nvidia-smi       0.5
+      1 systemd          0.1
+  89821 sshd             0.1
+   3866 gnome-shell      0.1
+     15 rcu_preempt      0.1
+   1325 napi/phy0-0      0.1
+   1327 napi/phy0-0      0.0
+   3065 containerd       0.0
+   1644 polkitd          0.0
+   4882 systemd          0.0
+   1617 dbus-daemon      0.0
+ 133430 kworker/u80:0-m  0.0
+   1640 nvidia-persiste  0.0
+ 116491 kworker/u80:1-g  0.0
+   2273 tailscaled       0.0
+   1618 dashboard-servi  0.0
+   1563 mt76-tx phy0     0.0
+   1684 snapd            0.0
+    616 systemd-journal  0.0
