@@ -6,11 +6,12 @@
 # (native/Cargo.lock, built --locked). The wheel is not manylinux-audited, so the builder
 # runs trixie like the runtime; the runtime stage copies no toolchain. RUST_VERSION is the
 # same pin as the native job in .github/workflows/tests.yml.
-# PYTHON=3.14t is the experimental free-threaded image (ADR 0006): turbovec ships no
+# PYTHON=3.14t opts into the free-threaded image (docs/free-threaded-python.md,
+# ADR 0006): turbovec ships no
 # cp314t wheel, so uv builds it from its sdist here (rust-version 1.89). The check at the
 # end of the builder fails the build if the interpreter is not the flavour PYTHON names or
 # anything the app loads re-enables the GIL.
-ARG UV_VERSION=0.12.22
+ARG UV_VERSION=0.13.7
 ARG PYTHON=3.12
 ARG RUST_VERSION=1.99.0
 

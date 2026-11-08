@@ -61,10 +61,32 @@ podman run -p 8000:8000 -v raggio-data:/data \
   raggio
 ```
 
-The image runs CPython 3.12. An experimental free-threaded CPython 3.14t image builds from
-the same Dockerfile, for evaluation only ([ADR 0006](docs/adr/0006-free-threaded-python.md)):
-`podman build --build-arg PYTHON=3.14t -t raggio:py314t .`. It compiles turbovec from source
-and fails the build if anything re-enables the GIL; `/healthz` reports `gil_enabled`.
+### Opt in to free-threaded Python 3.14t
+
+Choose Python 3.14t with a build flag, then run the resulting image:
+
+```bash
+podman build --build-arg PYTHON=3.14t -t raggio:py314t .
+podman run -p 8000:8000 -v raggio-data:/data -e ROOT_API_KEY=change-me raggio:py314t
+```
+
+The default image uses Python 3.12. For the exact interpreter measured below, use
+`--build-arg PYTHON=3.14.10t`. Stop the previous process before using the same data
+volume with the alternative image. `/healthz` reports `"gil_enabled": false` when
+free threading is active; the build and runtime guards reject unsupported extensions
+that would turn the GIL back on.
+
+| Pros | Cons |
+|---|---|
+| At 8 concurrent clients, document vector/hybrid throughput improved **47–87%** versus Python 3.12 in the [idle-host evaluation](docs/python-3.14-reevaluation-2026-11-07.md). | Single-client expanded document search was **18% slower**; performance gains depend on the request shape and concurrency. |
+| Large-corpus hybrid throughput improved about **6–7%**, with lower tail latency. All **818** applicable Linux tests and the extended concurrency soak passed. | At full CPU saturation, a blocking lock hand-off probe took about **111 ms** versus **2 ms** on the GIL builds. Reserve CPU headroom. |
+| The same Dockerfile builds both interpreters with the native scorer and GIL checks. | turbovec currently has no free-threaded wheel, so the image compiles it from source. The 3.14t image remains an experimental opt-in. |
+
+These results are from raggio 0.3.0 on one DGX Spark with locked turbovec 1.0.0;
+they are measurements for that setup, not a guarantee for later dependencies or other
+hardware. See [setup and safeguards](docs/free-threaded-python.md),
+[the full evaluation](docs/python-3.14-reevaluation-2026-11-07.md), and
+[ADR 0006](docs/adr/0006-free-threaded-python.md).
 
 One process per `DATA_DIR`: raggio locks `DATA_DIR/raggio.lock` before opening
 anything, and a second process (the new replica of a rolling restart on a shared

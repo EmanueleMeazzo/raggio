@@ -1,6 +1,6 @@
 # ADR 0006 — Free-threaded CPython 3.14t: an experimental image, evaluated
 
-Status: experimental (evaluation only) · Date: 2026-10-02 · Spec D2, D6, D11, D15, D16; item 4
+Status: experimental (explicit opt-in) · Date: 2026-10-02; opt-in authorized 2026-11-08 · Spec D2, D6, D11, D15, D16; item 4
 
 ## Context
 
@@ -62,6 +62,23 @@ refuses a `raggio_native` built for any other interpreter.
 | **meta.db connections without a statement cache on free-threaded builds** (`SQLITE_CACHED_STATEMENTS` in `store.py`: 0 there, sqlite3's own 128 otherwise) | With biased reference counting, a statement another thread cached is freed only when that thread next runs Python, so `stop()`'s `close()` left a zombie connection holding `meta.db`, `-wal` and `-shm` open (on Windows, deleting the collection failed). Reproduced on 3.14.7t (Windows); not on 3.14.8t, whose gh-157838 merges a detached thread's biased reference counts. Kept for 3.14.7t and older builds; Linux not observed. Preparing each statement again costs about 10 µs per statement on 3.14t (laptop: a 10-id hydrate 18–20 → 28–30 µs, an FTS query 151–157 → 160–176 µs), well under 1% of a search; the DGX A/B includes it. The writer connection loses its cache too, so D2's batched finishes re-prepare their statements; the ABAB measures search only. The catalog connection keeps the default: it closes only at shutdown, and nothing deletes catalog.db while the server runs |
 | **Non-blocking CI job** on 3.14t, x86_64 and aarch64, with the extension required and the warning filter set; then the image check and the concurrency stress tests at 30 s | Spec D11. `continue-on-error` until 3.14t is the default image |
 | **Unicode drift is measured, not fixed**: `bench/unicode_drift_probe.py` | 3.12 has Unicode 15.0.0 and 3.14 has 16.0.0. The tokenizer runs on `unicodedata` at query time, and `raggio_native` builds its tables from the interpreter it is compiled for, so each image is self-consistent but the two arms differ. On x86_64: 5,812 code points newly assigned, 1 changed category without token drift (U+1171E, Mn → Mc), 5,053 tokenize differently, all newly assigned. The probe counts the bench corpus rows that contain one, so a quality difference between arms can be attributed |
+
+## Opt-in availability after the 2026-11-08 reevaluation
+
+The maintainer authorized making 3.14t available through an explicit flag and
+documenting its pros and cons. The existing Docker build argument
+`PYTHON=3.14t` is that opt-in; `PYTHON=3.14.10t` reproduces the tested patch release.
+The installer pin is updated to uv 0.13.7, the version used for the new evaluation,
+so the flag selects the current 3.14t interpreter with the same build/runtime GIL
+checks. Python 3.12 remains the default, the free-threaded CI job stays non-blocking,
+and the default-promotion wheel gate remains in place.
+
+The [idle-host reevaluation](../python-3.14-reevaluation-2026-11-07.md) records
+109,080 measured searches and the full tests. Its strongest gains were concurrent
+document-scoped requests, with costs for serial expansion and CPU-saturated locks.
+See [the opt-in guide](../free-threaded-python.md) for commands and safeguards.
+The historical decision rule and verification below are retained as the record of
+the original experiment; they are not rewritten as evidence for this newer run.
 
 ## Decision rule
 

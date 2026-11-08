@@ -16,11 +16,14 @@ Any OpenAI-compatible `/embeddings` endpoint works. For Azure AI Foundry, set
 `EMBEDDING_BASE_URL` to the full deployment URL — the key is sent as both
 `Authorization: Bearer` and `api-key`, so both providers work unchanged.
 
-!!! note "Experimental: free-threaded Python"
-    `podman build --build-arg PYTHON=3.14t -t raggio:py314t .` builds the same image on
-    free-threaded CPython 3.14t, for evaluation only
-    ([ADR 0006](adr/0006-free-threaded-python.md)). It compiles turbovec from source and
-    fails the build if anything re-enables the GIL; `/healthz` reports `gil_enabled`.
+!!! note "Opt in to free-threaded Python 3.14t"
+    `podman build --build-arg PYTHON=3.14t -t raggio:py314t .` selects the free-threaded
+    interpreter; run `raggio:py314t` to use it. The default image stays on Python 3.12.
+    `/healthz` reports `gil_enabled: false`, and the image compiles native dependencies
+    for the selected interpreter and fails if an import re-enables the GIL.
+    Use `PYTHON=3.14.10t` to reproduce the tested version. See
+    [the setup guide and pros/cons](free-threaded-python.md) and
+    [the idle-host evaluation](python-3.14-reevaluation-2026-11-07.md).
 
 !!! tip "No embedding endpoint?"
     raggio works without one: ingest pre-computed vectors and search with
