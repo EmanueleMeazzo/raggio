@@ -1,0 +1,77 @@
+{
+  "requests": 244915,
+  "max_host_busy_fraction": 0.11155328153622635,
+  "aa_envelopes": {
+    "sofia-summary/c8": {
+      "p50_ms": 6.422970378904221,
+      "server_cpu_ms": 2.239799031706573,
+      "qps": 6.818106116556948
+    }
+  },
+  "gates": {
+    "sofia-summary/c8": {
+      "p50_ms": {
+        "change_pct": 0.2626607360278088,
+        "ci_pct": [
+          -9.107190430035061,
+          2.3796891266533615
+        ],
+        "aa_envelope_pct": 6.422970378904221,
+        "gain_beyond_noise": false,
+        "regression_gate_failure": false
+      },
+      "server_cpu_ms": {
+        "change_pct": 0.8511643002707681,
+        "ci_pct": [
+          -0.8528791203983754,
+          2.6829305434999284
+        ],
+        "aa_envelope_pct": 2.239799031706573,
+        "gain_beyond_noise": false,
+        "regression_gate_failure": false
+      },
+      "qps": {
+        "change_pct": 0.12694159141666272,
+        "ci_pct": [
+          -2.5085448521000697,
+          10.188109913573374
+        ],
+        "aa_envelope_pct": 6.818106116556948,
+        "gain_beyond_noise": false,
+        "regression_gate_failure": false
+      }
+    },
+    "sofia-doc-vector/c8": {
+      "p50_ms": {
+        "change_pct": 0.5805463662364563,
+        "ci_pct": [
+          -0.7411726208471081,
+          2.2955083367690587
+        ],
+        "aa_envelope_pct": 6.422970378904221,
+        "gain_beyond_noise": false,
+        "regression_gate_failure": false
+      },
+      "server_cpu_ms": {
+        "change_pct": -0.11868486749365692,
+        "ci_pct": [
+          -0.39553230183434485,
+          0.13644769681635527
+        ],
+        "aa_envelope_pct": 2.239799031706573,
+        "gain_beyond_noise": false,
+        "regression_gate_failure": false
+      },
+      "qps": {
+        "change_pct": -0.49996206910162266,
+        "ci_pct": [
+          -1.6985444806942862,
+          0.508063092449218
+        ],
+        "aa_envelope_pct": 6.818106116556948,
+        "gain_beyond_noise": false,
+        "regression_gate_failure": false
+      }
+    }
+  }
+}

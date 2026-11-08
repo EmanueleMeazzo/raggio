@@ -1,0 +1,109 @@
+# Sibling-vector reuse reevaluation protocol
+
+Prepared 2026-11-08, before new performance measurements.
+
+## Frozen comparison
+
+- Baseline: main `37c686eb1c1ee89f31f91b71d133b25a772f7011` (raggio 0.4.0).
+- Historical candidate: `614c4b87f6411a449fe9ab8bc10e0cc666b7233c`.
+- Port only sibling reuse onto current main. Preserve current scoped batching,
+  metadata FTS, JSON handling, lifecycle fixes and turbovec 1.1.2.
+- The reference copies all three changed production methods, not just the
+  expansion-loop wrapper. Keep identical dependencies, native BM25 and one BLAS
+  thread in both arms. Evaluate production CPython 3.12 first.
+- Original branch remains untouched. This investigation does not approve adoption.
+
+## Correctness and resource gates
+
+1. Exact serialized scores, IDs, order and expansion contents against the frozen
+   current-main methods; cover flat/IVF, 2/4-bit, dimension/alignment, legacy rows,
+   ties, fusion, tokenizers and expansion modes.
+2. Existing metadata and lifecycle checks stay green. Preparation must remain off
+   the loop, bounded during cancellation, and discarded after a write or close.
+3. Prepared float32 storage stays at most 8 MiB and 4,096 rows per request. This
+   bound excludes Python bookkeeping, decode temporaries and returned responses;
+   measure total temporary allocations and process RSS separately.
+4. Show reduced vector reads on eligible repeated-document requests. Controls
+   must not prepare vectors or introduce extra vector reads.
+
+## Workloads
+
+Use deterministic document/chunk data, seed 821, 20 chunks and one summary per
+document. Primary dimension is 1024; use 3072 as a targeted sensitivity check.
+Include an oversized-document fallback case and byte-equal responses across arms.
+
+- Vector and hybrid ranked sibling expansion, k=5 and k=10, with repeated documents.
+- Ranked expansion with one result per document and summary-only result hits.
+- Sofia controls: summary search and filtered in-document vector/hybrid search
+  without expansion.
+- Expansion controls: summary-only and `siblings_all`; these cannot use this cache.
+- Concurrency 1 and 8. Greater concurrency or free-threading is follow-up work if
+  the production-interpreter comparison shows a useful result.
+
+Fixture shapes are functional proxies, not evidence that a real caller uses ranked
+expansion. Current `doc-expand` measurements use `siblings_all` and cannot establish
+the candidate's benefit. Report applicability separately from speed.
+
+## Measurement
+
+Start with same-code A/A comparisons for a positive-shaped request, the strict
+ranked-summary control, and ordinary summary search. Then measure A/B with seven
+alternating paired rounds; each measured arm runs for at least two seconds.
+Warm each case first. Record every round and preserve ordering, sample counts,
+response parity, environment, source hashes and fixture identity.
+
+For hardware evaluation, run isolated HTTP servers on GN100 with identical data
+copies, interpreter, dependencies, CPU/memory limits and BLAS configuration. Use
+a fixed external client. Collect server process CPU and RSS independently of client
+CPU; record latency percentiles and throughput. Monitor host contention. Never
+replace the regular checkout or touch unrelated services/data volumes.
+
+SQL/array diagnostics and allocation tracing run separately from latency timings.
+In-process local measurements, if used, include client cost and are direction-only;
+they cannot establish deployment throughput or server-only CPU improvements.
+
+## Interpretation and disposition
+
+Report paired percentage changes and deterministic paired-bootstrap 95% intervals.
+Measure an A/A noise envelope using the same analysis. A useful result requires
+an eligible-case gain beyond both the A/A envelope and an interval containing zero.
+Treat an unaffected-control loss above max(3%, its A/A envelope), with an interval
+excluding zero, as a regression gate failure. If uncertainty is too wide, report it
+as inconclusive rather than claiming equivalence or attributing the old slowdown.
+
+### Calibration-driven harness correction, before A/B
+
+The first short functional smoke passed parity but had large timing variation.
+GN100 has heterogeneous cores; evaluation servers were pinned to fast cores 15–17,
+and the fixed client to core 19, before A/A calibration. Separate baseline processes
+still showed a material same-code difference on a summary control. Preserve that
+between-process A/A as a diagnostic, not the primary causal comparison.
+
+Use one HTTP server process and one data/index state for the primary A/A and A/B.
+A benchmark-only keyed endpoint selects the three frozen baseline or candidate
+methods between fully drained blocks, outside the clocks. Alternate arm order as
+above. This removes fixed process placement and initialization as treatment
+confounders. The candidate runtime design is unchanged. Memory tracing remains a
+separate operation; same-process retained RSS is not a per-arm allocation measure.
+
+### Targeted follow-up after the primary comparison
+
+The primary run's ordinary summary control at eight clients has a median latency
+change near +3%, but a wide paired interval crossing zero. Before interpreting it,
+repeat ordinary summary and in-document vector controls with seven paired rounds
+and eight-second measured blocks, with a matching summary A/A calibration. Preserve
+this as a separate follow-up; do not pool it silently into the primary results.
+
+Also run the planned synthetic 3072-dimension sensitivity: k=10 ranked in-document
+search, global hybrid ranked expansion and the strict ranked-summary control at
+eight clients. Keep source, CPU affinity, quotas and exact-output gates unchanged.
+
+The final resource audit found heavy host contention only in the long summary A/A
+calibration (host CPU about 94%, unlike the clean primary and subsequent A/B runs).
+Retain it as contaminated and exclude its noise estimates. Repeat only this A/A
+after a fresh idle probe. Preserve the clean A/B and sensitivity recordings as
+separate phases; do not pool the contaminated calibration into their analysis.
+
+No adoption recommendation without exact correctness, bounded resources, useful
+ranked-expansion gains and acceptable unaffected controls. Record limitations and
+the outcome in an ADR, retain raw results, and return the decision for discussion.

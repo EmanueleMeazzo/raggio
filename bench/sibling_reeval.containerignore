@@ -1,0 +1,8 @@
+.git
+.worktrees
+.venv
+.venv-ft
+site
+native/target
+**/__pycache__
+NUL

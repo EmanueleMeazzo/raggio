@@ -1,6 +1,10 @@
 # ADR 0012 — Bounded per-search sibling-vector reuse
 
-Status: not adopted; PR closed without merging · Date: 2026-11-04 · Disposition: 2026-11-05 · Evaluates the vector-reuse candidate in ADR 0011
+Status: historical PR #10 closed unmerged; current-main port accepted in ADR 0019 · Date: 2026-11-04 · Disposition: 2026-11-05
+
+**Current decision, 2026-11-08:** [ADR 0019](0019-sibling-vector-reuse-reevaluation.md)
+adopts a fresh port on current main after new Wikipedia/control measurements and
+regression gates. This page preserves the earlier PR #10 decision and its evidence.
 
 ## Final decision, 2026-11-05
 
@@ -24,12 +28,16 @@ probes, implementation and tests remain available for a future workload that act
 needs ranked sibling expansion. Reopening requires evidence of that usage and a
 fresh comparison against the accepted baseline, including adverse controls and memory.
 
-Main retains the [accepted PR #11 retrieval baseline](../research/sofia-scoped-search-baseline-2026-11-05.md).
-Only these historical decision records are carried forward. The implementation,
-results, test counts and reproduction commands below describe the archived candidate
-checkout, not a feature shipped in main.
+At the 2026-11-05 disposition, main retained the
+[accepted PR #11 retrieval baseline](../research/sofia-scoped-search-baseline-2026-11-05.md).
+The implementation, results, test counts and reproduction commands below describe
+the archived candidate checkout. Current adoption and measurements are in ADR 0019.
 
 ## Evaluated implementation and scope
+
+**Reevaluation, 2026-11-08:** [ADR 0019](0019-sibling-vector-reuse-reevaluation.md)
+records a separate current-main candidate and fresh Wikipedia/control measurements.
+The historical branch and decision below remain the record of PR #10.
 
 Reuse normalized retained sibling vectors within one search when ranked vector
 expansion returns several hits from a document. Keep the existing ranking, self

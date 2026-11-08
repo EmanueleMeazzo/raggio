@@ -211,6 +211,11 @@ context to an LLM:
 | `siblings_all: true` | All sibling chunks in document order |
 | `summary: true` | The document's summary record, if one was ingested |
 
+When ranked vector/hybrid expansion returns several hits from one document,
+raggio reuses its sibling vectors within that request. The reuse is bounded;
+larger or unsupported documents keep their ordinary scoring path. Measurements
+and compatibility checks are in [ADR 0019](adr/0019-sibling-vector-reuse-reevaluation.md).
+
 Expansion results are attached per hit under `expansion`:
 
 ```json

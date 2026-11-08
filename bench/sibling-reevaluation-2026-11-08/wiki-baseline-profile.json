@@ -1,0 +1,136 @@
+{
+  "facts": {
+    "arm": "baseline",
+    "baseline_revision": "37c686eb1c1ee89f31f91b71d133b25a772f7011",
+    "benchmark_server_sha256": "fcdcb2bd1a3833ec2a5e3c5dd0ab76f9d426680a7e720450bce1b67e7ddf9214",
+    "baseline_store_sha256": "7b593115c86eac7fed632bef8a7ca5ac098bb398bbcf5fb1bae0669c7e4bb399",
+    "candidate_store_sha256": "831797123e268658764242e1a76563d5fb64d8a9dac82a0677b00a6c35e6ead7",
+    "executed_methods_sha256": {
+      "search": "33f8481d685b60780607806a1e044ddf4274e7ac6ba6a179790b2b08759faba2",
+      "_expand": "4b173ce2da175c0273b76d58285c6c234a53a4ea742535e6c5cb920f821dae34",
+      "_search_allowed": "3a56f96a780b62fdf71bf48eb5a69707759f36fdefdc55d6f42360e93f97b9d6"
+    },
+    "python": "3.12.15 (main, Oct 21 2026, 17:46:20) [Clang 23.1.3 ]",
+    "platform": "Linux-7.0.0-1025-nvidia-aarch64-with-glibc2.41",
+    "sqlite": "3.53.1",
+    "versions": {
+      "raggio": "0.4.0",
+      "turbovec": "1.1.2",
+      "numpy": "2.5.3",
+      "httpx": "0.28.1",
+      "fastapi": "0.142.2",
+      "raggio-native": "0.1.0"
+    },
+    "native_bm25": true,
+    "openblas_threads": "1"
+  },
+  "cases": {
+    "doc-vector-k5-ranked": {
+      "sql": {
+        "vector_blobs": 6,
+        "other_select": 11,
+        "document_membership": 10
+      },
+      "python_peak_bytes": 741512,
+      "response_sha256": "958a56fcf09941e7ed0ab4920c594893f9039fb6f2ad5cd31ed3ecdeefde13be",
+      "hits": 5,
+      "distinct_documents": 1
+    },
+    "doc-vector-k10-ranked": {
+      "sql": {
+        "vector_blobs": 6,
+        "other_select": 11,
+        "document_membership": 10
+      },
+      "python_peak_bytes": 738530,
+      "response_sha256": "958a56fcf09941e7ed0ab4920c594893f9039fb6f2ad5cd31ed3ecdeefde13be",
+      "hits": 5,
+      "distinct_documents": 1
+    },
+    "global-vector-k10-ranked": {
+      "sql": {
+        "vector_blobs": 11,
+        "other_select": 21,
+        "document_membership": 20
+      },
+      "python_peak_bytes": 2175140,
+      "response_sha256": "e8778bdbddba0f209e82a83ba33c3903fb014418482f14b50f6f2cdc22183b85",
+      "hits": 10,
+      "distinct_documents": 4
+    },
+    "global-hybrid-k10-ranked": {
+      "sql": {
+        "other_select": 23,
+        "vector_blobs": 11,
+        "document_membership": 20
+      },
+      "python_peak_bytes": 2202871,
+      "response_sha256": "914033090b12872737dccea975940a9adad579d655bf9c60e48bc31120892877",
+      "hits": 10,
+      "distinct_documents": 4
+    },
+    "ranked-summary-control": {
+      "sql": {
+        "vector_blobs": 11,
+        "other_select": 11,
+        "document_membership": 10
+      },
+      "python_peak_bytes": 1826590,
+      "response_sha256": "050b9dc21ad29524b43f81f7476315d7a148d8fae137dd801f7ead729ad677b4",
+      "hits": 10,
+      "distinct_documents": 10
+    },
+    "sofia-summary": {
+      "sql": {
+        "other_select": 2,
+        "vector_blobs": 1
+      },
+      "python_peak_bytes": 2201759,
+      "response_sha256": "74662c05e70e41241aac9c48d5adfa7d017803747fef7d8b9ec8ddff3237a93c",
+      "hits": 10,
+      "distinct_documents": 10
+    },
+    "sofia-doc-vector": {
+      "sql": {
+        "vector_blobs": 1,
+        "other_select": 1
+      },
+      "python_peak_bytes": 261159,
+      "response_sha256": "eb2f81cc1493c718a05d7451e6e86736e745cfc93d3fbd06d8e4f3e2e301abba",
+      "hits": 5,
+      "distinct_documents": 1
+    },
+    "sofia-doc-hybrid": {
+      "sql": {
+        "other_select": 3,
+        "vector_blobs": 1
+      },
+      "python_peak_bytes": 264889,
+      "response_sha256": "0b6c97bf178c8eaaddc424d3685473f49fc5953e8f352e1f5ac76062075dacb4",
+      "hits": 5,
+      "distinct_documents": 1
+    },
+    "all-siblings-control": {
+      "sql": {
+        "vector_blobs": 1,
+        "other_select": 13,
+        "document_membership": 10
+      },
+      "python_peak_bytes": 919697,
+      "response_sha256": "1ac7735a12e6c7ca40bca7d450488fce8d1c1f506f890cc79162da1516b2f9b3",
+      "hits": 5,
+      "distinct_documents": 1
+    },
+    "summary-only-control": {
+      "sql": {
+        "vector_blobs": 1,
+        "other_select": 11,
+        "document_membership": 10
+      },
+      "python_peak_bytes": 758894,
+      "response_sha256": "5d5cdab54e46f43e2c1418b4647b97c9f38950c8533c852cf1c333103b2eb2a5",
+      "hits": 10,
+      "distinct_documents": 4
+    }
+  }
+}
