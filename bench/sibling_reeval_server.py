@@ -22,14 +22,16 @@ import raggio.store as store
 from raggio.config import Settings
 from _sibling_reference import BASELINE_REVISION, BASELINE_STORE_SHA256, METHODS
 
+CANDIDATE_METHODS = {name: getattr(store.Collection, name) for name in METHODS}
+
 KEY = "sibling-evaluation"
 COLLECTION = "fixture"
 
 
 def select_arm(arm):
-    if arm == "baseline":
-        for name, method in METHODS.items():
-            setattr(store.Collection, name, method)
+    methods = METHODS if arm == "baseline" else CANDIDATE_METHODS
+    for name, method in methods.items():
+        setattr(store.Collection, name, method)
 
 
 def write_json(path, value):
@@ -172,6 +174,7 @@ async def prepare(args):
 
 def facts(arm):
     return {"arm": arm, "baseline_revision": BASELINE_REVISION,
+            "benchmark_server_sha256": hashlib.sha256(Path(__file__).read_text(encoding="utf-8").encode()).hexdigest(),
             "baseline_store_sha256": BASELINE_STORE_SHA256,
             "candidate_store_sha256": hashlib.sha256(Path(store.__file__).read_text(encoding="utf-8").encode()).hexdigest(),
             "executed_methods_sha256": {name: hashlib.sha256(inspect.getsource(getattr(store.Collection, name)).encode()).hexdigest()
@@ -255,10 +258,24 @@ def main():
             profile(args)
         else:
             import uvicorn
+            from fastapi import HTTPException, Request
             if store._native is None:
                 raise RuntimeError("native scorer required")
             write_json(args.output, facts(args.arm))
-            uvicorn.run(app_module.create_app(settings(args.data_dir)), host="0.0.0.0", port=args.port,
+            app = app_module.create_app(settings(args.data_dir))
+
+            @app.post("/__sibling_evaluation/arm")
+            async def switch_arm(body: dict, request: Request):
+                # Benchmark-only: the client drains each block before switching.
+                if request.headers.get("x-api-key") != KEY:
+                    raise HTTPException(401, "evaluation key required")
+                arm = body.get("arm")
+                if arm not in ("baseline", "candidate"):
+                    raise HTTPException(400, "invalid evaluation arm")
+                select_arm(arm)
+                return facts(arm)
+
+            uvicorn.run(app, host="0.0.0.0", port=args.port,
                         log_level="warning", access_log=False)
 
 

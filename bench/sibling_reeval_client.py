@@ -59,6 +59,8 @@ async def run(args):
     coverage = {}
     headers = {"x-api-key": KEY, "content-type": "application/json"}
     output = {"mode": args.mode, "fixture": {k: v for k, v in manifest.items() if k != "cases"},
+              "benchmark_client_sha256": hashlib.sha256(Path(__file__).read_text(encoding="utf-8").encode()).hexdigest(),
+              "client_cpu_affinity": sorted(os.sched_getaffinity(0)),
               "python": sys.version, "platform": platform.platform(), "httpx": httpx.__version__,
               "pairs": args.pairs, "minimum_seconds_per_arm": args.seconds,
               "servers": servers, "coverage": coverage, "runs": {}, "summary": {}}
@@ -68,6 +70,14 @@ async def run(args):
         process_rss(pid)
     async with httpx.AsyncClient(headers=headers, timeout=120,
         limits=httpx.Limits(max_connections=32, max_keepalive_connections=32)) as client:
+        async def select(arm):
+            if "variant" in servers[arm]:
+                response = await client.post(servers[arm]["url"] + "/__sibling_evaluation/arm",
+                                             json={"arm": servers[arm]["variant"]})
+                response.raise_for_status()
+                if response.json()["arm"] != servers[arm]["variant"]:
+                    raise RuntimeError("server arm selection failed")
+
         for arm in arms:
             ready = False
             for _ in range(120):
@@ -86,6 +96,7 @@ async def run(args):
             for raw in raws:
                 responses = []
                 for arm in arms:
+                    await select(arm)
                     r = await client.post(servers[arm]["url"] + "/collections/fixture/search", content=raw)
                     r.raise_for_status()
                     responses.append(r.content)
@@ -99,6 +110,7 @@ async def run(args):
             expected[name], coverage[name] = hashes, counts
 
         async def block(arm, name, concurrency):
+            await select(arm)  # outside CPU/wall clocks, with prior requests drained
             url, pid = servers[arm]["url"], servers[arm]["pid"]
             raws = bodies[name]
             latencies = []

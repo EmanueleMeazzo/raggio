@@ -71,6 +71,21 @@ Treat an unaffected-control loss above max(3%, its A/A envelope), with an interv
 excluding zero, as a regression gate failure. If uncertainty is too wide, report it
 as inconclusive rather than claiming equivalence or attributing the old slowdown.
 
+### Calibration-driven harness correction, before A/B
+
+The first short functional smoke passed parity but had large timing variation.
+GN100 has heterogeneous cores; evaluation servers were pinned to fast cores 15–17,
+and the fixed client to core 19, before A/A calibration. Separate baseline processes
+still showed a material same-code difference on a summary control. Preserve that
+between-process A/A as a diagnostic, not the primary causal comparison.
+
+Use one HTTP server process and one data/index state for the primary A/A and A/B.
+A benchmark-only keyed endpoint selects the three frozen baseline or candidate
+methods between fully drained blocks, outside the clocks. Alternate arm order as
+above. This removes fixed process placement and initialization as treatment
+confounders. The candidate runtime design is unchanged. Memory tracing remains a
+separate operation; same-process retained RSS is not a per-arm allocation measure.
+
 No adoption recommendation without exact correctness, bounded resources, useful
 ranked-expansion gains and acceptable unaffected controls. Record limitations and
 the outcome in an ADR, retain raw results, and return the decision for discussion.
