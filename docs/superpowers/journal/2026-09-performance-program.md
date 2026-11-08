@@ -81,6 +81,8 @@ At 22:53:49Z the maintainer replied "Plan for items 1,2,3,4". Item 5 stayed guid
 
 **Dated note, 2026-11-07, evening.** The maintainer asked whether "no improvement" was really the result of all those PRs. It was not: the arxiv benchmark never runs the request shapes they targeted. A document-shaped benchmark (25,000 Wikipedia articles as summary + chunk documents) measured `19c3293` against 0.3.0: one-document search 197 → 2.9 ms p50, concurrent summary and large-k throughput 1.2–1.6× at a third to a half of the CPU per query, quality identical, ~110 MB more memory (section 4.22, X36, PR #17).
 
+**Dated note, 2026-11-08.** turbovec 1.1.2 replaced 1.0.0 as raggio 0.4.0, with no code change. Its staged 4-bit search halved flat search on the 2.55M arxiv corpus: p50 18.5 → 8.0 ms, concurrent QPS 149 → 321, CPU per query 98.8 → 28.8 ms, recall@10 unchanged. IVF did not move. On the document corpus the changes were small: summary CPU and tails lower, 14 MB more memory, and flat recall@100 0.99988 → 0.99984–0.99986, the one quality cost. Index files move one way to turbovec's v8 format (section 4.23, X37–X39, PR #19).
+
 ## 2. Timeline
 
 Times are UTC unless marked CEST (UTC+2). The maintainer's messages are quoted verbatim, typos included. Source: the session transcript; DGX run windows are from the research notes.
@@ -1889,6 +1891,39 @@ The maintainer chose one end-to-end A/B, baseline `19a8a2e` against the final `m
 
 **PR #17 merged; the README becomes baseline-only.** The maintainer said "Merge": PR #17 merged as `5d6ee3c`, CI and docs green, branch and worktree removed. Then: "These benchmark numbers are the new baseline, don't make a difference in the readme. Simplify the readme removing all history, leave only the current baseline." PR #18 (`docs/readme-baseline`): the README's performance section keeps two tables of 0.3.0 against Weaviate (arXiv 2.55M; the document collection, now with raggio and Weaviate columns only) and drops the 2026-09 A/B, the 0.3.0 re-measurement, the before column, the email run and the ADR 0008/0009 notes; the IVF sentence quotes the 2.55M figures. History stays in the docs pages, the ADR index and this journal. From now on the README states the current baseline only.
 
+**After PR #18.** The maintainer said "merge and clean": PR #18 merged as `7947eba`, and the document benchmark's leftovers on gn100 were removed (the per-arm volumes, the Weaviate volume, the two images and the code copies). The Wikipedia corpus (1.5 GB) and the run logs were kept.
+
+**"Are we using the latest turbovec version?"** No: the lock had 1.0.0, PyPI had 1.1.2. The answer listed what 1.1 brings:
+- a staged 4-bit search on large enough indexes;
+- the v8 file format, which 1.0.0 cannot read;
+- fix releases 1.1.1 (masked search) and 1.1.2 (recall on tightly clustered corpora);
+- still no cp314t wheel.
+
+The maintainer said "Go ahead with all": lock bump, ADR, compatibility test, and an A/B on both benchmarks with recall gates. They also asked "Why do we have to keep reingesting Arxiv tho?". The answer: there is no need. Each arm can search its own byte copy of the existing volume (`podman unshare cp -a`, 10 s for 16 GB), since the ingest path does not change (X37).
+
+**Preparation.** Branch `deps/turbovec-1.1.2`, commit `5581e4d`.
+- The lock pins turbovec 1.1.2 with a floor, and raggio becomes 0.4.0.
+- A generator, run once under 1.0.0, writes a `DATA_DIR` fixture (a v7 index) and the results of 8 searches on it.
+- `tests/test_turbovec_upgrade.py` checks the fixture under 1.1.2: the same results, conversion, reload after a write, and id enumeration past the staged threshold.
+- Two assumptions failed on the way:
+  - **Opening alone converts.** The draft test asserted that reads never rewrite the file. `stop()` always syncs the index, so the first stop writes v8; the test now pins that.
+  - **Enumeration was the worry, recall turned out to be.** A probe on gn100 (40,000 vectors) showed `search(probe, k=len(index))` still returns every id, as `_reconcile_ghosts` and the IVF intersections need. The staged search was 1.9× faster than the whole-index scan but shared only 90% of its top 10 on synthetic data. That made real-corpus recall the deciding gate.
+- The bench client patch first failed its hash check: the script's final diff exits 1, and the expected hashes had been swapped. The build script now re-extracts and verifies the patched hashes, which equal the earlier A/Bs'.
+
+**The first attempt and the reboot.** Launched on the evening of 2026-11-07. The host rebooted for a kernel update at 22:42Z, five minutes into the first session, and the run died with it (section 5.35). Its partial files were set aside.
+
+**The unattended run.** The maintainer: "3.14 evaluation is over. Launch the runs on the spark, but know that I'm turning off this PC after you launch it. So pack as much as possible on the spark to have it run unattended."
+- **One resumable driver** on the host (`flock`): fresh volume copies once, then the arxiv A/B, the document A/B and the analysis. Each step is skipped once its end marker exists, and a session cut short is retried under a new label (up to 4 attempts).
+- **Reboots.** A temporary crontab `@reboot` line, in a crontab that had been empty, relaunched the driver after a reboot. The driver removed it at the end.
+- **The run.** Launched 00:37Z; arxiv sessions 00:39Z–02:35Z; document ingests and sessions 02:35Z–03:17Z; analysis at 03:17Z. No reboot, all 12 sessions clean at the first attempt, and the crontab line was gone.
+
+**The write-up** (2026-11-08, from 13:22Z).
+- **Merging main.** `main` had moved to `9fcbbdd` with the 3.14t opt-in (uv 0.13.7, a `.dockerignore` fix), so it was merged into the branch without conflicts. `uv lock --check` passed under uv 0.13.7. turbovec 1.1.2's sdist needs Rust 1.89, as 1.0.0's did, so the 3.14t image's source build is unaffected. 781 passed, 74 skipped.
+- **Docs.** ADR 0017 with the gates and results, raw tables in `bench/results-turbovec-2026-11.md`, the arxiv and document pages, the indexing guidance (IVF's lead at 2.55M is now 1.3× on p50, 3.8× on filtered search) and storage upgrade notes (back up before upgrading; rollback by backup, turbovec's `convert` example, or export).
+- **A real recall difference.** The analysis tables round to three decimals and showed every quality cell equal. Reading the run files at full precision found the one real difference: flat chunk recall@100 0.99988 in every 0.3.0 run against 0.99986 and 0.99984 in 0.4.0's two sessions. The ADR draft had called quality identical and the gates pre-registered; both were corrected. The recall gate had no numeric threshold, so the difference is recorded as the upgrade's measured cost, with acceptance recommended and the merge left to the maintainer (X38).
+- **The README.** Mid-way, the maintainer: "Do not add separate and different sections in the readme, that should always only be the latest baseline." The README figures were overwritten in place. The 3.14t section's pros/cons table, measured on 0.3.0 with turbovec 1.0.0 and already in `docs/free-threaded-python.md`, left the README; the instructions stayed, with a link (X39).
+- Commit `3c6e3d4`, PR #19. `mkdocs build --strict` clean.
+
 ## 3. Decision register
 
 ID prefixes:
@@ -1977,6 +2012,9 @@ ID prefixes:
 | X34 | 2026-11-06, 09:40Z | Re-measure on gn100 with section 4.20's protocol: A = `19c3293` (the image measured on 2026-10-03) against B = `main` `f1b0ab3` (runtime 0.3.0), fresh volumes, both detaching at 4 GiB; publish B's medians. | Relabel only: keep the October figures, labelled as `19c3293`'s. Both: relabel now, replace after a re-run. | The README showed `19c3293`; PRs #6–#14 changed the request path; no arXiv run since. | Maintainer (chose "Re-run on gn100", recommended) | AskUserQuestion, 2026-11-06 | Done (section 4.21, `8b45bb2`) |
 | X35 | 2026-11-06, about 13:15Z | Discard the first set of search sessions for both arms and re-run all 8 behind a host-CPU guard: 1 Hz per-process sampler, a quiet-host gate before each session, and a session verdict fixed before data (mean foreign CPU < 0.25 cores, highest 10-s mean < 1.0 core), up to 3 attempts. Keep the ingests and cold starts (run on an idle host). Never touch the other job. | The maintainer pauses the other job, then an immediate re-run. Publish from the runs outside the contaminated windows only. | Section 5.33. | Maintainer (chose "Re-run sessions, guarded", recommended) | AskUserQuestion, 2026-11-06 | Done: 8 of 8 clean at the first attempt |
 | X36 | 2026-11-07, afternoon | Extend the public benchmark with a document-shaped corpus and workloads: summary scope, one-document search, k=10/100/1000. Controller's calls under "Just start": public Wikipedia data in the Sofia shape (~25k documents, ~173k records) embedded with the arxiv corpus's model; `19c3293` (metadata filter) against 0.3.0 (`doc_id`); Weaviate 1.38.11 as a reference with the same returned fields; concurrency 8 only; two ingests and two sessions per version, ABAB, behind the host-CPU guard. | A README table of the ADRs' own numbers only. More arxiv ingest runs. A synthetic corpus (ADR 0007's): no real embeddings, no meaningful quality figures. | The arxiv corpus has one chunk per document; ADRs 0007/0010/0013/0016 measured these shapes only locally or in the Sofia deployment. | Maintainer (scope), controller (design) | Transcript, 2026-11-07 | Done (section 4.22, PR #17) |
+| X37 | 2026-11-07, evening | Upgrade turbovec 1.0.0 → 1.1.2 as raggio 0.4.0: a lock bump with a floor and no code change; a test on a `DATA_DIR` written by 1.0.0; an A/B on both public benchmarks on gn100, behind the host-CPU guard, with real-corpus recall deciding. Each arm searches a byte copy of the existing arxiv volume instead of re-ingesting. | Stay on 1.0.0. Re-ingest arxiv per arm. Ship 1.1.2 with `TURBOVEC_4BIT_PLANES=0`. | 1.1 brings a staged search (1.9× in a probe, 90% top-10 overlap before the rescore) and a one-way file format; the ingest path does not change. | Maintainer ("Go ahead with all"), controller (design) | Transcript, 2026-11-07 | Done (section 4.23, PR #19) |
+| X38 | 2026-11-08, afternoon | Record flat recall@100 0.99988 → 0.99984–0.99986 (document corpus, 1–2 more misses per 50,000 hits) as the upgrade's measured quality cost; recommend shipping with the staged search on; leave the merge to the maintainer. | Ship with `TURBOVEC_4BIT_PLANES=0` (results identical to 0.3.0, no speed-up). Hold the upgrade for a deeper-rescore study. | The recall gate had no numeric threshold; the difference is beyond both bands but small, and every other quality figure is identical at full precision, against 2.3× faster flat search. | Controller (recommendation), maintainer (merge) | Transcript, 2026-11-08 | Pending the maintainer's merge decision on PR #19 |
+| X39 | 2026-11-08, afternoon | README: overwrite the figures in place with 0.4.0's; move the 3.14t pros/cons table (measured on 0.3.0, turbovec 1.0.0) out of the README, keeping the opt-in instructions and a link to `docs/free-threaded-python.md`. | Keep the 3.14t table in the README with its provenance sentence. | Maintainer: "Do not add separate and different sections in the readme, that should always only be the latest baseline." | Maintainer | Transcript, 2026-11-08 | Done (`3c6e3d4`) |
 | W-1 | 2026-09-27 23:27Z | "Answer, don't act": a question such as "is it OK to X?" gets an answer and an offer, never an unrequested action. | None. | The gn100 restart incident (section 7). | Maintainer (correction) | Transcript | Standing rule |
 | W-2 | 2026-09-27 23:09Z to 2026-09-28 01:11Z | Offload work to gn100 "when it makes sense". First baseline: "not more than 65m". Later: "no limits" for this program while the PC stays on. The spec keeps a rule that DGX runs over about 5 minutes need a go-ahead with a time cap. | None. | None. | Maintainer | Transcript; spec §6 | Standing |
 | W-3 | 2026-09-28 18:45Z | Every question to the maintainer goes through the structured question tool. | None. | None. | Maintainer | Transcript | Standing |
@@ -1995,7 +2033,7 @@ ID prefixes:
 | W-13 | 2026-09-30, asked 10:05Z, answered 10:24Z | `main` is pushed after plan C: a fast-forward from 00c70a1 to d7f4b01 (plan C's 13 commits, its merge bb907ac, and the probe-path fix), no force. The docs branches and `bench-hardening` stay local. | "Not yet" (keep `main` local and ask again later). | Pushed 10:24:36Z; Actions green (tests, docs). A scan of 00c70a1..cd3cbf2, run after the pushes, finds no added home path, IP or key path; the only home-path lines are the ones d7f4b01 removes. | Maintainer (chose "Push main now", recommended) | Transcript; section 2 | Done. cd3cbf2 (the 4 GiB detach) followed at 10:37:21Z under W-14. |
 | W-14 | 2026-09-30, about 10:24Z | Routine decisions no longer go to the maintainer: "just assume that the reply is the same and ask only really blocking questions. If something needs to be double checked, just do it, assume I'm not at the desk and you have time to do stuff". The controller takes the usual answer for a local merge commit, pushing `main`, committing the journal, the recommended option, archiving ledgers and starting the next plan in the agreed order. It still asks before a history rewrite, a force-push, anything posted outside the repo (issues, upstream), deleting data, or touching the maintainer's containers. | None offered: a free-text instruction. | "I have replied in the same way for the past 10 times you've asked the same stuff". | Maintainer (free text) | Transcript; section 2 | In force |
 
-Register total: 75 entries (P 3, D 16, R 23, X 19, W 14). (Dated note, 2026-11-07: X20 to X33 were added without updating this total; with X34 and X35 the register has 91 entries: P 3, D 16, R 23, X 35, W 14.) (Dated note, 2026-11-07 evening: X36 added; 92 entries.) (Dated note, 2026-10-02 07:10Z: X18 and X19 added. Dated note, 2026-10-02 05:52Z: X17 added. Dated note, 2026-10-02 04:25Z: X13 to X16 added. Dated note, 2026-10-02 03:12Z: X11 and X12 added; X9 and X10, added on 2026-10-01 and 2026-10-02, had not been counted here. Dated note, 2026-10-01 21:45Z: X8 added. Dated note, 2026-10-01 21:26Z: R-D5 added; X7, added 2026-09-30 at 14:04Z, had not been counted here. Dated note, 2026-09-30 13:20Z: X6 added. Dated note, 2026-09-30 10:46Z: W-13 and W-14 added. Dated note, 2026-09-30 00:28Z: W-12 added. Dated note, 2026-09-30 00:08Z: R-A5 added. Dated note, 2026-09-29 21:05Z: W-11 added. Dated note, 08:30Z: R-A4 added. Dated note, 08:05Z: R-A3 and W-10 added; W-8 superseded. Dated note, 23:00Z: W-9 added. Dated note, 22:45Z: R-G8, R-G9 and W-8 added. Dated note, 21:20Z: R-G7 added. Dated note, 21:23Z: X4 added. Dated note, 21:45Z: X5 added. Dated note, 22:30Z: W-7 added.) (Dated note, 20:40Z: R-B1, R-B2, R-G5, R-G6, W-6 and X3 were added after p4; before them the total was 38 (P 3, D 16, R 12, X 2, W 5).) R-D3, R-G3 and R-G4 were added at 20:05Z, and R-D4 at about 20:15Z; the backfill written at about 19:30Z had 34.
+Register total: 75 entries (P 3, D 16, R 23, X 19, W 14). (Dated note, 2026-11-07: X20 to X33 were added without updating this total; with X34 and X35 the register has 91 entries: P 3, D 16, R 23, X 35, W 14.) (Dated note, 2026-11-07 evening: X36 added; 92 entries.) (Dated note, 2026-11-08: X37 to X39 added; 95 entries.) (Dated note, 2026-10-02 07:10Z: X18 and X19 added. Dated note, 2026-10-02 05:52Z: X17 added. Dated note, 2026-10-02 04:25Z: X13 to X16 added. Dated note, 2026-10-02 03:12Z: X11 and X12 added; X9 and X10, added on 2026-10-01 and 2026-10-02, had not been counted here. Dated note, 2026-10-01 21:45Z: X8 added. Dated note, 2026-10-01 21:26Z: R-D5 added; X7, added 2026-09-30 at 14:04Z, had not been counted here. Dated note, 2026-09-30 13:20Z: X6 added. Dated note, 2026-09-30 10:46Z: W-13 and W-14 added. Dated note, 2026-09-30 00:28Z: W-12 added. Dated note, 2026-09-30 00:08Z: R-A5 added. Dated note, 2026-09-29 21:05Z: W-11 added. Dated note, 08:30Z: R-A4 added. Dated note, 08:05Z: R-A3 and W-10 added; W-8 superseded. Dated note, 23:00Z: W-9 added. Dated note, 22:45Z: R-G8, R-G9 and W-8 added. Dated note, 21:20Z: R-G7 added. Dated note, 21:23Z: X4 added. Dated note, 21:45Z: X5 added. Dated note, 22:30Z: W-7 added.) (Dated note, 20:40Z: R-B1, R-B2, R-G5, R-G6, W-6 and X3 were added after p4; before them the total was 38 (P 3, D 16, R 12, X 2, W 5).) R-D3, R-G3 and R-G4 were added at 20:05Z, and R-D4 at about 20:15Z; the backfill written at about 19:30Z had 34.
 
 Three recommended options were overridden: the review scope at 18:46:59Z (R-EX, "Go through the key ones" instead of "Accept all defaults"), and R-A1 and W-5 at 18:51:48Z. At 18:46:59Z the commit question's recommended "I commit in my terminal" was also answered with free text instead: "I already committed, let's debug the shell, I can also reboot if necessary". Separately, spec §3.1 says two of its rows override a plan's default: A1 and the fallback in G2.
 
@@ -2940,6 +2978,40 @@ Flat index, 8 clients, medians, A → B (Weaviate):
 - **Memory after the workload set:** 366 → 474 MB (flat), 363 → 480 MB (IVF), both from 151 MB, every run within a few MB; not explained (section 9.4). Weaviate about 2.1 GB.
 - Raw: `bench/results-docs-2026-11.md` (`4174bc3`).
 
+### 4.23 turbovec 1.1.2 on gn100: 0.3.0 against 0.4.0, both public benchmarks
+
+2026-11-08, one boot; arxiv sessions 00:39Z–02:35Z, document ingests and sessions 02:35Z–03:17Z (X37).
+- **Arms:** A `:7947eba` (0.3.0, turbovec 1.0.0), B `:5581e4d` (0.4.0, turbovec 1.1.2). The images' installed packages are identical except raggio and turbovec.
+- **arxiv:** each arm searched its own byte copy of the 2.55M volume; B's copy became v8 at its first shutdown. 8 sessions at c=8 and c=16, all clean at the first attempt (0.005–0.022 cores).
+- **Documents:** two ingests per arm, 4 sessions at c=8, all clean (0.003–0.016 cores). No Weaviate.
+- **Statistics:** medians of 6 measured runs.
+
+arxiv, flat index, A → B:
+
+| Metric | c=8 | c=16 |
+|---|---|---|
+| Serial p50 (ms) | 18.5 → 8.0 | 18.6 → 8.0 |
+| Concurrent QPS | 149 → 321 | 206 → 418 |
+| CPU per query (ms) | 98.8 → 28.8 | 69.0 → 22.1 |
+| Hybrid CPU per query (ms) | 339 → 226 | 478 → 402 |
+| Recall@10 | 0.9998 → 0.9998 | 0.9998 → 0.9998 |
+| Memory after a restart (MB) | 1502 → 1470 | 1501 → 1470 |
+
+- **Beyond both bands:** every serial and concurrent latency, throughput and CPU figure of the flat vector search; hybrid p50 47.8 → 45.4 ms and serial hybrid QPS; filtered p95 31.5 → 24.9 ms (p50 within the spread); memory.
+- **Within the spread:** cold start, disk, text-hit@10 and every IVF figure (p50 6.0 → 6.2 ms, QPS 389 → 401, recall 0.995 → 0.993, build 172 → 178 s).
+- **Why IVF did not move:** its shards (about 10k vectors) are below the 32,768-vector staged threshold.
+- **Bimodality gone:** A's flat concurrent QPS was bimodal as always (125–128 or 170–217); B's runs read 309–335.
+
+Documents, flat index, A → B, beyond both bands:
+- summary vector p95 9.5 → 8.0 ms and CPU per query 7.0 → 4.5 ms;
+- summary hybrid QPS 220 → 242 and CPU 13.6 → 12.7 ms;
+- memory after the workload set 474–477 → 486–491 MB;
+- flat recall@100 0.99988 → 0.99986 / 0.99984 (by session).
+
+Everything else is within the spread, including the one-document and chunk latency and throughput cells, every IVF cell, ingest (2,338 → 2,373 records/s) and every other quality figure at full precision.
+
+- Raw: `bench/results-turbovec-2026-11.md`; ADR 0017 (`docs/adr/0017-turbovec-1-1.md`, `3c6e3d4`).
+
 ## 5. Negative results and surprises
 
 ### 5.1 Audience batching lost on NEON
@@ -3179,6 +3251,15 @@ Building the document corpus (section 2, 2026-11-07) hit two tooling surprises.
 - **The GPU.** Rootless podman 4.9.3 on gn100 answered `--device nvidia.com/gpu=all` with "unresolvable CDI devices" although `nvidia-ctk cdi list` showed the device in `/var/run/cdi`; `--gpus all` started the container without the driver tools. The arxiv corpus had been embedded by a host vLLM, which is what was used again.
 - **The stall.** With the arxiv run's vLLM arguments (abstracts of ~250 tokens), chunks of ~1,100 tokens stalled the server: after 60 requests, 7 sequences stayed "running" at 0 tokens/s with the GPU idle. The documented `--max-num-batched-tokens 131072 --max-num-seqs 1024` kept it moving at about 52k tokens/s, but 7 more stalls occurred in the full run, each recovered only by the client's 300 s request timeout and retry (about 15% of the 73 minutes). Not investigated further; a shorter client timeout would have cost less.
 - **Elapsed time misread.** Twice the controller read a quiet log as a stall when only a few minutes had passed; checking process ages and timestamps settled it each time.
+
+### 5.35 The host rebooted under a run, and three decimals hid a recall difference
+
+The turbovec A/B (section 4.23, 2026-11-07/08) had five surprises.
+- **The reboot.** gn100 rebooted for a kernel update at 22:42Z on 2026-11-07, five minutes into the first session. The run had been started over ssh, with no service and no lingering user unit (`Linger=no`), so nothing brought it back. The relaunch made the driver resumable and added a temporary crontab `@reboot` line. That line waits for the user's runtime directory, needed by rootless podman, and the driver removes it when done. No reboot came that night.
+- **Rounding.** The analysis tables print quality to three decimals, and every cell matched. A full-precision read of the run files found flat recall@100 0.99988 → 0.99984–0.99986 on the document corpus: 1–2 more misses per 50,000 hits, constant within a session and different between B's two sessions, each of which rebuilds the flat index at its detach. Quality gates now get read from the run files, not the rounded tables.
+- **A fast first IVF build.** The first IVF build in each arm took 40 and 46 s against 168–180 s for the rest and 180–185 s in the 0.3.0 re-measurement. Each ran right after its volume had been copied, with the files in the page cache. It was the same in both arms, and the other builds set the medians.
+- **Bimodality gone.** 0.3.0's flat concurrent throughput has been bimodal since the original baseline (125 or 170–217 QPS, with CPU per query 117 or 57–80 ms). Under turbovec 1.1.2 every run read 309–335.
+- **Opening converts.** The upgrade test was first written on the assumption that a v7 file is rewritten only by a write. raggio's `stop()` always syncs the index (it is the flush of shutdown, eviction and delete), so loading a collection once under 0.4.0 converts it.
 
 ## 6. Method: how we measured
 
@@ -3440,6 +3521,7 @@ State as of 2026-09-28, about 19:30Z.
 - **One 3.14.8t suite failure at plan G's `05c2731`** (Task 2, 2026-10-02): 1 failed and 460 passed, once, in the controller's check. The next 15 runs were green, 8 of them in concurrent pairs. The summary line lost the test's name, so it is not known which test failed, or whether Task 2's change is involved. (Dated note, 2026-10-02 09:25Z: no failure since, in about 20 more 3.14.8t runs on the laptop through `cdf8ab9`, and 3 on Linux on gn100. The tally is 1 in about 36 laptop runs. The final review is asked for candidates.) (Dated note, 2026-10-02 12:15Z: G-R40's loop at `e3f558e` failed twice in 16 runs, and both failures were 5 s waits running out on the free-threaded build's slow hand-offs under load (section 2, 11:10Z). A short budget is now a third candidate, next to I1 and M1. That failure's output was lost, so it stays unexplained.)
 
 - Dated note, 2026-11-07: in the document retrieval benchmark (section 4.22), 0.3.0's server holds about 110 MB more after the workload set than `19c3293` (474 against 366 MB flat, 480 against 363 MB IVF), from the same 151 MB at the start, in every run. Candidates are 0.3.0's caches (ADR 0013's cached scope allowlists, ADR 0007's document paths); not measured.
+- Dated note, 2026-11-08: 0.4.0 (turbovec 1.1.2) holds about 14 MB more than 0.3.0 after the document workload set (486–491 against 474–477 MB, flat) but 32 MB less on the 2.55M arxiv index after a restart (1470 against 1502 MB). Not investigated. Also open: why B's two document sessions give different flat recall@100 (0.99986 and 0.99984) when each session's three runs agree. Each session rebuilds the flat index at its detach; under 1.0.0 the same rebuilds gave identical recall.
 
 ### 9.5 Disputed, unaddressed, and limits
 
