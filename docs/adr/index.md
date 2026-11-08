@@ -26,6 +26,7 @@ results describe their measured revisions, rather than the latest commit.
 | [0014](0014-contains-any-metadata-filter.md) | Add bounded OR of metadata substring alternatives | Accepted; retrieval capability, PR #12 |
 | [0015](0015-metadata-fts-keys.md) | Opt-in metadata keys in every BM25 path, with transactional PATCH | Accepted after Sofia DEV validation; merged in PR #14 |
 | [0016](0016-native-search-json.md) | Reuse a shared native JSON request parser for search | Accepted; merged in PR #13 and included in 0.3.0 DEV acceptance |
+| [0017](0017-turbovec-1-1.md) | turbovec 1.1.2: staged 4-bit search on, v8 index files (one-way), raggio 0.4.0 | Accepted; flat search 2.3× faster on the 2.55M arxiv corpus |
 
 ADRs 0011–0012 archive the expansion experiments and sibling-vector reuse from
 [PR #10](https://github.com/EmanueleMeazzo/raggio/pull/10), closed without merging
@@ -36,7 +37,24 @@ summary-search path.
 
 ## Current retrieval baseline
 
-The current accepted runtime is **0.3.0**, PR #14's `2939c3c` including native search
+The current runtime is **0.4.0**: 0.3.0 with turbovec 1.1.2
+([ADR 0017](0017-turbovec-1-1.md)). It was measured against 0.3.0 on 2026-11-08 on both
+public benchmarks, on images that differ only in raggio's version and turbovec:
+
+- **arxiv, 2.55M vectors:** flat search p50 18.5 → 8.0 ms, concurrent QPS 149 → 321
+  at a third of the CPU per query, recall@10 unchanged, memory 32 MB lower. IVF
+  unchanged.
+- **Document benchmark:** summary search CPU per query and tails lower, one-document
+  and chunk figures within the spread, about 14 MB more memory, and flat recall@100
+  0.99988 → 0.99984–0.99986.
+
+Index files move to turbovec's v8 format, which 0.3.0 cannot read
+([upgrade notes](../storage.md#upgrading)). The README, the
+[arxiv table](../benchmark-arxiv.md) and the
+[document benchmark](../benchmark-documents.md) show 0.4.0's medians. The 0.3.0
+paragraphs below describe the previous baseline.
+
+The previous accepted runtime is **0.3.0**, PR #14's `2939c3c` including native search
 JSON parsing from PR #13, merged into main by `2e8082b` on 2026-11-05. The user
 accepted [Sofia's DEV title-retrieval and copy-integrity checks](../research/sofia-fts-keys-acceptance-2026-11-05.md)
 and authorized both merges. That report records the image, exact comparison counts,
@@ -50,8 +68,8 @@ that differ only in `src/`: over six runs per arm, no search, hybrid, recall,
 memory, disk, cold-start or index-build figure moved beyond the run-to-run spread,
 and ingest throughput stayed within it
 ([re-measurement](../benchmark-arxiv-2026-11.md), raw tables in
-`bench/results-arxiv-2026-11.md`). The README and the current arxiv table now show
-0.3.0's medians.
+`bench/results-arxiv-2026-11.md`). Until 0.4.0, the README and the arxiv table
+showed 0.3.0's medians.
 
 The request shapes these ADRs target are measured publicly by the
 [document retrieval benchmark](../benchmark-documents.md) (2026-11-07; 25,000 Wikipedia
@@ -78,6 +96,7 @@ without a new deployment performance measurement.
 
 | Work | Implementation / decision | Documentation and evidence |
 |---|---|---|
+| turbovec 1.1.2 (raggio 0.4.0) | Lock bump, no code change; v7 → v8 index conversion on first sync | [ADR 0017](0017-turbovec-1-1.md); `tests/test_turbovec_upgrade.py` with a 1.0.0-written `DATA_DIR` fixture; raw tables in `bench/results-turbovec-2026-11.md` |
 | Python 3.14 reevaluation and opt-in | `PYTHON=3.14t` selects the guarded free-threaded image; Python 3.12 remains the default | [Setup and pros/cons](../free-threaded-python.md), [idle-host evaluation](../python-3.14-reevaluation-2026-11-07.md), [full tables](../python-3.14-reevaluation-measurements-2026-11-08.md), raw evidence in `bench/python314-2026-11-08/` |
 | Rust rewrite assessment | Keep the Python/native architecture; no service rewrite | [Archived assessment](../research/rust-rewrite-assessment-2026-11-04.md), measured at `da432a6`; original raw experiments retained locally in `C:/DevOps/raggio-rust-evaluation-20261104/` |
 | Native ingest JSON parsing | `b6311a5`, merged by `96b55ed` in [PR #7](https://github.com/EmanueleMeazzo/raggio/pull/7) | [ADR 0008](0008-native-ingest-json.md); `bench/results-ingest-json.json` |

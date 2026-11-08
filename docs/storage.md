@@ -120,6 +120,23 @@ that survives version changes, page through
 
 ## Upgrading
 
+**0.4.0 (turbovec 1.1.2): index files move to a format 0.3.0 cannot read.**
+turbovec 1.1 reads the old v7 index files and writes its v8 format
+([ADR 0017](adr/0017-turbovec-1-1.md)).
+
+- **When files change:** a flat collection's `index.tvim` is written at every offload
+  and shutdown, so each collection is converted the first time 0.4.0 loads it,
+  whether or not anything is written to it. IVF shard files under `ivf/` are
+  converted as they are written. Collections 0.4.0 never loads keep their old files.
+- **Downgrades:** raggio 0.3.0 and earlier cannot open a v8 file. If a downgrade must
+  stay possible, [back up](#backup) `DATA_DIR` before the first start of 0.4.0.
+- **Rolling back:** restore that backup (writes made since are lost); or convert each
+  file with turbovec's `convert` example from the 1.1.2 sources
+  (`cargo run --example convert -- <in> <out> v7`); or export through the documents
+  API and re-ingest.
+- **What stays the same:** search results, `meta.db` and the rest of the directory.
+  Nothing else migrates, and there is no extra start-up time.
+
 **2026-09 release (cold start and loop hygiene).** The first open of each
 collection after the upgrade runs a one-time migration in its `meta.db`: it
 builds the covering index `idx_records_doc_type` (doc_id, type, indexed), then

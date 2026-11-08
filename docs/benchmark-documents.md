@@ -13,7 +13,54 @@ uses a corpus shaped like a document store and measures:
 - **B:** raggio 0.3.0 (`5da2b28`).
 - **Weaviate 1.38.11** as a reference, on the same corpus, queries and client.
 
-## Results
+The first section has the current version's figures.
+
+## Current version: 0.4.0 (turbovec 1.1.2), 2026-11-08
+
+- **Source:** medians of 6 runs at concurrency 8, from the turbovec 1.1.2 A/B in
+  [ADR 0017](adr/0017-turbovec-1-1.md) (`5581e4d`, the same host, corpus, queries and
+  client; raw tables in `bench/results-turbovec-2026-11.md`).
+- **Weaviate:** in parentheses, from the 2026-11-07 run below. The A/B's 0.3.0 arm
+  reproduced that day's 0.3.0 figures within the run-to-run spread.
+- **What moved:** on this corpus 0.4.0 moved only a few figures beyond the spread:
+  summary vector p95 and CPU per query, summary hybrid throughput, about 14 MB more
+  memory after the workload set, and flat recall@100 (below).
+
+### Flat (4-bit scan + fp16 rescore)
+
+| Query | p50 (ms) | QPS serial | QPS, 8 clients | p95, 8 clients (ms) | Server CPU per query, 8 clients (ms) | Quality |
+|---|---|---|---|---|---|---|
+| Summaries, vector, k=10 | **6.9** (21.2) | **145** (51.7) | **522** (285) | **21.0** (33.5) | **4.5** (24.9) | 0.996 (0.996) |
+| Summaries, hybrid, k=10 | **9.2** (19.6) | **87.7** (50.7) | 242 (**262**) | 42.6 (**35.7**) | **12.7** (30.1) | 0.994 (0.994) |
+| One document, vector, k=5 | **3.2** (5.9) | **295** (177) | 1,076 (**1,201**) | 13.7 (**11.3**) | **1.2** (4.4) | 0.993 (0.993) |
+| One document, hybrid, k=5 | **5.7** (7.3) | **160** (134) | 613 (**1,011**) | 19.1 (**12.2**) | **2.5** (6.7) | 1.000 (1.000) |
+| Chunks, k=10 | 12.2 (**8.1**) | 81.6 (**131**) | 338 (**986**) | 26.9 (**11.8**) | **6.1** (6.6) | **1.000** (0.979) |
+| Chunks, k=100 | 19.4 (**17.2**) | 49.9 (**55.7**) | 179 (**396**) | 55.3 (**25.7**) | **10.0** (18.6) | **1.000** (0.982) |
+| Chunks, k=1000 | **67.9** (74.9) | **13.0** (12.3) | 21.4 (**87.7**) | 390 (**110**) | **61.0** (83.3) | **1.000** (0.949) |
+
+### IVF index (nlist 256, nprobe 16)
+
+| Query | p50 (ms) | QPS serial | QPS, 8 clients | p95, 8 clients (ms) | Server CPU per query, 8 clients (ms) | Quality |
+|---|---|---|---|---|---|---|
+| Summaries, vector, k=10 | **6.4** (21.2) | **153** (51.7) | **324** (285) | **27.8** (33.5) | **13.2** (24.9) | 0.996 (0.996) |
+| Summaries, hybrid, k=10 | **9.3** (19.6) | **84.7** (50.7) | 182 (**262**) | 61.8 (**35.7**) | **24.4** (30.1) | 0.994 (0.994) |
+| One document, vector, k=5 | **3.4** (5.9) | **286** (177) | 847 (**1,201**) | 13.4 (**11.3**) | **1.6** (4.4) | 0.993 (0.993) |
+| One document, hybrid, k=5 | **5.7** (7.3) | **157** (134) | 683 (**1,011**) | 17.4 (**12.2**) | **2.6** (6.7) | 1.000 (1.000) |
+| Chunks, k=10 | **7.0** (8.1) | **138** (131) | 306 (**986**) | 31.4 (**11.8**) | 15.8 (**6.6**) | **1.000** (0.979) |
+| Chunks, k=100 | **13.2** (17.2) | **71.7** (55.7) | 144 (**396**) | 69.5 (**25.7**) | 22.6 (**18.6**) | **1.000** (0.982) |
+| Chunks, k=1000 | **62.3** (74.9) | **14.6** (12.3) | 20.6 (**87.7**) | 411 (**110**) | 139 (**83.3**) | **1.000** (0.949) |
+
+- **Quality** is the own-target hit rate (summaries, one document) or recall@k against
+  exact search (chunks), rounded. At full precision:
+  - flat recall@100 is 0.99984–0.99986 (0.3.0: 0.99988, 6 misses in 50,000);
+  - IVF recall@100 is 0.99988;
+  - recall@1000 is 0.999895 on both indexes.
+- **Ingest:** 2,373 records/s (two runs: 2,392 and 2,354).
+- **Memory and disk:** after the workload set, 489 MB (flat) and 481 MB (IVF), from
+  148–151 MB before the queries. Disk: 2,041 MB (flat) and 2,058 MB (IVF).
+- **IVF:** builds in 4.1 s and detaches in 2.1 s.
+
+## 0.3.0 against `19c3293` (2026-11-07)
 
 Medians, concurrency 8, A → **B** (Weaviate), flat index. One-document search uses
 each version's way of scoping to a document: `19c3293` has no document filter, so it

@@ -4,9 +4,10 @@
     This email-corpus run was measured on the initial release's build, before the
     exact-rescoring work ([ADR 0003](adr/0003-recall-rescoring.md)) and the 2026-09
     performance work, and has not been re-run. Figures for the current release
-    (0.3.0), on the 2.55M-vector arxiv corpus, are in
+    (0.4.0), on the 2.55M-vector arxiv corpus, are in
     [Benchmark: arxiv abstracts](benchmark-arxiv.md#results); how they were
-    measured is in [the 0.3.0 re-measurement](benchmark-arxiv-2026-11.md).
+    measured is in [ADR 0017](adr/0017-turbovec-1-1.md) and
+    [the 0.3.0 re-measurement](benchmark-arxiv-2026-11.md).
 
 raggio vs [Weaviate](https://weaviate.io/) on 552,515 real email embeddings,
 measured with the same harness, corpus, queries, and host — an NVIDIA DGX

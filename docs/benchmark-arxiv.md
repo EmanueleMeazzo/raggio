@@ -66,41 +66,44 @@ its cap fails loudly rather than getting a quiet upgrade.
 
 ## Results
 
-**Current version, release 0.3.0, measured 2026-11-07** on the same DGX Spark and
-corpus: the raggio columns are commit `f1b0ab3`, each figure the median of 6 runs
-(concurrency 8; ingest: the median of 2), from the re-measurement in
-[Benchmark: arxiv abstracts, 0.3.0 re-measurement](benchmark-arxiv-2026-11.md),
-which has the protocol, the `19c3293` figures next to these, and the caveats.
-Against `19c3293` (the version this table showed before, measured 2026-10-03 in
-[the end-to-end A/B](benchmark-arxiv-2026-10.md)) no row moved beyond the
-run-to-run spread. The Weaviate column is carried over from the 2026-08-23 run
-below and was not re-measured, so the two sides were measured about eleven weeks
-apart.
+**Current version, release 0.4.0 (turbovec 1.1.2), measured 2026-11-08** on the same
+DGX Spark and corpus. The raggio columns are commit `5581e4d`. Each figure is the
+median of 6 runs at concurrency 8, from the A/B against 0.3.0 in
+[ADR 0017](adr/0017-turbovec-1-1.md), which has the protocol, the 0.3.0 figures and
+the raw tables (`bench/results-turbovec-2026-11.md`).
+
+- **What moved:** turbovec 1.1's staged 4-bit search halved the flat scan's latency and
+  cut its CPU per query to a third, with recall@10 still 1.000. The IVF column did not
+  move: its shards are too small for the staged search.
+- **Ingest and the Weaviate column:** the ingest rows were not re-run for 0.4.0; they
+  are 0.3.0's (2026-11-07, [re-measurement](benchmark-arxiv-2026-11.md)). The
+  document benchmark's ingest did not change between the two versions. The Weaviate
+  column is carried over from the 2026-08-23 run below.
 
 | Metric | raggio | raggio-ivf | weaviate |
 |---|---|---|---|
 | Ingest wall time (s) | 764 | — | 975 |
 | Ingest throughput (vec/s) | 3378 | — | 2614 |
-| IVF index build (s) | — | 183 | — |
-| Memory after a restart (MB) | 1501 | 1506 | 22990 |
-| Memory under query load (MB) | 1506 | 1514 | 23380 |
+| IVF index build (s) | — | 178 | — |
+| Memory after a restart (MB) | 1470 | 1506 | 22990 |
+| Memory under query load (MB) | 1479 | 1513 | 23380 |
 | Disk footprint (MB) | 16463 | 16751 | 18374 |
-| Search p50 (ms) | 18.5 | 6.2 | 15.3 |
-| Search p95 (ms) | 19.9 | 8.0 | 50.3 |
-| Search p99 (ms) | 20.5 | 8.9 | 82.5 |
-| QPS serial | 54 | 160 | 49 |
-| QPS concurrent | 126 | 385 | 1050 |
-| p95 under concurrency (ms) | 69.4 | 25.5 | 10.8 |
-| Filtered p50 (ms) | 24.4 | 6.0 | 12.8 |
-| Filtered p95 (ms) | 31.0 | 7.2 | 21.1 |
-| Recall@10 vs exact | **1.000** | 0.994 | 0.995 |
-| Hybrid p50 (ms) | 48.1 | 45.1 | 35.8 |
-| Hybrid p95 (ms) | 73.4 | 70.8 | 72.5 |
-| Hybrid p99 (ms) | 98.8 | 96.1 | 114.4 |
-| Hybrid QPS serial | 20.5 | 21.9 | 25.3 |
-| Hybrid QPS concurrent | 34.9 | 38.5 | 169.0 |
+| Search p50 (ms) | 8.0 | 6.2 | 15.3 |
+| Search p95 (ms) | 9.3 | 7.8 | 50.3 |
+| Search p99 (ms) | 9.8 | 8.5 | 82.5 |
+| QPS serial | 124 | 160 | 49 |
+| QPS concurrent | 321 | 401 | 1050 |
+| p95 under concurrency (ms) | 31.2 | 22.8 | 10.8 |
+| Filtered p50 (ms) | 21.7 | 5.7 | 12.8 |
+| Filtered p95 (ms) | 24.9 | 7.0 | 21.1 |
+| Recall@10 vs exact | **1.000** | 0.993 | 0.995 |
+| Hybrid p50 (ms) | 45.4 | 44.6 | 35.8 |
+| Hybrid p95 (ms) | 70.6 | 69.7 | 72.5 |
+| Hybrid p99 (ms) | 94.6 | 93.8 | 114.4 |
+| Hybrid QPS serial | 21.7 | 22.1 | 25.3 |
+| Hybrid QPS concurrent | 37.9 | 37.5 | 169.0 |
 | Hybrid text-hit@10 | **0.984** | **0.984** | 0.978 |
-| Cold start, evicted page cache, to first answer (s) | 4.9 | 5.2 | 12.8 (older measure) |
+| Cold start, evicted page cache, to first answer (s) | 5.0 | 5.2 | 12.8 (older measure) |
 
 Notes on the current table:
 
@@ -109,15 +112,17 @@ Notes on the current table:
   cache. It is not the measure of the original run's "Cold start to first query"
   row (restart to first vector search, file cache not evicted), and Weaviate's
   12.8 s is that older measure, so the row is not like for like.
-- **Memory** rows are read after a container restart, in a 4 GiB container. In the
-  container that just ingested, flat raggio reads 1555 MB right after ingest (the
-  original run read 729 MB, so that row is higher now) and 1587 MB under load
-  (original: 1761 MB). The original run's 3052 MB for raggio-ivf was read in the
-  container that had just built the index, not after a restart.
-- **Flat concurrent QPS** (126) is bimodal across runs (125 to 175), as it was for
-  `19c3293` (125 in the same sessions) and the original baseline.
-- **Ingest** is the median of two full ingests, at 3,007 and 3,749 vec/s;
-  `19c3293` ingested at 3,124 and 3,107 vec/s in the same session.
+- **Memory** rows are read after a container restart, in a 4 GiB container.
+- **Flat concurrent QPS** is 309–335 across the six runs. Under turbovec 1.0.0 it was
+  bimodal (125 to 217) in every run since the original baseline.
+- **CPU-dependent:** the staged search needs an arm64 CPU with `dotprod` or an x86-64
+  CPU with AVX-512 VBMI and VNNI, and an index of at least 32,768 vectors. Elsewhere
+  turbovec 1.1.2 keeps the whole-index scan. Under 1.0.0 that scan measured 18.5 ms p50
+  on this host ([0.3.0 figures](benchmark-arxiv-2026-11.md)); 1.1.2's whole-index scan
+  was not measured.
+- **IVF index build:** 178 s is the median of B's four builds (46, 178, 180, 178 s).
+  The first ran right after its volume was copied, with the files in the page cache.
+  The detach took 94 s.
 
 ### Original run, 2026-08-23
 
