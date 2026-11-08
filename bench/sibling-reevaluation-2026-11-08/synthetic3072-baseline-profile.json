@@ -1,0 +1,136 @@
+{
+  "facts": {
+    "arm": "baseline",
+    "baseline_revision": "37c686eb1c1ee89f31f91b71d133b25a772f7011",
+    "benchmark_server_sha256": "fcdcb2bd1a3833ec2a5e3c5dd0ab76f9d426680a7e720450bce1b67e7ddf9214",
+    "baseline_store_sha256": "7b593115c86eac7fed632bef8a7ca5ac098bb398bbcf5fb1bae0669c7e4bb399",
+    "candidate_store_sha256": "831797123e268658764242e1a76563d5fb64d8a9dac82a0677b00a6c35e6ead7",
+    "executed_methods_sha256": {
+      "search": "33f8481d685b60780607806a1e044ddf4274e7ac6ba6a179790b2b08759faba2",
+      "_expand": "4b173ce2da175c0273b76d58285c6c234a53a4ea742535e6c5cb920f821dae34",
+      "_search_allowed": "3a56f96a780b62fdf71bf48eb5a69707759f36fdefdc55d6f42360e93f97b9d6"
+    },
+    "python": "3.12.15 (main, Oct 21 2026, 17:46:20) [Clang 23.1.3 ]",
+    "platform": "Linux-7.0.0-1025-nvidia-aarch64-with-glibc2.41",
+    "sqlite": "3.53.1",
+    "versions": {
+      "raggio": "0.4.0",
+      "turbovec": "1.1.2",
+      "numpy": "2.5.3",
+      "httpx": "0.28.1",
+      "fastapi": "0.142.2",
+      "raggio-native": "0.1.0"
+    },
+    "native_bm25": true,
+    "openblas_threads": "1"
+  },
+  "cases": {
+    "doc-vector-k5-ranked": {
+      "sql": {
+        "vector_blobs": 6,
+        "other_select": 11,
+        "document_membership": 10
+      },
+      "python_peak_bytes": 893555,
+      "response_sha256": "75536129483bd44f0c8a30d41a714c224cbd864d5f91a118dfdeeafc0330672b",
+      "hits": 5,
+      "distinct_documents": 1
+    },
+    "doc-vector-k10-ranked": {
+      "sql": {
+        "vector_blobs": 11,
+        "other_select": 21,
+        "document_membership": 20
+      },
+      "python_peak_bytes": 926911,
+      "response_sha256": "f4ee426b2a36aace037c080139d20525e1a3847da83142ec00a1beb3d8af41bf",
+      "hits": 10,
+      "distinct_documents": 1
+    },
+    "global-vector-k10-ranked": {
+      "sql": {
+        "vector_blobs": 11,
+        "other_select": 21,
+        "document_membership": 20
+      },
+      "python_peak_bytes": 1820871,
+      "response_sha256": "83146af1a5d5eba94cb72be344963ebca4b484e8a584dc05689838471e930b91",
+      "hits": 10,
+      "distinct_documents": 1
+    },
+    "global-hybrid-k10-ranked": {
+      "sql": {
+        "other_select": 24,
+        "vector_blobs": 11,
+        "document_membership": 20
+      },
+      "python_peak_bytes": 6459758,
+      "response_sha256": "f2df16b747fa304b7acb6d31eb420e887d5c52610a2103149751dd18fd28071c",
+      "hits": 10,
+      "distinct_documents": 1
+    },
+    "ranked-summary-control": {
+      "sql": {
+        "vector_blobs": 11,
+        "other_select": 11,
+        "document_membership": 10
+      },
+      "python_peak_bytes": 1820847,
+      "response_sha256": "8f09e5b13a5deff444148f524cf5f177868653b9df35b93a0738adc73e8a7f27",
+      "hits": 10,
+      "distinct_documents": 10
+    },
+    "sofia-summary": {
+      "sql": {
+        "other_select": 4,
+        "vector_blobs": 1
+      },
+      "python_peak_bytes": 6459589,
+      "response_sha256": "f7993953a5d4bc79832f0e5c57e725e7c76ab574db6fd57f5c05f43fbffd6dab",
+      "hits": 10,
+      "distinct_documents": 10
+    },
+    "sofia-doc-vector": {
+      "sql": {
+        "vector_blobs": 1,
+        "other_select": 1
+      },
+      "python_peak_bytes": 890306,
+      "response_sha256": "09a791ad1f2f0d377dac2c07a9924dba3b8c2746be89001cdfb7641746d37a9a",
+      "hits": 5,
+      "distinct_documents": 1
+    },
+    "sofia-doc-hybrid": {
+      "sql": {
+        "vector_blobs": 1,
+        "other_select": 3
+      },
+      "python_peak_bytes": 895003,
+      "response_sha256": "22c76ac681b0328aa9374caa65e3b1898975df9bd9480925cc7ba2fd4f51cfa9",
+      "hits": 5,
+      "distinct_documents": 1
+    },
+    "all-siblings-control": {
+      "sql": {
+        "vector_blobs": 1,
+        "other_select": 23,
+        "document_membership": 20
+      },
+      "python_peak_bytes": 1151134,
+      "response_sha256": "e0bffb24071883ea6a4e9ab4171659c4eea014b88c7389bb0f0a1b58a6ccc85d",
+      "hits": 10,
+      "distinct_documents": 1
+    },
+    "summary-only-control": {
+      "sql": {
+        "vector_blobs": 1,
+        "other_select": 11,
+        "document_membership": 10
+      },
+      "python_peak_bytes": 1819971,
+      "response_sha256": "a02dd2a5b0837f007d8260ecaeae8370bf879b69e4dbc30f4eebe385da0040c1",
+      "hits": 10,
+      "distinct_documents": 1
+    }
+  }
+}

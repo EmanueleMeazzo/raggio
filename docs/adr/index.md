@@ -28,6 +28,7 @@ results describe their measured revisions, rather than the latest commit.
 | [0016](0016-native-search-json.md) | Reuse a shared native JSON request parser for search | Accepted; merged in PR #13 and included in 0.3.0 DEV acceptance |
 | [0017](0017-turbovec-1-1.md) | turbovec 1.1.2: staged 4-bit search on, v8 index files (one-way), raggio 0.4.0 | Accepted; flat search 2.3× faster on the 2.55M arxiv corpus |
 | [0018](0018-collection-delete-and-embedding-retries.md) | Retire deleted directories before name reuse; retry only transient embedding failures | Accepted; issues #1/#4 fixed, #2/#5 already addressed |
+| [0019](0019-sibling-vector-reuse-reevaluation.md) | Reevaluate request-scoped sibling vectors against current main, with real-data controls | Evaluated candidate for review; historical PR #10 remains unmerged |
 
 ADRs 0011–0012 archive the expansion experiments and sibling-vector reuse from
 [PR #10](https://github.com/EmanueleMeazzo/raggio/pull/10), closed without merging

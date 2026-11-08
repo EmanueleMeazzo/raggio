@@ -1,0 +1,1 @@
+{"a": {"url": "http://127.0.0.1:28312", "pid": 1591639, "variant": "baseline", "server_cpu_affinity": [15, 16, 17]}, "b": {"url": "http://127.0.0.1:28312", "pid": 1591639, "variant": "baseline", "server_cpu_affinity": [15, 16, 17]}, "c": {"url": "http://127.0.0.1:28312", "pid": 1591639, "variant": "candidate", "server_cpu_affinity": [15, 16, 17]}}

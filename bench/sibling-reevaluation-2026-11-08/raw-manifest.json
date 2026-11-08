@@ -1,0 +1,41 @@
+{
+  "synthetic3072-ab.json": {
+    "sha256": "35f0b4239bce366fe70f6a1abf0fb34e32ced727e3f5740e1639e01d88447d34",
+    "bytes": 522257,
+    "gzip": "synthetic3072-ab.json.gz"
+  },
+  "wiki-aa-single.json": {
+    "sha256": "7d27f780adb408e2b18b6ba01eb12a32db1220d4f461e0c45736e75f449fb853",
+    "bytes": 1040305,
+    "gzip": "wiki-aa-single.json.gz"
+  },
+  "wiki-aa.json": {
+    "sha256": "c02099b11075d1a2441431cc3ea23c5766c8e14eae76690c3ca89cce5d331cc6",
+    "bytes": 971009,
+    "gzip": "wiki-aa.json.gz",
+    "excluded_from_performance": true,
+    "reason": "Initial between-process calibration, superseded by primary same-process A/A."
+  },
+  "wiki-ab-single.json": {
+    "sha256": "9d9475ff646adb79d5fb0cd3cca239cdf1734dd9a746de70ccc1a110cf1a5794",
+    "bytes": 5126902,
+    "gzip": "wiki-ab-single.json.gz"
+  },
+  "wiki-controls-aa.json": {
+    "sha256": "37319beb320a4ac85a140aa80ffc39a7e27e53d9a5e99cb9f9d6b94598350221",
+    "bytes": 537123,
+    "gzip": "wiki-controls-aa.json.gz",
+    "excluded_from_performance": true,
+    "reason": "Unrelated host contention: median 94.3%, maximum 95.2% host CPU busy; replaced by clean calibration."
+  },
+  "wiki-controls-ab.json": {
+    "sha256": "08df5eb87418d2897d8de3841d51310b6c9bef1e7d29d3f90a6a72631a44edce",
+    "bytes": 4112415,
+    "gzip": "wiki-controls-ab.json.gz"
+  },
+  "wiki-controls-aa-clean.json": {
+    "sha256": "69abb5aa64178a20494c61adbf0586d7df325117c0f2abdf44d5f0d86a01e1a9",
+    "bytes": 633002,
+    "gzip": "wiki-controls-aa-clean.json.gz"
+  }
+}

@@ -1,0 +1,38 @@
+{
+ "model": "Qwen/Qwen3-Embedding-0.6B",
+ "dims": 1024,
+ "dataset": "legacy-datasets/wikipedia",
+ "config": "20220301.en",
+ "revision": "97a0b052c326b45fb68593a14972d9eed884cd17",
+ "shards": [
+  "train-00000-of-00041.parquet"
+ ],
+ "seed": 42,
+ "n_docs": 25000,
+ "n_records": 173320,
+ "n_summaries": 25000,
+ "n_chunks": 148320,
+ "n_queries": {
+  "summary": 500,
+  "indoc": 500
+ },
+ "params": {
+  "summary_words": 300,
+  "min_lead_words": 60,
+  "chunk_words": 800,
+  "min_tail_words": 200,
+  "max_chunks": 10,
+  "min_body_words": 2400,
+  "sentence_words": [
+   8,
+   40
+  ],
+  "indoc_min_chunks": 3,
+  "query_instruction": "Given a web search query, retrieve relevant passages that answer the query"
+ },
+ "words": {
+  "summary_mean": 219.0584,
+  "chunk_mean": 822.365574433657
+ },
+ "embedded": true
+}

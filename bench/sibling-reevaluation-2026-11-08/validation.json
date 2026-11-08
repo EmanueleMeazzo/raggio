@@ -1,0 +1,30 @@
+{
+  "windows_native": {
+    "python": "3.12.15",
+    "passed": 911,
+    "skipped": 6,
+    "seconds": 141.29
+  },
+  "linux_arm64_native": {
+    "python": "3.12.15",
+    "passed": 913,
+    "skipped": 4,
+    "seconds": 43.91,
+    "junit": "linux-native.xml"
+  },
+  "windows_free_threaded_candidate_and_stress": {
+    "python": "3.14.10t",
+    "passed": 34,
+    "deselected": 38,
+    "seconds": 33.19,
+    "gil_enabled": false
+  },
+  "candidate_specific_reference_tests": {
+    "passed": 32,
+    "seconds": 10.36
+  },
+  "analysis_gate_tests": {
+    "passed": 4,
+    "seconds": 0.03
+  }
+}

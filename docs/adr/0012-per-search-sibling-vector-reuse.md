@@ -31,6 +31,10 @@ checkout, not a feature shipped in main.
 
 ## Evaluated implementation and scope
 
+**Reevaluation, 2026-11-08:** [ADR 0019](0019-sibling-vector-reuse-reevaluation.md)
+records a separate current-main candidate and fresh Wikipedia/control measurements.
+The historical branch and decision below remain the record of PR #10.
+
 Reuse normalized retained sibling vectors within one search when ranked vector
 expansion returns several hits from a document. Keep the existing ranking, self
 exclusion, membership, score calculation and legacy-vector fallback. Text expansion,

@@ -86,6 +86,24 @@ above. This removes fixed process placement and initialization as treatment
 confounders. The candidate runtime design is unchanged. Memory tracing remains a
 separate operation; same-process retained RSS is not a per-arm allocation measure.
 
+### Targeted follow-up after the primary comparison
+
+The primary run's ordinary summary control at eight clients has a median latency
+change near +3%, but a wide paired interval crossing zero. Before interpreting it,
+repeat ordinary summary and in-document vector controls with seven paired rounds
+and eight-second measured blocks, with a matching summary A/A calibration. Preserve
+this as a separate follow-up; do not pool it silently into the primary results.
+
+Also run the planned synthetic 3072-dimension sensitivity: k=10 ranked in-document
+search, global hybrid ranked expansion and the strict ranked-summary control at
+eight clients. Keep source, CPU affinity, quotas and exact-output gates unchanged.
+
+The final resource audit found heavy host contention only in the long summary A/A
+calibration (host CPU about 94%, unlike the clean primary and subsequent A/B runs).
+Retain it as contaminated and exclude its noise estimates. Repeat only this A/A
+after a fresh idle probe. Preserve the clean A/B and sensitivity recordings as
+separate phases; do not pool the contaminated calibration into their analysis.
+
 No adoption recommendation without exact correctness, bounded resources, useful
 ranked-expansion gains and acceptable unaffected controls. Record limitations and
 the outcome in an ADR, retain raw results, and return the decision for discussion.
