@@ -15,7 +15,7 @@ results describe their measured revisions, rather than the latest commit.
 | [0003](0003-recall-rescoring.md) | Exact fp16 rescoring and two-stage full-query BM25 | Accepted; native scorer in 0004, relative fusion in 0007 |
 | [0004](0004-native-bm25.md) | Native BM25/tokenizer with Python reference and bit parity | Accepted |
 | [0005](0005-ivf-fanout-and-upstream-stance.md) | Parallel IVF shard searches, intersections, and upstream stance | Accepted |
-| [0006](0006-free-threaded-python.md) | Free-threaded Python evaluation and optional image | Experimental |
+| [0006](0006-free-threaded-python.md) | Free-threaded Python evaluation and flag-selected image | Experimental opt-in; reevaluated 2026-11-08 |
 | [0007](0007-sofia-backend-requirements.md) | Relative fusion, document filters, small-set exact search, lifecycle and NFS contracts | Accepted |
 | [0008](0008-native-ingest-json.md) | Pydantic native ingest JSON parsing with compatibility fallback | Accepted |
 | [0009](0009-ingest-vector-conversion.md) | Reuse validated ingest vectors until journal encoding | Accepted |
@@ -78,6 +78,7 @@ without a new deployment performance measurement.
 
 | Work | Implementation / decision | Documentation and evidence |
 |---|---|---|
+| Python 3.14 reevaluation and opt-in | `PYTHON=3.14t` selects the guarded free-threaded image; Python 3.12 remains the default | [Setup and pros/cons](../free-threaded-python.md), [idle-host evaluation](../python-3.14-reevaluation-2026-11-07.md), [full tables](../python-3.14-reevaluation-measurements-2026-11-08.md), raw evidence in `bench/python314-2026-11-08/` |
 | Rust rewrite assessment | Keep the Python/native architecture; no service rewrite | [Archived assessment](../research/rust-rewrite-assessment-2026-11-04.md), measured at `da432a6`; original raw experiments retained locally in `C:/DevOps/raggio-rust-evaluation-20261104/` |
 | Native ingest JSON parsing | `b6311a5`, merged by `96b55ed` in [PR #7](https://github.com/EmanueleMeazzo/raggio/pull/7) | [ADR 0008](0008-native-ingest-json.md); `bench/results-ingest-json.json` |
 | Avoid ingest vector-list copies | `7b3eb14`, merged by `813b6da` in [PR #8](https://github.com/EmanueleMeazzo/raggio/pull/8) | [ADR 0009](0009-ingest-vector-conversion.md); large/small raw results under `bench/` |

@@ -117,9 +117,9 @@ The historical [ADR 0006](adr/0006-free-threaded-python.md) explicitly said **Ho
 
 Full tables: [supporting measurements](python-3.14-reevaluation-measurements-2026-11-08.md).
 
-Portable numerical evidence and runners: [evaluation archive](../bench/python314-2026-11-08/README.md),
-[validation](../bench/python314-2026-11-08/validation-idle.json), and
-[aggregate results](../bench/python314-2026-11-08/idle-summary.json). The original
+Portable numerical evidence and runners: [evaluation archive](https://github.com/EmanueleMeazzo/raggio/blob/89acfe9c3547a1c6b8a4f58e2af33076ca16cb78/bench/python314-2026-11-08/README.md),
+[validation](https://github.com/EmanueleMeazzo/raggio/blob/89acfe9c3547a1c6b8a4f58e2af33076ca16cb78/bench/python314-2026-11-08/validation-idle.json), and
+[aggregate results](https://github.com/EmanueleMeazzo/raggio/blob/89acfe9c3547a1c6b8a4f58e2af33076ca16cb78/bench/python314-2026-11-08/idle-summary.json). These links pin the saved evidence commit so they also work from the documentation site. The original
 local archive remains at `D:/DEV/_scratch/python314-reevaluation/`; remote evidence,
 query fixture and private data copies remain at
 `~/raggio-bench/python314-reevaluation-20261107/` on GN100. This evaluation's

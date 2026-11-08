@@ -51,6 +51,7 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Getting started: getting-started.md
+  - Free-threaded Python: free-threaded-python.md
   - Search: search.md
   - Concepts & terminology: concepts.md
   - Vector indexing: indexing.md
@@ -62,3 +63,4 @@ nav:
   - Benchmark (arxiv, end-to-end A/B 2026-10): benchmark-arxiv-2026-10.md
   - Benchmark (arxiv, 0.3.0 re-measurement 2026-11): benchmark-arxiv-2026-11.md
   - Benchmark (document retrieval, 2026-11): benchmark-documents.md
+  - Python 3.14 evaluation (2026-11): python-3.14-reevaluation-2026-11-07.md
