@@ -12,8 +12,9 @@ mkdir -p "$TASK/results" "$TASK/data"
 
 case "${1:?setup|start|smoke|measure|stop|profile}" in
   setup)
-    podman build -f "$TASK/source/bench/SiblingReevaluation.Dockerfile" -t "$IMAGE" "$TASK/source" > "$TASK/results/build.log" 2>&1
+    podman build --ignorefile "$TASK/source/bench/sibling_reeval.containerignore" -f "$TASK/source/bench/SiblingReevaluation.Dockerfile" -t "$IMAGE" "$TASK/source" > "$TASK/results/build.log" 2>&1
     podman image inspect "$IMAGE" > "$TASK/results/image.json"
+    podman run --rm --network none "$IMAGE" -c 'from pathlib import Path; assert Path("/project/bench/sibling_reeval_server.py").is_file(); assert Path("/project/tests/test_sibling_vectors.py").is_file()'
     podman run --rm --network none --cpus 3 --memory 4g -v "$TASK/data:/data" "$IMAGE" "$SERVER" prepare --source synthetic --docs 500 --dim 1024 --output /data/synthetic > "$TASK/results/prepare-synthetic.log" 2>&1
     podman run --rm --network none --cpus 3 --memory 4g -v "$TASK/data:/data" -v "$HOME/raggio-bench/wiki/bench/corpus-wiki:/corpus:ro" "$IMAGE" "$SERVER" prepare --source wiki --docs 5000 --corpus /corpus --output /data/wiki > "$TASK/results/prepare-wiki.log" 2>&1
     ;;
