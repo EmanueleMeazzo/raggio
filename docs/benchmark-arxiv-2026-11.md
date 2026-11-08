@@ -18,9 +18,10 @@ spread**, for flat or IVF search, at 8 or 16 clients: vector, filtered and
 hybrid latency and throughput, CPU per query, recall, text-hit rate, memory,
 disk, cold start, index build and detach. Ingest throughput (two runs per arm)
 is within the spread too; three two-run rows measured right after an ingest are
-not ([below](#right-after-a-fresh-ingest)). The current figures in
-[Benchmark: arxiv abstracts](benchmark-arxiv.md#results) and the README are
-B's medians.
+not ([below](#right-after-a-fresh-ingest)). B's medians were the published
+figures until 0.4.0 ([ADR 0017](adr/0017-turbovec-1-1.md)), whose turbovec 1.1.2
+halved the flat scan's latency; the ingest rows of
+[Benchmark: arxiv abstracts](benchmark-arxiv.md#results) and the README are still B's.
 
 ## Setup
 

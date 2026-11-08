@@ -70,23 +70,12 @@ podman build --build-arg PYTHON=3.14t -t raggio:py314t .
 podman run -p 8000:8000 -v raggio-data:/data -e ROOT_API_KEY=change-me raggio:py314t
 ```
 
-The default image uses Python 3.12. For the exact interpreter measured below, use
-`--build-arg PYTHON=3.14.10t`. Stop the previous process before using the same data
-volume with the alternative image. `/healthz` reports `"gil_enabled": false` when
-free threading is active; the build and runtime guards reject unsupported extensions
-that would turn the GIL back on.
-
-| Pros | Cons |
-|---|---|
-| At 8 concurrent clients, document vector/hybrid throughput improved **47–87%** versus Python 3.12 in the [idle-host evaluation](docs/python-3.14-reevaluation-2026-11-07.md). | Single-client expanded document search was **18% slower**; performance gains depend on the request shape and concurrency. |
-| Large-corpus hybrid throughput improved about **6–7%**, with lower tail latency. All **818** applicable Linux tests and the extended concurrency soak passed. | At full CPU saturation, a blocking lock hand-off probe took about **111 ms** versus **2 ms** on the GIL builds. Reserve CPU headroom. |
-| The same Dockerfile builds both interpreters with the native scorer and GIL checks. | turbovec currently has no free-threaded wheel, so the image compiles it from source. The 3.14t image remains an experimental opt-in. |
-
-These results are from raggio 0.3.0 on one DGX Spark with locked turbovec 1.0.0;
-they are measurements for that setup, not a guarantee for later dependencies or other
-hardware. See [setup and safeguards](docs/free-threaded-python.md),
-[the full evaluation](docs/python-3.14-reevaluation-2026-11-07.md), and
-[ADR 0006](docs/adr/0006-free-threaded-python.md).
+The default image uses Python 3.12; the 3.14t image is an experimental opt-in. Stop
+the previous process before using the same data volume with the alternative image.
+`/healthz` reports `"gil_enabled": false` when free threading is active; the build and
+runtime guards reject unsupported extensions that would turn the GIL back on.
+turbovec has no free-threaded wheel, so the image compiles it from source. Measured
+gains and costs, setup and safeguards: [docs/free-threaded-python.md](docs/free-threaded-python.md).
 
 One process per `DATA_DIR`: raggio locks `DATA_DIR/raggio.lock` before opening
 anything, and a second process (the new replica of a rolling restart on a shared
@@ -164,10 +153,11 @@ an existing chunk/doc id upserts it.
 
 ### Optional vector index
 
-Collections don't need an index — below ~1M vectors the exact quantized scan is as
-fast as (or faster than) a graph index at higher recall, so the default is none. Past
-~2M vectors, attach a ScaNN-style IVF index (at 2.55M vectors: 6.2 ms p50 against
-18.5 ms and 3x the concurrent throughput, for recall@10 0.994; tunable per query via
+Collections don't need an index: up to the 2.55M vectors measured below, the
+quantized scan answers faster than a graph index, at higher recall, so the default is
+none. Past ~2M vectors, a ScaNN-style IVF index trims latency further, most of all for
+filtered searches (at 2.55M vectors: 6.2 against 8.0 ms p50, filtered 5.7 against
+21.7 ms, 1.25x the concurrent throughput, for recall@10 0.993; tunable per query via
 `nprobe`):
 
 ```bash
@@ -204,20 +194,20 @@ embeddings, k=10), Weaviate at **32 GiB** (HNSW, uncompressed float32, defaults)
 
 | Metric | raggio (4 GiB) | + IVF index | Weaviate (32 GiB) |
 |---|---|---|---|
-| Vector search p50 / p95 | 18.5 / 19.9 ms | **6.2 / 8.0 ms** | 15.3 / 50.3 ms |
-| Recall@10 vs exact float32 | **1.000** (4-bit scan + fp16 rescore) | 0.994 | 0.995 |
-| Hybrid search (RRF) p50 | 48.1 ms | 45.1 ms | **35.8 ms** |
+| Vector search p50 / p95 | 8.0 / 9.3 ms | **6.2 / 7.8 ms** | 15.3 / 50.3 ms |
+| Recall@10 vs exact float32 | **1.000** (4-bit scan + fp16 rescore) | 0.993 | 0.995 |
+| Hybrid search (RRF) p50 | 45.4 ms | 44.6 ms | **35.8 ms** |
 | Hybrid text-hit@10 | 0.984 | 0.984 | 0.978 |
-| QPS concurrent (8) | 126 | 385 | **1050** |
+| QPS concurrent (8) | 321 | 401 | **1050** |
 | Memory under query load | **1.5 GB** | **1.5 GB** | 23.4 GB |
 | Disk footprint | **16.5 GB** | 16.8 GB | 18.4 GB |
-| Ingest 2.55M vectors (journaled + crash-safe) | **13 min (3,378 vec/s)** | +3.1 min index build | 16.3 min (2,614 vec/s) |
-| Cold start, evicted page cache, to first answer | 4.9 s | 5.2 s | 12.8 s (not the same measure) |
+| Ingest 2.55M vectors (journaled + crash-safe) | **13 min (3,378 vec/s)** | +3.0 min index build | 16.3 min (2,614 vec/s) |
+| Cold start, evicted page cache, to first answer | 5.0 s | 5.2 s | 12.8 s (not the same measure) |
 
-raggio serves the same 2.55M vectors in ~15x less memory with recall 1.000 (the
-quantized scan re-ranks its candidates against the stored fp16 originals) and
-text-hit parity from two-stage BM25; the optional IVF index beats HNSW on vector
-latency at equal recall. Weaviate wins concurrent throughput and hybrid latency.
+raggio serves the same 2.55M vectors in ~15x less memory, and even without an index
+answers a vector search in about half of HNSW's p50 latency at recall 1.000 (the
+quantized scan re-ranks its candidates against the stored fp16 originals), with
+text-hit parity from two-stage BM25. Weaviate wins concurrent throughput and hybrid latency.
 Weaviate's column comes from its own run on the same host and corpus; its cold start
 is restart to first query, not the evicted-cache measure. Full table, method and
 caveats: [docs/benchmark-arxiv.md](docs/benchmark-arxiv.md).
@@ -228,13 +218,13 @@ plus up to 10 chunks each, 173,320 records, 1024-dim), flat index, 8 clients, We
 
 | Query | raggio | Weaviate |
 |---|---|---|
-| Within one document, vector, k=5: p50 / QPS | **2.9 ms** / 902 | 5.9 ms / **1,201** |
-| Within one document, hybrid, k=5: p50 / QPS | **5.5 ms** / 607 | 7.3 ms / **1,011** |
-| Summaries, vector, k=10: p50 / QPS | **7.5 ms** / **461** | 21.2 ms / 285 |
-| Summaries, hybrid, k=10: p50 / QPS | **9.9 ms** / 222 | 19.6 ms / **262** |
-| Chunks, k=100: p50 / QPS / recall@100 | 18.1 ms / 166 / **1.000** | **17.2 ms** / **396** / 0.982 |
-| Chunks, k=1000: p50 / QPS / recall@1000 | **69 ms** / 21 / **1.000** | 75 ms / **88** / 0.949 |
-| Memory after the workloads / disk | **474 MB / 2.0 GB** | 2.1 GB / 2.5 GB |
+| Within one document, vector, k=5: p50 / QPS | **3.2 ms** / 1,076 | 5.9 ms / **1,201** |
+| Within one document, hybrid, k=5: p50 / QPS | **5.7 ms** / 613 | 7.3 ms / **1,011** |
+| Summaries, vector, k=10: p50 / QPS | **6.9 ms** / **522** | 21.2 ms / 285 |
+| Summaries, hybrid, k=10: p50 / QPS | **9.2 ms** / 242 | 19.6 ms / **262** |
+| Chunks, k=100: p50 / QPS / recall@100 | 19.4 ms / 179 / **1.000** | **17.2 ms** / **396** / 0.982 |
+| Chunks, k=1000: p50 / QPS / recall@1000 | **68 ms** / 21 / **1.000** | 75 ms / **88** / 0.949 |
+| Memory after the workloads / disk | **489 MB / 2.0 GB** | 2.1 GB / 2.5 GB |
 
 raggio answers summary, one-document and k=1000 queries faster, at recall 1.000 and
 in a quarter of the memory; Weaviate serves more concurrent queries within one
