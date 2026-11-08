@@ -1933,6 +1933,7 @@ The maintainer said "Go ahead with all": lock bump, ADR, compatibility test, and
   - locally, the merged branch (local and remote), its worktree and a downloaded sdist.
 - **Kept:** `bench-tv`, `bench-wv`, the Wikipedia corpus, `localhost/raggio:baseline`, every run log, result and harness script on gn100 (3.4 MB and 0.7 MB), and the journal worktree.
 - **Left alone:** gn100's untagged `<none>` images, 12 of them. Some come from the 3.14 evaluation's builds, and which are this work's could not be told apart.
+- **Then removed on request:** the maintainer said "Remove the 12 untagged <none> images on the Spark". All 12 were dangling (no tag, no container using them) and were removed by ID without force. Every tagged image and container was unchanged afterwards.
 - **Archived:** the ledger, to `sdd-archive/2026-11-07-turbovec/`.
 
 ## 3. Decision register
