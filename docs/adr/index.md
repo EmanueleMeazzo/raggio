@@ -20,22 +20,22 @@ results describe their measured revisions, rather than the latest commit.
 | [0008](0008-native-ingest-json.md) | Pydantic native ingest JSON parsing with compatibility fallback | Accepted |
 | [0009](0009-ingest-vector-conversion.md) | Reuse validated ingest vectors until journal encoding | Accepted |
 | [0010](0010-search-response-encoding.md) | Encode hydrated search hits directly; retrieval-only optimization | Accepted |
-| [0011](0011-expansion-read-batching-evaluation.md) | Evaluate expansion read batching and sibling-vector reuse | Archived; not adopted |
-| [0012](0012-per-search-sibling-vector-reuse.md) | Evaluate bounded per-search sibling-vector reuse | Not adopted; PR #10 closed unmerged |
+| [0011](0011-expansion-read-batching-evaluation.md) | Evaluate expansion read batching and sibling-vector reuse | Historical; sibling reuse followed up in 0019 |
+| [0012](0012-per-search-sibling-vector-reuse.md) | Evaluate bounded per-search sibling-vector reuse | Historical PR #10 closed unmerged; current port accepted in 0019 |
 | [0013](0013-scoped-search-batching.md) | Bound and coalesce warm scope-only vector searches | Accepted; retrieval baseline from 2026-11-05 |
 | [0014](0014-contains-any-metadata-filter.md) | Add bounded OR of metadata substring alternatives | Accepted; retrieval capability, PR #12 |
 | [0015](0015-metadata-fts-keys.md) | Opt-in metadata keys in every BM25 path, with transactional PATCH | Accepted after Sofia DEV validation; merged in PR #14 |
 | [0016](0016-native-search-json.md) | Reuse a shared native JSON request parser for search | Accepted; merged in PR #13 and included in 0.3.0 DEV acceptance |
 | [0017](0017-turbovec-1-1.md) | turbovec 1.1.2: staged 4-bit search on, v8 index files (one-way), raggio 0.4.0 | Accepted; flat search 2.3× faster on the 2.55M arxiv corpus |
 | [0018](0018-collection-delete-and-embedding-retries.md) | Retire deleted directories before name reuse; retry only transient embedding failures | Accepted; issues #1/#4 fixed, #2/#5 already addressed |
-| [0019](0019-sibling-vector-reuse-reevaluation.md) | Reevaluate request-scoped sibling vectors against current main, with real-data controls | Evaluated candidate for review; historical PR #10 remains unmerged |
+| [0019](0019-sibling-vector-reuse-reevaluation.md) | Reuse request-scoped sibling vectors after current-main real-data and regression checks | Accepted; historical PR #10 remains preserved |
 
 ADRs 0011–0012 archive the expansion experiments and sibling-vector reuse from
 [PR #10](https://github.com/EmanueleMeazzo/raggio/pull/10), closed without merging
 on 2026-11-05 because Sofia does not use ranked sibling expansion and representative
-deployment benefit remains unvalidated. The branch and raw evidence are retained;
-its runtime and tests are not part of main. ADR 0013 independently targets Sofia's
-summary-search path.
+deployment benefit remained unvalidated. The old branch and raw evidence are retained.
+ADR 0019 later adopts a fresh current-main sibling-reuse port after new measurements;
+ADR 0013 independently targets Sofia's summary-search path.
 
 ## Current retrieval baseline
 
@@ -94,6 +94,10 @@ or controlled working-set improvement. Keep these historical benchmarks labeled
 by their measured revision and settings; the 0.3.0 acceptance adds quality evidence
 without a new deployment performance measurement.
 
+The subsequent [ADR 0019](0019-sibling-vector-reuse-reevaluation.md) adds bounded
+ranked-expansion reuse. The published benchmark rows above retain their original
+measured revisions; the separate reevaluation records this optimization's results.
+
 ## Work from the November 2026 optimization review
 
 | Work | Implementation / decision | Documentation and evidence |
@@ -105,6 +109,7 @@ without a new deployment performance measurement.
 | Avoid ingest vector-list copies | `7b3eb14`, merged by `813b6da` in [PR #8](https://github.com/EmanueleMeazzo/raggio/pull/8) | [ADR 0009](0009-ingest-vector-conversion.md); large/small raw results under `bench/` |
 | Search response encoding | `a872161`, merged by `6327693` in [PR #9](https://github.com/EmanueleMeazzo/raggio/pull/9); only the search response path changes | [ADR 0010](0010-search-response-encoding.md), endpoint parity tests and paired search results under `bench/`; [Sofia deployment follow-up](../research/sofia-retrieval-benchmark-2026-11-04.md) |
 | Expansion experiments and sibling reuse | [PR #10](https://github.com/EmanueleMeazzo/raggio/pull/10), closed without merging; branch `perf/sibling-vector-reuse` retained at `614c4b8` | Archived [ADR 0011](0011-expansion-read-batching-evaluation.md) and [ADR 0012](0012-per-search-sibling-vector-reuse.md), with original results/source links and closure rationale |
+| Current-main sibling-vector reuse | Fresh port accepted after Wikipedia, control and exact-parity gates | [ADR 0019](0019-sibling-vector-reuse-reevaluation.md), [reevaluation](../research/sibling-vector-reevaluation-2026-11-08.md), and raw paired recordings under `bench/sibling-reevaluation-2026-11-08/` |
 | Warm scope search batching | `1cdae1d`, merged by `01b160f` in [PR #11](https://github.com/EmanueleMeazzo/raggio/pull/11); bounded independent cohorts for cached scope allowlists | [ADR 0013](0013-scoped-search-batching.md), paired benchmarks, exact parity/resource/lifecycle tests and [accepted Sofia baseline](../research/sofia-scoped-search-baseline-2026-11-05.md) |
 | Alternative title/source substrings | [PR #12](https://github.com/EmanueleMeazzo/raggio/pull/12); `contains_any` with 1–256 scalar alternatives, OR within a key and AND across keys | [ADR 0014](0014-contains-any-metadata-filter.md), API grammar and title/literal/validation regression tests |
 | Metadata in keyword retrieval | `2939c3c`, merged by `2e8082b` in [PR #14](https://github.com/EmanueleMeazzo/raggio/pull/14); immutable `fts_keys`, stored suffix and generated single BM25 text | [ADR 0015](0015-metadata-fts-keys.md), [local cost evaluation](../research/fts-keys-evaluation-2026-11-05.md), [accepted DEV baseline](../research/sofia-fts-keys-acceptance-2026-11-05.md), integrity/parity/lifecycle tests and raw results |

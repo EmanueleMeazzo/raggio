@@ -1,6 +1,6 @@
 # ADR 0019 — Current-main sibling-vector reuse reevaluation
 
-Status: evaluated candidate for review; not merged · Date: 2026-11-08
+Status: accepted · Date: 2026-11-08
 
 Builds on [ADR 0012](0012-per-search-sibling-vector-reuse.md), whose historical
 candidate remains unmerged, and preserves [ADR 0013](0013-scoped-search-batching.md)
@@ -8,10 +8,12 @@ and [ADR 0017](0017-turbovec-1-1.md).
 
 ## Decision
 
-The fresh comparison supports reopening request-scoped sibling reuse as an
-optimization of raggio's existing ranked-expansion feature. It does not establish
-usage or benefit for Sofia's recorded summary/in-document flow without expansion.
-Keep this current-main port separate for review; do not merge the old branch.
+Adopt the validated current-main port of request-scoped sibling reuse for raggio's
+existing ranked-expansion feature. The maintainer authorized inclusion after the
+regression gates pass. The measured controls have no gate failures; the full
+production/native/free-threaded CI matrix must also pass before integration.
+The historical PR #10 branch remains preserved as an archive. Sofia's recorded
+summary/in-document flow without expansion has no claimed performance benefit.
 
 The cache remains per request, bounded to 8 MiB of prepared float32 rows and 4,096
 rows, with read-only arrays and existing membership/scoring/legacy fallback.
@@ -38,10 +40,11 @@ suites pass. Optional 3.14t candidate/lifecycle checks pass with the GIL off;
 and excluded; its replacement completes on an idle host. The usable recordings
 contain 579,758 exact-parity HTTP requests, with maximum host CPU busy 21.0%.
 
-## Limits and next decision
+## Limits and compatibility
 
 The real-data benefit is modest and workload dependent. Temporary allocation
 peaks do not materially decrease; the explicit cache bound excludes response,
 bookkeeping and native memory. Host-local HTTP and local storage do not establish
-Sofia's deployment results. Review the current-main implementation and decide
-whether this supported optional feature warrants the added code before adoption.
+Sofia's deployment results. The optimization activates for eligible repeated
+document hits using ranked vector/hybrid expansion. Other request shapes and
+unsupported documents retain their existing operations and score behavior.

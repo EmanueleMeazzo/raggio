@@ -1,7 +1,7 @@
 # Sibling-vector reuse: current-main reevaluation
 
-Date: 2026-11-08. Result: a fresh performance case for ranked sibling expansion;
-the candidate remains separate from main for review.
+Date: 2026-11-08. Result: the fresh current-main implementation is accepted for
+ranked sibling expansion after regression gates and the full CI matrix pass.
 
 ## What this establishes
 
@@ -143,11 +143,12 @@ recordings was 21.0%; the excluded calibration reached 95.2%.
 
 ## Disposition and evidence
 
-Reopen the performance case for the public ranked-expansion feature using this
-current-main candidate. Keep the old branch and its historical disposition intact.
-The immediate next decision is whether the modest real-data gains and larger
-repeated-document gains justify the additional request-scoped code for raggio's
-supported feature set. Sofia's recorded unexpanded flow receives no claimed benefit.
+The maintainer authorized inclusion of the current-main implementation after
+regression checks. The recorded primary and clean follow-up controls have no
+regression-gate failures; full CI is the remaining integration gate. The old branch
+and its historical disposition remain intact. The modest real-data gains and larger
+repeated-document gains apply to ranked expansion; Sofia's recorded unexpanded flow
+receives no claimed benefit.
 Deployment-specific storage, query mix and free-threaded performance remain limits.
 
 Raw evidence lives in `bench/sibling-reevaluation-2026-11-08/`: primary and follow-up

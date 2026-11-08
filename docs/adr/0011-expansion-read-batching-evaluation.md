@@ -1,6 +1,10 @@
 # ADR 0011 — Expansion read batching and sibling-vector reuse evaluation
 
-Status: archived investigation; not adopted · Date: 2026-11-04 · Disposition: 2026-11-05 · Builds on ADRs 0007 and 0010
+Status: historical investigation; read batching not adopted, sibling reuse followed up in ADR 0019 · Date: 2026-11-04 · Disposition: 2026-11-05
+
+**Current decision, 2026-11-08:** [ADR 0019](0019-sibling-vector-reuse-reevaluation.md)
+adopts the separately reevaluated current-main sibling-reuse port. The investigation
+below retains the earlier measurements and disposition of PR #10.
 
 ## Archive disposition
 
@@ -18,7 +22,7 @@ commands below refer to that archived checkout; main does not contain those prob
 The earlier exploration is also preserved by the
 [`archive/expansion-retrieval-2026-11-08` tag](https://github.com/EmanueleMeazzo/raggio/tree/archive/expansion-retrieval-2026-11-08).
 Its old `research/expansion-retrieval` branch was retired on 2026-11-08.
-The separate `perf/sibling-vector-reuse` branch remains available for review.
+The separate `perf/sibling-vector-reuse` branch remains preserved as historical source.
 
 Implementation follow-up: [ADR 0012](0012-per-search-sibling-vector-reuse.md) records
 the evaluated vector-reuse candidate and its subsequent disposition. The results below describe
