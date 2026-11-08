@@ -66,6 +66,14 @@ older release cannot read `job_payloads`, so drain the ingest queue
 (`pending_jobs` is 0 in `GET /collections/{name}` for every collection)
 before downgrading.
 
+## Deleting a collection
+
+Deletion stops the collection and removes its catalog entry, then renames its
+directory to `<name>.deleted-<uuid>` before allowing another create to reuse the
+name. Removing the retired directory runs separately, so its cleanup cannot
+remove a replacement collection. Startup removes retired directories left by
+interrupted cleanup. See [ADR 0018](adr/0018-collection-delete-and-embedding-retries.md).
+
 ## One process per data directory
 
 A `DATA_DIR` belongs to one raggio process at a time. Before it opens any

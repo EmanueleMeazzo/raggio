@@ -1117,6 +1117,207 @@ async def _seed_http(c: httpx.AsyncClient, name: str) -> None:
     raise AssertionError(f"seed job of {name} not done: {r.text}")
 
 
+@pytest.mark.parametrize("resident", [False, True])
+@pytest.mark.parametrize("cancel_delete", [False, True])
+def test_same_name_create_survives_a_parked_delete_cleanup(
+        tmp_path, monkeypatch, resident, cancel_delete):
+    app = _http_app(tmp_path, monkeypatch)
+    inside, release, finished = threading.Event(), threading.Event(), threading.Event()
+    real_rmtree = store.shutil.rmtree
+    cleaned = []
+
+    def parked_rmtree(path, ignore_errors=False, *args, **kwargs):
+        cleaned.append(Path(path))
+        if ignore_errors and not inside.is_set():
+            inside.set()
+            assert release.wait(WAIT_SECONDS), "delete cleanup was never released"
+        try:
+            return real_rmtree(path, ignore_errors, *args, **kwargs)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(store.shutil, "rmtree", parked_rmtree)
+
+    async def run():
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+                if resident:
+                    await _seed_http(c, "x")
+                else:
+                    r = await c.post("/collections", headers=ROOT, json={"name": "x"})
+                    assert r.status_code == 201, r.text
+                delete = asyncio.create_task(c.delete("/collections/x", headers=ROOT))
+                try:
+                    assert await asyncio.to_thread(inside.wait, WAIT_SECONDS)
+                    if cancel_delete:
+                        delete.cancel()
+                        with pytest.raises(asyncio.CancelledError):
+                            await delete
+                    recreated = await c.post("/collections", headers=ROOT, json={"name": "x"})
+                    assert recreated.status_code == 201, recreated.text
+                    db = sqlite3.connect(tmp_path / "collections" / "x" / "meta.db")
+                    try:
+                        assert db.execute("SELECT COUNT(*) FROM records").fetchone()[0] == 0
+                    finally:
+                        db.close()
+                finally:
+                    release.set()
+                    if not cancel_delete:
+                        deleted = await delete
+                    assert await asyncio.to_thread(finished.wait, WAIT_SECONDS)
+                search = await c.post("/collections/x/search", headers=ROOT,
+                                      json={"query": {"text": "w1"}, "mode": "text"})
+                if not cancel_delete:
+                    assert deleted.status_code == 200, deleted.text
+                assert search.status_code == 200, search.text
+                assert search.json() == {"hits": []}
+                assert (tmp_path / "collections" / "x" / "meta.db").is_file()
+                assert not list((tmp_path / "collections").glob("*.deleted-*"))
+
+    asyncio.run(run())
+    assert len(cleaned) == 1 and cleaned[0].name.startswith("x.deleted-")
+
+
+def test_boot_sweeps_retired_directories_and_preserves_live_collections(tmp_path, monkeypatch):
+    m = make_manager(tmp_path, monkeypatch)
+
+    async def prepare():
+        await m.create_collection("x", DIM, 4, None, None, None)
+        await m.shutdown()
+
+    asyncio.run(prepare())
+    retired = tmp_path / "collections" / f"x.deleted-{'0' * 32}"
+    retired.mkdir()
+    (retired / "meta.db").write_bytes(b"old deleted data")
+    m = make_manager(tmp_path, monkeypatch)
+
+    async def check():
+        try:
+            assert not retired.exists()
+            assert m.list_collections() == ["x"]
+            assert (await m.touch("x")).stats()["documents"] == 0
+        finally:
+            await m.shutdown()
+
+    asyncio.run(check())
+
+
+def test_delete_with_a_blocked_directory_rename_leaves_a_safe_leftover(tmp_path, monkeypatch):
+    # Windows can still hold a reader's handle after the close deadline. Physical
+    # cleanup was already best-effort; a failed rename must not turn DELETE into 500.
+    app = _http_app(tmp_path, monkeypatch)
+    real_rename = Path.rename
+
+    def blocked_rename(path, target):
+        if path == tmp_path / "collections" / "x":
+            raise PermissionError("a reader still owns a SQLite handle")
+        return real_rename(path, target)
+
+    async def run():
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+                await _seed_http(c, "x")
+                with monkeypatch.context() as blocked:
+                    blocked.setattr(Path, "rename", blocked_rename)
+                    deleted = await c.delete("/collections/x", headers=ROOT)
+                    assert deleted.status_code == 200, deleted.text
+                    assert (await c.get("/collections/x", headers=ROOT)).status_code == 404
+                    assert (tmp_path / "collections" / "x").is_dir()
+                recreated = await c.post("/collections", headers=ROOT, json={"name": "x"})
+                assert recreated.status_code == 201, recreated.text
+                stats = await c.get("/collections/x", headers=ROOT)
+                assert stats.status_code == 200 and stats.json()["documents"] == 0
+                assert not list((tmp_path / "collections").glob("*.deleted-*"))
+
+    asyncio.run(run())
+
+
+def test_create_rechecks_the_name_after_a_dimension_probe(tmp_path, monkeypatch):
+    m = make_manager(tmp_path, monkeypatch)
+    m.settings.embedding_dim = None
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class ProbeEmbedder(FakeEmbedder):
+        async def embed(self, texts):
+            entered.set()
+            await release.wait()
+            return await super().embed(texts)
+
+    m.embedder_factory = lambda cfg: ProbeEmbedder()
+
+    async def run():
+        probe = asyncio.create_task(m.create_collection("x", None, 4, None, None, None))
+        marker = m._dir("x") / "keep"
+        try:
+            await asyncio.wait_for(entered.wait(), WAIT_SECONDS)
+            await m.create_collection("x", DIM, 4, None, None, None)
+            marker.write_text("the winning create's data")
+        finally:
+            release.set()
+        try:
+            with pytest.raises(ValueError, match="already exists"):
+                await probe
+            assert marker.read_text() == "the winning create's data"
+            assert m.get_config("x").dim == DIM
+        finally:
+            await m.shutdown()
+
+    asyncio.run(run())
+
+
+def test_http_real_embedding_client_closed_by_delete_fails_without_backoff(tmp_path, monkeypatch):
+    from raggio.embeddings import Embedder
+    import raggio.embeddings as embeddings
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    backoffs = []
+
+    async def sleep(delay):
+        backoffs.append(delay)
+
+    monkeypatch.setattr(embeddings, "asyncio", SimpleNamespace(sleep=sleep))
+
+    def factory(cfg):
+        emb = Embedder("https://embedding.test/v1", "", "")
+        post, close = emb._client.post, emb.aclose
+
+        async def parked_post(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return await post(*args, **kwargs)  # real HTTPX closed-client check, no network
+
+        async def close_and_release():
+            await close()
+            release.set()
+
+        monkeypatch.setattr(emb._client, "post", parked_post)
+        monkeypatch.setattr(emb, "aclose", close_and_release)
+        return emb
+
+    app = _http_app(tmp_path, monkeypatch, embedder_factory=factory)
+
+    async def run():
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+                await _seed_http(c, "x")
+                search = asyncio.create_task(c.post("/collections/x/search", headers=ROOT,
+                    json={"query": {"text": "w1"}, "mode": "hybrid"}))
+                try:
+                    await asyncio.wait_for(entered.wait(), WAIT_SECONDS)
+                    deleted = await c.delete("/collections/x", headers=ROOT)
+                finally:
+                    release.set()
+                result = await asyncio.wait_for(search, WAIT_SECONDS)
+                assert deleted.status_code == 200, deleted.text
+                assert result.status_code == 404, result.text
+
+    asyncio.run(run())
+    assert backoffs == []
+
+
 # every route that runs on a collection, and its answer when nothing races it. The index
 # routes are left out: on a collection this small they answer 400/404 before reaching
 # the store, and with enough rows they reach it through enqueue, which ingest covers

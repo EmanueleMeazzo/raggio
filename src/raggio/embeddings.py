@@ -31,10 +31,19 @@ class Embedder:
                 data = r.json()["data"]
                 data.sort(key=lambda d: d["index"])
                 return [d["embedding"] for d in data]
-            except Exception as e:  # ponytail: retry everything 3x; per-status handling if a provider needs it
+            except (httpx.HTTPStatusError, httpx.TransportError) as e:
+                if self._client.is_closed:
+                    raise  # closing an in-flight request can surface a transport error
+                if (isinstance(e, httpx.HTTPStatusError)
+                        and e.response.status_code != 429
+                        and not 500 <= e.response.status_code < 600):
+                    raise
                 last = e
+            # A closed client, a bad request or a malformed response cannot be repaired
+            # by retrying. Only wait when another attempt will actually be made.
+            if attempt < 2:
                 await asyncio.sleep(2**attempt)
-        raise RuntimeError(f"embedding request to {self.url} failed after 3 attempts: {last}")
+        raise RuntimeError(f"embedding request to {self.url} failed after 3 attempts: {last}") from last
 
     async def aclose(self) -> None:
         await self._client.aclose()

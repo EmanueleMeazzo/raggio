@@ -21,6 +21,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 from turbovec import IdMapIndex
@@ -2981,7 +2982,13 @@ class CollectionManager:
         self.settings = settings
         self.embedder_factory = embedder_factory or self._default_embedder
         self.data_dir = Path(settings.data_dir)
-        (self.data_dir / "collections").mkdir(parents=True, exist_ok=True)
+        collections_dir = self.data_dir / "collections"
+        collections_dir.mkdir(parents=True, exist_ok=True)
+        # Names accepted by the API contain no dots. These directories were retired
+        # before a cancelled request or a crash interrupted their physical cleanup.
+        for tombstone in collections_dir.glob("*.deleted-*"):
+            if tombstone.is_dir():
+                shutil.rmtree(tombstone, ignore_errors=True)
         self.catalog = connect_db(self.data_dir / "catalog.db", check_same_thread=False)
         self.catalog.execute(
             "CREATE TABLE IF NOT EXISTS collections("
@@ -3019,6 +3026,16 @@ class CollectionManager:
 
     def _dir(self, name: str) -> Path:
         return self.data_dir / "collections" / name
+
+    def _retire_directory(self, name: str) -> Path | None:
+        """Detach the old directory while holding _load_lock; cleanup can then yield
+        without touching a replacement collection of the same name."""
+        directory = self._dir(name)
+        if not directory.exists():
+            return None
+        tombstone = directory.with_name(f"{name}.deleted-{uuid4().hex}")
+        directory.rename(tombstone)
+        return tombstone
 
     def bm25_backend(self) -> str:
         """The stage-2 scorer collections run, as GET /healthz reports it."""
@@ -3084,18 +3101,25 @@ class CollectionManager:
                                hash_key(collection_key) if collection_key else None, tokenizer,
                                fts_keys=list(fts_keys) if fts_keys is not None else None)
         directory = self._dir(name)
-        if directory.exists():  # leftover from a crashed create or failed delete: never resurrect
-            await asyncio.to_thread(shutil.rmtree, directory)
-        directory.mkdir(parents=True)
-        open_meta_db(directory / "meta.db", tokenizer, cfg.fts_keys).close()
-        with self._catalog_lock:
-            self.catalog.execute(
-                "INSERT INTO collections(name, dim, bit_width, model, base_url, key_hash,"
-                " created_at, tokenizer, fts_keys) VALUES (?,?,?,?,?,?,?,?,?)",
-                (name, dim, bit_width, model, base_url, cfg.key_hash, _now(), tokenizer,
-                 json.dumps(cfg.fts_keys) if cfg.fts_keys is not None else None),
-            )
-            self.catalog.commit()
+        async with self._load_lock:
+            # The dimension probe may have yielded while another create won the name.
+            if self.get_config(name):
+                raise ValueError(f"collection '{name}' already exists")
+            # A leftover from a crashed create or failed delete is never resurrected.
+            # Retire it too: cancellation must not leave an orphan rmtree on a live name.
+            tombstone = self._retire_directory(name)
+            directory.mkdir(parents=True)
+            open_meta_db(directory / "meta.db", tokenizer, cfg.fts_keys).close()
+            with self._catalog_lock:
+                self.catalog.execute(
+                    "INSERT INTO collections(name, dim, bit_width, model, base_url, key_hash,"
+                    " created_at, tokenizer, fts_keys) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (name, dim, bit_width, model, base_url, cfg.key_hash, _now(), tokenizer,
+                     json.dumps(cfg.fts_keys) if cfg.fts_keys is not None else None),
+                )
+                self.catalog.commit()
+        if tombstone is not None:
+            await asyncio.to_thread(shutil.rmtree, tombstone, True)
         return cfg
 
     async def touch(self, name: str) -> Collection:
@@ -3187,8 +3211,8 @@ class CollectionManager:
         # evictions: stop() yields, and a touch() landing there would reload the
         # collection from the still-present row and files (a resident zombie on
         # deleted files that would also shadow a re-created collection of the same
-        # name). Once the row is gone a racing touch() raises KeyError (404), so the
-        # rmtree can run unlocked.
+        # name). Detach the old directory before releasing the lock: an unlocked
+        # rmtree on the live name would remove a same-name create (issue #1).
         async with self._load_lock:
             c = self.resident.get(name)
             if c is not None:  # its queued searches answer 404 once stop() closes it
@@ -3197,7 +3221,20 @@ class CollectionManager:
             with self._catalog_lock:
                 self.catalog.execute("DELETE FROM collections WHERE name=?", (name,))
                 self.catalog.commit()
-        await asyncio.to_thread(shutil.rmtree, self._dir(name), True)
+            # stop() closed the SQLite handles before this Windows rename. Remove
+            # the catalog row first: a crash before the rename leaves an unregistered
+            # directory that the next create retires, never a row pointing at lost data.
+            try:
+                tombstone = self._retire_directory(name)
+            except OSError:
+                # Like the existing best-effort rmtree, a blocked physical cleanup
+                # does not undo the logical delete. Never schedule rmtree on this
+                # live path: the next create retires the leftover before publishing.
+                _log.warning("collection %s: retiring its deleted directory failed;"
+                             " the next create will clean up the leftover", name, exc_info=True)
+                tombstone = None
+        if tombstone is not None:
+            await asyncio.to_thread(shutil.rmtree, tombstone, True)
 
     async def resume_pending(self) -> None:
         """On boot, load any collection with unfinished jobs so its worker replays them."""
