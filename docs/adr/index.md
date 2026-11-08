@@ -116,3 +116,15 @@ including vector, text, hybrid, filtering and result expansion.
 Future performance changes must update an ADR (or add one), link it here, and
 retain the comparison protocol, raw measurements and relevant correctness gates.
 Investigations that reject a change should record that result too.
+
+## Archived development histories
+
+These tags preserve the original histories after branch cleanup on 2026-11-08.
+Their journals and plans describe the work and evidence at their dated revisions;
+use the current ADRs for accepted behavior and current execution decisions.
+
+| History | Archive | Disposition |
+|---|---|---|
+| Performance-program journal, original specs, plans, and research | [`archive/performance-program-2026-11-08`](https://github.com/EmanueleMeazzo/raggio/tree/archive/performance-program-2026-11-08), at `41ed0d3`; [journal](https://github.com/EmanueleMeazzo/raggio/blob/41ed0d3b74414f6681eabc326586624b276d3a70/docs/superpowers/journal/2026-09-performance-program.md) | Retains the histories of `docs/planB-race-rerun` and its ancestor `docs/perf-plans-2026-09` |
+| Original benchmark-hardening commits | [`archive/bench-hardening-2026-11-08`](https://github.com/EmanueleMeazzo/raggio/tree/archive/bench-hardening-2026-11-08), at `eccdc6c` | Implementation already incorporated into main through `ff48930`; old local branch retired |
+| Initial expansion-read and sibling-vector-reuse probes | [`archive/expansion-retrieval-2026-11-08`](https://github.com/EmanueleMeazzo/raggio/tree/archive/expansion-retrieval-2026-11-08), at `f87e1d1` | `research/expansion-retrieval` retired; the later `perf/sibling-vector-reuse` branch is retained for separate review |

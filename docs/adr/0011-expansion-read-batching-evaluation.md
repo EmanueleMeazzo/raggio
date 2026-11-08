@@ -15,6 +15,11 @@ results remain in the [archived source tree at `614c4b8`](https://github.com/Ema
 and branch `perf/sibling-vector-reuse`. Paths, implementation gates and reproduction
 commands below refer to that archived checkout; main does not contain those probes.
 
+The earlier exploration is also preserved by the
+[`archive/expansion-retrieval-2026-11-08` tag](https://github.com/EmanueleMeazzo/raggio/tree/archive/expansion-retrieval-2026-11-08).
+Its old `research/expansion-retrieval` branch was retired on 2026-11-08.
+The separate `perf/sibling-vector-reuse` branch remains available for review.
+
 Implementation follow-up: [ADR 0012](0012-per-search-sibling-vector-reuse.md) records
 the evaluated vector-reuse candidate and its subsequent disposition. The results below describe
 the historical exploration committed at `f87e1d1`, rather than the final implementation.
