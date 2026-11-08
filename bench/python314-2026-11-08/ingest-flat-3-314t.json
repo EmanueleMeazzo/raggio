@@ -1,0 +1,48 @@
+{
+  "args": {
+    "batch_jobs": null,
+    "batch_ms": null,
+    "dim": 512,
+    "enqueuers": 2,
+    "ivf": 0,
+    "job_rows": 50,
+    "jobs": 40,
+    "out": "/results/ingest-flat-3-314t.json",
+    "prefill": 10000,
+    "reupsert_every": 5,
+    "seed": 42,
+    "tmp": null
+  },
+  "drain_s": 0.2723302159997729,
+  "enqueue_s": 0.07733590799989543,
+  "fingerprint": {
+    "counts": {
+      "chunk": 11600
+    },
+    "n_index": 11600,
+    "records": "1a4405048a62e478",
+    "vecs": "f8f7113c84ef81b1"
+  },
+  "freelist": 0,
+  "index": {
+    "type": "flat"
+  },
+  "ingest_vps": 7344.025313745088,
+  "jobs": {
+    "done": 40
+  },
+  "loop_lag_max_ms": 1.2081619998934912,
+  "loop_stall_s": 0,
+  "machine": "aarch64",
+  "openblas_num_threads": "1",
+  "payload_rows": 0,
+  "prefill_s": 1.3812067799999568,
+  "python": "3.14.10",
+  "regime": "host-warm, uncapped host process",
+  "rows": 2000,
+  "sqlite_version": "3.53.1",
+  "store_file": "/project/src/raggio/store.py",
+  "sync_batch_jobs": 8,
+  "sync_batch_ms": 1000.0,
+  "turbovec": "1.0.0"
+}

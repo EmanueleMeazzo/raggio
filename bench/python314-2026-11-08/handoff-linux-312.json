@@ -1,0 +1,50 @@
+{
+  "python": "3.12.15 (main, Oct 21 2026, 17:46:20) [Clang 23.1.3 ]",
+  "platform": "Linux-7.0.0-1025-nvidia-aarch64-with-glibc2.41",
+  "gil_enabled": true,
+  "cpus": [
+    5,
+    6,
+    7,
+    8
+  ],
+  "load": "external independent CPU busy-loop processes",
+  "cases": {
+    "0": {
+      "pingpong": {
+        "p50_ms": 0.016234499980782857,
+        "p95_ms": 0.13063000005786307,
+        "samples": 30
+      },
+      "to_thread": {
+        "p50_ms": 0.1583944999765663,
+        "p95_ms": 0.17327699970337562,
+        "samples": 30
+      }
+    },
+    "3": {
+      "pingpong": {
+        "p50_ms": 0.007825000011507655,
+        "p95_ms": 0.008482000339427032,
+        "samples": 30
+      },
+      "to_thread": {
+        "p50_ms": 0.017202500202984083,
+        "p95_ms": 0.017730999843479367,
+        "samples": 30
+      }
+    },
+    "4": {
+      "pingpong": {
+        "p50_ms": 1.9999010000901762,
+        "p95_ms": 2.0005730002594646,
+        "samples": 30
+      },
+      "to_thread": {
+        "p50_ms": 1.9999009998628026,
+        "p95_ms": 2.00065299986818,
+        "samples": 30
+      }
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "complete": true,
+  "problems": [],
+  "completed_sessions": {
+    "arxiv": 18,
+    "document": 9,
+    "ingest": 18,
+    "control": 18
+  },
+  "measured_http_requests": 109080,
+  "known_standard_314_assertion_failure": true
+}
