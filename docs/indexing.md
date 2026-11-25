@@ -79,7 +79,8 @@ Rules of thumb:
 - **Disk**: attach/detach rebuilds need the original vectors, so raggio retains an
   fp16 copy of every ingested vector in `meta.db` (`dim × 2` bytes per record —
   3 KB/record at 1536 dims). This is always on, disk-only, and also what makes the
-  index fully reversible.
+  index fully reversible. A [`dot` collection](search.md#dot-product-collections)
+  keeps the float32 values instead (`dim × 4` bytes) and rebuilds from those.
 - **Rebuild**: attaching/removing streams the collection through a rebuild — 178 s to
   attach and 94 s to remove at 2.55M × 1024-d in a 4 GiB container on a DGX Spark,
   run as a background job. Searches keep serving from the

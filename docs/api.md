@@ -34,7 +34,8 @@ Other errors stay **500**.
   "base_url": null,
   "collection_key": "kb-secret",
   "tokenizer": "unicode61",
-  "fts_keys": ["title", "source", "tags"]
+  "fts_keys": ["title", "source", "tags"],
+  "metric": "cosine"
 }
 ```
 
@@ -48,12 +49,19 @@ Other errors stay **500**.
 | `collection_key` | string | none | Per-collection API key; if unset, root-only |
 | `tokenizer` | `unicode61` \| `trigram` | `unicode61` | BM25 tokenizer, immutable after creation |
 | `fts_keys` | string array or null | `null` | Metadata keys appended to BM25 text, immutable; at most 8 unique literal keys matching `[A-Za-z0-9_.-]{1,64}`, excluding `doc_id` |
+| `metric` | `cosine` \| `dot` | `cosine` | How vectors are kept and ranked, immutable. `cosine`: scaled to unit length, an fp16 copy kept, hits scored by cosine. `dot`: kept as the float32 values sent and returned bit for bit, hits re-ranked by their dot product with the query as sent ([dot-product collections](search.md#dot-product-collections)) |
 
-**201** `{"name": "kb", "dim": 1536, "bit_width": 4, "tokenizer": "unicode61", "fts_keys": ["title", "source", "tags"]}` ·
+**201** `{"name": "kb", "dim": 1536, "bit_width": 4, "tokenizer": "unicode61", "fts_keys": ["title", "source", "tags"], "metric": "cosine"}` ·
 **409** name exists · **400** invalid dim / no embedding endpoint to probe
 
 Invalid `fts_keys` returns **422**. Omitted, `null`, or empty keys preserve text-only
 indexing. See [indexed metadata](search.md#what-bm25-indexes) for value conversion.
+
+An unknown `metric` returns **422**. The metric of an existing collection cannot be
+changed: a create on its name with another metric is the same **409**, and its
+message names the metric the collection has. A raggio from before this option
+ignores the field, so check that the response says `"metric": "dot"` when you asked
+for it.
 
 ### List collections
 
@@ -72,6 +80,7 @@ indexing. See [indexed metadata](search.md#what-bm25-indexes) for value conversi
   "name": "kb", "dim": 1536, "bit_width": 4,
   "model": null, "tokenizer": "unicode61",
   "fts_keys": ["title", "source", "tags"],
+  "metric": "cosine",
   "index": {"type": "flat"},
   "documents": 12, "chunks": 340, "summaries": 12, "pending_jobs": 0
 }
@@ -101,7 +110,7 @@ large for the collection
 
 `DELETE /collections/{name}/index`
 
-Rebuilds the flat index from the retained fp16 vectors and drops the shards.
+Rebuilds the flat index from the retained vectors and drops the shards.
 
 **202** `{"job_id": 8}` · **404** collection has no index
 
@@ -139,6 +148,10 @@ Asynchronous: the job is journaled durably, then **202** returns immediately.
   embedded server-side, a supplied `vector` must match the collection `dim`.
 - `position` defaults to the chunk's array index.
 - Re-ingesting an existing chunk `id` or `doc_id` upserts it.
+- A zero vector fails its job (`"status": "error"`), and the job stores nothing.
+- In a [`dot` collection](search.md#dot-product-collections) vectors are kept as
+  the float32 values sent, not normalised; there a vector with a number beyond
+  the float32 range is refused like a zero one, before anything is stored.
 
 **202** `{"job_id": 1}` · **400** missing text+vector or wrong vector dim
 
@@ -168,7 +181,7 @@ browsing, paging, per-filter counts and exports.
 | `sort` | string | insertion order | Metadata key; `-` prefix for descending. Records lacking the key sort first ascending, last descending |
 | `limit` | int | `20` | 1–1000 |
 | `offset` | int | `0` | |
-| `include_vector` | bool | `false` | Attach each record's stored vector (decoded from the fp16 copy) as `vector` |
+| `include_vector` | bool | `false` | Attach each record's stored vector as `vector`: decoded from the fp16 copy of the unit vector, or in a [`dot` collection](search.md#dot-product-collections) the float32 values that were sent, bit for bit |
 
 ```bash
 curl -G :8000/collections/kb/documents -H "x-api-key: $KEY" \
@@ -250,13 +263,16 @@ Removes the document's summary and chunks from both indexes.
 ```
 
 `score` is on the mode's scale ([Search](search.md#modes)): cosine for
-`vector`, BM25 for `text`, and for `hybrid` an RRF score in `(0, 2/61]` or, with
-`fusion: relative`, a score in `[0, 1]`.
+`vector` (in a [`dot` collection](search.md#dot-product-collections) the dot
+product of the stored float32 vector with the query as sent), BM25 for `text`,
+and for `hybrid` an RRF score in `(0, 2/61]` or, with `fusion: relative`, a
+score in `[0, 1]`.
 
-**400** — query/mode mismatch, wrong vector dim, unsupported filter operator,
-or a text query in `vector`/`hybrid` mode with no embedding endpoint
-configured · **422** — a field outside its schema (`k` or `alpha` out of range,
-an unknown `mode` or `fusion`).
+**400** — query/mode mismatch, wrong vector dim, a zero query vector (in a
+`dot` collection also one with a number beyond the float32 range), unsupported
+filter operator, or a text query in `vector`/`hybrid` mode with no embedding
+endpoint configured · **422** — a field outside its schema (`k` or `alpha` out
+of range, an unknown `mode` or `fusion`).
 
 ---
 
