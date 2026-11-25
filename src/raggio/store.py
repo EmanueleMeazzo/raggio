@@ -78,6 +78,13 @@ RESCORE_MULT = 2
 RESCORE_FLOOR = {2: 200, 4: 50}
 RESCORE_CAP = 2000  # bounds per-query blob fetches at huge k
 
+# A collection's metric, fixed at creation (ADR 0020). "cosine", the default: vectors are
+# unit-normalized at ingest, the vecs table keeps their fp16 copies, and the rescore is
+# the cosine of those. "dot": the vecs table keeps the float32 values as they were sent,
+# the quantized index gets unit copies (it only proposes candidates, by angle), and the
+# rescore is the dot product of the kept values with the query as sent.
+METRICS = ("cosine", "dot")
+
 # Request-scoped sibling reuse: bound the float32 payload and row bookkeeping.
 SIBLING_VECTOR_CACHE_BYTES = 8 * 1024 * 1024
 SIBLING_VECTOR_CACHE_ROWS = 4096
@@ -250,6 +257,36 @@ def _normalize(mat: np.ndarray) -> np.ndarray:
     return (mat / norms).astype(np.float32)
 
 
+def _dot_unit(mat: np.ndarray) -> np.ndarray:
+    """Unit-norm float32 copies of float32 rows, for the quantized index of a "dot"
+    collection (ADR 0020): the index proposes candidates by direction, and the rows
+    themselves are kept and scored as they are. Norms are taken in float64, because this
+    metric takes any finite length and a float32 sum of squares overflows for lengths
+    past ~1e19 and is 0 below ~1e-23. ValueError on a zero or non-finite row, which has
+    no direction."""
+    wide = mat.astype(np.float64)
+    norms = np.linalg.norm(wide, axis=1, keepdims=True)
+    if not np.isfinite(norms).all():
+        raise ValueError(
+            "non-finite vector: a collection with metric 'dot' takes finite float32"
+            " values (a number past 3.4e38 does not fit)"
+        )
+    if (norms == 0).any():
+        raise ValueError(
+            "zero vector: a collection with metric 'dot' finds candidates by direction,"
+            " and a zero vector has none"
+        )
+    return (wide / norms).astype(np.float32)
+
+
+def _dot_scores(mat: np.ndarray, q: np.ndarray) -> np.ndarray:
+    """Dot products of float32 rows with a float32 query, summed in float64 (ADR 0020).
+    The product of two float32 values is exact in float64, so only the sum rounds, near
+    1e-16 relative where a float32 sum rounds near 1e-7: the order of close candidates
+    does not depend on the BLAS kernel or on how the rows were batched."""
+    return mat.astype(np.float64) @ q.astype(np.float64)
+
+
 # Binary job journal row (job_payloads.data): _JOB_HEADER (magic, JSON byte length,
 # vector count, dim; little-endian, so aarch64 and x86 read the same bytes), then the
 # payload as UTF-8 JSON with each supplied vector replaced by its row index, then the
@@ -381,6 +418,15 @@ def _rows_matrix(rows: list[list]) -> np.ndarray:
     np.array over nested float lists is ~13 ms per 250x1024 job: _process_job runs it
     in a worker thread."""
     return _normalize(np.array([r[6] for r in rows], dtype=np.float32))
+
+
+def _rows_matrix_dot(rows: list[list]) -> tuple[np.ndarray, np.ndarray]:
+    """_rows_matrix for a "dot" collection (ADR 0020): the rows' vectors as float32, as
+    they were sent (what the collection keeps and scores), and their unit-norm copies
+    (what the quantized index takes). ValueError on a zero or non-finite vector. Runs in
+    a worker thread too."""
+    raw = np.array([r[6] for r in rows], dtype=np.float32)
+    return raw, _dot_unit(raw)
 
 
 def _filter_sql(scope: str, filt: dict | None) -> tuple[str, list]:
@@ -612,6 +658,7 @@ class CollectionConfig:
     tokenizer: str = "unicode61"
     index_config: dict | None = None  # {"nlist": N, "nprobe": M} when an IVF index is attached
     fts_keys: list[str] | None = None
+    metric: str = "cosine"  # one of METRICS, fixed at creation (ADR 0020)
 
 
 def _validate_fts_keys(keys: list[str] | None) -> None:
@@ -1259,6 +1306,14 @@ class CollectionClosedError(RuntimeError):
 class Collection:
     """A resident collection: turbovec index + sqlite metadata + ingest worker."""
 
+    # The metric's two switches (ADR 0020), here with the default metric's values and set
+    # per collection by __init__: a Collection assembled without __init__
+    # (bench/ivf_fanout_probe.py's read-only shell) is then a cosine one, as it always was.
+    # _vec_dtype is what a vecs row holds: the fp16 copy of the unit vector, or with
+    # metric "dot" the float32 values as they were sent, little-endian
+    _dot = False
+    _vec_dtype = np.dtype(np.float16)
+
     def __init__(
         self,
         cfg: CollectionConfig,
@@ -1270,7 +1325,17 @@ class Collection:
         sync_batch_jobs: int = 8,
         sync_batch_ms: float = 1000.0,
     ) -> None:
+        if cfg.metric not in METRICS:
+            # before anything is opened. A catalog from a later release: opening the
+            # collection under another metric would rank by, and read back, another
+            # representation than the one its vecs rows hold
+            raise ValueError(
+                f"collection '{cfg.name}' has metric '{cfg.metric}', which this raggio"
+                f" does not know (it knows {', '.join(METRICS)})"
+            )
         self.cfg = cfg
+        if cfg.metric == "dot":
+            self._dot, self._vec_dtype = True, np.dtype("<f4")
         self.dir = directory
         self.index_path = directory / "index.tvim"
         self.ivf_dir = directory / "ivf"
@@ -1777,7 +1842,12 @@ class Collection:
             vecs = await self.embedder.embed([rows[i][4] for i in batch])
             for i, v in zip(batch, vecs):
                 rows[i][6] = v
-        mat = await asyncio.to_thread(_rows_matrix, rows)
+        if self._dot:
+            # ADR 0020: the vectors as sent are what the collection keeps and scores;
+            # the quantized index gets their directions
+            kept, mat = await asyncio.to_thread(_rows_matrix_dot, rows)
+        else:
+            kept = mat = await asyncio.to_thread(_rows_matrix, rows)
 
         async with self.lock.write():
             # off the event loop: the FTS triggers tokenize every row (expensive with
@@ -1785,7 +1855,7 @@ class Collection:
             # touches neither the index nor indexed_counts before it commits, so a
             # failed job leaves the collection as it was. The rows it replaced leave the
             # index only after that commit.
-            ids, fresh, replaced = await asyncio.to_thread(self._upsert_rows, rows, mat)
+            ids, fresh, replaced = await asyncio.to_thread(self._upsert_rows, rows, kept)
             if replaced:
                 if (self._removed_since_sync
                         and self._removed_since_sync + len(replaced) > SYNC_MAX_REMOVALS):
@@ -1859,17 +1929,19 @@ class Collection:
     def _upsert_rows(self, rows: list, mat: np.ndarray) -> tuple[list[int], list[bool], list[int]]:
         """Insert `rows` (_payload_rows' shape) with `mat` as their vectors, replacing
         any record with the same external_id: one transaction, rolled back on any
-        failure. Returns (ids, fresh, replaced): the new record ids in row order, per
-        row whether its external_id was new, and the replaced records' ids that are in
-        the vector index. The index is not touched here: the caller (holding
-        lock.write()) removes `replaced` with _unindex once this has committed, so a
-        failed upsert is a pure database rollback."""
+        failure. `mat` is what the collection retains: the unit vectors, or with metric
+        "dot" the vectors as sent. Returns (ids, fresh, replaced): the new record ids in
+        row order, per row whether its external_id was new, and the replaced records'
+        ids that are in the vector index. The index is not touched here: the caller
+        (holding lock.write()) removes `replaced` with _unindex once this has committed,
+        so a failed upsert is a pure database rollback."""
         # fp16 originals retained on disk (half the f32 size, negligible loss vs the
         # 4-bit codes): the only way to rebuild the index representation later, since
-        # turbovec can't enumerate or reconstruct vectors
-        vecs16 = mat.astype(np.float16)
+        # turbovec can't enumerate or reconstruct vectors. With metric "dot" the float32
+        # values themselves (ADR 0020): they are also what is scored and read back
+        retained = mat.astype(self._vec_dtype, copy=False)
         # row CPU before db_lock: the lock serializes every write on self.db
-        blobs = [v.tobytes() for v in vecs16]
+        blobs = [v.tobytes() for v in retained]
         metas = [json.dumps(r[5] or {}) for r in rows]
         suffixes = [_fts_metadata(r[5], self.cfg.fts_keys) for r in rows] if self.cfg.fts_keys else None
         with self.db_lock:
@@ -1977,8 +2049,15 @@ class Collection:
             raise ValueError("collection has no index")
         return await self.enqueue({"op": "detach_index"})
 
+    def _index_rows(self, blob: bytes, n: int) -> np.ndarray:
+        """`n` retained vectors (vecs rows, joined) as the float32 rows the quantized
+        index takes: the fp16 copies decoded, or with metric "dot" the directions of the
+        float32 values (ADR 0020)."""
+        mat = np.frombuffer(blob, dtype=self._vec_dtype).reshape(n, -1)
+        return _dot_unit(mat) if self._dot else mat.astype(np.float32)
+
     def _iter_vec_blocks(self):
-        """Stream (ids, f32 matrix) of every indexed record from the retained fp16
+        """Stream (ids, f32 matrix) of every indexed record from the retained
         vectors, blockwise so a multi-GB collection never materializes at once."""
         last = 0
         while True:
@@ -1993,10 +2072,9 @@ class Collection:
             if not rows:
                 return
             last = rows[-1][0]
-            mat = np.frombuffer(b"".join(r[1] for r in rows), dtype=np.float16)
             yield (
                 np.array([r[0] for r in rows], dtype=np.uint64),
-                mat.reshape(len(rows), -1).astype(np.float32),
+                self._index_rows(b"".join(r[1] for r in rows), len(rows)),
             )
 
     def _live_ids_read(self) -> np.ndarray:
@@ -2030,9 +2108,7 @@ class Collection:
                 if len(got) >= k:
                     keys = list(got)
                     pick = rng.choice(len(keys), k, replace=False)
-                    blob = b"".join(got[keys[i]] for i in pick)
-                    mat = np.frombuffer(blob, dtype=np.float16)
-                    return mat.reshape(k, self.cfg.dim).astype(np.float32)
+                    return self._index_rows(b"".join(got[keys[i]] for i in pick), k)
         with self._reading() as db:
             rows = db.execute(
                 "SELECT v.vec FROM vecs v JOIN records r ON r.id=v.id WHERE r.indexed=1"
@@ -2040,8 +2116,7 @@ class Collection:
             ).fetchall()
         if not rows:
             return np.empty((0, self.cfg.dim), np.float32)
-        mat = np.frombuffer(b"".join(r[0] for r in rows), dtype=np.float16)
-        return mat.reshape(len(rows), -1).astype(np.float32)
+        return self._index_rows(b"".join(r[0] for r in rows), len(rows))
 
     async def _backfill_vecs(self, ids: np.ndarray | None = None, add=None) -> int:
         """Records ingested before vector retention lack the fp16 original a rebuild
@@ -2079,7 +2154,14 @@ class Collection:
         for s in range(0, len(rows), 64):
             batch = rows[s : s + 64]
             vecs = await self.embedder.embed([t for _, t in batch])
-            vecs16 = _normalize(np.array(vecs, dtype=np.float32)).astype(np.float16)
+            embedded = np.array(vecs, dtype=np.float32)
+            if self._dot:
+                # ADR 0020: kept as the endpoint returned them, indexed by direction (a
+                # zero or non-finite one fails the job here, before the write)
+                unit = _dot_unit(embedded)
+                vecs16 = embedded.astype(self._vec_dtype, copy=False)
+            else:
+                vecs16 = _normalize(embedded).astype(np.float16)
 
             def write():
                 # A DELETE can land while the batch is embedded; an orphan vecs row would
@@ -2100,7 +2182,8 @@ class Collection:
                 await asyncio.to_thread(
                     add,
                     np.array([rid for rid, _ in batch], dtype=np.uint64),
-                    vecs16.astype(np.float32),  # the fp16 round trip a stream would read
+                    # the fp16 round trip a stream would read ("dot": the directions)
+                    unit if self._dot else vecs16.astype(np.float32),
                 )
         return written
 
@@ -2310,15 +2393,20 @@ class Collection:
     def _fp16_vecs(self, ids: list[int]) -> tuple[list[int], np.ndarray]:
         """The retained fp16 originals of `ids` as unit-norm float32 rows, for the ids
         that have a valid blob (rows ingested before vector retention have none):
-        (those ids, one matrix row each)."""
+        (those ids, one matrix row each). With metric "dot" (ADR 0020) the rows are the
+        float32 values as they were sent, in a read-only view of the blobs: what a query
+        is scored against either way."""
         dim = self.cfg.dim
+        size = dim * self._vec_dtype.itemsize
         with self._reading() as db:
             blobs = {
                 rid: blob
                 for rid, blob in _rows_by_id(db, "SELECT id, vec FROM vecs WHERE id IN ({})", ids)
-                if blob is not None and len(blob) == dim * 2
+                if blob is not None and len(blob) == size
             }
-        mat = np.frombuffer(b"".join(blobs.values()), dtype=np.float16)
+        mat = np.frombuffer(b"".join(blobs.values()), dtype=self._vec_dtype)
+        if self._dot:
+            return list(blobs), mat.reshape(len(blobs), dim)
         mat = mat.reshape(len(blobs), dim).astype(np.float32)
         # fp16 round-trip drifts norms ~1e-3: renormalize for exact cosine
         mat /= np.maximum(np.linalg.norm(mat, axis=1, keepdims=True), 1e-12)
@@ -2328,10 +2416,12 @@ class Collection:
         self, queries: np.ndarray, rows: list[tuple[list[int], list[float], int]]
     ) -> list[tuple[list[int], list[float]]]:
         """Re-rank quantized candidates against the retained fp16 originals (exact
-        cosine). rows: one (candidate_ids, quantized_scores, n) per query row. One
-        union blob fetch + decode serves the whole batch, so the batched scan path
-        pays a single round of point lookups. Ids without a valid blob (rows ingested
-        before vector retention) keep their quantized score — merged, never dropped."""
+        cosine; with metric "dot" the dot product of the float32 originals with the
+        query as sent, ADR 0020). rows: one (candidate_ids, quantized_scores, n) per
+        query row. One union blob fetch + decode serves the whole batch, so the batched
+        scan path pays a single round of point lookups. Ids without a valid blob (rows
+        ingested before vector retention) keep their quantized score — merged, never
+        dropped."""
         found, mat = self._fp16_vecs(list({rid for ids, _, _ in rows for rid in ids}))
         rowof = {rid: j for j, rid in enumerate(found)}
         out = []
@@ -2339,7 +2429,8 @@ class Collection:
             merged = list(scores)
             have = [k for k, rid in enumerate(ids) if rid in rowof]
             if have:
-                exact = mat[[rowof[ids[k]] for k in have]] @ queries[qi]
+                cand = mat[[rowof[ids[k]] for k in have]]
+                exact = _dot_scores(cand, queries[qi]) if self._dot else cand @ queries[qi]
                 for j, k in enumerate(have):
                     merged[k] = float(exact[j])
             order = sorted(range(len(ids)), key=lambda k: (-merged[k], ids[k]))[:n]
@@ -2353,7 +2444,10 @@ class Collection:
         _rescore_k, drop -inf batch padding (short IVF rows, never real hits), and
         fp16-rescore — no caller can surface quantized scores by accident. ns: the
         final depth wanted per query row. Blocking; call from a thread."""
-        scores, ids = self.index.search(queries, k=self._rescore_k(max(ns)), **kw)
+        # metric "dot" (ADR 0020): the index holds directions and is asked with the
+        # queries' directions; the rescore takes the queries as they were sent
+        scan = _dot_unit(queries) if self._dot else queries
+        scores, ids = self.index.search(scan, k=self._rescore_k(max(ns)), **kw)
         rows = []
         for row, n in enumerate(ns):
             r_ids, r_scores = [], []
@@ -2383,7 +2477,7 @@ class Collection:
             else:
                 ids, mat = self._fp16_vecs(allowed)
             if len(ids) == len(allow):  # else rows without a blob: only the index scores them
-                scores = mat @ qvec[0]
+                scores = _dot_scores(mat, qvec[0]) if self._dot else mat @ qvec[0]
                 top = np.lexsort((ids, -scores))[:n]
                 return [ids[j] for j in top], [float(scores[j]) for j in top]
         return self._search_rescored(qvec, [n], allowlist=allow, **kw)[0]
@@ -2392,7 +2486,8 @@ class Collection:
         self, qvec: np.ndarray, n: int, scope: str, filt: dict | None,
         nprobe: int | None = None,
     ) -> tuple[list[int], list[float]]:
-        """Top-n by cosine similarity. Caller must hold self.lock."""
+        """Top-n by cosine similarity (metric "dot": by dot product, among the
+        candidates nearest by angle). Caller must hold self.lock."""
         if len(self.index) == 0:
             return [], []
         other = {"chunks": "summary", "summaries": "chunk"}.get(scope)
@@ -2948,11 +3043,14 @@ class Collection:
                 blobs = dict(_rows_by_id(
                     db, "SELECT r.external_id, v.vec FROM records r JOIN vecs v ON v.id = r.id WHERE r.id IN ({})", ids
                 ))
+            # metric "dot" (ADR 0020): the float32 values as they were sent, each one
+            # exact as the double tolist() makes of it, so a client reads the same bits
+            size = self.cfg.dim * self._vec_dtype.itemsize
             for rec in recs:
                 blob = blobs.get(rec["id"])
                 rec["vector"] = (
-                    np.frombuffer(blob, dtype=np.float16).astype(np.float32).tolist()
-                    if blob is not None and len(blob) == self.cfg.dim * 2 else None
+                    np.frombuffer(blob, dtype=self._vec_dtype).astype(np.float32).tolist()
+                    if blob is not None and len(blob) == size else None
                 )
         return {"records": recs, "total": total}
 
@@ -3052,13 +3150,15 @@ class CollectionManager:
             "CREATE TABLE IF NOT EXISTS collections("
             "name TEXT PRIMARY KEY, dim INT, bit_width INT, model TEXT, base_url TEXT,"
             "key_hash TEXT, created_at TEXT, tokenizer TEXT DEFAULT 'unicode61',"
-            "index_config TEXT, fts_keys TEXT)"
+            "index_config TEXT, fts_keys TEXT, metric TEXT DEFAULT 'cosine')"
         )
         have = [r[1] for r in self.catalog.execute("PRAGMA table_info(collections)")]
         for col, ddl in (  # migrate catalogs created before hybrid search / the IVF index
             ("tokenizer", "tokenizer TEXT DEFAULT 'unicode61'"),
             ("index_config", "index_config TEXT"),
             ("fts_keys", "fts_keys TEXT"),
+            # every collection from before the option is a cosine one (ADR 0020)
+            ("metric", "metric TEXT DEFAULT 'cosine'"),
         ):
             if col not in have:
                 self.catalog.execute(f"ALTER TABLE collections ADD COLUMN {ddl}")
@@ -3104,15 +3204,15 @@ class CollectionManager:
     def get_config(self, name: str) -> CollectionConfig | None:
         with self._catalog_lock:
             row = self.catalog.execute(
-                "SELECT name, dim, bit_width, model, base_url, key_hash, tokenizer, index_config, fts_keys"
-                " FROM collections WHERE name=?",
+                "SELECT name, dim, bit_width, model, base_url, key_hash, tokenizer, index_config, fts_keys,"
+                " metric FROM collections WHERE name=?",
                 (name,),
             ).fetchone()
         if row is None:
             return None
         return CollectionConfig(
             *row[:6], row[6] or "unicode61", json.loads(row[7]) if row[7] else None,
-            json.loads(row[8]) if row[8] else None,
+            json.loads(row[8]) if row[8] else None, row[9] or "cosine",
         )
 
     def set_index_config(self, name: str, ic: dict | None) -> None:
@@ -3122,6 +3222,17 @@ class CollectionManager:
                 (json.dumps(ic) if ic else None, name),
             )
             self.catalog.commit()
+
+    @staticmethod
+    def _exists_error(existing: CollectionConfig, metric: str) -> ValueError:
+        """The name is taken (409). A create that asks for another metric than the
+        collection has is told so: the metric decides what the vecs rows hold, and there
+        is no converting them (ADR 0020)."""
+        msg = f"collection '{existing.name}' already exists"
+        if existing.metric != metric:
+            msg += (f" with metric '{existing.metric}'; the metric of a collection cannot be"
+                    " changed (delete the collection and create it again)")
+        return ValueError(msg)
 
     def list_collections(self) -> list[str]:
         with self._catalog_lock:  # fetchall inside: the cursor is the shared state
@@ -3138,12 +3249,16 @@ class CollectionManager:
         collection_key: str | None,
         tokenizer: str = "unicode61",
         fts_keys: list[str] | None = None,
+        metric: str = "cosine",
     ) -> CollectionConfig:
         _validate_fts_keys(fts_keys)
         if tokenizer not in FTS_TOKENIZERS:
             raise ValueError(f"tokenizer must be one of {sorted(FTS_TOKENIZERS)}")
-        if self.get_config(name):
-            raise ValueError(f"collection '{name}' already exists")
+        if metric not in METRICS:
+            raise ValueError(f"metric must be one of {sorted(METRICS)}")
+        existing = self.get_config(name)
+        if existing:
+            raise self._exists_error(existing, metric)
         if dim is None:
             dim = self.settings.embedding_dim
         if dim is None:  # probe the embedding endpoint for the dimension
@@ -3157,12 +3272,14 @@ class CollectionManager:
             raise ValueError(f"dim must be a positive multiple of 8, got {dim}")
         cfg = CollectionConfig(name, dim, bit_width, model, base_url,
                                hash_key(collection_key) if collection_key else None, tokenizer,
-                               fts_keys=list(fts_keys) if fts_keys is not None else None)
+                               fts_keys=list(fts_keys) if fts_keys is not None else None,
+                               metric=metric)
         directory = self._dir(name)
         async with self._load_lock:
             # The dimension probe may have yielded while another create won the name.
-            if self.get_config(name):
-                raise ValueError(f"collection '{name}' already exists")
+            existing = self.get_config(name)
+            if existing:
+                raise self._exists_error(existing, metric)
             # A leftover from a crashed create or failed delete is never resurrected.
             # Retire it too: cancellation must not leave an orphan rmtree on a live name.
             tombstone = self._retire_directory(name)
@@ -3171,9 +3288,9 @@ class CollectionManager:
             with self._catalog_lock:
                 self.catalog.execute(
                     "INSERT INTO collections(name, dim, bit_width, model, base_url, key_hash,"
-                    " created_at, tokenizer, fts_keys) VALUES (?,?,?,?,?,?,?,?,?)",
+                    " created_at, tokenizer, fts_keys, metric) VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (name, dim, bit_width, model, base_url, cfg.key_hash, _now(), tokenizer,
-                     json.dumps(cfg.fts_keys) if cfg.fts_keys is not None else None),
+                     json.dumps(cfg.fts_keys) if cfg.fts_keys is not None else None, metric),
                 )
                 self.catalog.commit()
         if tombstone is not None:
