@@ -1,6 +1,6 @@
 # ADR 0020 — A dot-product metric that keeps float32 vectors as they were sent
 
-Status: proposed · Date: 2026-11-25 · Branch `feat/dot-metric-float32`, not merged ·
+Status: accepted · Date: 2026-11-25 · [PR #21](https://github.com/EmanueleMeazzo/raggio/pull/21) ·
 Builds on [ADR 0003](0003-recall-rescoring.md) (rescoring) and
 [ADR 0007](0007-sofia-backend-requirements.md) (small allowlists scored directly)
 
@@ -266,3 +266,53 @@ default collection **built by main's source** (`31ab17e`) and read by both sourc
 
 Not measured: the DGX benchmarks, concurrency, IVF, hybrid, memory. No published
 figure changes, and none is claimed for the new path.
+
+## Addendum 2026-11 — the query check without the unit vector
+
+**Scope.** The search handler (`app.py`) refused a `dot` query with no direction by
+calling `_dot_unit` on it and dropping the result: a float64 copy, a norm, a division
+and a float32 cast per request, while `_search_rescored` takes the unit vector again
+for the index. It now calls `_dot_check`, which raises the same two `ValueError`s
+(shared message constants) from element-wise tests on the float32 row: `isfinite` on
+every value, then a non-zero value in every row. Raised by a review comment on PR #21.
+The check stays in the handler: the allowlist path (`_search_allowed` at or below the
+rescore depth) scores the retained rows without the index and never takes a unit
+vector, so without it a zero query would return all-zero scores and an infinite one
+non-finite scores.
+
+**Why element-wise is the same rule.** On float32 values the float64 norm `_dot_unit`
+takes is non-finite only when a value is: 3.4e38 squared is about 1.2e77, far below
+float64's 1.8e308 times any dim. It is 0 only when every value is: the least float32
+subnormal, 1.4e-45, squares to about 2e-90, which float64 holds. A float32 norm is not
+the same rule: it overflows past about 1e19 and is 0 below about 1e-23, which is why
+`_dot_unit` widens.
+
+**Compatibility gates.** Same accepted and refused queries, same messages, same 400.
+`test_the_query_check_refuses_what_dot_unit_refuses` compares the two functions on
+twelve inputs, among them 1e-45 and ±3.4e38 (which a float32-norm check gets wrong:
+checked by hand against such a variant), -0.0, NaN, ±inf, 1e39 (inf once cast) and
+two-row inputs where both rules apply. The existing HTTP test
+`test_a_query_without_a_direction_is_a_400` (zero and 1e39 queries, plain, filtered
+and hybrid) passes unchanged. Full suite: 967 passed, 6 skipped. The cosine path is
+untouched.
+
+**Measurement.** `bench/dot_query_check.py`, raw output
+`bench/results-dot-query-check-2026-11.json`. In-process on the calling thread, same
+desktop as above (Xeon E-2226G, Windows 11, Python 3.12.8, NumPy 2.5.3): per dim one
+1 × dim float32 query from a list of Python floats, 15 rounds of 20,000 calls of each
+function in alternating order; per-call µs, median over rounds (minimum in brackets).
+
+| dim | `_dot_unit` | `_dot_check` | median per-round difference |
+|---|---|---|---|
+| 384 | 10.89 (9.74) | 3.53 (3.34) | −7.32 |
+| 768 | 11.94 (10.93) | 4.29 (3.96) | −7.31 |
+| 1024 | 14.11 (12.50) | 5.27 (4.63) | −8.75 |
+| 1536 | 18.17 (13.95) | 7.72 (5.20) | −9.60 |
+| 3072 | 22.32 (18.15) | 8.03 (6.83) | −13.49 |
+
+About 9 µs per `dot` vector query at 1024-d. Against the dot-path p50s above, that is
+0.26 to 0.29 % of the rescored scan at k=10 (3.0 to 3.4 ms), 0.12 to 0.15 % at k=100
+(5.9 to 7.0 ms), and 1.8 to 1.9 % of the 40-record allowlist (468 to 484 µs): below
+this ADR's 1.5 % in-process resolution for the scans, at its edge for the allowlist. Those p50s are taken below the handler, so
+they never included this call; the saving is per HTTP request. Not measured end to end:
+it would not resolve through HTTP's own per-request cost.

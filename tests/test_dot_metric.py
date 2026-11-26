@@ -573,6 +573,41 @@ def test_a_query_without_a_direction_is_a_400(client, query, word):
     assert r.status_code == 400 and "dim" in r.json()["detail"]
 
 
+def _refusal(fn, mat) -> str | None:
+    try:
+        fn(mat)
+    except ValueError as e:
+        return str(e)
+    return None
+
+
+@pytest.mark.filterwarnings("ignore:overflow encountered in cast")
+@pytest.mark.parametrize("rows,word", [
+    ([[1.0, 2.0]], None),
+    ([[1e-45]], None),  # a float32 subnormal: its float32 square is 0, its float64 one is not
+    ([[-1e-45, 0.0]], None),
+    ([[3.4e38, -3.4e38]], None),  # finite; its float32 sum of squares is not
+    ([[0.0]], "zero"),
+    ([[-0.0, 0.0]], "zero"),
+    ([[np.inf]], "finite"),
+    ([[-np.inf, 1.0]], "finite"),
+    ([[np.nan]], "finite"),
+    ([[1e39]], "finite"),  # past float32: inf once cast
+    ([[1.0], [0.0]], "zero"),
+    ([[0.0], [np.inf]], "finite"),  # both wrong: the non-finite row is named, as _dot_unit does
+])
+def test_the_query_check_refuses_what_dot_unit_refuses(rows, word):
+    """The search handler checks a dot query with _dot_check, not _dot_unit, so it skips
+    the float64 copy and the division whose result it would drop: the two must accept
+    and refuse the same float32 rows, with the same message."""
+    mat = np.zeros((len(rows), DIM), np.float32)
+    for i, row in enumerate(rows):
+        mat[i, : len(row)] = np.array(row, dtype=np.float64).astype(np.float32)
+    got = _refusal(store._dot_check, mat)
+    assert got == _refusal(store._dot_unit, mat)
+    assert got is None if word is None else word in got
+
+
 # ---- the store's other paths ----
 
 def test_queries_that_share_a_scan_keep_their_own_dot_products(tmp_path):

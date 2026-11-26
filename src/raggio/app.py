@@ -21,7 +21,7 @@ from .store import (
     CollectionClosedError,
     CollectionDeletedError,
     CollectionManager,
-    _dot_unit,
+    _dot_check,
     _log,
     _normalize,
     _validate_fts_keys,
@@ -487,8 +487,9 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
                 qvec = np.array([vec], dtype=np.float32)
                 if c.cfg.metric == "dot":
                     # ADR 0020: scored as sent. Only refused here (400) when it is zero
-                    # or non-finite: it has no direction to find candidates by
-                    _dot_unit(qvec)
+                    # or non-finite: it has no direction to find candidates by. Checked
+                    # here, not left to the scan: the allowlist path never takes one
+                    _dot_check(qvec)
                 else:
                     qvec = _normalize(qvec)
             hits = await c.search(body.mode, qvec, q.text, body.k, body.scope, body.filter,

@@ -257,6 +257,16 @@ def _normalize(mat: np.ndarray) -> np.ndarray:
     return (mat / norms).astype(np.float32)
 
 
+_DOT_NON_FINITE = (
+    "non-finite vector: a collection with metric 'dot' takes finite float32"
+    " values (a number past 3.4e38 does not fit)"
+)
+_DOT_ZERO = (
+    "zero vector: a collection with metric 'dot' finds candidates by direction,"
+    " and a zero vector has none"
+)
+
+
 def _dot_unit(mat: np.ndarray) -> np.ndarray:
     """Unit-norm float32 copies of float32 rows, for the quantized index of a "dot"
     collection (ADR 0020): the index proposes candidates by direction, and the rows
@@ -267,16 +277,23 @@ def _dot_unit(mat: np.ndarray) -> np.ndarray:
     wide = mat.astype(np.float64)
     norms = np.linalg.norm(wide, axis=1, keepdims=True)
     if not np.isfinite(norms).all():
-        raise ValueError(
-            "non-finite vector: a collection with metric 'dot' takes finite float32"
-            " values (a number past 3.4e38 does not fit)"
-        )
+        raise ValueError(_DOT_NON_FINITE)
     if (norms == 0).any():
-        raise ValueError(
-            "zero vector: a collection with metric 'dot' finds candidates by direction,"
-            " and a zero vector has none"
-        )
+        raise ValueError(_DOT_ZERO)
     return (wide / norms).astype(np.float32)
+
+
+def _dot_check(mat: np.ndarray) -> None:
+    """_dot_unit's refusals without its float64 copy and division, for the search
+    handler, which drops the unit rows (ADR 0020 addendum). Element-wise on float32
+    rows, so the same rows are refused with the same message: a float64 norm of float32
+    values is non-finite only when a value is (3.4e38 squared, times any dim, stays far
+    below 1.8e308), and 0 only when every value is (the least subnormal, 1.4e-45, squares
+    to 2e-90). A float32 norm would not do: it overflows past ~1e19 and is 0 below ~1e-23."""
+    if not np.isfinite(mat).all():
+        raise ValueError(_DOT_NON_FINITE)
+    if not mat.any(axis=1).all():
+        raise ValueError(_DOT_ZERO)
 
 
 def _dot_scores(mat: np.ndarray, q: np.ndarray) -> np.ndarray:
