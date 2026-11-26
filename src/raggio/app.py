@@ -21,6 +21,7 @@ from .store import (
     CollectionClosedError,
     CollectionDeletedError,
     CollectionManager,
+    _dot_check,
     _log,
     _normalize,
     _validate_fts_keys,
@@ -67,6 +68,9 @@ class CollectionIn(BaseModel):
     collection_key: str | None = None
     tokenizer: Literal["unicode61", "trigram"] = "unicode61"
     fts_keys: list[str] | None = None
+    # "dot" (ADR 0020): vectors are kept as the float32 values that were sent, and hits
+    # are ranked by their dot product with the query as sent; "cosine" normalizes both
+    metric: Literal["cosine", "dot"] = "cosine"
 
     @field_validator("fts_keys")
     @classmethod
@@ -320,12 +324,12 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
         try:
             cfg = await manager.create_collection(
                 body.name, body.dim, body.bit_width, body.model, body.base_url,
-                body.collection_key, body.tokenizer, body.fts_keys,
+                body.collection_key, body.tokenizer, body.fts_keys, body.metric,
             )
         except ValueError as e:
             raise HTTPException(409 if "already exists" in str(e) else 400, str(e))
         return {"name": cfg.name, "dim": cfg.dim, "bit_width": cfg.bit_width,
-                "tokenizer": cfg.tokenizer, "fts_keys": cfg.fts_keys}
+                "tokenizer": cfg.tokenizer, "fts_keys": cfg.fts_keys, "metric": cfg.metric}
 
     @app.get("/collections", dependencies=[Depends(require_root)])
     async def list_collections():
@@ -338,7 +342,7 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
         stats = await asyncio.to_thread(c.stats)
         return {"name": c.cfg.name, "dim": c.cfg.dim, "bit_width": c.cfg.bit_width,
                 "model": c.cfg.model, "tokenizer": c.cfg.tokenizer, "fts_keys": c.cfg.fts_keys,
-                "index": c.index_info(), **stats}
+                "metric": c.cfg.metric, "index": c.index_info(), **stats}
 
     # ---- optional IVF index: an additional object, added/removed per collection ----
 
@@ -480,7 +484,14 @@ def create_app(settings: Settings | None = None, embedder_factory=None) -> FastA
                         if c.deleted or c._closed:
                             raise c._closed_error() from None
                         raise
-                qvec = _normalize(np.array([vec], dtype=np.float32))
+                qvec = np.array([vec], dtype=np.float32)
+                if c.cfg.metric == "dot":
+                    # ADR 0020: scored as sent. Only refused here (400) when it is zero
+                    # or non-finite: it has no direction to find candidates by. Checked
+                    # here, not left to the scan: the allowlist path never takes one
+                    _dot_check(qvec)
+                else:
+                    qvec = _normalize(qvec)
             hits = await c.search(body.mode, qvec, q.text, body.k, body.scope, body.filter,
                                   body.expand, body.nprobe, body.fusion, body.alpha)
         except ValueError as e:

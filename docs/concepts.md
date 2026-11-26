@@ -36,6 +36,15 @@ a stored vector. 1 means pointing the same way (same meaning), 0 unrelated,
 −1 opposite; higher is better, and vector lengths don't matter — only
 direction.
 
+### Dot product
+
+The sum of the products of two vectors' components: the cosine multiplied by
+both lengths. For unit vectors the two are the same number. A collection
+created with `"metric": "dot"` scores by it instead, on the float32 vectors
+exactly as they were sent — for clients whose vectors are not exactly
+unit-length and whose ranking must count that
+([Search](search.md#dot-product-collections)).
+
 ### L2 normalization
 
 Scaling a vector to length 1. Once vectors are unit-length, cosine similarity
@@ -43,7 +52,9 @@ reduces to a plain dot product — one multiply-add per dimension, the cheapest
 thing a CPU can stream. raggio normalizes vectors on the way in, and
 renormalizes decoded fp16 candidates before rescoring because fp16 storage
 drifts lengths by about a part in a thousand
-([ADR 0003](adr/0003-recall-rescoring.md)).
+([ADR 0003](adr/0003-recall-rescoring.md)). In a `dot` collection only the
+copy that goes into the quantized index is normalized; the stored vector and
+the query are used as sent.
 
 ### Top-k / k-nearest-neighbor (k-NN)
 

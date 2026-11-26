@@ -1,0 +1,2390 @@
+{
+ "note": "Raw output of bench/dot_metric_ab.py for ADR 0020; see results-dot-metric-2026-11.md for the protocol.",
+ "between_process_runs": {
+  "order": "main1 branch1 branch2 main2 main3 branch3 branch4 main4 main5 branch5 branch6 main6",
+  "main": [
+   {
+    "source": "main 31ab17e (git archive main src)",
+    "has_option": false,
+    "cases": {
+     "plain direct: scan + rescore, k=10": {
+      "calls": 1500,
+      "p50_us": 2833.2,
+      "p90_us": 3343.7,
+      "mean_us": 2924.0,
+      "sha256": "71ca1ce147a1f00c9405ee87c7ef76e190052c836e979cb40bfa8743d61c5b5f"
+     },
+     "plain direct: scan + rescore, k=100": {
+      "calls": 1500,
+      "p50_us": 5459.7,
+      "p90_us": 7122.5,
+      "mean_us": 6016.7,
+      "sha256": "0966348f1643997e038f778d8b85ed7207ff3273fdfeefdb7298dea812671128"
+     },
+     "plain direct: allowlist of 40, k=10": {
+      "calls": 1500,
+      "p50_us": 274.9,
+      "p90_us": 350.5,
+      "mean_us": 305.8,
+      "sha256": "bb94541926dac8aeab4f8774a4e03a3f72ef419dd25050bfef3d024f035738e7"
+     },
+     "plain search: vector k=10": {
+      "calls": 300,
+      "p50_us": 3863.2,
+      "p90_us": 4360.9,
+      "mean_us": 4344.1,
+      "sha256": "df7745fb7428e37d71ed2f260e1690ac2f97ba051800a9e2c81e128eae1d99ed"
+     },
+     "plain search: vector k=100": {
+      "calls": 300,
+      "p50_us": 6451.9,
+      "p90_us": 7417.5,
+      "mean_us": 6734.4,
+      "sha256": "e753c3b6703210b080b6518c5f501e956f48cac847a680d3840a5ade098846a5"
+     },
+     "plain search: vector k=10, filter of 40": {
+      "calls": 300,
+      "p50_us": 643.8,
+      "p90_us": 692.2,
+      "mean_us": 653.5,
+      "sha256": "9853580566519b833930a6f5d891074fde2ba8454075d9945b9d2d81fbc18e69"
+     },
+     "plain list 100 with vectors": {
+      "calls": 300,
+      "p50_us": 6204.8,
+      "p90_us": 7031.4,
+      "mean_us": 6432.9,
+      "sha256": "c2793d062518d66f1e9b92830bf1264e72b0628a092c867ea0bdeb06fc74f9ac"
+     }
+    }
+   },
+   {
+    "source": "main 31ab17e (git archive main src)",
+    "has_option": false,
+    "cases": {
+     "plain direct: scan + rescore, k=10": {
+      "calls": 1500,
+      "p50_us": 2984.0,
+      "p90_us": 3441.5,
+      "mean_us": 3062.1,
+      "sha256": "71ca1ce147a1f00c9405ee87c7ef76e190052c836e979cb40bfa8743d61c5b5f"
+     },
+     "plain direct: scan + rescore, k=100": {
+      "calls": 1500,
+      "p50_us": 5554.8,
+      "p90_us": 6650.2,
+      "mean_us": 5831.2,
+      "sha256": "0966348f1643997e038f778d8b85ed7207ff3273fdfeefdb7298dea812671128"
+     },
+     "plain direct: allowlist of 40, k=10": {
+      "calls": 1500,
+      "p50_us": 281.6,
+      "p90_us": 365.1,
+      "mean_us": 310.7,
+      "sha256": "bb94541926dac8aeab4f8774a4e03a3f72ef419dd25050bfef3d024f035738e7"
+     },
+     "plain search: vector k=10": {
+      "calls": 300,
+      "p50_us": 3882.5,
+      "p90_us": 4457.1,
+      "mean_us": 3983.9,
+      "sha256": "df7745fb7428e37d71ed2f260e1690ac2f97ba051800a9e2c81e128eae1d99ed"
+     },
+     "plain search: vector k=100": {
+      "calls": 300,
+      "p50_us": 6001.9,
+      "p90_us": 6480.6,
+      "mean_us": 6050.6,
+      "sha256": "e753c3b6703210b080b6518c5f501e956f48cac847a680d3840a5ade098846a5"
+     },
+     "plain search: vector k=10, filter of 40": {
+      "calls": 300,
+      "p50_us": 638.3,
+      "p90_us": 727.5,
+      "mean_us": 652.5,
+      "sha256": "9853580566519b833930a6f5d891074fde2ba8454075d9945b9d2d81fbc18e69"
+     },
+     "plain list 100 with vectors": {
+      "calls": 300,
+      "p50_us": 5849.1,
+      "p90_us": 6641.8,
+      "mean_us": 5936.5,
+      "sha256": "c2793d062518d66f1e9b92830bf1264e72b0628a092c867ea0bdeb06fc74f9ac"
+     }
+    }
+   },
+   {
+    "source": "main 31ab17e (git archive main src)",
+    "has_option": false,
+    "cases": {
+     "plain direct: scan + rescore, k=10": {
+      "calls": 1500,
+      "p50_us": 2871.6,
+      "p90_us": 3376.6,
+      "mean_us": 2962.8,
+      "sha256": "71ca1ce147a1f00c9405ee87c7ef76e190052c836e979cb40bfa8743d61c5b5f"
+     },
+     "plain direct: scan + rescore, k=100": {
+      "calls": 1500,
+      "p50_us": 5524.5,
+      "p90_us": 6547.8,
+      "mean_us": 5758.1,
+      "sha256": "0966348f1643997e038f778d8b85ed7207ff3273fdfeefdb7298dea812671128"
+     },
+     "plain direct: allowlist of 40, k=10": {
+      "calls": 1500,
+      "p50_us": 232.0,
+      "p90_us": 254.4,
+      "mean_us": 237.5,
+      "sha256": "bb94541926dac8aeab4f8774a4e03a3f72ef419dd25050bfef3d024f035738e7"
+     },
+     "plain search: vector k=10": {
+      "calls": 300,
+      "p50_us": 3152.7,
+      "p90_us": 4073.1,
+      "mean_us": 3430.2,
+      "sha256": "df7745fb7428e37d71ed2f260e1690ac2f97ba051800a9e2c81e128eae1d99ed"
+     },
+     "plain search: vector k=100": {
+      "calls": 300,
+      "p50_us": 6467.6,
+      "p90_us": 8568.3,
+      "mean_us": 6953.4,
+      "sha256": "e753c3b6703210b080b6518c5f501e956f48cac847a680d3840a5ade098846a5"
+     },
+     "plain search: vector k=10, filter of 40": {
+      "calls": 300,
+      "p50_us": 515.3,
+      "p90_us": 555.6,
+      "mean_us": 523.7,
+      "sha256": "9853580566519b833930a6f5d891074fde2ba8454075d9945b9d2d81fbc18e69"
+     },
+     "plain list 100 with vectors": {
+      "calls": 300,
+      "p50_us": 5814.0,
+      "p90_us": 7135.5,
+      "mean_us": 6094.2,
+      "sha256": "c2793d062518d66f1e9b92830bf1264e72b0628a092c867ea0bdeb06fc74f9ac"
+     }
+    }
+   },
+   {
+    "source": "main 31ab17e (git archive main src)",
+    "has_option": false,
+    "cases": {
+     "plain direct: scan + rescore, k=10": {
+      "calls": 1500,
+      "p50_us": 2423.6,
+      "p90_us": 2684.6,
+      "mean_us": 2481.1,
+      "sha256": "71ca1ce147a1f00c9405ee87c7ef76e190052c836e979cb40bfa8743d61c5b5f"
+     },
+     "plain direct: scan + rescore, k=100": {
+      "calls": 1500,
+      "p50_us": 5078.5,
+      "p90_us": 5912.2,
+      "mean_us": 5251.2,
+      "sha256": "0966348f1643997e038f778d8b85ed7207ff3273fdfeefdb7298dea812671128"
+     },
+     "plain direct: allowlist of 40, k=10": {
+      "calls": 1500,
+      "p50_us": 222.1,
+      "p90_us": 233.5,
+      "mean_us": 226.6,
+      "sha256": "bb94541926dac8aeab4f8774a4e03a3f72ef419dd25050bfef3d024f035738e7"
+     },
+     "plain search: vector k=10": {
+      "calls": 300,
+      "p50_us": 2727.2,
+      "p90_us": 2987.4,
+      "mean_us": 2784.2,
+      "sha256": "df7745fb7428e37d71ed2f260e1690ac2f97ba051800a9e2c81e128eae1d99ed"
+     },
+     "plain search: vector k=100": {
+      "calls": 300,
+      "p50_us": 5517.3,
+      "p90_us": 6263.0,
+      "mean_us": 5659.0,
+      "sha256": "e753c3b6703210b080b6518c5f501e956f48cac847a680d3840a5ade098846a5"
+     },
+     "plain search: vector k=10, filter of 40": {
+      "calls": 300,
+      "p50_us": 522.4,
+      "p90_us": 577.7,
+      "mean_us": 547.4,
+      "sha256": "9853580566519b833930a6f5d891074fde2ba8454075d9945b9d2d81fbc18e69"
+     },
+     "plain list 100 with vectors": {
+      "calls": 300,
+      "p50_us": 5115.2,
+      "p90_us": 5629.2,
+      "mean_us": 5156.3,
+      "sha256": "c2793d062518d66f1e9b92830bf1264e72b0628a092c867ea0bdeb06fc74f9ac"
+     }
+    }
+   },
+   {
+    "source": "main 31ab17e (git archive main src)",
+    "has_option": false,
+    "cases": {
+     "plain direct: scan + rescore, k=10": {
+      "calls": 1500,
+      "p50_us": 2453.4,
+      "p90_us": 2792.9,
+      "mean_us": 2519.4,
+      "sha256": "71ca1ce147a1f00c9405ee87c7ef76e190052c836e979cb40bfa8743d61c5b5f"
+     },
+     "plain direct: scan + rescore, k=100": {
+      "calls": 1500,
+      "p50_us": 4968.6,
+      "p90_us": 5613.0,
+      "mean_us": 5092.0,
+      "sha256": "0966348f1643997e038f778d8b85ed7207ff3273fdfeefdb7298dea812671128"
+     },
+     "plain direct: allowlist of 40, k=10": {
+      "calls": 1500,
+      "p50_us": 232.6,
+      "p90_us": 262.0,
+      "mean_us": 243.4,
+      "sha256": "bb94541926dac8aeab4f8774a4e03a3f72ef419dd25050bfef3d024f035738e7"
+     },
+     "plain search: vector k=10": {
+      "calls": 300,
+      "p50_us": 2750.9,
+      "p90_us": 3068.2,
+      "mean_us": 2829.6,
+      "sha256": "df7745fb7428e37d71ed2f260e1690ac2f97ba051800a9e2c81e128eae1d99ed"
+     },
+     "plain search: vector k=100": {
+      "calls": 300,
+      "p50_us": 5907.4,
+      "p90_us": 6452.0,
+      "mean_us": 5966.6,
+      "sha256": "e753c3b6703210b080b6518c5f501e956f48cac847a680d3840a5ade098846a5"
+     },
+     "plain search: vector k=10, filter of 40": {
+      "calls": 300,
+      "p50_us": 491.2,
+      "p90_us": 544.3,
+      "mean_us": 500.8,
+      "sha256": "9853580566519b833930a6f5d891074fde2ba8454075d9945b9d2d81fbc18e69"
+     },
+     "plain list 100 with vectors": {
+      "calls": 300,
+      "p50_us": 5111.9,
+      "p90_us": 5633.4,
+      "mean_us": 5148.6,
+      "sha256": "c2793d062518d66f1e9b92830bf1264e72b0628a092c867ea0bdeb06fc74f9ac"
+     }
+    }
+   },
+   {
+    "source": "main 31ab17e (git archive main src)",
+    "has_option": false,
+    "cases": {
+     "plain direct: scan + rescore, k=10": {
+      "calls": 1500,
+      "p50_us": 2447.0,
+      "p90_us": 2836.5,
+      "mean_us": 2537.0,
+      "sha256": "71ca1ce147a1f00c9405ee87c7ef76e190052c836e979cb40bfa8743d61c5b5f"
+     },
+     "plain direct: scan + rescore, k=100": {
+      "calls": 1500,
+      "p50_us": 4954.0,
+      "p90_us": 5523.3,
+      "mean_us": 5067.5,
+      "sha256": "0966348f1643997e038f778d8b85ed7207ff3273fdfeefdb7298dea812671128"
+     },
+     "plain direct: allowlist of 40, k=10": {
+      "calls": 1500,
+      "p50_us": 229.8,
+      "p90_us": 273.7,
+      "mean_us": 240.7,
+      "sha256": "bb94541926dac8aeab4f8774a4e03a3f72ef419dd25050bfef3d024f035738e7"
+     },
+     "plain search: vector k=10": {
+      "calls": 300,
+      "p50_us": 2799.7,
+      "p90_us": 3046.7,
+      "mean_us": 2847.7,
+      "sha256": "df7745fb7428e37d71ed2f260e1690ac2f97ba051800a9e2c81e128eae1d99ed"
+     },
+     "plain search: vector k=100": {
+      "calls": 300,
+      "p50_us": 5482.2,
+      "p90_us": 5842.3,
+      "mean_us": 5553.3,
+      "sha256": "e753c3b6703210b080b6518c5f501e956f48cac847a680d3840a5ade098846a5"
+     },
+     "plain search: vector k=10, filter of 40": {
+      "calls": 300,
+      "p50_us": 502.8,
+      "p90_us": 548.0,
+      "mean_us": 509.9,
+      "sha256": "9853580566519b833930a6f5d891074fde2ba8454075d9945b9d2d81fbc18e69"
+     },
+     "plain list 100 with vectors": {
+      "calls": 300,
+      "p50_us": 5085.5,
+      "p90_us": 5551.6,
+      "mean_us": 5104.7,
+      "sha256": "c2793d062518d66f1e9b92830bf1264e72b0628a092c867ea0bdeb06fc74f9ac"
+     }
+    }
+   }
+  ],
+  "branch": [
+   {
+    "source": "branch feat/dot-metric-float32 at ed1a302",
+    "has_option": true,
+    "cases": {
+     "plain direct: scan + rescore, k=10": {
+      "calls": 1500,
+      "p50_us": 2979.3,
+      "p90_us": 3976.2,
+      "mean_us": 3339.8,
+      "sha256": "71ca1ce147a1f00c9405ee87c7ef76e190052c836e979cb40bfa8743d61c5b5f"
+     },
+     "plain direct: scan + rescore, k=100": {
+      "calls": 1500,
+      "p50_us": 5493.2,
+      "p90_us": 7130.0,
+      "mean_us": 6022.7,
+      "sha256": "0966348f1643997e038f778d8b85ed7207ff3273fdfeefdb7298dea812671128"
+     },
+     "plain direct: allowlist of 40, k=10": {
+      "calls": 1500,
+      "p50_us": 236.3,
+      "p90_us": 256.0,
+      "mean_us": 240.3,
+      "sha256": "bb94541926dac8aeab4f8774a4e03a3f72ef419dd25050bfef3d024f035738e7"
+     },
+     "plain search: vector k=10": {
+      "calls": 300,
+      "p50_us": 2900.7,
+      "p90_us": 4739.6,
+      "mean_us": 3597.0,
+      "sha256": "df7745fb7428e37d71ed2f260e1690ac2f97ba051800a9e2c81e128eae1d99ed"
+     },
+     "plain search: vector k=100": {
+      "calls": 300,
+      "p50_us": 5934.8,
+      "p90_us": 7974.2,
+      "mean_us": 6669.1,
+      "sha256": "e753c3b6703210b080b6518c5f501e956f48cac847a680d3840a5ade098846a5"
+     },
+     "plain search: vector k=10, filter of 40": {
+      "calls": 300,
+      "p50_us": 537.0,
+      "p90_us": 582.0,
+      "mean_us": 546.2,
+      "sha256": "9853580566519b833930a6f5d891074fde2ba8454075d9945b9d2d81fbc18e69"
+     },
+     "plain list 100 with vectors": {
+      "calls": 300,
+      "p50_us": 5714.3,
+      "p90_us": 6657.8,
+      "mean_us": 5835.0,
+      "sha256": "c2793d062518d66f1e9b92830bf1264e72b0628a092c867ea0bdeb06fc74f9ac"
+     },
+     "exact direct: scan + rescore, k=10": {
+      "calls": 1500,
+      "p50_us": 2885.4,
+      "p90_us": 4095.0,
+      "mean_us": 3273.8,
+      "sha256": "9f01f99dfe257851e4663d7b40aadb9907777148f1c41aafe10518dd2c71ec71"
+     },
+     "exact direct: scan + rescore, k=100": {
+      "calls": 1500,
+      "p50_us": 5670.3,
+      "p90_us": 6793.9,
+      "mean_us": 6083.4,
+      "sha256": "91b43f35df191407bca736806573a6f7f54d4b8260fade81adc031b93668c0f5"
+     },
+     "exact direct: allowlist of 40, k=10": {
+      "calls": 1500,
+      "p50_us": 337.4,
+      "p90_us": 412.6,
+      "mean_us": 358.3,
+      "sha256": "fae75b25ce4b30e9879cbc12250bad6b7a3e869f1709ad3ebda1af6d4f243621"
+     },
+     "exact search: vector k=10": {
+      "calls": 300,
+      "p50_us": 3192.6,
+      "p90_us": 3637.6,
+      "mean_us": 3245.3,
+      "sha256": "848ee97ddc9be55c290dcc4b6f43c290dc473bafd872b26ad4eac196c6a62638"
+     },
+     "exact search: vector k=100": {
+      "calls": 300,
+      "p50_us": 5921.0,
+      "p90_us": 6581.7,
+      "mean_us": 6018.3,
+      "sha256": "8d176d954297a822b69b53aac4611c954094e480b8fc4658d83f780f349df9e9"
+     }
+    }
+   },
+   {
+    "source": "branch feat/dot-metric-float32 at ed1a302",
+    "has_option": true,
+    "cases": {
+     "plain direct: scan + rescore, k=10": {
+      "calls": 1500,
+      "p50_us": 2501.8,
+      "p90_us": 2885.4,
+      "mean_us": 2577.2,
+      "sha256": "71ca1ce147a1f00c9405ee87c7ef76e190052c836e979cb40bfa8743d61c5b5f"
+     },
+     "plain direct: scan + rescore, k=100": {
+      "calls": 1500,
+      "p50_us": 4802.2,
+      "p90_us": 5518.8,
+      "mean_us": 4858.5,
+      "sha256": "0966348f1643997e038f778d8b85ed7207ff3273fdfeefdb7298dea812671128"
+     },
+     "plain direct: allowlist of 40, k=10": {
+      "calls": 1500,
+      "p50_us": 233.8,
+      "p90_us": 286.2,
+      "mean_us": 246.2,
+      "sha256": "bb94541926dac8aeab4f8774a4e03a3f72ef419dd25050bfef3d024f035738e7"
+     },
+     "plain search: vector k=10": {
+      "calls": 300,
+      "p50_us": 2908.2,
+      "p90_us": 3296.6,
+      "mean_us": 2961.2,
+      "sha256": "df7745fb7428e37d71ed2f260e1690ac2f97ba051800a9e2c81e128eae1d99ed"
+     },
+     "plain search: vector k=100": {
+      "calls": 300,
+      "p50_us": 5417.0,
+      "p90_us": 6162.1,
+      "mean_us": 5495.7,
+      "sha256": "e753c3b6703210b080b6518c5f501e956f48cac847a680d3840a5ade098846a5"
+     },
+     "plain search: vector k=10, filter of 40": {
+      "calls": 300,
+      "p50_us": 549.1,
+      "p90_us": 677.6,
+      "mean_us": 586.1,
+      "sha256": "9853580566519b833930a6f5d891074fde2ba8454075d9945b9d2d81fbc18e69"
+     },
+     "plain list 100 with vectors": {
+      "calls": 300,
+      "p50_us": 5295.7,
+      "p90_us": 6227.5,
+      "mean_us": 5454.5,
+      "sha256": "c2793d062518d66f1e9b92830bf1264e72b0628a092c867ea0bdeb06fc74f9ac"
+     },
+     "exact direct: scan + rescore, k=10": {
+      "calls": 1500,
+      "p50_us": 2966.8,
+      "p90_us": 4285.4,
+      "mean_us": 3526.0,
+      "sha256": "9f01f99dfe257851e4663d7b40aadb9907777148f1c41aafe10518dd2c71ec71"
+     },
+     "exact direct: scan + rescore, k=100": {
+      "calls": 1500,
+      "p50_us": 6531.9,
+      "p90_us": 8343.7,
+      "mean_us": 7139.5,
+      "sha256": "91b43f35df191407bca736806573a6f7f54d4b8260fade81adc031b93668c0f5"
+     },
+     "exact direct: allowlist of 40, k=10": {
+      "calls": 1500,
+      "p50_us": 359.5,
+      "p90_us": 407.3,
+      "mean_us": 370.3,
+      "sha256": "fae75b25ce4b30e9879cbc12250bad6b7a3e869f1709ad3ebda1af6d4f243621"
+     },
+     "exact search: vector k=10": {
+      "calls": 300,
+      "p50_us": 3334.1,
+      "p90_us": 3654.5,
+      "mean_us": 3374.1,
+      "sha256": "848ee97ddc9be55c290dcc4b6f43c290dc473bafd872b26ad4eac196c6a62638"
+     },
+     "exact search: vector k=100": {
+      "calls": 300,
+      "p50_us": 6505.0,
+      "p90_us": 7082.8,
+      "mean_us": 6505.5,
+      "sha256": "8d176d954297a822b69b53aac4611c954094e480b8fc4658d83f780f349df9e9"
+     }
+    }
+   },
+   {
+    "source": "branch feat/dot-metric-float32 at ed1a302",
+    "has_option": true,
+    "cases": {
+     "plain direct: scan + rescore, k=10": {
+      "calls": 1500,
+      "p50_us": 2733.0,
+      "p90_us": 3938.9,
+      "mean_us": 3191.9,
+      "sha256": "71ca1ce147a1f00c9405ee87c7ef76e190052c836e979cb40bfa8743d61c5b5f"
+     },
+     "plain direct: scan + rescore, k=100": {
+      "calls": 1500,
+      "p50_us": 5350.7,
+      "p90_us": 6650.1,
+      "mean_us": 5635.4,
+      "sha256": "0966348f1643997e038f778d8b85ed7207ff3273fdfeefdb7298dea812671128"
+     },
+     "plain direct: allowlist of 40, k=10": {
+      "calls": 1500,
+      "p50_us": 248.2,
+      "p90_us": 269.4,
+      "mean_us": 254.0,
+      "sha256": "bb94541926dac8aeab4f8774a4e03a3f72ef419dd25050bfef3d024f035738e7"
+     },
+     "plain search: vector k=10": {
+      "calls": 300,
+      "p50_us": 3422.0,
+      "p90_us": 3766.9,
+      "mean_us": 3467.6,
+      "sha256": "df7745fb7428e37d71ed2f260e1690ac2f97ba051800a9e2c81e128eae1d99ed"
+     },
+     "plain search: vector k=100": {
+      "calls": 300,
+      "p50_us": 6492.7,
+      "p90_us": 7431.2,
+      "mean_us": 6594.0,
+      "sha256": "e753c3b6703210b080b6518c5f501e956f48cac847a680d3840a5ade098846a5"
+     },
+     "plain search: vector k=10, filter of 40": {
+      "calls": 300,
+      "p50_us": 647.8,
+      "p90_us": 758.1,
+      "mean_us": 713.2,
+      "sha256": "9853580566519b833930a6f5d891074fde2ba8454075d9945b9d2d81fbc18e69"
+     },
+     "plain list 100 with vectors": {
+      "calls": 300,
+      "p50_us": 5782.2,
+      "p90_us": 7408.1,
+      "mean_us": 6082.6,
+      "sha256": "c2793d062518d66f1e9b92830bf1264e72b0628a092c867ea0bdeb06fc74f9ac"
+     },
+     "exact direct: scan + rescore, k=10": {
+      "calls": 1500,
+      "p50_us": 2897.7,
+      "p90_us": 3388.5,
+      "mean_us": 3048.3,
+      "sha256": "9f01f99dfe257851e4663d7b40aadb9907777148f1c41aafe10518dd2c71ec71"
+     },
+     "exact direct: scan + rescore, k=100": {
+      "calls": 1500,
+      "p50_us": 6138.5,
+      "p90_us": 7209.3,
+      "mean_us": 6353.3,
+      "sha256": "91b43f35df191407bca736806573a6f7f54d4b8260fade81adc031b93668c0f5"
+     },
+     "exact direct: allowlist of 40, k=10": {
+      "calls": 1500,
+      "p50_us": 343.2,
+      "p90_us": 384.2,
+      "mean_us": 354.5,
+      "sha256": "fae75b25ce4b30e9879cbc12250bad6b7a3e869f1709ad3ebda1af6d4f243621"
+     },
+     "exact search: vector k=10": {
+      "calls": 300,
+      "p50_us": 3086.6,
+      "p90_us": 3987.2,
+      "mean_us": 3344.4,
+      "sha256": "848ee97ddc9be55c290dcc4b6f43c290dc473bafd872b26ad4eac196c6a62638"
+     },
+     "exact search: vector k=100": {
+      "calls": 300,
+      "p50_us": 7453.2,
+      "p90_us": 9046.0,
+      "mean_us": 7813.5,
+      "sha256": "8d176d954297a822b69b53aac4611c954094e480b8fc4658d83f780f349df9e9"
+     }
+    }
+   },
+   {
+    "source": "branch feat/dot-metric-float32 at ed1a302",
+    "has_option": true,
+    "cases": {
+     "plain direct: scan + rescore, k=10": {
+      "calls": 1500,
+      "p50_us": 2837.3,
+      "p90_us": 4078.7,
+      "mean_us": 3181.5,
+      "sha256": "71ca1ce147a1f00c9405ee87c7ef76e190052c836e979cb40bfa8743d61c5b5f"
+     },
+     "plain direct: scan + rescore, k=100": {
+      "calls": 1500,
+      "p50_us": 5452.2,
+      "p90_us": 7126.7,
+      "mean_us": 5882.8,
+      "sha256": "0966348f1643997e038f778d8b85ed7207ff3273fdfeefdb7298dea812671128"
+     },
+     "plain direct: allowlist of 40, k=10": {
+      "calls": 1500,
+      "p50_us": 249.4,
+      "p90_us": 289.1,
+      "mean_us": 259.7,
+      "sha256": "bb94541926dac8aeab4f8774a4e03a3f72ef419dd25050bfef3d024f035738e7"
+     },
+     "plain search: vector k=10": {
+      "calls": 300,
+      "p50_us": 3084.0,
+      "p90_us": 4726.5,
+      "mean_us": 3892.5,
+      "sha256": "df7745fb7428e37d71ed2f260e1690ac2f97ba051800a9e2c81e128eae1d99ed"
+     },
+     "plain search: vector k=100": {
+      "calls": 300,
+      "p50_us": 5703.5,
+      "p90_us": 7486.5,
+      "mean_us": 6319.7,
+      "sha256": "e753c3b6703210b080b6518c5f501e956f48cac847a680d3840a5ade098846a5"
+     },
+     "plain search: vector k=10, filter of 40": {
+      "calls": 300,
+      "p50_us": 576.3,
+      "p90_us": 683.0,
+      "mean_us": 594.5,
+      "sha256": "9853580566519b833930a6f5d891074fde2ba8454075d9945b9d2d81fbc18e69"
+     },
+     "plain list 100 with vectors": {
+      "calls": 300,
+      "p50_us": 5667.3,
+      "p90_us": 6910.0,
+      "mean_us": 5970.4,
+      "sha256": "c2793d062518d66f1e9b92830bf1264e72b0628a092c867ea0bdeb06fc74f9ac"
+     },
+     "exact direct: scan + rescore, k=10": {
+      "calls": 1500,
+      "p50_us": 3280.5,
+      "p90_us": 4314.1,
+      "mean_us": 3695.5,
+      "sha256": "9f01f99dfe257851e4663d7b40aadb9907777148f1c41aafe10518dd2c71ec71"
+     },
+     "exact direct: scan + rescore, k=100": {
+      "calls": 1500,
+      "p50_us": 5405.2,
+      "p90_us": 6179.1,
+      "mean_us": 5577.1,
+      "sha256": "91b43f35df191407bca736806573a6f7f54d4b8260fade81adc031b93668c0f5"
+     },
+     "exact direct: allowlist of 40, k=10": {
+      "calls": 1500,
+      "p50_us": 329.3,
+      "p90_us": 386.7,
+      "mean_us": 344.1,
+      "sha256": "fae75b25ce4b30e9879cbc12250bad6b7a3e869f1709ad3ebda1af6d4f243621"
+     },
+     "exact search: vector k=10": {
+      "calls": 300,
+      "p50_us": 2895.5,
+      "p90_us": 3208.8,
+      "mean_us": 2949.0,
+      "sha256": "848ee97ddc9be55c290dcc4b6f43c290dc473bafd872b26ad4eac196c6a62638"
+     },
+     "exact search: vector k=100": {
+      "calls": 300,
+      "p50_us": 5819.6,
+      "p90_us": 6320.1,
+      "mean_us": 5876.1,
+      "sha256": "8d176d954297a822b69b53aac4611c954094e480b8fc4658d83f780f349df9e9"
+     }
+    }
+   },
+   {
+    "source": "branch feat/dot-metric-float32 at ed1a302",
+    "has_option": true,
+    "cases": {
+     "plain direct: scan + rescore, k=10": {
+      "calls": 1500,
+      "p50_us": 2497.7,
+      "p90_us": 2865.7,
+      "mean_us": 2597.1,
+      "sha256": "71ca1ce147a1f00c9405ee87c7ef76e190052c836e979cb40bfa8743d61c5b5f"
+     },
+     "plain direct: scan + rescore, k=100": {
+      "calls": 1500,
+      "p50_us": 4625.1,
+      "p90_us": 5670.2,
+      "mean_us": 4813.4,
+      "sha256": "0966348f1643997e038f778d8b85ed7207ff3273fdfeefdb7298dea812671128"
+     },
+     "plain direct: allowlist of 40, k=10": {
+      "calls": 1500,
+      "p50_us": 240.9,
+      "p90_us": 310.4,
+      "mean_us": 261.1,
+      "sha256": "bb94541926dac8aeab4f8774a4e03a3f72ef419dd25050bfef3d024f035738e7"
+     },
+     "plain search: vector k=10": {
+      "calls": 300,
+      "p50_us": 2855.7,
+      "p90_us": 3140.2,
+      "mean_us": 2893.8,
+      "sha256": "df7745fb7428e37d71ed2f260e1690ac2f97ba051800a9e2c81e128eae1d99ed"
+     },
+     "plain search: vector k=100": {
+      "calls": 300,
+      "p50_us": 4862.9,
+      "p90_us": 5440.5,
+      "mean_us": 4983.1,
+      "sha256": "e753c3b6703210b080b6518c5f501e956f48cac847a680d3840a5ade098846a5"
+     },
+     "plain search: vector k=10, filter of 40": {
+      "calls": 300,
+      "p50_us": 485.1,
+      "p90_us": 545.8,
+      "mean_us": 501.8,
+      "sha256": "9853580566519b833930a6f5d891074fde2ba8454075d9945b9d2d81fbc18e69"
+     },
+     "plain list 100 with vectors": {
+      "calls": 300,
+      "p50_us": 5038.7,
+      "p90_us": 5575.8,
+      "mean_us": 5070.7,
+      "sha256": "c2793d062518d66f1e9b92830bf1264e72b0628a092c867ea0bdeb06fc74f9ac"
+     },
+     "exact direct: scan + rescore, k=10": {
+      "calls": 1500,
+      "p50_us": 2512.8,
+      "p90_us": 2861.2,
+      "mean_us": 2582.3,
+      "sha256": "9f01f99dfe257851e4663d7b40aadb9907777148f1c41aafe10518dd2c71ec71"
+     },
+     "exact direct: scan + rescore, k=100": {
+      "calls": 1500,
+      "p50_us": 5094.5,
+      "p90_us": 5785.8,
+      "mean_us": 5226.1,
+      "sha256": "91b43f35df191407bca736806573a6f7f54d4b8260fade81adc031b93668c0f5"
+     },
+     "exact direct: allowlist of 40, k=10": {
+      "calls": 1500,
+      "p50_us": 338.2,
+      "p90_us": 384.4,
+      "mean_us": 350.8,
+      "sha256": "fae75b25ce4b30e9879cbc12250bad6b7a3e869f1709ad3ebda1af6d4f243621"
+     },
+     "exact search: vector k=10": {
+      "calls": 300,
+      "p50_us": 2984.3,
+      "p90_us": 3298.3,
+      "mean_us": 3037.2,
+      "sha256": "848ee97ddc9be55c290dcc4b6f43c290dc473bafd872b26ad4eac196c6a62638"
+     },
+     "exact search: vector k=100": {
+      "calls": 300,
+      "p50_us": 5693.6,
+      "p90_us": 6096.2,
+      "mean_us": 5740.5,
+      "sha256": "8d176d954297a822b69b53aac4611c954094e480b8fc4658d83f780f349df9e9"
+     }
+    }
+   },
+   {
+    "source": "branch feat/dot-metric-float32 at ed1a302",
+    "has_option": true,
+    "cases": {
+     "plain direct: scan + rescore, k=10": {
+      "calls": 1500,
+      "p50_us": 2457.8,
+      "p90_us": 2825.2,
+      "mean_us": 2530.5,
+      "sha256": "71ca1ce147a1f00c9405ee87c7ef76e190052c836e979cb40bfa8743d61c5b5f"
+     },
+     "plain direct: scan + rescore, k=100": {
+      "calls": 1500,
+      "p50_us": 4641.0,
+      "p90_us": 5279.9,
+      "mean_us": 4683.1,
+      "sha256": "0966348f1643997e038f778d8b85ed7207ff3273fdfeefdb7298dea812671128"
+     },
+     "plain direct: allowlist of 40, k=10": {
+      "calls": 1500,
+      "p50_us": 220.4,
+      "p90_us": 229.1,
+      "mean_us": 224.3,
+      "sha256": "bb94541926dac8aeab4f8774a4e03a3f72ef419dd25050bfef3d024f035738e7"
+     },
+     "plain search: vector k=10": {
+      "calls": 300,
+      "p50_us": 2814.1,
+      "p90_us": 3102.3,
+      "mean_us": 2848.7,
+      "sha256": "df7745fb7428e37d71ed2f260e1690ac2f97ba051800a9e2c81e128eae1d99ed"
+     },
+     "plain search: vector k=100": {
+      "calls": 300,
+      "p50_us": 5514.4,
+      "p90_us": 6087.1,
+      "mean_us": 5538.0,
+      "sha256": "e753c3b6703210b080b6518c5f501e956f48cac847a680d3840a5ade098846a5"
+     },
+     "plain search: vector k=10, filter of 40": {
+      "calls": 300,
+      "p50_us": 471.8,
+      "p90_us": 531.1,
+      "mean_us": 483.7,
+      "sha256": "9853580566519b833930a6f5d891074fde2ba8454075d9945b9d2d81fbc18e69"
+     },
+     "plain list 100 with vectors": {
+      "calls": 300,
+      "p50_us": 4959.0,
+      "p90_us": 5485.4,
+      "mean_us": 5003.8,
+      "sha256": "c2793d062518d66f1e9b92830bf1264e72b0628a092c867ea0bdeb06fc74f9ac"
+     },
+     "exact direct: scan + rescore, k=10": {
+      "calls": 1500,
+      "p50_us": 2485.7,
+      "p90_us": 2813.3,
+      "mean_us": 2556.6,
+      "sha256": "9f01f99dfe257851e4663d7b40aadb9907777148f1c41aafe10518dd2c71ec71"
+     },
+     "exact direct: scan + rescore, k=100": {
+      "calls": 1500,
+      "p50_us": 4960.8,
+      "p90_us": 5652.9,
+      "mean_us": 5124.3,
+      "sha256": "91b43f35df191407bca736806573a6f7f54d4b8260fade81adc031b93668c0f5"
+     },
+     "exact direct: allowlist of 40, k=10": {
+      "calls": 1500,
+      "p50_us": 343.0,
+      "p90_us": 391.6,
+      "mean_us": 355.4,
+      "sha256": "fae75b25ce4b30e9879cbc12250bad6b7a3e869f1709ad3ebda1af6d4f243621"
+     },
+     "exact search: vector k=10": {
+      "calls": 300,
+      "p50_us": 3109.0,
+      "p90_us": 3380.1,
+      "mean_us": 3144.4,
+      "sha256": "848ee97ddc9be55c290dcc4b6f43c290dc473bafd872b26ad4eac196c6a62638"
+     },
+     "exact search: vector k=100": {
+      "calls": 300,
+      "p50_us": 5742.0,
+      "p90_us": 6549.8,
+      "mean_us": 5893.6,
+      "sha256": "8d176d954297a822b69b53aac4611c954094e480b8fc4658d83f780f349df9e9"
+     }
+    }
+   }
+  ]
+ },
+ "paired_three_arms_fixed_rotation": [
+  {
+   "sources": {
+    "base_a": "main 31ab17e (git archive main src)",
+    "base_b": "main 31ab17e (git archive main src)",
+    "new": "branch feat/dot-metric-float32 at ed1a302"
+   },
+   "calls": 1500,
+   "cases": {
+    "scan + rescore, k=10": {
+     "p50_us": {
+      "base_a": 2452.8,
+      "base_b": 2454.7,
+      "new": 2453.6
+     },
+     "mean_us": {
+      "base_a": 2541.7,
+      "base_b": 2547.5,
+      "new": 2540.5
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -2.65,
+      "ci95_us": [
+       -8.11,
+       2.1
+      ],
+      "median_pct_of_base_p50": -0.11,
+      "iqr_us": [
+       -67.0,
+       76.7
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": 4.8,
+      "ci95_us": [
+       1.1,
+       10.25
+      ],
+      "median_pct_of_base_p50": 0.2,
+      "iqr_us": [
+       -74.3,
+       74.9
+      ]
+     }
+    },
+    "scan + rescore, k=100": {
+     "p50_us": {
+      "base_a": 4503.7,
+      "base_b": 4506.9,
+      "new": 4489.5
+     },
+     "mean_us": {
+      "base_a": 4649.5,
+      "base_b": 4643.6,
+      "new": 4656.6
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -13.1,
+      "ci95_us": [
+       -26.5,
+       2.95
+      ],
+      "median_pct_of_base_p50": -0.29,
+      "iqr_us": [
+       -159.9,
+       163.2
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": 3.15,
+      "ci95_us": [
+       -7.0,
+       13.2
+      ],
+      "median_pct_of_base_p50": 0.07,
+      "iqr_us": [
+       -163.2,
+       134.1
+      ]
+     }
+    },
+    "allowlist of 40, k=10": {
+     "p50_us": {
+      "base_a": 224.4,
+      "base_b": 226.4,
+      "new": 224.9
+     },
+     "mean_us": {
+      "base_a": 251.1,
+      "base_b": 234.7,
+      "new": 233.9
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": 0.5,
+      "ci95_us": [
+       0.15,
+       0.8
+      ],
+      "median_pct_of_base_p50": 0.22,
+      "iqr_us": [
+       -4.2,
+       5.9
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": 0.5,
+      "ci95_us": [
+       0.2,
+       0.85
+      ],
+      "median_pct_of_base_p50": 0.22,
+      "iqr_us": [
+       -3.9,
+       5.5
+      ]
+     }
+    }
+   }
+  },
+  {
+   "sources": {
+    "base_a": "main 31ab17e (git archive main src)",
+    "base_b": "main 31ab17e (git archive main src)",
+    "new": "branch feat/dot-metric-float32 at ed1a302"
+   },
+   "calls": 1500,
+   "cases": {
+    "scan + rescore, k=10": {
+     "p50_us": {
+      "base_a": 2529.0,
+      "base_b": 2521.2,
+      "new": 2540.1
+     },
+     "mean_us": {
+      "base_a": 2608.1,
+      "base_b": 2596.3,
+      "new": 2612.4
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -14.5,
+      "ci95_us": [
+       -22.15,
+       -8.8
+      ],
+      "median_pct_of_base_p50": -0.57,
+      "iqr_us": [
+       -79.8,
+       56.9
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": 9.45,
+      "ci95_us": [
+       4.09,
+       16.55
+      ],
+      "median_pct_of_base_p50": 0.37,
+      "iqr_us": [
+       -68.7,
+       72.7
+      ]
+     }
+    },
+    "scan + rescore, k=100": {
+     "p50_us": {
+      "base_a": 4572.5,
+      "base_b": 4565.6,
+      "new": 4587.6
+     },
+     "mean_us": {
+      "base_a": 4677.8,
+      "base_b": 4679.5,
+      "new": 4679.9
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -0.75,
+      "ci95_us": [
+       -17.2,
+       17.4
+      ],
+      "median_pct_of_base_p50": -0.02,
+      "iqr_us": [
+       -176.4,
+       185.6
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": 8.15,
+      "ci95_us": [
+       -6.05,
+       24.3
+      ],
+      "median_pct_of_base_p50": 0.18,
+      "iqr_us": [
+       -178.3,
+       190.2
+      ]
+     }
+    },
+    "allowlist of 40, k=10": {
+     "p50_us": {
+      "base_a": 237.6,
+      "base_b": 238.1,
+      "new": 238.1
+     },
+     "mean_us": {
+      "base_a": 245.7,
+      "base_b": 246.9,
+      "new": 246.2
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -0.1,
+      "ci95_us": [
+       -0.4,
+       0.2
+      ],
+      "median_pct_of_base_p50": -0.04,
+      "iqr_us": [
+       -4.2,
+       3.8
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": 0.3,
+      "ci95_us": [
+       0.0,
+       0.6
+      ],
+      "median_pct_of_base_p50": 0.13,
+      "iqr_us": [
+       -4.0,
+       4.5
+      ]
+     }
+    }
+   }
+  },
+  {
+   "sources": {
+    "base_a": "main 31ab17e (git archive main src)",
+    "base_b": "main 31ab17e (git archive main src)",
+    "new": "branch feat/dot-metric-float32 at ed1a302"
+   },
+   "calls": 1500,
+   "cases": {
+    "scan + rescore, k=10": {
+     "p50_us": {
+      "base_a": 2517.0,
+      "base_b": 2511.6,
+      "new": 2517.9
+     },
+     "mean_us": {
+      "base_a": 2597.0,
+      "base_b": 2593.7,
+      "new": 2600.1
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -9.2,
+      "ci95_us": [
+       -12.65,
+       -5.4
+      ],
+      "median_pct_of_base_p50": -0.37,
+      "iqr_us": [
+       -68.0,
+       56.4
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": 3.8,
+      "ci95_us": [
+       -1.7,
+       9.2
+      ],
+      "median_pct_of_base_p50": 0.15,
+      "iqr_us": [
+       -63.7,
+       57.6
+      ]
+     }
+    },
+    "scan + rescore, k=100": {
+     "p50_us": {
+      "base_a": 5037.0,
+      "base_b": 5012.1,
+      "new": 5013.0
+     },
+     "mean_us": {
+      "base_a": 5159.3,
+      "base_b": 5129.7,
+      "new": 5150.0
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -25.75,
+      "ci95_us": [
+       -43.65,
+       -12.8
+      ],
+      "median_pct_of_base_p50": -0.51,
+      "iqr_us": [
+       -194.8,
+       156.2
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": -9.45,
+      "ci95_us": [
+       -27.4,
+       2.6
+      ],
+      "median_pct_of_base_p50": -0.19,
+      "iqr_us": [
+       -217.0,
+       145.1
+      ]
+     }
+    },
+    "allowlist of 40, k=10": {
+     "p50_us": {
+      "base_a": 261.5,
+      "base_b": 260.5,
+      "new": 261.3
+     },
+     "mean_us": {
+      "base_a": 275.7,
+      "base_b": 276.3,
+      "new": 281.5
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -1.2,
+      "ci95_us": [
+       -1.75,
+       -0.7
+      ],
+      "median_pct_of_base_p50": -0.46,
+      "iqr_us": [
+       -8.3,
+       4.3
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": -0.25,
+      "ci95_us": [
+       -0.6,
+       0.3
+      ],
+      "median_pct_of_base_p50": -0.1,
+      "iqr_us": [
+       -6.6,
+       6.9
+      ]
+     }
+    }
+   }
+  }
+ ],
+ "paired_four_arms_fixed_rotation": [
+  {
+   "sources": {
+    "base_a": "main 31ab17e (git archive main src)",
+    "base_b": "main 31ab17e (git archive main src)",
+    "new": "branch feat/dot-metric-float32 at ed1a302"
+   },
+   "calls": 1500,
+   "cases": {
+    "scan + rescore, k=10": {
+     "p50_us": {
+      "base_a": 2783.8,
+      "base_b": 2765.2,
+      "new": 2800.1,
+      "dot": 2926.2
+     },
+     "mean_us": {
+      "base_a": 2864.8,
+      "base_b": 2862.3,
+      "new": 2889.1,
+      "dot": 2999.3
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -28.15,
+      "ci95_us": [
+       -34.4,
+       -20.89
+      ],
+      "median_pct_of_base_p50": -1.01,
+      "iqr_us": [
+       -91.1,
+       62.2
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": 10.2,
+      "ci95_us": [
+       3.5,
+       18.2
+      ],
+      "median_pct_of_base_p50": 0.37,
+      "iqr_us": [
+       -70.0,
+       98.9
+      ]
+     },
+     "dot_minus_base_a": {
+      "median_us": 145.1,
+      "ci95_us": [
+       137.6,
+       150.65
+      ],
+      "median_pct_of_base_p50": 5.21,
+      "iqr_us": [
+       65.2,
+       212.7
+      ]
+     }
+    },
+    "scan + rescore, k=100": {
+     "p50_us": {
+      "base_a": 4898.5,
+      "base_b": 4875.8,
+      "new": 4886.9,
+      "dot": 5657.9
+     },
+     "mean_us": {
+      "base_a": 5021.9,
+      "base_b": 5011.1,
+      "new": 4984.5,
+      "dot": 5776.2
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -47.85,
+      "ci95_us": [
+       -66.05,
+       -29.65
+      ],
+      "median_pct_of_base_p50": -0.98,
+      "iqr_us": [
+       -220.7,
+       193.0
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": -28.55,
+      "ci95_us": [
+       -50.05,
+       -8.5
+      ],
+      "median_pct_of_base_p50": -0.58,
+      "iqr_us": [
+       -285.3,
+       235.6
+      ]
+     },
+     "dot_minus_base_a": {
+      "median_us": 755.95,
+      "ci95_us": [
+       736.2,
+       774.3
+      ],
+      "median_pct_of_base_p50": 15.43,
+      "iqr_us": [
+       527.3,
+       972.6
+      ]
+     }
+    },
+    "allowlist of 40, k=10": {
+     "p50_us": {
+      "base_a": 264.1,
+      "base_b": 261.5,
+      "new": 260.0,
+      "dot": 398.4
+     },
+     "mean_us": {
+      "base_a": 286.9,
+      "base_b": 304.1,
+      "new": 289.6,
+      "dot": 482.5
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -3.25,
+      "ci95_us": [
+       -3.7,
+       -2.8
+      ],
+      "median_pct_of_base_p50": -1.23,
+      "iqr_us": [
+       -10.7,
+       1.9
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": -4.7,
+      "ci95_us": [
+       -5.3,
+       -4.25
+      ],
+      "median_pct_of_base_p50": -1.78,
+      "iqr_us": [
+       -13.5,
+       1.3
+      ]
+     },
+     "dot_minus_base_a": {
+      "median_us": 132.7,
+      "ci95_us": [
+       131.4,
+       134.25
+      ],
+      "median_pct_of_base_p50": 50.26,
+      "iqr_us": [
+       122.8,
+       160.9
+      ]
+     }
+    }
+   }
+  },
+  {
+   "sources": {
+    "base_a": "main 31ab17e (git archive main src)",
+    "base_b": "main 31ab17e (git archive main src)",
+    "new": "branch feat/dot-metric-float32 at ed1a302"
+   },
+   "calls": 1500,
+   "cases": {
+    "scan + rescore, k=10": {
+     "p50_us": {
+      "base_a": 3160.4,
+      "base_b": 3162.9,
+      "new": 3141.4,
+      "dot": 3373.0
+     },
+     "mean_us": {
+      "base_a": 3551.1,
+      "base_b": 3607.6,
+      "new": 3487.3,
+      "dot": 3796.4
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -25.15,
+      "ci95_us": [
+       -36.35,
+       -10.65
+      ],
+      "median_pct_of_base_p50": -0.8,
+      "iqr_us": [
+       -172.2,
+       167.2
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": -29.05,
+      "ci95_us": [
+       -46.75,
+       -15.19
+      ],
+      "median_pct_of_base_p50": -0.92,
+      "iqr_us": [
+       -205.4,
+       152.3
+      ]
+     },
+     "dot_minus_base_a": {
+      "median_us": 210.05,
+      "ci95_us": [
+       198.2,
+       221.3
+      ],
+      "median_pct_of_base_p50": 6.65,
+      "iqr_us": [
+       43.1,
+       370.5
+      ]
+     }
+    },
+    "scan + rescore, k=100": {
+     "p50_us": {
+      "base_a": 5573.3,
+      "base_b": 5547.2,
+      "new": 5533.0,
+      "dot": 6493.8
+     },
+     "mean_us": {
+      "base_a": 5856.0,
+      "base_b": 5875.8,
+      "new": 5844.5,
+      "dot": 6782.1
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -35.85,
+      "ci95_us": [
+       -54.1,
+       -13.0
+      ],
+      "median_pct_of_base_p50": -0.64,
+      "iqr_us": [
+       -244.0,
+       224.3
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": -44.45,
+      "ci95_us": [
+       -65.6,
+       -27.94
+      ],
+      "median_pct_of_base_p50": -0.8,
+      "iqr_us": [
+       -311.1,
+       237.8
+      ]
+     },
+     "dot_minus_base_a": {
+      "median_us": 900.55,
+      "ci95_us": [
+       874.35,
+       922.7
+      ],
+      "median_pct_of_base_p50": 16.16,
+      "iqr_us": [
+       652.1,
+       1174.8
+      ]
+     }
+    },
+    "allowlist of 40, k=10": {
+     "p50_us": {
+      "base_a": 326.1,
+      "base_b": 318.7,
+      "new": 313.5,
+      "dot": 494.2
+     },
+     "mean_us": {
+      "base_a": 387.6,
+      "base_b": 374.0,
+      "new": 382.3,
+      "dot": 575.4
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -8.3,
+      "ci95_us": [
+       -9.4,
+       -6.5
+      ],
+      "median_pct_of_base_p50": -2.55,
+      "iqr_us": [
+       -27.2,
+       9.4
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": -10.0,
+      "ci95_us": [
+       -11.5,
+       -8.4
+      ],
+      "median_pct_of_base_p50": -3.07,
+      "iqr_us": [
+       -33.9,
+       11.3
+      ]
+     },
+     "dot_minus_base_a": {
+      "median_us": 164.55,
+      "ci95_us": [
+       162.6,
+       167.65
+      ],
+      "median_pct_of_base_p50": 50.46,
+      "iqr_us": [
+       138.6,
+       208.8
+      ]
+     }
+    }
+   }
+  },
+  {
+   "sources": {
+    "base_a": "main 31ab17e (git archive main src)",
+    "base_b": "main 31ab17e (git archive main src)",
+    "new": "branch feat/dot-metric-float32 at ed1a302"
+   },
+   "calls": 1500,
+   "cases": {
+    "scan + rescore, k=10": {
+     "p50_us": {
+      "base_a": 3050.5,
+      "base_b": 3010.3,
+      "new": 3063.6,
+      "dot": 3207.6
+     },
+     "mean_us": {
+      "base_a": 3215.7,
+      "base_b": 3201.5,
+      "new": 3260.4,
+      "dot": 3412.9
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -51.8,
+      "ci95_us": [
+       -62.55,
+       -41.5
+      ],
+      "median_pct_of_base_p50": -1.7,
+      "iqr_us": [
+       -198.3,
+       116.8
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": 2.7,
+      "ci95_us": [
+       -11.9,
+       15.6
+      ],
+      "median_pct_of_base_p50": 0.09,
+      "iqr_us": [
+       -167.2,
+       168.1
+      ]
+     },
+     "dot_minus_base_a": {
+      "median_us": 160.35,
+      "ci95_us": [
+       149.15,
+       173.15
+      ],
+      "median_pct_of_base_p50": 5.26,
+      "iqr_us": [
+       0.8,
+       304.1
+      ]
+     }
+    },
+    "scan + rescore, k=100": {
+     "p50_us": {
+      "base_a": 5346.5,
+      "base_b": 5310.4,
+      "new": 5315.3,
+      "dot": 6154.3
+     },
+     "mean_us": {
+      "base_a": 5626.4,
+      "base_b": 5608.3,
+      "new": 5634.2,
+      "dot": 6571.5
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -39.8,
+      "ci95_us": [
+       -61.2,
+       -14.65
+      ],
+      "median_pct_of_base_p50": -0.74,
+      "iqr_us": [
+       -298.9,
+       274.4
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": -17.1,
+      "ci95_us": [
+       -43.15,
+       5.26
+      ],
+      "median_pct_of_base_p50": -0.32,
+      "iqr_us": [
+       -359.9,
+       338.2
+      ]
+     },
+     "dot_minus_base_a": {
+      "median_us": 800.4,
+      "ci95_us": [
+       772.2,
+       830.25
+      ],
+      "median_pct_of_base_p50": 14.97,
+      "iqr_us": [
+       498.5,
+       1134.5
+      ]
+     }
+    },
+    "allowlist of 40, k=10": {
+     "p50_us": {
+      "base_a": 289.6,
+      "base_b": 283.7,
+      "new": 283.3,
+      "dot": 438.6
+     },
+     "mean_us": {
+      "base_a": 306.7,
+      "base_b": 311.1,
+      "new": 293.4,
+      "dot": 470.1
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -5.45,
+      "ci95_us": [
+       -6.3,
+       -4.7
+      ],
+      "median_pct_of_base_p50": -1.88,
+      "iqr_us": [
+       -15.3,
+       3.1
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": -6.0,
+      "ci95_us": [
+       -6.8,
+       -5.2
+      ],
+      "median_pct_of_base_p50": -2.07,
+      "iqr_us": [
+       -18.0,
+       5.8
+      ]
+     },
+     "dot_minus_base_a": {
+      "median_us": 143.2,
+      "ci95_us": [
+       141.25,
+       145.5
+      ],
+      "median_pct_of_base_p50": 49.44,
+      "iqr_us": [
+       127.6,
+       174.2
+      ]
+     }
+    }
+   }
+  }
+ ],
+ "paired_four_arms_random_order": [
+  {
+   "sources": {
+    "base_a": "main 31ab17e (git archive main src)",
+    "base_b": "main 31ab17e (git archive main src)",
+    "new": "branch feat/dot-metric-float32 at ed1a302"
+   },
+   "calls": 1500,
+   "cases": {
+    "scan + rescore, k=10": {
+     "p50_us": {
+      "base_a": 3074.6,
+      "base_b": 3023.1,
+      "new": 3022.3,
+      "dot": 3197.9
+     },
+     "mean_us": {
+      "base_a": 3395.1,
+      "base_b": 3301.8,
+      "new": 3238.4,
+      "dot": 3440.2
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -48.7,
+      "ci95_us": [
+       -61.45,
+       -39.7
+      ],
+      "median_pct_of_base_p50": -1.58,
+      "iqr_us": [
+       -193.1,
+       83.9
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": -50.35,
+      "ci95_us": [
+       -60.66,
+       -39.35
+      ],
+      "median_pct_of_base_p50": -1.64,
+      "iqr_us": [
+       -189.1,
+       90.5
+      ]
+     },
+     "dot_minus_base_a": {
+      "median_us": 107.0,
+      "ci95_us": [
+       98.9,
+       118.6
+      ],
+      "median_pct_of_base_p50": 3.48,
+      "iqr_us": [
+       -14.9,
+       265.6
+      ]
+     }
+    },
+    "scan + rescore, k=100": {
+     "p50_us": {
+      "base_a": 5489.3,
+      "base_b": 5430.3,
+      "new": 5436.9,
+      "dot": 6289.0
+     },
+     "mean_us": {
+      "base_a": 5892.7,
+      "base_b": 5910.3,
+      "new": 5783.6,
+      "dot": 6709.5
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -49.55,
+      "ci95_us": [
+       -72.75,
+       -29.1
+      ],
+      "median_pct_of_base_p50": -0.9,
+      "iqr_us": [
+       -338.8,
+       245.9
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": -58.05,
+      "ci95_us": [
+       -86.3,
+       -38.1
+      ],
+      "median_pct_of_base_p50": -1.06,
+      "iqr_us": [
+       -343.0,
+       230.3
+      ]
+     },
+     "dot_minus_base_a": {
+      "median_us": 773.05,
+      "ci95_us": [
+       745.6,
+       796.0
+      ],
+      "median_pct_of_base_p50": 14.08,
+      "iqr_us": [
+       471.5,
+       1106.0
+      ]
+     }
+    },
+    "allowlist of 40, k=10": {
+     "p50_us": {
+      "base_a": 306.9,
+      "base_b": 308.1,
+      "new": 306.3,
+      "dot": 468.4
+     },
+     "mean_us": {
+      "base_a": 374.3,
+      "base_b": 355.3,
+      "new": 395.9,
+      "dot": 546.6
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": 0.45,
+      "ci95_us": [
+       -0.8,
+       1.7
+      ],
+      "median_pct_of_base_p50": 0.15,
+      "iqr_us": [
+       -12.4,
+       15.0
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": -0.85,
+      "ci95_us": [
+       -1.95,
+       0.1
+      ],
+      "median_pct_of_base_p50": -0.28,
+      "iqr_us": [
+       -13.8,
+       12.7
+      ]
+     },
+     "dot_minus_base_a": {
+      "median_us": 156.0,
+      "ci95_us": [
+       153.2,
+       158.2
+      ],
+      "median_pct_of_base_p50": 50.83,
+      "iqr_us": [
+       136.2,
+       195.4
+      ]
+     }
+    }
+   }
+  },
+  {
+   "sources": {
+    "base_a": "main 31ab17e (git archive main src)",
+    "base_b": "main 31ab17e (git archive main src)",
+    "new": "branch feat/dot-metric-float32 at ed1a302"
+   },
+   "calls": 1500,
+   "cases": {
+    "scan + rescore, k=10": {
+     "p50_us": {
+      "base_a": 2874.2,
+      "base_b": 2841.3,
+      "new": 2894.5,
+      "dot": 3042.1
+     },
+     "mean_us": {
+      "base_a": 3047.3,
+      "base_b": 3006.8,
+      "new": 3069.5,
+      "dot": 3214.9
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -33.55,
+      "ci95_us": [
+       -42.81,
+       -21.5
+      ],
+      "median_pct_of_base_p50": -1.17,
+      "iqr_us": [
+       -170.4,
+       100.0
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": 5.6,
+      "ci95_us": [
+       -6.3,
+       18.9
+      ],
+      "median_pct_of_base_p50": 0.19,
+      "iqr_us": [
+       -133.9,
+       155.7
+      ]
+     },
+     "dot_minus_base_a": {
+      "median_us": 161.25,
+      "ci95_us": [
+       151.0,
+       171.6
+      ],
+      "median_pct_of_base_p50": 5.61,
+      "iqr_us": [
+       33.9,
+       320.6
+      ]
+     }
+    },
+    "scan + rescore, k=100": {
+     "p50_us": {
+      "base_a": 5174.6,
+      "base_b": 5152.2,
+      "new": 5169.9,
+      "dot": 5902.2
+     },
+     "mean_us": {
+      "base_a": 5576.5,
+      "base_b": 5639.5,
+      "new": 5590.5,
+      "dot": 6407.4
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -18.3,
+      "ci95_us": [
+       -44.35,
+       13.7
+      ],
+      "median_pct_of_base_p50": -0.35,
+      "iqr_us": [
+       -336.9,
+       281.1
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": -12.2,
+      "ci95_us": [
+       -36.3,
+       11.26
+      ],
+      "median_pct_of_base_p50": -0.24,
+      "iqr_us": [
+       -313.3,
+       282.2
+      ]
+     },
+     "dot_minus_base_a": {
+      "median_us": 693.4,
+      "ci95_us": [
+       665.5,
+       717.95
+      ],
+      "median_pct_of_base_p50": 13.4,
+      "iqr_us": [
+       376.7,
+       1048.1
+      ]
+     }
+    },
+    "allowlist of 40, k=10": {
+     "p50_us": {
+      "base_a": 308.6,
+      "base_b": 308.0,
+      "new": 309.7,
+      "dot": 474.8
+     },
+     "mean_us": {
+      "base_a": 367.0,
+      "base_b": 337.8,
+      "new": 345.1,
+      "dot": 565.2
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -0.7,
+      "ci95_us": [
+       -1.9,
+       0.6
+      ],
+      "median_pct_of_base_p50": -0.23,
+      "iqr_us": [
+       -14.2,
+       11.9
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": -0.1,
+      "ci95_us": [
+       -1.35,
+       1.0
+      ],
+      "median_pct_of_base_p50": -0.03,
+      "iqr_us": [
+       -13.7,
+       13.4
+      ]
+     },
+     "dot_minus_base_a": {
+      "median_us": 160.75,
+      "ci95_us": [
+       158.6,
+       163.25
+      ],
+      "median_pct_of_base_p50": 52.08,
+      "iqr_us": [
+       139.4,
+       195.8
+      ]
+     }
+    }
+   }
+  },
+  {
+   "sources": {
+    "base_a": "main 31ab17e (git archive main src)",
+    "base_b": "main 31ab17e (git archive main src)",
+    "new": "branch feat/dot-metric-float32 at ed1a302"
+   },
+   "calls": 1500,
+   "cases": {
+    "scan + rescore, k=10": {
+     "p50_us": {
+      "base_a": 3180.2,
+      "base_b": 3189.8,
+      "new": 3175.0,
+      "dot": 3356.6
+     },
+     "mean_us": {
+      "base_a": 3440.9,
+      "base_b": 3527.6,
+      "new": 3485.0,
+      "dot": 3614.1
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": 9.85,
+      "ci95_us": [
+       -11.4,
+       31.4
+      ],
+      "median_pct_of_base_p50": 0.31,
+      "iqr_us": [
+       -238.1,
+       264.7
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": -17.15,
+      "ci95_us": [
+       -32.75,
+       2.7
+      ],
+      "median_pct_of_base_p50": -0.54,
+      "iqr_us": [
+       -265.2,
+       233.5
+      ]
+     },
+     "dot_minus_base_a": {
+      "median_us": 164.6,
+      "ci95_us": [
+       140.15,
+       182.2
+      ],
+      "median_pct_of_base_p50": 5.18,
+      "iqr_us": [
+       -80.2,
+       439.4
+      ]
+     }
+    },
+    "scan + rescore, k=100": {
+     "p50_us": {
+      "base_a": 5954.7,
+      "base_b": 5947.5,
+      "new": 5925.2,
+      "dot": 7012.1
+     },
+     "mean_us": {
+      "base_a": 6428.0,
+      "base_b": 6481.3,
+      "new": 6531.6,
+      "dot": 7570.1
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": 8.6,
+      "ci95_us": [
+       -33.4,
+       43.8
+      ],
+      "median_pct_of_base_p50": 0.14,
+      "iqr_us": [
+       -466.6,
+       459.2
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": 1.85,
+      "ci95_us": [
+       -53.15,
+       47.43
+      ],
+      "median_pct_of_base_p50": 0.03,
+      "iqr_us": [
+       -503.6,
+       472.1
+      ]
+     },
+     "dot_minus_base_a": {
+      "median_us": 1012.85,
+      "ci95_us": [
+       965.7,
+       1054.95
+      ],
+      "median_pct_of_base_p50": 17.01,
+      "iqr_us": [
+       489.2,
+       1565.6
+      ]
+     }
+    },
+    "allowlist of 40, k=10": {
+     "p50_us": {
+      "base_a": 306.9,
+      "base_b": 306.2,
+      "new": 305.1,
+      "dot": 483.5
+     },
+     "mean_us": {
+      "base_a": 318.8,
+      "base_b": 325.8,
+      "new": 319.5,
+      "dot": 512.9
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -1.4,
+      "ci95_us": [
+       -2.5,
+       -0.1
+      ],
+      "median_pct_of_base_p50": -0.46,
+      "iqr_us": [
+       -15.3,
+       14.3
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": -1.4,
+      "ci95_us": [
+       -2.5,
+       -0.5
+      ],
+      "median_pct_of_base_p50": -0.46,
+      "iqr_us": [
+       -17.1,
+       12.9
+      ]
+     },
+     "dot_minus_base_a": {
+      "median_us": 171.95,
+      "ci95_us": [
+       168.5,
+       175.3
+      ],
+      "median_pct_of_base_p50": 56.02,
+      "iqr_us": [
+       145.5,
+       205.9
+      ]
+     }
+    }
+   }
+  },
+  {
+   "sources": {
+    "base_a": "main 31ab17e (git archive main src)",
+    "base_b": "main 31ab17e (git archive main src)",
+    "new": "branch feat/dot-metric-float32 at ed1a302"
+   },
+   "calls": 1500,
+   "cases": {
+    "scan + rescore, k=10": {
+     "p50_us": {
+      "base_a": 3026.8,
+      "base_b": 3003.7,
+      "new": 3020.2,
+      "dot": 3147.7
+     },
+     "mean_us": {
+      "base_a": 3334.2,
+      "base_b": 3288.9,
+      "new": 3303.8,
+      "dot": 3408.0
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -10.25,
+      "ci95_us": [
+       -27.3,
+       4.3
+      ],
+      "median_pct_of_base_p50": -0.34,
+      "iqr_us": [
+       -161.2,
+       140.3
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": 8.6,
+      "ci95_us": [
+       -6.9,
+       19.8
+      ],
+      "median_pct_of_base_p50": 0.28,
+      "iqr_us": [
+       -140.6,
+       144.7
+      ]
+     },
+     "dot_minus_base_a": {
+      "median_us": 122.8,
+      "ci95_us": [
+       109.7,
+       135.5
+      ],
+      "median_pct_of_base_p50": 4.06,
+      "iqr_us": [
+       -10.1,
+       264.3
+      ]
+     }
+    },
+    "scan + rescore, k=100": {
+     "p50_us": {
+      "base_a": 5560.1,
+      "base_b": 5553.8,
+      "new": 5561.3,
+      "dot": 6408.1
+     },
+     "mean_us": {
+      "base_a": 5948.1,
+      "base_b": 6050.7,
+      "new": 6013.6,
+      "dot": 6807.8
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -3.0,
+      "ci95_us": [
+       -22.4,
+       16.8
+      ],
+      "median_pct_of_base_p50": -0.05,
+      "iqr_us": [
+       -223.1,
+       210.1
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": 7.75,
+      "ci95_us": [
+       -15.15,
+       24.6
+      ],
+      "median_pct_of_base_p50": 0.14,
+      "iqr_us": [
+       -214.4,
+       230.4
+      ]
+     },
+     "dot_minus_base_a": {
+      "median_us": 829.2,
+      "ci95_us": [
+       813.85,
+       851.0
+      ],
+      "median_pct_of_base_p50": 14.91,
+      "iqr_us": [
+       599.7,
+       1113.5
+      ]
+     }
+    },
+    "allowlist of 40, k=10": {
+     "p50_us": {
+      "base_a": 306.1,
+      "base_b": 305.2,
+      "new": 304.5,
+      "dot": 474.4
+     },
+     "mean_us": {
+      "base_a": 363.5,
+      "base_b": 357.2,
+      "new": 352.9,
+      "dot": 563.6
+     },
+     "same_answers": true,
+     "aa_base_b_minus_base_a": {
+      "median_us": -1.3,
+      "ci95_us": [
+       -2.45,
+       -0.25
+      ],
+      "median_pct_of_base_p50": -0.42,
+      "iqr_us": [
+       -14.0,
+       12.5
+      ]
+     },
+     "ab_new_minus_base_a": {
+      "median_us": -0.7,
+      "ci95_us": [
+       -1.7,
+       0.2
+      ],
+      "median_pct_of_base_p50": -0.23,
+      "iqr_us": [
+       -12.8,
+       11.5
+      ]
+     },
+     "dot_minus_base_a": {
+      "median_us": 160.7,
+      "ci95_us": [
+       158.4,
+       163.8
+      ],
+      "median_pct_of_base_p50": 52.5,
+      "iqr_us": [
+       139.5,
+       193.2
+      ]
+     }
+    }
+   }
+  }
+ ]
+}

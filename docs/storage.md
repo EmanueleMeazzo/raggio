@@ -5,7 +5,7 @@
 ```
 /data/catalog.db                     collections registry + key hashes
 /data/collections/<name>/index.tvim  turbovec quantized vector index (4-bit ≈ 8x smaller)
-/data/collections/<name>/meta.db     text, metadata, fp16 vector copies, FTS5 (BM25) index, job queue
+/data/collections/<name>/meta.db     text, metadata, fp16 vector copies (float32 in dot collections), FTS5 (BM25) index, job queue
 /data/collections/<name>/ivf/        IVF shards + centroids (only when an index is attached)
 ```
 
@@ -21,6 +21,15 @@ what makes [attaching or removing an IVF index](indexing.md) possible, since
 the quantized index cannot reconstruct its vectors. When an IVF index is
 attached, `ivf/` replaces `index.tvim` as the live representation (the catalog
 records which one is current).
+
+A collection created with `"metric": "dot"`
+([Search](search.md#dot-product-collections)) keeps in `vecs` the float32
+values each vector was sent with, little-endian and unnormalised, in place of
+the fp16 copy: they are what searches are scored against and what
+`include_vector=true` returns, and index rebuilds read them too. Its quantized
+index holds unit-length copies, like any other. The table and the rest of
+`meta.db` have the same schema in both kinds of collection; the catalog
+records the metric.
 
 ## Ingest durability
 
@@ -128,6 +137,15 @@ that survives version changes, page through
 
 ## Upgrading
 
+**Dot-product collections ([ADR 0020](adr/0020-dot-metric-float32.md)): no
+migration, but no way back for those collections.** The first start adds a
+`metric` column to `catalog.db`; existing collections read as `cosine` and
+their files are not touched. A release from before the option still opens the
+catalog, but it treats every collection as a cosine one: on a `dot` collection
+its searches fall back to quantized scores, `include_vector` returns `null`,
+and new ingests would write fp16 copies into it. Export (page through
+`include_vector=true`) or delete `dot` collections before downgrading.
+
 **0.4.0 (turbovec 1.1.2): index files move to a format 0.3.0 cannot read.**
 turbovec 1.1 reads the old v7 index files and writes its v8 format
 ([ADR 0017](adr/0017-turbovec-1-1.md)).
@@ -214,7 +232,12 @@ A resident collection's index needs roughly
 An attached [IVF index](indexing.md) holds the same codes plus ~0.5–1 MB fixed
 RAM per shard (e.g. `nlist=256` ≈ +0.15–0.25 GB). On disk, the retained fp16
 vector copies add `dim × 2` bytes per record to `meta.db` (1536 dims ≈ 3 GB per
-1M records) whether or not an index is attached.
+1M records) whether or not an index is attached. A
+[`dot` collection](search.md#dot-product-collections) keeps float32 instead:
+`dim × 4` bytes per record (1536 dims ≈ 6 GB per 1M records). How much the
+file really grows depends on how the rows fill SQLite's 4 KiB pages: at 1024
+dims it measured 12 % more, not twice
+([ADR 0020](adr/0020-dot-metric-float32.md)). Its memory is the same.
 
 Budget: `MAX_RESIDENT_COLLECTIONS × (largest collection's index)` must fit in
 container memory, with headroom for SQLite page cache and request handling.

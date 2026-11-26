@@ -7,7 +7,7 @@ with the `mode` field.
 
 | Mode | How it ranks | Query requirements | Score in `hits[].score` |
 |---|---|---|---|
-| `vector` (default) | Cosine similarity: quantized scan, then exact re-rank of the top candidates against the stored fp16 vectors | Exactly one of `query.text` (embedded server-side) or `query.vector` | Cosine similarity (exact), higher = better |
+| `vector` (default) | Cosine similarity: quantized scan, then exact re-rank of the top candidates against the stored fp16 vectors. In a [`dot` collection](#dot-product-collections), re-ranked by dot product against the stored float32 vectors | Exactly one of `query.text` (embedded server-side) or `query.vector` | Cosine similarity (exact), higher = better; in a `dot` collection the dot product |
 | `text` | BM25 over SQLite FTS5 — no embedding endpoint involved | `query.text` only | BM25, higher = better (unbounded) |
 | `hybrid` | Both rankings fused, with Reciprocal Rank Fusion (default) or relative score fusion | `query.text` required; `query.vector` optional (skips the embedding call) | RRF score in `(0, 2/61]`; relative score in `[0, 1]` |
 
@@ -61,6 +61,77 @@ good: no shard goes unprobed) ([ADR 0007](adr/0007-sofia-backend-requirements.md
   but only when you supply a raw query vector).
 - **hybrid** — the robust default for user-facing search: semantic recall
   from the vector leg, exact-term precision from the BM25 leg.
+
+## Dot-product collections
+
+By default raggio scales every vector to unit length, keeps an fp16 copy, and
+scores by cosine. A collection created with `"metric": "dot"` instead keeps
+each vector as the float32 values it was sent and ranks by their dot product
+with the query as it was sent ([ADR 0020](adr/0020-dot-metric-float32.md)). It
+is for clients that compute with their stored vectors, or whose vectors are
+close to unit length without being exactly so and whose ranking must count
+that length.
+
+```bash
+curl :8000/collections -H "x-api-key: $ROOT" --json '{"name": "kb", "dim": 1024, "metric": "dot"}'
+# -> {"name": "kb", "dim": 1024, "bit_width": 4, "tokenizer": "unicode61", "fts_keys": null, "metric": "dot"}
+```
+
+In such a collection:
+
+- **Stored vectors are the values sent.** Each JSON number becomes the nearest
+  float32, and those are kept, unnormalised.
+  `GET /collections/{name}/documents?include_vector=true` returns them bit for
+  bit. A vector embedded by the server from `text` is kept as the embedding
+  endpoint returned it.
+- **`score` is the dot product** of the stored float32 values with the float32
+  query, `Σ query[i] × stored[i]`, summed in double precision. The query is
+  not normalised: twice the query gives twice every score. Scores are not
+  bounded by 1 and can be negative.
+- **Candidates still come from the quantized scan, by angle.** The scan keeps
+  its usual `2k` candidates (never fewer than 50 at 4-bit, 200 at 2-bit; never
+  more than 2000), and those are re-ranked by dot product. So this is an exact
+  re-ranking of approximate candidates, not an exact search: a record outside
+  the candidates is not returned, however large its dot product. For vectors
+  near unit length the two orders differ only among close neighbours, which
+  the candidates cover; for vectors of very different lengths they do not,
+  and a `dot` collection is the wrong tool. Whenever the candidates cover
+  everything searched (a collection, a filter result or a scope of at most
+  that many records), the result is the exact top `k` by dot product.
+- **Hybrid and text work as elsewhere.** `text` mode is the same BM25. In
+  `hybrid` mode the vector leg is the dot-product ranking: RRF uses its ranks,
+  relative fusion min-max normalises its dot products. Ranked sibling
+  expansion uses the dot product too.
+- **A zero or non-finite vector is refused**: the ingest job ends as `error`
+  and stores nothing, and such a query is a `400`. A number beyond the float32
+  range (about 3.4e38) counts as non-finite.
+- **The metric is fixed at creation.** Creating an existing name with another
+  metric is a `409` that names the existing one. Filters, scopes, expansion
+  and the [IVF index](indexing.md) work unchanged.
+
+The stored vectors take `dim × 4` bytes per record on disk instead of
+`dim × 2` ([sizing](storage.md#sizing)); memory is the same.
+
+### Notes for client authors
+
+- **Check the answer to the create request.** It must contain
+  `"metric": "dot"`. A raggio from before this option ignores the field,
+  answers `201` and creates a cosine collection; its response has no `metric`
+  key. `GET /collections/{name}` reports the metric too.
+- **Send float32 values as the doubles they equal** (numpy:
+  `vector.astype(numpy.float32).tolist()`), and read them back with
+  `numpy.asarray(record["vector"], dtype=numpy.float32)`: the bytes are the
+  ones you sent. To fetch particular records, filter the listing by `doc_id`
+  (`filter={"doc_id": ["a", "b"]}`, up to 1000 records a page).
+- **Do not expect your own float32 arithmetic to reproduce a score to the
+  last bit.** A float32 `stored @ query` agrees to float32 rounding (about
+  1e-7 relative), a float64 one to about 1e-15.
+- **The candidate depth is the request's `k`**: to have more candidates
+  considered, ask for a larger `k` (up to 1000, which re-ranks 2000) and keep
+  the head of the list.
+- **Replacing a vector is re-ingesting its record**: an upsert replaces the
+  whole chunk, text and metadata included. Ingest is a job; a refused vector
+  shows as `"status": "error"` on `GET /collections/{name}/jobs/{job_id}`.
 
 ## How hybrid works
 

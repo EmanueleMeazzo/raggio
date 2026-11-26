@@ -109,7 +109,8 @@ nothing on the others.
 
 ```bash
 # create a collection (dim probed from the embedding endpoint if omitted;
-# tokenizer: unicode61 [default] or trigram for substring matching, used by BM25)
+# tokenizer: unicode61 [default] or trigram for substring matching, used by BM25;
+# optional "metric": "dot" keeps float32 vectors as sent and ranks by dot product)
 curl :8000/collections -H "x-api-key: $ROOT" \
   --json '{"name": "bu-sales", "collection_key": "sales-secret", "bit_width": 4, "tokenizer": "unicode61"}'
 
@@ -146,6 +147,13 @@ the vector leg). Collections can opt into `fts_keys` to include metadata such as
 title, source and tags in BM25. Records without either text or selected metadata
 are invisible to that leg; embeddings and returned text remain unchanged.
 
+Collections normalise vectors and score by cosine. One created with
+`"metric": "dot"` keeps each vector as the float32 values it was sent, returns them
+bit for bit (`GET /collections/{name}/documents?include_vector=true`), and ranks vector
+hits by their dot product with the query as sent: an exact re-ranking of the quantized
+scan's candidates, for clients whose near-unit vectors must keep their length
+([details and limits](docs/search.md#dot-product-collections)).
+
 Also: `GET/DELETE /collections/{name}`, `GET/PATCH/DELETE /collections/{name}/documents/{doc_id}`
 (PATCH merge-patches metadata without re-embedding), `GET /collections/{name}/documents`
 (unranked filtered listing with paging, sort and total count), `GET /healthz`. Re-ingesting
@@ -174,7 +182,7 @@ memory/disk costs, and the recall trade: [docs/indexing.md](docs/indexing.md).
 ```
 /data/catalog.db                     collections registry + key hashes
 /data/collections/<name>/index.tvim  turbovec quantized vector index (4-bit ≈ 8x smaller)
-/data/collections/<name>/meta.db     text, metadata, fp16 vector copies, FTS5 index (BM25), job queue (SQLite)
+/data/collections/<name>/meta.db     text, metadata, fp16 vector copies (float32 in dot collections), FTS5 index (BM25), job queue (SQLite)
 /data/collections/<name>/ivf/        IVF shards + centroids (only when an index is attached)
 ```
 
